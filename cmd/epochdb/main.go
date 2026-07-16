@@ -1,4 +1,73 @@
 // Command epochdb runs the compact C-chain historical node.
 package main
 
-func main() {}
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/containerman17/epochdb/fetch"
+)
+
+func main() {
+	if len(os.Args) < 2 || os.Args[1] != "fetch" {
+		fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>]")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "directory for arrival.log and index.log")
+	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default "+fetch.DefaultNodeURI+")")
+	fs.Parse(os.Args[2:])
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	f, err := fetch.New(fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI})
+	if err != nil {
+		log.Fatalf("epochdb: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- f.Sync(ctx) }()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	prev := f.Progress()
+	prevT := time.Now()
+	for {
+		select {
+		case err := <-done:
+			// Close flushes the store before releasing it.
+			if cerr := f.Close(); cerr != nil {
+				log.Printf("epochdb: close: %v", cerr)
+			}
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Fatalf("epochdb: sync: %v", err)
+			}
+			if err != nil {
+				log.Printf("epochdb: interrupted, state flushed")
+			} else {
+				log.Printf("epochdb: sync complete")
+			}
+			return
+		case <-ticker.C:
+			cur := f.Progress()
+			now := time.Now()
+			dt := now.Sub(prevT).Seconds()
+			rate := float64(cur.Stored-prev.Stored) / dt
+			var pct float64
+			if dr := cur.Requests - prev.Requests; dr > 0 {
+				pct = 100 * float64(cur.NonEmpty-prev.NonEmpty) / float64(dr)
+			}
+			log.Printf("epochdb: height=%d stored=%d rate=%.0f blk/s peers_nonempty=%.0f%% written=%.1f MB",
+				cur.WalkHeight, cur.Stored, rate, pct, float64(cur.SessionBytes)/1e6)
+			prev, prevT = cur, now
+		}
+	}
+}

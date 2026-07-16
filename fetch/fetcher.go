@@ -312,7 +312,6 @@ func (f *Fetcher) raceAncestors(ctx context.Context, tip ids.ID) (ancestorsRespo
 				f.tracker.RegisterFailure(o.peer)
 				continue
 			}
-			f.answersNonEmpty.Add(1)
 			return o.resp, o.peer, true
 		}
 	}
@@ -351,6 +350,7 @@ func (f *Fetcher) singleRequest(ctx context.Context, peer ids.NodeID, tip ids.ID
 			bytes += len(b)
 		}
 		if bytes > 0 {
+			f.answersNonEmpty.Add(1)
 			elapsed := time.Since(sendStart).Seconds()
 			if elapsed <= 0 {
 				elapsed = 1e-9
