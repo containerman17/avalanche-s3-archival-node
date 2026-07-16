@@ -2,6 +2,7 @@ package fetch
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,30 +17,39 @@ func fakeContainer(h uint64, fill byte, n int) (parsedContainer, []byte) {
 		raw[i] = fill
 	}
 	var id ids.ID
-	id[0] = fill
-	id[1] = byte(h)
+	binary.BigEndian.PutUint64(id[:8], h)
+	id[8] = fill
 	return parsedContainer{containerID: id, blockNumber: h, blockHash: id}, raw
 }
 
-func TestStoreRebuildAndReaders(t *testing.T) {
+func TestStoreSegmentsRebuildAndReaders(t *testing.T) {
 	dir := t.TempDir()
 	s, err := OpenStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for h := uint64(5); h <= 7; h++ {
-		p, raw := fakeContainer(h, byte(0xa0+h), 100+int(h))
+	// Contiguous run spanning the bucket 0 / bucket 1 boundary, plus a
+	// detached higher block in bucket 2.
+	heights := []uint64{99_998, 99_999, 100_000, 100_001, 250_000}
+	for i, h := range heights {
+		p, raw := fakeContainer(h, byte(0xa0+i), 100+i)
 		if err := s.Append(p, raw); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Non-contiguous higher block.
-	p9, raw9 := fakeContainer(9, 0xff, 50)
-	if err := s.Append(p9, raw9); err != nil {
-		t.Fatal(err)
-	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
+	}
+
+	// Destination file is a pure function of height.
+	for _, name := range []string{
+		"arrival_00000.log", "index_00000.log",
+		"arrival_00001.log", "index_00001.log",
+		"arrival_00002.log", "index_00002.log",
+	} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("missing segment file %s: %v", name, err)
+		}
 	}
 
 	s, err = OpenStore(dir)
@@ -47,35 +57,36 @@ func TestStoreRebuildAndReaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if got := s.Count(); got != 4 {
-		t.Fatalf("count=%d want 4", got)
+	if got := s.Count(); got != 5 {
+		t.Fatalf("count=%d want 5", got)
 	}
-	if head, ok := s.Head(); !ok || head != 9 {
-		t.Fatalf("head=%d,%v want 9,true", head, ok)
+	if head, ok := s.Head(); !ok || head != 250_000 {
+		t.Fatalf("head=%d,%v want 250000,true", head, ok)
 	}
-	if lo := s.LowestContiguous(7); lo != 5 {
-		t.Fatalf("lowestContiguous(7)=%d want 5", lo)
+	if lo := s.LowestContiguous(100_001); lo != 99_998 {
+		t.Fatalf("lowestContiguous=%d want 99998", lo)
 	}
-	raw, ok, err := s.GetByHeight(6)
-	if err != nil || !ok || len(raw) != 106 || raw[0] != 0xa6 {
-		t.Fatalf("GetByHeight(6)=%v,%v,%v", len(raw), ok, err)
+	raw, ok, err := s.GetByHeight(100_000)
+	if err != nil || !ok || len(raw) != 102 || raw[0] != 0xa2 {
+		t.Fatalf("GetByHeight(100000)=%v,%v,%v", len(raw), ok, err)
 	}
-	if _, ok, _ := s.GetByHeight(8); ok {
-		t.Fatal("height 8 should be missing")
+	if _, ok, _ := s.GetByHeight(100_002); ok {
+		t.Fatal("height 100002 should be missing")
 	}
-	p6, _ := fakeContainer(6, 0xa6, 0)
-	if h, ok := s.HeightOf(p6.containerID); !ok || h != 6 {
-		t.Fatalf("HeightOf=%d,%v want 6,true", h, ok)
+	p, _ := fakeContainer(99_999, 0xa1, 0)
+	if h, ok := s.HeightOf(p.containerID); !ok || h != 99_999 {
+		t.Fatalf("HeightOf=%d,%v want 99999,true", h, ok)
 	}
 }
 
-func TestStoreTornTailTruncation(t *testing.T) {
+func TestStoreTornTailTruncationPerSegment(t *testing.T) {
 	dir := t.TempDir()
 	s, err := OpenStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for h := uint64(1); h <= 3; h++ {
+	// Two blocks in bucket 0, three in bucket 1.
+	for _, h := range []uint64{1, 2, 100_001, 100_002, 100_003} {
 		p, raw := fakeContainer(h, byte(h), 64)
 		if err := s.Append(p, raw); err != nil {
 			t.Fatal(err)
@@ -85,18 +96,18 @@ func TestStoreTornTailTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate a crash that tore the last arrival write: index record 3
-	// now points past arrival.log's end.
-	arrival := filepath.Join(dir, "arrival.log")
-	st, err := os.Stat(arrival)
+	// Simulate a crash that tore bucket 1's last arrival write: its index
+	// record now points past the arrival file's end.
+	arrival1 := filepath.Join(dir, "arrival_00001.log")
+	st, err := os.Stat(arrival1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(arrival, st.Size()-10); err != nil {
+	if err := os.Truncate(arrival1, st.Size()-10); err != nil {
 		t.Fatal(err)
 	}
 	// And a torn index append on top: a partial trailing record.
-	idx, err := os.OpenFile(filepath.Join(dir, "index.log"), os.O_WRONLY|os.O_APPEND, 0o644)
+	idx, err := os.OpenFile(filepath.Join(dir, "index_00001.log"), os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,30 +120,33 @@ func TestStoreTornTailTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.Count(); got != 2 {
-		t.Fatalf("count after torn tail=%d want 2", got)
+	if got := s.Count(); got != 4 {
+		t.Fatalf("count after torn tail=%d want 4", got)
 	}
-	if _, ok, _ := s.GetByHeight(3); ok {
-		t.Fatal("height 3 should have been truncated away")
+	if _, ok, _ := s.GetByHeight(100_003); ok {
+		t.Fatal("torn height 100003 should have been truncated away")
 	}
-	if raw, ok, err := s.GetByHeight(2); err != nil || !ok || len(raw) != 64 {
-		t.Fatalf("GetByHeight(2)=%v,%v,%v", len(raw), ok, err)
+	// Bucket 0 untouched, bucket 1's earlier records intact.
+	for _, h := range []uint64{1, 2, 100_001, 100_002} {
+		if raw, ok, err := s.GetByHeight(h); err != nil || !ok || len(raw) != 64 {
+			t.Fatalf("GetByHeight(%d)=%v,%v,%v", h, len(raw), ok, err)
+		}
 	}
-	// Both files must be truncated to the last consistent record.
-	ist, _ := os.Stat(filepath.Join(dir, "index.log"))
+	// Both files of bucket 1 truncated to the last consistent record.
+	ist, _ := os.Stat(filepath.Join(dir, "index_00001.log"))
 	if ist.Size() != 2*indexRecSize {
-		t.Fatalf("index size=%d want %d", ist.Size(), 2*indexRecSize)
+		t.Fatalf("index_00001 size=%d want %d", ist.Size(), 2*indexRecSize)
 	}
-	ast, _ := os.Stat(arrival)
-	if ast.Size() != 2*(1+64) { // uvarint(64)=1 byte
-		t.Fatalf("arrival size=%d want %d", ast.Size(), 2*(1+64))
+	ast, _ := os.Stat(arrival1)
+	if ast.Size() != 2*(1+64) { // uvarint(64) = 1 byte
+		t.Fatalf("arrival_00001 size=%d want %d", ast.Size(), 2*(1+64))
 	}
-	// Store must accept appends again after truncation.
-	p3, raw3 := fakeContainer(3, 3, 64)
-	if err := s.Append(p3, raw3); err != nil {
+	// Store must accept re-appends after truncation.
+	p, raw := fakeContainer(100_003, 3, 64)
+	if err := s.Append(p, raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw, ok, _ := s.GetByHeight(3); !ok || len(raw) != 64 {
+	if raw, ok, _ := s.GetByHeight(100_003); !ok || len(raw) != 64 {
 		t.Fatal("re-append after truncation failed")
 	}
 	if err := s.Close(); err != nil {
@@ -157,7 +171,7 @@ func TestSubscribeAscending(t *testing.T) {
 	ch := s.Subscribe(ctx, 1)
 
 	ev := <-ch
-	if ev.BlockNumber != 1 || len(ev.Raw) != 10 {
+	if ev.BlockNumber != 1 || len(ev.Raw) != 10 || ev.ContainerID != p1.containerID {
 		t.Fatalf("event 1: %+v", ev)
 	}
 	// Height 2 lands after the subscriber is already waiting.
@@ -171,9 +185,6 @@ func TestSubscribeAscending(t *testing.T) {
 		t.Fatalf("event 2: %+v", ev)
 	}
 	cancel()
-	if _, open := <-ch; open {
-		// One buffered event may sneak in; drain until close.
-		for range ch {
-		}
+	for range ch { // drain until close
 	}
 }
