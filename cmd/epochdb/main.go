@@ -16,7 +16,9 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 
+	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/epochdb/state"
 )
 
 // parseContainerID accepts a cb58 container ID or a 0x-hex 32-byte eth
@@ -33,16 +35,66 @@ func parseContainerID(s string) (ids.ID, error) {
 }
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "fetch" {
-		fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>] [--tip <containerID>]")
-		os.Exit(2)
+	if len(os.Args) < 2 {
+		usage()
 	}
+	switch os.Args[1] {
+	case "fetch":
+		fetchMain(os.Args[2:])
+	case "exec":
+		execMain(os.Args[2:])
+	default:
+		usage()
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>] [--tip <containerID>]")
+	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>]")
+	os.Exit(2)
+}
+
+// execMain replays blocks ascending from genesis out of the (possibly
+// still filling) staging dir, verifying every state root.
+func execMain(args []string) {
+	fs := flag.NewFlagSet("exec", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory (staging segments + state layer)")
+	fs.Parse(args)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	reader, err := fetch.OpenReader(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: open staging reader: %v", err)
+	}
+	defer reader.Close()
+
+	store, err := state.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: open state layer: %v", err)
+	}
+	defer store.Close()
+
+	e, err := exec.New(exec.Config{DataDir: *dataDir, Blocks: reader, Store: store})
+	if err != nil {
+		log.Fatalf("epochdb: exec.New: %v", err)
+	}
+	defer e.Close()
+
+	if err := e.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("epochdb: exec: %v", err)
+	}
+	log.Printf("epochdb: exec stopped at height=%d, state flushed", e.Head())
+}
+
+func fetchMain(args []string) {
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "directory for the segment files")
 	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default "+fetch.DefaultNodeURI+")")
-	walks := fs.Int("walks", 6, "concurrent backward walks")
+	walks := fs.Int("walks", 16, "concurrent backward walks")
 	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
-	fs.Parse(os.Args[2:])
+	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
