@@ -75,6 +75,7 @@ type Executor struct {
 	chainCtx  chainContext
 
 	genesisRoot common.Hash
+	genesisHash common.Hash
 	headRoot    common.Hash
 	headNum     uint64
 	totalGas    uint64 // session gas, for mgas/s
@@ -170,6 +171,7 @@ func New(cfg Config) (*Executor, error) {
 		snowCtx:     snowCtx,
 		chainCtx:    chainContext{store: cfg.Store},
 		genesisRoot: genesisRoot,
+		genesisHash: g.ToBlock().Hash(),
 		headRoot:    genesisRoot,
 		headNum:     0,
 	}
@@ -203,6 +205,7 @@ func (e *Executor) reconcile() error {
 		if err := e.cfg.Store.FlushAndSetExecHead(0); err != nil {
 			return fmt.Errorf("seed exechead: %w", err)
 		}
+		e.fwBackend.SetHashAndHeight(e.genesisHash, 0)
 		log.Printf("exec: fresh state, genesis root=%x", e.genesisRoot)
 		return nil
 	}
@@ -218,6 +221,14 @@ func (e *Executor) reconcile() error {
 		if rootFW != e.genesisRoot {
 			return fmt.Errorf("head=0 but firewood root %x != genesis %x", rootFW, e.genesisRoot)
 		}
+		// Resume at genesis: a fresh-opened Firewood only knows its disk
+		// root, not any block hash (tree.blockHashes = {zero hash}), so
+		// block 1's Update could not resolve its parent hash. Register
+		// the genesis block hash ("must be called at startup" per
+		// SetHashAndHeight's contract). Without this, replay dies
+		// deterministically at the first non-empty block after a restart
+		// at height 0.
+		e.fwBackend.SetHashAndHeight(e.genesisHash, 0)
 		return nil
 	}
 
@@ -249,9 +260,10 @@ func (e *Executor) reconcile() error {
 	if !found {
 		if rootFW == e.genesisRoot {
 			// Firewood opened against pristine disk; its revisions are
-			// gone. Re-execute everything from genesis.
+			// gone. Re-execute everything from genesis, whose block hash
+			// Firewood needs registered to resolve block 1's parent.
 			fwN = 0
-			fwHash = common.Hash{}
+			fwHash = e.genesisHash
 		} else {
 			return fmt.Errorf("reconcile: firewood root %x not found in headers [%d..%d]", rootFW, lo, top)
 		}

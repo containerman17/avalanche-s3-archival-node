@@ -4,7 +4,10 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/ava-labs/libevm/common"
+	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/rlp"
 
 	"github.com/containerman17/epochdb/fetch"
@@ -16,6 +19,65 @@ type fakeSource map[uint64][]byte
 func (f fakeSource) GetByHeight(n uint64) ([]byte, bool, error) {
 	raw, ok := f[n]
 	return raw, ok, nil
+}
+
+// TestRestartAtGenesisExecutesFirstBlock is the regression for the
+// production wall "no proposal found for block 1": process 1 commits
+// genesis and exits at head 0; process 2 reopens (genesis already on
+// disk, exechead=0) and must be able to commit the first NON-empty
+// block, whose Firewood Update resolves its parent by the genesis BLOCK
+// hash. A fresh-opened Firewood only knows the zero hash until
+// SetHashAndHeight registers the real one.
+func TestRestartAtGenesisExecutesFirstBlock(t *testing.T) {
+	fetch.RegisterExtras()
+	dir := t.TempDir()
+
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(Config{DataDir: dir, Blocks: fakeSource{}, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// "Restart": genesis initialized on disk, exechead=0, no headers.
+	store, err = state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	e, err = New(Config{DataDir: dir, Blocks: fakeSource{}, Store: store})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer e.Close()
+
+	// Mimic executeBlock's commit path for a non-empty block 1: a state
+	// change committed with the (genesis hash, block-1 hash) payload.
+	sdb, err := ethstate.New(e.genesisRoot, e.wrapDB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdb.SetNonce(common.HexToAddress("0x1234"), 1)
+	blk1Hash := common.HexToHash("0xb10c")
+	root, err := sdb.Commit(1, true, stateconf.WithTrieDBUpdateOpts(
+		stateconf.WithTrieDBUpdatePayload(e.genesisHash, blk1Hash)))
+	if err != nil {
+		t.Fatalf("first non-empty block after restart at genesis: %v", err)
+	}
+	if root == e.genesisRoot {
+		t.Fatal("expected a state change")
+	}
+	if err := e.triedb.Commit(root, false); err != nil {
+		t.Fatalf("triedb commit: %v", err)
+	}
 }
 
 // TestEmptyBlockFastPathAcrossRestart replays consecutive empty blocks
