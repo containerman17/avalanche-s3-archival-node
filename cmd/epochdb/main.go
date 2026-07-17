@@ -21,8 +21,9 @@ func main() {
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "directory for arrival.log and index.log")
+	dataDir := fs.String("data", "./data", "directory for the segment files")
 	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default "+fetch.DefaultNodeURI+")")
+	walks := fs.Int("walks", 6, "concurrent backward walks")
 	fs.Parse(os.Args[2:])
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -34,9 +35,9 @@ func main() {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- f.Sync(ctx) }()
+	go func() { done <- f.Sync(ctx, *walks) }()
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	prev := f.Progress()
 	prevT := time.Now()
@@ -65,8 +66,8 @@ func main() {
 			if dr := cur.Requests - prev.Requests; dr > 0 {
 				pct = 100 * float64(cur.NonEmpty-prev.NonEmpty) / float64(dr)
 			}
-			log.Printf("epochdb: height=%d stored=%d rate=%.0f blk/s peers_nonempty=%.0f%% written=%.1f MB",
-				cur.WalkHeight, cur.Stored, rate, pct, float64(cur.SessionBytes)/1e6)
+			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d peers_nonempty=%.0f%%",
+				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, pct)
 			prev, prevT = cur, now
 		}
 	}

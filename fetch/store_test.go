@@ -133,13 +133,18 @@ func TestStoreTornTailTruncationPerSegment(t *testing.T) {
 		}
 	}
 	// Both files of bucket 1 truncated to the last consistent record.
-	ist, _ := os.Stat(filepath.Join(dir, "index_00001.log"))
-	if ist.Size() != 2*indexRecSize {
-		t.Fatalf("index_00001 size=%d want %d", ist.Size(), 2*indexRecSize)
+	idxBytes, err := os.ReadFile(filepath.Join(dir, "index_00001.log"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(idxBytes) != 2*indexRecSize {
+		t.Fatalf("index_00001 size=%d want %d", len(idxBytes), 2*indexRecSize)
+	}
+	lastRec := idxBytes[indexRecSize:]
+	lastEnd := int64(binary.BigEndian.Uint64(lastRec[72:80])) + int64(binary.BigEndian.Uint32(lastRec[80:84]))
 	ast, _ := os.Stat(arrival1)
-	if ast.Size() != 2*(1+64) { // uvarint(64) = 1 byte
-		t.Fatalf("arrival_00001 size=%d want %d", ast.Size(), 2*(1+64))
+	if ast.Size() != lastEnd {
+		t.Fatalf("arrival_00001 size=%d want %d (end of last consistent record)", ast.Size(), lastEnd)
 	}
 	// Store must accept re-appends after truncation.
 	p, raw := fakeContainer(100_003, 3, 64)

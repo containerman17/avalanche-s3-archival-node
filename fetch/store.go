@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Store is an append-only flat-file container store. No database.
@@ -22,11 +23,13 @@ import (
 // function of height, independent of arrival order. The filenames ARE the
 // catalogue: deleting a segment is rm of both files of the bucket.
 //
-//	arrival_NNNN.log: [uvarint len][container bytes]... in arrival order.
-//	index_NNNN.log:   fixed 84-byte records, one per container, appended as
-//	                  containers land: height(8 BE) containerID(32)
-//	                  blockHash(32) offset(8 BE, into the segment's arrival
-//	                  file at the container bytes) len(4 BE).
+//	arrival_NNNNN.log: [uvarint compressedLen][zstd frame]... in arrival
+//	                   order; each frame is one container compressed
+//	                   standalone (no dict, default level).
+//	index_NNNNN.log:   fixed 84-byte records, one per container, appended as
+//	                   containers land: height(8 BE) containerID(32)
+//	                   blockHash(32) offset(8 BE, into the segment's arrival
+//	                   file at the zstd frame) len(4 BE, compressed).
 //
 // Startup rebuilds the RAM maps from a sequential scan of every index
 // sidecar. If a sidecar's tail points past the end of its arrival file
@@ -45,8 +48,12 @@ type Store struct {
 	head     uint64
 	haveAny  bool
 
-	useCounter   uint64
-	sessionBytes atomic.Uint64
+	enc *zstd.Encoder
+	dec *zstd.Decoder
+
+	useCounter      uint64
+	sessionBytes    atomic.Uint64 // compressed + index bytes written
+	sessionRawBytes atomic.Uint64 // container bytes before compression
 }
 
 type segment struct {
@@ -93,11 +100,21 @@ func OpenStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		return nil, err
+	}
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return nil, err
+	}
 	s := &Store{
 		dir:      dir,
 		segs:     make(map[uint64]*segment),
 		byHeight: make(map[uint64]heightRec),
 		byID:     make(map[ids.ID]uint64),
+		enc:      enc,
+		dec:      dec,
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -256,13 +273,14 @@ func (s *Store) Append(p parsedContainer, raw []byte) error {
 		return err
 	}
 
+	frame := s.enc.EncodeAll(raw, nil)
 	var lenBuf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(lenBuf[:], uint64(len(raw)))
-	off := sg.arrivalOff + uint64(n) // offset of the container bytes
+	n := binary.PutUvarint(lenBuf[:], uint64(len(frame)))
+	off := sg.arrivalOff + uint64(n) // offset of the zstd frame
 
-	buf := make([]byte, 0, n+len(raw))
+	buf := make([]byte, 0, n+len(frame))
 	buf = append(buf, lenBuf[:n]...)
-	buf = append(buf, raw...)
+	buf = append(buf, frame...)
 	if _, err := sg.arrival.Write(buf); err != nil {
 		return fmt.Errorf("arrival write: %w", err)
 	}
@@ -272,20 +290,21 @@ func (s *Store) Append(p parsedContainer, raw []byte) error {
 	copy(rec[8:40], p.containerID[:])
 	copy(rec[40:72], p.blockHash[:])
 	binary.BigEndian.PutUint64(rec[72:80], off)
-	binary.BigEndian.PutUint32(rec[80:84], uint32(len(raw)))
+	binary.BigEndian.PutUint32(rec[80:84], uint32(len(frame)))
 	if _, err := sg.index.Write(rec[:]); err != nil {
 		return fmt.Errorf("index write: %w", err)
 	}
 
-	sg.arrivalOff = off + uint64(len(raw))
+	sg.arrivalOff = off + uint64(len(frame))
 	sg.dirty = true
-	s.byHeight[p.blockNumber] = heightRec{id: p.containerID, off: off, ln: uint32(len(raw))}
+	s.byHeight[p.blockNumber] = heightRec{id: p.containerID, off: off, ln: uint32(len(frame))}
 	s.byID[p.containerID] = p.blockNumber
 	if !s.haveAny || p.blockNumber > s.head {
 		s.head = p.blockNumber
 		s.haveAny = true
 	}
 	s.sessionBytes.Add(uint64(len(buf) + indexRecSize))
+	s.sessionRawBytes.Add(uint64(len(raw)))
 	return nil
 }
 
@@ -351,9 +370,13 @@ func (s *Store) readAt(n uint64) ([]byte, ids.ID, bool, error) {
 	if err != nil {
 		return nil, ids.Empty, false, err
 	}
-	raw := make([]byte, rec.ln)
-	if _, err := sg.arrival.ReadAt(raw, int64(rec.off)); err != nil {
+	frame := make([]byte, rec.ln)
+	if _, err := sg.arrival.ReadAt(frame, int64(rec.off)); err != nil {
 		return nil, ids.Empty, false, fmt.Errorf("read container at height %d: %w", n, err)
+	}
+	raw, err := s.dec.DecodeAll(frame, nil)
+	if err != nil {
+		return nil, ids.Empty, false, fmt.Errorf("decompress container at height %d: %w", n, err)
 	}
 	return raw, rec.id, true, nil
 }
@@ -387,8 +410,11 @@ func (s *Store) Count() uint64 {
 	return uint64(len(s.byID))
 }
 
-// SessionBytes returns bytes written (arrival + index) since open.
+// SessionBytes returns bytes written (compressed arrival + index) since open.
 func (s *Store) SessionBytes() uint64 { return s.sessionBytes.Load() }
+
+// SessionRawBytes returns pre-compression container bytes appended since open.
+func (s *Store) SessionRawBytes() uint64 { return s.sessionRawBytes.Load() }
 
 // Subscribe emits stored blocks in ascending height order starting at
 // fromBlock. The channel stays open across gaps: heights not yet stored are

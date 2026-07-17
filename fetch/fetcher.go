@@ -76,7 +76,7 @@ type Fetcher struct {
 	// Stats for progress logging.
 	requestsSent    atomic.Uint64
 	answersNonEmpty atomic.Uint64
-	walkHeight      atomic.Uint64
+	activeWalks     atomic.Int64
 }
 
 // New opens the flat-file store, dials the Fuji primary network, and waits

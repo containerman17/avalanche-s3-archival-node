@@ -4,48 +4,84 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
+	"sync"
 
 	"github.com/ava-labs/avalanchego/genesis"
 	"github.com/ava-labs/avalanchego/ids"
+	"golang.org/x/sync/errgroup"
 )
 
-// Sync populates the store with the full C-chain history. Strategy: fetch
-// every embedded checkpoint container (avalanchego ships 99 for Fuji C-chain,
-// heights are not published so each is fetched and parsed), then walk
-// backward from the highest one via GetAncestors. A walk short-circuits when
-// it hits an already-stored container (skipping to the bottom of the
-// contiguous stored run, which is how resume works) or the locally computed
-// genesis container ID (genesis is never served over GetAncestors).
-func (f *Fetcher) Sync(ctx context.Context) error {
+// Sync populates the store with the full C-chain history using `walks`
+// concurrent backward walks. Strategy: fetch every embedded checkpoint
+// container (heights are not published, so each is fetched and parsed),
+// sort by height, and split history into disjoint spans, one per adjacent
+// checkpoint pair. Each walk claims a span and follows parent links down
+// via GetAncestors until it reaches its floor (the next lower checkpoint,
+// which is already stored), the locally computed genesis container ID
+// (genesis is never served over GetAncestors), or block 0. A walk
+// short-circuits over already-stored containers by skipping to the bottom
+// of the contiguous stored run, which is also how resume works.
+func (f *Fetcher) Sync(ctx context.Context, walks int) error {
+	if walks < 1 {
+		walks = 1
+	}
 	cps := genesis.GetCheckpoints(f.networkID, f.chainID)
 	if cps.Len() == 0 {
 		return fmt.Errorf("no embedded checkpoints for network %d chain %s", f.networkID, f.chainID)
 	}
-	log.Printf("fetch: checkpoints=%d", cps.Len())
+	log.Printf("fetch: checkpoints=%d walks=%d", cps.Len(), walks)
 
-	var (
-		tip     ids.ID
-		tipH    uint64
-		haveTip bool
-		done    int
-	)
-	for id := range cps {
-		parsed, err := f.getContainer(ctx, id)
-		if err != nil {
-			return fmt.Errorf("fetch checkpoint %s: %w", id, err)
-		}
-		done++
-		if done%20 == 0 {
-			log.Printf("fetch: checkpoints resolved %d/%d", done, cps.Len())
-		}
-		if !haveTip || parsed.blockNumber > tipH {
-			tip, tipH = parsed.containerID, parsed.blockNumber
-			haveTip = true
-		}
+	type point struct {
+		id ids.ID
+		h  uint64
 	}
-	log.Printf("fetch: walking back from checkpoint height=%d id=%s", tipH, tip)
+	var (
+		mu  sync.Mutex
+		pts = make([]point, 0, cps.Len())
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(walks)
+	for id := range cps {
+		g.Go(func() error {
+			parsed, err := f.getContainer(gctx, id)
+			if err != nil {
+				return fmt.Errorf("fetch checkpoint %s: %w", id, err)
+			}
+			mu.Lock()
+			pts = append(pts, point{id, parsed.blockNumber})
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i].h > pts[j].h })
+	log.Printf("fetch: checkpoints resolved, highest=%d lowest=%d", pts[0].h, pts[len(pts)-1].h)
 
-	id := tip
+	g, gctx = errgroup.WithContext(ctx)
+	g.SetLimit(walks)
+	for i, p := range pts {
+		var floor uint64
+		if i+1 < len(pts) {
+			floor = pts[i+1].h
+		}
+		g.Go(func() error {
+			f.activeWalks.Add(1)
+			defer f.activeWalks.Add(-1)
+			return f.walkSpan(gctx, p.id, floor)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	log.Printf("fetch: all %d spans complete", len(pts))
+	return nil
+}
+
+// walkSpan walks backward from tip until the span floor, genesis, or block 0.
+func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -56,13 +92,18 @@ func (f *Fetcher) Sync(ctx context.Context) error {
 		default:
 		}
 		if id == f.genesisID {
-			log.Printf("fetch: reached genesis container, sync complete")
 			return nil
 		}
 		if h, ok := f.store.HeightOf(id); ok {
+			if h <= floor {
+				return nil // reached the next span's territory
+			}
 			// Short-circuit: skip past the contiguous stored run in RAM,
 			// re-parse only the bottom container to find its parent.
 			lo := f.store.LowestContiguous(h)
+			if lo == 0 || (floor > 0 && lo <= floor+1) {
+				return nil // run connects to the floor checkpoint (or block 0)
+			}
 			raw, ok, err := f.store.GetByHeight(lo)
 			if err != nil || !ok {
 				return fmt.Errorf("read stored container at height %d: %w", lo, err)
@@ -71,9 +112,7 @@ func (f *Fetcher) Sync(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("parse stored container at height %d: %w", lo, err)
 			}
-			f.walkHeight.Store(parsed.blockNumber)
 			if parsed.blockNumber == 0 {
-				log.Printf("fetch: reached block 0, sync complete")
 				return nil
 			}
 			id = parsed.parentID
@@ -83,9 +122,7 @@ func (f *Fetcher) Sync(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		f.walkHeight.Store(parsed.blockNumber)
 		if parsed.blockNumber == 0 {
-			log.Printf("fetch: reached block 0, sync complete")
 			return nil
 		}
 		id = parsed.parentID
@@ -170,19 +207,21 @@ func (f *Fetcher) fetchAndStore(ctx context.Context, id ids.ID) error {
 
 // Progress is a snapshot of sync counters for logging.
 type Progress struct {
-	WalkHeight   uint64 // current backward-walk height
 	Stored       uint64 // containers in the store
-	SessionBytes uint64 // bytes written since open
+	SessionBytes uint64 // compressed + index bytes written since open
+	SessionRaw   uint64 // container bytes before compression since open
 	Requests     uint64 // GetAncestors requests sent
 	NonEmpty     uint64 // requests answered non-empty within the race window
+	ActiveWalks  int64
 }
 
 func (f *Fetcher) Progress() Progress {
 	return Progress{
-		WalkHeight:   f.walkHeight.Load(),
 		Stored:       f.store.Count(),
 		SessionBytes: f.store.SessionBytes(),
+		SessionRaw:   f.store.SessionRawBytes(),
 		Requests:     f.requestsSent.Load(),
 		NonEmpty:     f.answersNonEmpty.Load(),
+		ActiveWalks:  f.activeWalks.Load(),
 	}
 }
