@@ -7,6 +7,7 @@ require (
 	github.com/ava-labs/avalanchego/graft/coreth v1.14.2
 	github.com/ava-labs/avalanchego/graft/evm v1.14.2
 	github.com/ava-labs/libevm v1.13.14-0.4.0.rc.2
+	github.com/holiman/uint256 v1.2.4
 	github.com/klauspost/compress v1.18.0
 	github.com/prometheus/client_golang v1.23.0
 	golang.org/x/sync v0.19.0
@@ -54,7 +55,6 @@ require (
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.1 // indirect
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
-	github.com/holiman/uint256 v1.2.4 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
