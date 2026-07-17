@@ -6,7 +6,6 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
-	avap2p "github.com/ava-labs/avalanchego/network/p2p"
 	"github.com/ava-labs/avalanchego/proto/pb/p2p"
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/version"
@@ -21,17 +20,17 @@ type ancestorsResponse struct {
 type inboundHandler struct {
 	connectedCh chan ids.NodeID
 	peers       set.Set[ids.NodeID]
-	tracker     *avap2p.PeerTracker
+	pool        *peerPool
 
 	routeMu  sync.Mutex
 	routeMap map[uint32]chan ancestorsResponse
 }
 
-func newHandler(peers set.Set[ids.NodeID], tracker *avap2p.PeerTracker) *inboundHandler {
+func newHandler(peers set.Set[ids.NodeID], pool *peerPool) *inboundHandler {
 	return &inboundHandler{
 		connectedCh: make(chan ids.NodeID, peers.Len()+4),
 		peers:       peers,
-		tracker:     tracker,
+		pool:        pool,
 		routeMap:    make(map[uint32]chan ancestorsResponse),
 	}
 }
@@ -40,7 +39,7 @@ func (h *inboundHandler) Connected(nodeID ids.NodeID, _ *version.Application, _ 
 	if !h.peers.Contains(nodeID) {
 		return
 	}
-	h.tracker.Connected(nodeID, nil)
+	h.pool.connected(nodeID)
 	select {
 	case h.connectedCh <- nodeID:
 	default:
@@ -48,7 +47,7 @@ func (h *inboundHandler) Connected(nodeID ids.NodeID, _ *version.Application, _ 
 }
 
 func (h *inboundHandler) Disconnected(nodeID ids.NodeID) {
-	h.tracker.Disconnected(nodeID)
+	h.pool.disconnected(nodeID)
 }
 
 func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMessage) {

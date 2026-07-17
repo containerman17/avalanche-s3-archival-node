@@ -32,6 +32,8 @@ func (f *Fetcher) Sync(ctx context.Context, walks int) error {
 	}
 	log.Printf("fetch: checkpoints=%d walks=%d", cps.Len(), walks)
 
+	go f.probeLoop(ctx)
+
 	type point struct {
 		id ids.ID
 		h  uint64
@@ -154,16 +156,16 @@ func (f *Fetcher) getContainer(ctx context.Context, id ids.ID) (parsedContainer,
 	return parseContainer(raw)
 }
 
-// fetchAndStore races a batch of peers for GetAncestors(id), appends every
+// fetchAndStore asks an archival peer for GetAncestors(id), appends every
 // returned container to the store, and returns once the requested container
-// itself is persisted. Peers that answer empty or a wrong first container
-// are penalised and rotated out.
+// itself is persisted. Peers that answer empty, time out, or return a bad
+// payload are demoted out of the archival set and the request retried.
 func (f *Fetcher) fetchAndStore(ctx context.Context, id ids.ID) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		resp, peer, ok := f.raceAncestors(ctx, id)
+		resp, peer, ok := f.fetchAncestors(ctx, id)
 		if !ok {
 			continue
 		}
@@ -175,14 +177,14 @@ func (f *Fetcher) fetchAndStore(ctx context.Context, id ids.ID) error {
 			if err != nil {
 				log.Printf("fetch: parse container %d/%d from %s: %v (raw_len=%d)",
 					i, len(resp.blocks), peer, err, len(raw))
-				f.tracker.RegisterFailure(peer)
+				f.pool.setArchival(peer, false)
 				respOK = false
 				break
 			}
 			if i == 0 && parsed.containerID != id {
 				log.Printf("fetch: peer %s returned wrong head container: got=%s want=%s",
 					peer, parsed.containerID, id)
-				f.tracker.RegisterFailure(peer)
+				f.pool.setArchival(peer, false)
 				respOK = false
 				break
 			}
@@ -211,8 +213,11 @@ type Progress struct {
 	SessionBytes uint64 // compressed + index bytes written since open
 	SessionRaw   uint64 // container bytes before compression since open
 	Requests     uint64 // GetAncestors requests sent
-	NonEmpty     uint64 // requests answered non-empty within the race window
+	Answers      uint64 // answers received (any content)
+	NonEmpty     uint64 // answers carrying at least one container
 	ActiveWalks  int64
+	Archival     int   // current archival peer set size
+	InFlight     int64 // outstanding GetAncestors requests
 }
 
 func (f *Fetcher) Progress() Progress {
@@ -221,7 +226,10 @@ func (f *Fetcher) Progress() Progress {
 		SessionBytes: f.store.SessionBytes(),
 		SessionRaw:   f.store.SessionRawBytes(),
 		Requests:     f.requestsSent.Load(),
+		Answers:      f.answersTotal.Load(),
 		NonEmpty:     f.answersNonEmpty.Load(),
 		ActiveWalks:  f.activeWalks.Load(),
+		Archival:     f.pool.archivalCount(),
+		InFlight:     f.inFlight.Load(),
 	}
 }

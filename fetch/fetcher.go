@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/netip"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
 	"github.com/ava-labs/avalanchego/network"
-	avap2p "github.com/ava-labs/avalanchego/network/p2p"
 	"github.com/ava-labs/avalanchego/proto/pb/p2p"
 	avacommon "github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/validators"
@@ -37,7 +37,13 @@ const (
 
 	defaultConnectTimeout = 30 * time.Second
 	defaultPeerWarmup     = 5 * time.Second
-	defaultRequestTimeout = 20 * time.Second
+	// Archival peers answer ancient GetAncestors in 0.4-2s (measured);
+	// anything slower than 5s is treated as a miss and the peer demoted.
+	defaultRequestTimeout = 5 * time.Second
+	// probeInterval paces the background re-discovery of archival peers.
+	probeInterval = 15 * time.Second
+	// probeFanout is how many non-archival peers each probe round asks.
+	probeFanout = 3
 )
 
 // Config for opening a Fetcher.
@@ -49,6 +55,9 @@ type Config struct {
 	// (network ID, C-Chain ID, validator list, peer IPs). If empty, falls
 	// back to DefaultNodeURI.
 	NodeURI string
+	// PerPeer is the max outstanding GetAncestors requests per archival
+	// peer. 0 means 1.
+	PerPeer int
 }
 
 // Fetcher owns a flat-file store of raw C-Chain containers and a P2P
@@ -61,7 +70,7 @@ type Fetcher struct {
 	store     *Store
 	net       network.Network
 	handler   *inboundHandler
-	tracker   *avap2p.PeerTracker
+	pool      *peerPool
 	creator   message.Creator
 	networkID uint32
 	chainID   ids.ID
@@ -73,10 +82,19 @@ type Fetcher struct {
 	dispatchErrCh chan error
 	reqIDCounter  atomic.Uint32
 
+	// bootstrapMu serialises the race-like probe round used when the
+	// archival set is empty, so concurrent walks don't all fan out.
+	bootstrapMu sync.Mutex
+	// lastTip is the most recently requested container ID; the background
+	// prober reuses it instead of fabricating ranges.
+	lastTip atomic.Value // ids.ID
+
 	// Stats for progress logging.
 	requestsSent    atomic.Uint64
+	answersTotal    atomic.Uint64
 	answersNonEmpty atomic.Uint64
 	activeWalks     atomic.Int64
+	inFlight        atomic.Int64
 }
 
 // New opens the flat-file store, dials the Fuji primary network, and waits
@@ -154,17 +172,8 @@ func dial(cfg Config) (*Fetcher, error) {
 		peerIDs.Add(p.ID)
 	}
 
-	tracker, err := avap2p.NewPeerTracker(
-		logging.NoLog{},
-		"fetch",
-		prometheus.NewRegistry(),
-		set.Set[ids.NodeID]{},
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("NewPeerTracker: %w", err)
-	}
-	handler := newHandler(peerIDs, tracker)
+	pool := newPeerPool()
+	handler := newHandler(peerIDs, pool)
 
 	vdrs := &permissiveValidators{Manager: validators.NewManager()}
 	netCfg, err := network.NewTestNetworkConfig(
@@ -227,7 +236,7 @@ func dial(cfg Config) (*Fetcher, error) {
 	return &Fetcher{
 		net:           net,
 		handler:       handler,
-		tracker:       tracker,
+		pool:          pool,
 		creator:       creator,
 		networkID:     networkID,
 		chainID:       chainID,
@@ -279,63 +288,127 @@ func (f *Fetcher) WalkFrom(ctx context.Context, tip ids.ID) error {
 	return f.walkSpan(ctx, tip, 0)
 }
 
-// parallelRequests controls how many concurrent GetAncestors requests we
-// fan out to different peers for the same tip. Many peers have pruned
-// ancient C-Chain history and respond with an empty container list;
-// racing a handful of peers dramatically shortens the time to find one
-// that actually has the data.
-const parallelRequests = 8
+// ---- peer selection ----
+//
+// ~15 Fuji peers are stable archival peers that answer every ancient
+// GetAncestors non-empty in 0.4-2s; the rest answer empty fast or never.
+// We keep a self-managed runtime set of archival peers (answered non-empty
+// recently), give each walk the least-busy archival peer with one
+// outstanding request per peer by default, and demote peers on an empty
+// answer or timeout. A background probe round over non-archival peers
+// (reusing the last walk tip) discovers new archival peers and re-promotes
+// demoted ones; when the set is empty an initial race-like round over all
+// connected peers bootstraps it.
 
-// raceAncestors fans out parallelRequests GetAncestors calls for tip to
-// different peers, returning the first non-empty response. Peers that
-// answer empty or time out are penalised via the PeerTracker.
-func (f *Fetcher) raceAncestors(ctx context.Context, tip ids.ID) (ancestorsResponse, ids.NodeID, bool) {
-	rctx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
-	defer cancel()
+type peerState struct {
+	archival bool
+	busy     int
+}
 
-	results := make(chan raceOutcome, parallelRequests)
+type peerPool struct {
+	mu       sync.Mutex
+	peers    map[ids.NodeID]*peerState
+	archival int
+}
 
-	picked := make(map[ids.NodeID]struct{}, parallelRequests)
-	launched := 0
-	for launched < parallelRequests {
-		peer, ok := f.tracker.SelectPeer()
-		if !ok {
-			break
+func newPeerPool() *peerPool {
+	return &peerPool{peers: make(map[ids.NodeID]*peerState)}
+}
+
+func (p *peerPool) connected(id ids.NodeID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.peers[id]; !ok {
+		p.peers[id] = &peerState{}
+	}
+}
+
+func (p *peerPool) disconnected(id ids.NodeID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if s, ok := p.peers[id]; ok {
+		if s.archival {
+			p.archival--
 		}
-		if _, dup := picked[peer]; dup {
+		delete(p.peers, id)
+	}
+}
+
+// acquire returns the least-busy archival peer with capacity, incrementing
+// its busy count. ok=false with haveArchival=false means the archival set
+// is empty (caller should bootstrap); ok=false with haveArchival=true means
+// all archival peers are at capacity (caller should wait and retry).
+func (p *peerPool) acquire(maxBusy int) (peer ids.NodeID, ok, haveArchival bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	best := (*peerState)(nil)
+	for id, s := range p.peers {
+		if !s.archival {
 			continue
 		}
-		picked[peer] = struct{}{}
-		launched++
-		go f.singleRequest(rctx, peer, tip, results)
-	}
-	if launched == 0 {
-		time.Sleep(100 * time.Millisecond)
-		return ancestorsResponse{}, ids.EmptyNodeID, false
-	}
-
-	for i := 0; i < launched; i++ {
-		select {
-		case <-ctx.Done():
-			return ancestorsResponse{}, ids.EmptyNodeID, false
-		case o := <-results:
-			if !o.ok || len(o.resp.blocks) == 0 || len(o.resp.blocks[0]) == 0 {
-				f.tracker.RegisterFailure(o.peer)
-				continue
-			}
-			return o.resp, o.peer, true
+		haveArchival = true
+		if s.busy >= maxBusy {
+			continue
+		}
+		if best == nil || s.busy < best.busy {
+			best, peer = s, id
 		}
 	}
-	return ancestorsResponse{}, ids.EmptyNodeID, false
+	if best == nil {
+		return ids.EmptyNodeID, false, haveArchival
+	}
+	best.busy++
+	return peer, true, true
 }
 
-type raceOutcome struct {
-	peer ids.NodeID
-	resp ancestorsResponse
-	ok   bool
+func (p *peerPool) release(id ids.NodeID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if s, ok := p.peers[id]; ok && s.busy > 0 {
+		s.busy--
+	}
 }
 
-func (f *Fetcher) singleRequest(ctx context.Context, peer ids.NodeID, tip ids.ID, results chan<- raceOutcome) {
+func (p *peerPool) setArchival(id ids.NodeID, archival bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if s, ok := p.peers[id]; ok && s.archival != archival {
+		s.archival = archival
+		if archival {
+			p.archival++
+		} else {
+			p.archival--
+		}
+	}
+}
+
+func (p *peerPool) archivalCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.archival
+}
+
+// nonArchival returns up to n non-archival peers (map order, effectively
+// random).
+func (p *peerPool) nonArchival(n int) []ids.NodeID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]ids.NodeID, 0, n)
+	for id, s := range p.peers {
+		if s.archival {
+			continue
+		}
+		out = append(out, id)
+		if len(out) == n {
+			break
+		}
+	}
+	return out
+}
+
+// request sends one GetAncestors to peer and waits up to
+// defaultRequestTimeout for the answer. ok=false means error or timeout.
+func (f *Fetcher) request(ctx context.Context, peer ids.NodeID, tip ids.ID) (ancestorsResponse, bool) {
 	reqID := f.reqIDCounter.Add(1)
 	ch := make(chan ancestorsResponse, 1)
 	f.handler.registerRoute(reqID, ch)
@@ -343,32 +416,143 @@ func (f *Fetcher) singleRequest(ctx context.Context, peer ids.NodeID, tip ids.ID
 
 	msg, err := f.creator.GetAncestors(f.chainID, reqID, defaultRequestTimeout, tip, p2p.EngineType_ENGINE_TYPE_CHAIN)
 	if err != nil {
-		results <- raceOutcome{peer: peer}
-		return
+		return ancestorsResponse{}, false
 	}
 
-	f.tracker.RegisterRequest(peer)
 	f.requestsSent.Add(1)
-	sendStart := time.Now()
+	f.inFlight.Add(1)
+	defer f.inFlight.Add(-1)
 	f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, avaconstants.PrimaryNetworkID, subnets.NoOpAllower)
 
+	t := time.NewTimer(defaultRequestTimeout)
+	defer t.Stop()
 	select {
 	case <-ctx.Done():
-		results <- raceOutcome{peer: peer}
+		return ancestorsResponse{}, false
+	case <-t.C:
+		return ancestorsResponse{}, false
 	case resp := <-ch:
-		bytes := 0
-		for _, b := range resp.blocks {
-			bytes += len(b)
-		}
-		if bytes > 0 {
+		f.answersTotal.Add(1)
+		if len(resp.blocks) > 0 && len(resp.blocks[0]) > 0 {
 			f.answersNonEmpty.Add(1)
-			elapsed := time.Since(sendStart).Seconds()
-			if elapsed <= 0 {
-				elapsed = 1e-9
-			}
-			f.tracker.RegisterResponse(peer, float64(bytes)/elapsed)
 		}
-		results <- raceOutcome{peer: peer, resp: resp, ok: true}
+		return resp, true
+	}
+}
+
+// nonEmpty reports whether resp carries at least one container.
+func nonEmpty(resp ancestorsResponse) bool {
+	return len(resp.blocks) > 0 && len(resp.blocks[0]) > 0
+}
+
+// fetchAncestors picks an archival peer and asks it for tip, demoting the
+// peer and retrying on another one when it answers empty or times out.
+// With an empty archival set it falls back to a bootstrap round.
+func (f *Fetcher) fetchAncestors(ctx context.Context, tip ids.ID) (ancestorsResponse, ids.NodeID, bool) {
+	f.lastTip.Store(tip)
+	for {
+		if ctx.Err() != nil {
+			return ancestorsResponse{}, ids.EmptyNodeID, false
+		}
+		peer, ok, haveArchival := f.pool.acquire(f.maxPerPeer())
+		if !ok {
+			if !haveArchival {
+				if resp, p, got := f.bootstrapRound(ctx, tip); got {
+					return resp, p, true
+				}
+			} else {
+				// All archival peers saturated; wait for a slot.
+				time.Sleep(20 * time.Millisecond)
+			}
+			continue
+		}
+		resp, got := f.request(ctx, peer, tip)
+		f.pool.release(peer)
+		if !got || !nonEmpty(resp) {
+			f.pool.setArchival(peer, false)
+			continue
+		}
+		return resp, peer, true
+	}
+}
+
+func (f *Fetcher) maxPerPeer() int {
+	if f.cfg.PerPeer > 0 {
+		return f.cfg.PerPeer
+	}
+	return 1
+}
+
+// bootstrapRound fans tip out to every connected non-archival peer at once,
+// promotes every peer that answers non-empty, and returns the first useful
+// response. Serialised so concurrent walks don't all fan out.
+func (f *Fetcher) bootstrapRound(ctx context.Context, tip ids.ID) (ancestorsResponse, ids.NodeID, bool) {
+	f.bootstrapMu.Lock()
+	defer f.bootstrapMu.Unlock()
+	if f.pool.archivalCount() > 0 {
+		return ancestorsResponse{}, ids.EmptyNodeID, false // someone else bootstrapped; re-acquire
+	}
+	peers := f.pool.nonArchival(1 << 30)
+	if len(peers) == 0 {
+		time.Sleep(200 * time.Millisecond)
+		return ancestorsResponse{}, ids.EmptyNodeID, false
+	}
+	log.Printf("fetch: bootstrap probe round over %d peers", len(peers))
+	type outcome struct {
+		peer ids.NodeID
+		resp ancestorsResponse
+		good bool
+	}
+	results := make(chan outcome, len(peers))
+	for _, p := range peers {
+		go func(p ids.NodeID) {
+			resp, got := f.request(ctx, p, tip)
+			results <- outcome{peer: p, resp: resp, good: got && nonEmpty(resp)}
+		}(p)
+	}
+	var best outcome
+	for range peers {
+		o := <-results
+		if !o.good {
+			continue
+		}
+		f.pool.setArchival(o.peer, true)
+		if !best.good {
+			best = o
+		}
+	}
+	log.Printf("fetch: bootstrap round done, archival=%d", f.pool.archivalCount())
+	return best.resp, best.peer, best.good
+}
+
+// probeLoop periodically asks a few non-archival peers the most recent walk
+// tip to discover new archival peers and re-promote demoted ones. Responses
+// are used only for classification; the walk that owns the tip stores its
+// own copy.
+func (f *Fetcher) probeLoop(ctx context.Context) {
+	t := time.NewTicker(probeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		tip, ok := f.lastTip.Load().(ids.ID)
+		if !ok || f.pool.archivalCount() == 0 {
+			continue // nothing pending yet, or bootstrap round will run anyway
+		}
+		var wg sync.WaitGroup
+		for _, p := range f.pool.nonArchival(probeFanout) {
+			wg.Add(1)
+			go func(p ids.NodeID) {
+				defer wg.Done()
+				if resp, got := f.request(ctx, p, tip); got && nonEmpty(resp) {
+					f.pool.setArchival(p, true)
+				}
+			}(p)
+		}
+		wg.Wait()
 	}
 }
 

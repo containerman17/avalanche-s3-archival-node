@@ -93,13 +93,14 @@ func fetchMain(args []string) {
 	dataDir := fs.String("data", "./data", "directory for the segment files")
 	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default "+fetch.DefaultNodeURI+")")
 	walks := fs.Int("walks", 16, "concurrent backward walks")
+	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	f, err := fetch.New(fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI})
+	f, err := fetch.New(fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer})
 	if err != nil {
 		log.Fatalf("epochdb: %v", err)
 	}
@@ -141,11 +142,11 @@ func fetchMain(args []string) {
 			dt := now.Sub(prevT).Seconds()
 			rate := float64(cur.Stored-prev.Stored) / dt
 			var pct float64
-			if dr := cur.Requests - prev.Requests; dr > 0 {
-				pct = 100 * float64(cur.NonEmpty-prev.NonEmpty) / float64(dr)
+			if da := cur.Answers - prev.Answers; da > 0 {
+				pct = 100 * float64(cur.NonEmpty-prev.NonEmpty) / float64(da)
 			}
-			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d peers_nonempty=%.0f%%",
-				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, pct)
+			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d archival=%d inflight=%d answers_nonempty=%.0f%%",
+				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, cur.Archival, cur.InFlight, pct)
 			prev, prevT = cur, now
 		}
 	}
