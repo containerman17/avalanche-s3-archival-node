@@ -18,6 +18,7 @@ import (
 
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
 )
 
@@ -43,6 +44,12 @@ func main() {
 		fetchMain(os.Args[2:])
 	case "exec":
 		execMain(os.Args[2:])
+	case "cook-index":
+		cookMain(os.Args[2:])
+	case "serve":
+		serveMain(os.Args[2:])
+	case "ab-bench":
+		benchMain(os.Args[2:])
 	default:
 		usage()
 	}
@@ -51,7 +58,50 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>] [--tip <containerID>]")
 	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>]")
+	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
+	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650]")
+	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
 	os.Exit(2)
+}
+
+// cookMain external-sorts the writelog buckets into sorted_NNNNN.idx.
+func cookMain(args []string) {
+	fs := flag.NewFlagSet("cook-index", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	fs.Parse(args)
+	if err := state.CookIndex(*dataDir); err != nil {
+		log.Fatalf("epochdb: cook-index: %v", err)
+	}
+}
+
+// serveMain serves historical JSON-RPC reads over the cooked index. Run it
+// against a quiesced data dir (it shares files with fetch/exec).
+func serveMain(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	port := fs.Int("port", 9650, "HTTP listen port")
+	fs.Parse(args)
+
+	store, err := state.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: open state layer: %v", err)
+	}
+	defer store.Close()
+
+	g, err := exec.FujiGenesis()
+	if err != nil {
+		log.Fatalf("epochdb: genesis: %v", err)
+	}
+	hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
+	if err != nil {
+		log.Fatalf("epochdb: open history: %v", err)
+	}
+	defer hist.Close()
+
+	srv := rpc.NewServer(hist, exec.NewChainContext(store), g.Config)
+	addr := fmt.Sprintf(":%d", *port)
+	log.Printf("epochdb: serving historical RPC on %s, head=%d chainId=%s", addr, hist.Head(), g.Config.ChainID)
+	log.Fatal(srv.ListenAndServe(addr))
 }
 
 // execMain replays blocks ascending from genesis out of the (possibly
