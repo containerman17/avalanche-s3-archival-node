@@ -3,27 +3,45 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ava-labs/avalanchego/ids"
 
 	"github.com/containerman17/epochdb/fetch"
 )
 
+// parseContainerID accepts a cb58 container ID or a 0x-hex 32-byte eth
+// block hash (valid as a container ID for pre-ProposerVM blocks).
+func parseContainerID(s string) (ids.ID, error) {
+	if strings.HasPrefix(s, "0x") {
+		b, err := hex.DecodeString(s[2:])
+		if err != nil {
+			return ids.Empty, err
+		}
+		return ids.ToID(b)
+	}
+	return ids.FromString(s)
+}
+
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "fetch" {
-		fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>]")
+		fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>] [--tip <containerID>]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "directory for the segment files")
 	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default "+fetch.DefaultNodeURI+")")
 	walks := fs.Int("walks", 6, "concurrent backward walks")
+	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
 	fs.Parse(os.Args[2:])
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -35,7 +53,15 @@ func main() {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- f.Sync(ctx, *walks) }()
+	if *tip != "" {
+		id, err := parseContainerID(*tip)
+		if err != nil {
+			log.Fatalf("epochdb: --tip: %v", err)
+		}
+		go func() { done <- f.WalkFrom(ctx, id) }()
+	} else {
+		go func() { done <- f.Sync(ctx, *walks) }()
+	}
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()

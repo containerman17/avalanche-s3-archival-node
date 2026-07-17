@@ -268,6 +268,17 @@ func (f *Fetcher) Close() error {
 // Store exposes the underlying flat-file store for readers.
 func (f *Fetcher) Store() *Store { return f.store }
 
+// WalkFrom walks backward from an arbitrary container ID down to block 0
+// (short-circuiting over already-stored contiguous runs), storing every
+// container on the way. Used to backfill a specific historical range:
+// pre-ProposerVM container IDs equal the eth block hash, so any early
+// block hash from a trusted source is a valid anchor.
+func (f *Fetcher) WalkFrom(ctx context.Context, tip ids.ID) error {
+	f.activeWalks.Add(1)
+	defer f.activeWalks.Add(-1)
+	return f.walkSpan(ctx, tip, 0)
+}
+
 // parallelRequests controls how many concurrent GetAncestors requests we
 // fan out to different peers for the same tip. Many peers have pruned
 // ancient C-Chain history and respond with an empty container list;
