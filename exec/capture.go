@@ -1,7 +1,9 @@
 package exec
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/state"
@@ -64,17 +66,100 @@ type codeSink interface {
 // storage, and contract-code write passes through a trie interceptor that
 // records post-images into the current blockFrame. A nil frame disables
 // recording (genesis commit).
-func wrapDatabase(inner state.Database, code codeSink) *wrappedDatabase {
-	return &wrappedDatabase{inner: inner, code: code}
+//
+// cacheBytes > 0 additionally enables a Go-side read-through cache of
+// frontier state so EVM reads skip the per-key Firewood FFI crossing
+// (~50% of replay CPU at height ~3.7M). The cache feeds ONLY reads:
+// every write still flows to Firewood unchanged, and the state root is
+// still computed by Firewood's own tree, so the executor's
+// newRoot != header.Root hard stop keeps detecting any divergence.
+// verify makes every cache hit also do the FFI read and panic on any
+// difference (validation harness, not steady state).
+func wrapDatabase(inner state.Database, code codeSink, cacheBytes uint64, verify bool) *wrappedDatabase {
+	d := &wrappedDatabase{inner: inner, code: code, cacheCap: cacheBytes, verify: verify}
+	if cacheBytes > 0 {
+		d.cache = make(map[common.Address]*acctEntry)
+	}
+	return d
 }
 
 type wrappedDatabase struct {
 	inner state.Database
 	code  codeSink
 	frame *blockFrame
+
+	// ponytail: no locks, the executor is single-goroutine by design;
+	// add a mutex if a prefetcher or parallel EVM ever appears.
+	cache        map[common.Address]*acctEntry
+	cacheCap     uint64
+	cacheSize    uint64
+	verify       bool
+	hits, misses uint64
 }
 
+// acctEntry caches one account's frontier state. Per-account nesting is
+// what makes SELFDESTRUCT safe: Firewood's DeleteAccount prefix-deletes
+// the whole storage subtree, and dropping the entry mirrors that
+// atomically.
+type acctEntry struct {
+	acct      *types.StateAccount // nil with acctKnown = known-nonexistent
+	acctKnown bool
+	storage   map[common.Hash][]byte // present nil/empty value = known zero/deleted
+	cost      uint64
+}
+
+// Coarse per-item cost estimates (map+entry overhead, keys, pointers).
+const (
+	entryCost = 256
+	slotCost  = 104
+)
+
 func (d *wrappedDatabase) setFrame(f *blockFrame) { d.frame = f }
+
+// entry returns the cache entry for addr, creating it (and evicting over
+// the cap) as needed. Caller must have checked d.cache != nil.
+func (d *wrappedDatabase) entry(addr common.Address) *acctEntry {
+	if e, ok := d.cache[addr]; ok {
+		return e
+	}
+	if d.cacheSize > d.cacheCap {
+		// Random-victim, whole accounts, down to 7/8 of the cap so
+		// eviction runs in bursts. Always safe: a miss falls through to
+		// authoritative Firewood.
+		// ponytail: map-order random victim; make it LRU if hit rate
+		// ever proves too low.
+		target := d.cacheCap - d.cacheCap/8
+		for a, e := range d.cache {
+			if a == addr {
+				continue
+			}
+			d.cacheSize -= e.cost
+			delete(d.cache, a)
+			if d.cacheSize <= target {
+				break
+			}
+		}
+	}
+	e := &acctEntry{storage: make(map[common.Hash][]byte), cost: entryCost}
+	d.cache[addr] = e
+	d.cacheSize += entryCost
+	return e
+}
+
+func (e *acctEntry) setSlot(d *wrappedDatabase, slot common.Hash, val []byte) {
+	add := slotCost + uint64(len(val))
+	if old, existed := e.storage[slot]; existed {
+		sub := slotCost + uint64(len(old))
+		e.cost -= sub
+		d.cacheSize -= sub
+	}
+	e.cost += add
+	d.cacheSize += add
+	e.storage[slot] = val
+}
+
+// CacheStats returns hits, misses since open.
+func (d *wrappedDatabase) CacheStats() (uint64, uint64) { return d.hits, d.misses }
 
 func (d *wrappedDatabase) OpenTrie(root common.Hash) (state.Trie, error) {
 	t, err := d.inner.OpenTrie(root)
@@ -130,12 +215,26 @@ func (t *wrappingTrie) UpdateAccount(addr common.Address, acc *types.StateAccoun
 		}
 		f.recordAccount(addr, valRLP)
 	}
+	if d := t.db; d.cache != nil {
+		e := d.entry(addr)
+		e.acct = acc.Copy()
+		e.acctKnown = true
+	}
 	return t.inner.UpdateAccount(addr, acc)
 }
 
 func (t *wrappingTrie) DeleteAccount(addr common.Address) error {
 	if f := t.db.frame; f != nil {
 		f.recordAccount(addr, nil)
+	}
+	// THE selfdestruct hazard: Firewood prefix-deletes the whole storage
+	// subtree here, so the cached account AND all its slots must go
+	// atomically. Recreation repopulates via normal write-through.
+	if d := t.db; d.cache != nil {
+		if e, ok := d.cache[addr]; ok {
+			d.cacheSize -= e.cost
+			delete(d.cache, addr)
+		}
 	}
 	return t.inner.DeleteAccount(addr)
 }
@@ -144,12 +243,24 @@ func (t *wrappingTrie) UpdateStorage(addr common.Address, key, value []byte) err
 	if f := t.db.frame; f != nil {
 		f.recordStorage(addr, key, value)
 	}
+	if d := t.db; d.cache != nil {
+		var slot common.Hash
+		copy(slot[:], key)
+		v := make([]byte, len(value))
+		copy(v, value)
+		d.entry(addr).setSlot(d, slot, v)
+	}
 	return t.inner.UpdateStorage(addr, key, value)
 }
 
 func (t *wrappingTrie) DeleteStorage(addr common.Address, key []byte) error {
 	if f := t.db.frame; f != nil {
 		f.recordStorage(addr, key, nil)
+	}
+	if d := t.db; d.cache != nil {
+		var slot common.Hash
+		copy(slot[:], key)
+		d.entry(addr).setSlot(d, slot, nil)
 	}
 	return t.inner.DeleteStorage(addr, key)
 }
@@ -167,17 +278,100 @@ func (t *wrappingTrie) UpdateContractCode(addr common.Address, codeHash common.H
 	return t.inner.UpdateContractCode(addr, codeHash, code)
 }
 
-// --- pure delegators --------------------------------------------------------
-
-func (t *wrappingTrie) GetKey(k []byte) []byte { return t.inner.GetKey(k) }
+// --- reads (cache read-through) ---------------------------------------------
 
 func (t *wrappingTrie) GetAccount(addr common.Address) (*types.StateAccount, error) {
-	return t.inner.GetAccount(addr)
+	d := t.db
+	if d.cache != nil {
+		if e, ok := d.cache[addr]; ok && e.acctKnown {
+			d.hits++
+			if d.verify {
+				t.verifyAccountHit(addr, e)
+			}
+			if e.acct == nil {
+				return nil, nil
+			}
+			// Copy: statedb takes the struct by value but shares the
+			// Balance pointer.
+			return e.acct.Copy(), nil
+		}
+	}
+	acct, err := t.inner.GetAccount(addr)
+	if err != nil || d.cache == nil {
+		return acct, err
+	}
+	d.misses++
+	e := d.entry(addr)
+	e.acctKnown = true
+	if acct != nil {
+		e.acct = acct.Copy()
+	} else {
+		e.acct = nil // negative cache; overwritten by UpdateAccount on creation
+	}
+	return acct, nil
 }
 
 func (t *wrappingTrie) GetStorage(addr common.Address, key []byte) ([]byte, error) {
-	return t.inner.GetStorage(addr, key)
+	d := t.db
+	var slot common.Hash
+	if d.cache != nil {
+		copy(slot[:], key)
+		if e, ok := d.cache[addr]; ok {
+			if v, ok := e.storage[slot]; ok {
+				d.hits++
+				if d.verify {
+					t.verifyStorageHit(addr, key, v)
+				}
+				// Returned slice is treated read-only by statedb
+				// (SetBytes copies immediately); no defensive copy on
+				// the hot path.
+				return v, nil
+			}
+		}
+	}
+	v, err := t.inner.GetStorage(addr, key)
+	if err != nil || d.cache == nil {
+		return v, err
+	}
+	d.misses++
+	cv := make([]byte, len(v))
+	copy(cv, v)
+	d.entry(addr).setSlot(d, slot, cv)
+	return v, nil
 }
+
+// verifyAccountHit re-reads addr through Firewood and panics if the
+// cached view differs. --verify-cache harness only.
+func (t *wrappingTrie) verifyAccountHit(addr common.Address, e *acctEntry) {
+	got, err := t.inner.GetAccount(addr)
+	if err != nil {
+		panic(fmt.Sprintf("verify-cache: account %x: firewood read error: %v", addr, err))
+	}
+	switch {
+	case (got == nil) != (e.acct == nil):
+		panic(fmt.Sprintf("verify-cache: account %x: cache=%+v firewood=%+v", addr, e.acct, got))
+	case got != nil &&
+		(got.Nonce != e.acct.Nonce || got.Balance.Cmp(e.acct.Balance) != 0 ||
+			got.Root != e.acct.Root || !bytes.Equal(got.CodeHash, e.acct.CodeHash)):
+		panic(fmt.Sprintf("verify-cache: account %x mismatch: cache=%+v firewood=%+v", addr, e.acct, got))
+	}
+}
+
+// verifyStorageHit re-reads a slot through Firewood and panics if the
+// cached view differs. --verify-cache harness only.
+func (t *wrappingTrie) verifyStorageHit(addr common.Address, key, cached []byte) {
+	got, err := t.inner.GetStorage(addr, key)
+	if err != nil {
+		panic(fmt.Sprintf("verify-cache: storage %x/%x: firewood read error: %v", addr, key, err))
+	}
+	if !bytes.Equal(got, cached) {
+		panic(fmt.Sprintf("verify-cache: storage %x/%x mismatch: cache=%x firewood=%x", addr, key, cached, got))
+	}
+}
+
+// --- pure delegators --------------------------------------------------------
+
+func (t *wrappingTrie) GetKey(k []byte) []byte { return t.inner.GetKey(k) }
 
 func (t *wrappingTrie) Hash() common.Hash { return t.inner.Hash() }
 

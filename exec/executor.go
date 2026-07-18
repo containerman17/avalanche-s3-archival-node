@@ -60,6 +60,11 @@ type Config struct {
 	Blocks BlockSource
 	// Store is the flat-file state layer. Required.
 	Store *state.Store
+	// StateCacheBytes sizes the Go-side EVM read cache (0 disables).
+	StateCacheBytes uint64
+	// VerifyCache re-reads every cache hit through Firewood and panics
+	// on mismatch. Validation harness only.
+	VerifyCache bool
 }
 
 // Executor replays Fuji C-Chain blocks against Firewood-backed frontier
@@ -162,7 +167,7 @@ func New(cfg Config) (*Executor, error) {
 	}
 
 	inner := extstate.NewDatabaseWithNodeDB(memdb, tdb)
-	wrapDB := wrapDatabase(inner, cfg.Store)
+	wrapDB := wrapDatabase(inner, cfg.Store, cfg.StateCacheBytes, cfg.VerifyCache)
 
 	fwBackend, ok := tdb.Backend().(*firewood.TrieDB)
 	if !ok {
@@ -384,12 +389,19 @@ func (e *Executor) Run(ctx context.Context) error {
 
 		if since := time.Since(lastLog); since >= 10*time.Second {
 			dt := since.Seconds()
-			log.Printf("exec: height=%d blk/s=%.0f mgas/s=%.2f writelog=%.1fMB code_entries=%d",
+			hits, misses := e.wrapDB.CacheStats()
+			var hitPct float64
+			if hits+misses > 0 {
+				hitPct = 100 * float64(hits) / float64(hits+misses)
+			}
+			log.Printf("exec: height=%d blk/s=%.0f mgas/s=%.2f writelog=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
 				e.headNum,
 				float64(blocksDone-lastBlocks)/dt,
 				float64(e.totalGas-lastGas)/dt/1e6,
 				float64(e.cfg.Store.WritelogBytes())/1e6,
 				e.cfg.Store.CodeCount(),
+				hitPct,
+				float64(e.wrapDB.cacheSize)/1e6,
 			)
 			lastLog = time.Now()
 			lastGas, lastBlocks = e.totalGas, blocksDone

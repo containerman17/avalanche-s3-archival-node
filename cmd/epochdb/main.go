@@ -112,6 +112,8 @@ func execMain(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory (staging segments + state layer)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address (e.g. localhost:6060)")
+	stateCacheGiB := fs.Int("state-cache", 6, "Go-side EVM read cache size in GiB (0 disables)")
+	verifyCache := fs.Bool("verify-cache", false, "re-read every cache hit through Firewood and panic on mismatch (slow, validation only)")
 	fs.Parse(args)
 
 	if *pprofAddr != "" {
@@ -133,7 +135,13 @@ func execMain(args []string) {
 	}
 	defer store.Close()
 
-	e, err := exec.New(exec.Config{DataDir: *dataDir, Blocks: reader, Store: store})
+	e, err := exec.New(exec.Config{
+		DataDir:         *dataDir,
+		Blocks:          reader,
+		Store:           store,
+		StateCacheBytes: uint64(*stateCacheGiB) << 30,
+		VerifyCache:     *verifyCache,
+	})
 	if err != nil {
 		log.Fatalf("epochdb: exec.New: %v", err)
 	}
