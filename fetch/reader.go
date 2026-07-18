@@ -35,6 +35,34 @@ type readerBucket struct {
 // ascending so old buckets go cold immediately.
 const maxReaderBuckets = 4
 
+// BlockHashes scans every index sidecar in dir once and returns the
+// eth block hash -> height map (the sidecar stores the hash at rec[40:72]
+// exactly for consumers like eth_getBlockByHash). ~40 bytes RAM per block.
+func BlockHashes(dir string) (map[[32]byte]uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[[32]byte]uint64)
+	for _, e := range entries {
+		var bucket uint64
+		if _, err := fmt.Sscanf(e.Name(), "index_%d.log", &bucket); err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for off := 0; off+indexRecSize <= len(raw); off += indexRecSize {
+			height := binary.BigEndian.Uint64(raw[off : off+8])
+			var h [32]byte
+			copy(h[:], raw[off+40:off+72])
+			out[h] = height
+		}
+	}
+	return out, nil
+}
+
 // OpenReader opens a read-only follower over dir.
 func OpenReader(dir string) (*Reader, error) {
 	dec, err := zstd.NewReader(nil)

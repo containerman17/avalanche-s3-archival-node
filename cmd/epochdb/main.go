@@ -125,6 +125,8 @@ func main() {
 		benchMain(os.Args[2:])
 	case "ab-bench-tx":
 		benchTxMain(os.Args[2:])
+	case "ab-bench-logs":
+		benchLogsMain(os.Args[2:])
 	case "seal":
 		sealMain(os.Args[2:])
 	case "backfill-logs":
@@ -230,6 +232,19 @@ func serveMain(args []string) {
 			rawTx = rawIdx.NumTx()
 		}
 		log.Printf("epochdb: tx lookup: %d raw-indexed txs, %d sealed epochs", rawTx, len(epochs.Epochs))
+	}
+
+	// eth block hash -> height for the *ByHash methods, from the staging
+	// sidecars (~40B/block resident).
+	if hashes, err := fetch.BlockHashes(*dataDir); err != nil {
+		log.Printf("epochdb: block hash index unavailable: %v", err)
+	} else {
+		byHash := make(map[common.Hash]uint64, len(hashes))
+		for h, n := range hashes {
+			byHash[common.Hash(h)] = n
+		}
+		srv.EnableBlockAPIs(byHash)
+		log.Printf("epochdb: block hash index: %d blocks", len(byHash))
 	}
 
 	addr := fmt.Sprintf(":%d", *port)

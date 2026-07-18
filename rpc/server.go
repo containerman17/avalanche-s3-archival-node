@@ -44,6 +44,9 @@ type Server struct {
 	txidx  TxCandidateSource
 	blocks BlockSource
 	parse  ContainerParser
+
+	// block APIs: eth block hash -> height, wired by EnableBlockAPIs.
+	hashIdx map[common.Hash]uint64
 }
 
 // HistoryChainContext serves BLOCKHASH headers through the epochs-aware
@@ -146,6 +149,54 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 			return s.getTransactionByHash(req.Params)
 		}
 		return s.getTransactionReceipt(req.Params)
+	case "eth_getLogs":
+		if s.blocks == nil {
+			return nil, &rpcError{Code: -32000, Message: "log queries need the container source (tx APIs enabled)"}
+		}
+		return s.getLogs(req.Params)
+	// block, fee, and trivia methods live in block.go / misc.go.
+	case "eth_getBlockByNumber":
+		return s.getBlockByNumber(req.Params)
+	case "eth_getBlockByHash":
+		return s.getBlockByHash(req.Params)
+	case "eth_getBlockTransactionCountByNumber":
+		return s.blockTxCount(req.Params, false)
+	case "eth_getBlockTransactionCountByHash":
+		return s.blockTxCount(req.Params, true)
+	case "eth_getTransactionByBlockNumberAndIndex":
+		return s.txByBlockAndIndex(req.Params, false)
+	case "eth_getTransactionByBlockHashAndIndex":
+		return s.txByBlockAndIndex(req.Params, true)
+	case "eth_getBlockReceipts":
+		return s.getBlockReceipts(req.Params)
+	case "eth_estimateGas":
+		return s.estimateGas(req.Params)
+	case "eth_gasPrice":
+		return hexutil.EncodeBig(s.gasOracle()), nil
+	case "eth_maxPriorityFeePerGas":
+		// Pre-London corpus: the whole gas price is the tip.
+		return hexutil.EncodeBig(s.gasOracle()), nil
+	case "eth_feeHistory":
+		return s.feeHistory(req.Params)
+	case "net_version":
+		return s.chainCfg.ChainID.String(), nil
+	case "web3_clientVersion":
+		return ClientVersion, nil
+	case "eth_syncing":
+		return false, nil // fixed complete corpus
+	case "net_listening":
+		return false, nil // no p2p listener on the read server
+	case "eth_accounts":
+		return []common.Address{}, nil
+	case "eth_coinbase":
+		// Coreth's fixed blackhole coinbase, matching the public API.
+		return common.HexToAddress("0x0100000000000000000000000000000000000000"), nil
+	case "eth_getUncleCountByBlockNumber", "eth_getUncleCountByBlockHash":
+		return hexutil.Uint(0), nil // no uncles on Avalanche
+	case "eth_getUncleByBlockNumberAndIndex", "eth_getUncleByBlockHashAndIndex":
+		return nil, nil
+	case "eth_getProof":
+		return nil, &rpcError{Code: -32000, Message: "eth_getProof unsupported by design: epochdb stores no tries"}
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found: " + req.Method}
 	}
