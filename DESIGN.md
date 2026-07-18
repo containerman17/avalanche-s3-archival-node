@@ -25,3 +25,10 @@ v1 must produce the unknown numbers: body compression ratio with a trained dict 
 
 ## Reference
 Proven prior art: ~/deforestationdb (fetch+execute+overlay, 0 mismatches on 15k A/B checks vs archive RPC). Reference dep versions from its go.mod: go 1.25.8; github.com/ava-labs/avalanchego v1.14.2; github.com/ava-labs/avalanchego/graft/coreth v1.14.2; github.com/ava-labs/avalanchego/graft/evm v1.14.2; github.com/ava-labs/libevm v1.13.14-0.4.0.rc.2; github.com/ava-labs/firewood-go-ethhash/ffi v0.3.1 (indirect there).
+
+## Debt and rulings (2026-07-18, user-decided)
+- MUST-FIX, not debt: tip finality via REAL Snowman consensus called from avalanchego source (no reinvention, no external-RPC trust for tip choice). Current --tip-override fixed corpus is a temporary stand-in.
+- Fork upgrades: policy, not debt. Update avalanchego/coreth deps on the release schedule (months of lead time per release).
+- Guarantee: epoch bodies store VERBATIM proposervm-wrapped containers (already true in the format). Never switch to extras-reconstruction without an atomic-fidelity plan.
+- Derived-data latency: minimal node stays re-execute-on-demand; optional on-disk caches for receipts/logs may come later behind flags.
+- Tech debt (recorded, unbuilt): eth_sendRawTransaction + mempool relay, filters/WS subscriptions, pending-block semantics; serving GetAncestors to peers (be a peer, not a leech); avax_* API namespace + atomic tx lookup; RPC server global lock -> concurrent reads.
