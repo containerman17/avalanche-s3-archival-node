@@ -56,6 +56,10 @@ func main() {
 		benchMain(os.Args[2:])
 	case "ab-bench-tx":
 		benchTxMain(os.Args[2:])
+	case "backfill-logs":
+		backfillLogsMain(os.Args[2:])
+	case "verify-logs":
+		verifyLogsMain(os.Args[2:])
 	default:
 		usage()
 	}
@@ -69,6 +73,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
+	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
+	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
 	os.Exit(2)
 }
 
