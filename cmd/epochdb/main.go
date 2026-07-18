@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -109,7 +111,12 @@ func serveMain(args []string) {
 func execMain(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory (staging segments + state layer)")
+	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address (e.g. localhost:6060)")
 	fs.Parse(args)
+
+	if *pprofAddr != "" {
+		go func() { log.Printf("epochdb: pprof: %v", http.ListenAndServe(*pprofAddr, nil)) }()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

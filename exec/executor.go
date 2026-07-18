@@ -139,6 +139,14 @@ func New(cfg Config) (*Executor, error) {
 	// firewood.DefaultConfig nests its own "firewood" subdirectory under
 	// the path we give it, so DataDir -> DataDir/firewood/.
 	fwCfg := firewood.DefaultConfig(cfg.DataDir)
+	// The default 1MB node cache collapses once state outgrows it: at
+	// height ~3.7M a 60s CPU profile showed ~50% of samples inside the
+	// Rust library (per-SLOAD trie walks re-reading upper nodes), disk
+	// well under saturation. A real node cache keeps the hot trie
+	// interior resident.
+	// ponytail: fixed 4GB, sized for a 25GB box; make it a flag if this
+	// ever runs somewhere smaller.
+	fwCfg.CacheSizeBytes = 4 << 30
 
 	ethdbKV := cfg.Store.EthDB()
 	memdb := rawdb.NewDatabase(ethdbKV)
