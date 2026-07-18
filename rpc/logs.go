@@ -34,38 +34,46 @@ func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 	if err := json.Unmarshal(params[0], &f); err != nil {
 		return nil, errInvalid("bad filter: %v", err)
 	}
+	from, to, addrs, topics, rerr := s.parseFilterCriteria(&f)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return s.runGetLogs(from, to, addrs, topics)
+}
+
+// parseFilterCriteria resolves and validates a logs filter object, shared
+// between eth_getLogs and the filter API.
+func (s *Server) parseFilterCriteria(f *logsFilter) (from, to uint64, addrs []common.Address, topics [][]common.Hash, _ *rpcError) {
 	if f.BlockHash != nil {
-		return nil, errInvalid("blockHash filter unsupported")
+		return 0, 0, nil, nil, errInvalid("blockHash filter unsupported")
 	}
 	from, rerr := s.blockNumber(f.FromBlock)
 	if rerr != nil {
-		return nil, rerr
+		return 0, 0, nil, nil, rerr
 	}
-	to, rerr := s.blockNumber(f.ToBlock)
+	to, rerr = s.blockNumber(f.ToBlock)
 	if rerr != nil {
-		return nil, rerr
+		return 0, 0, nil, nil, rerr
 	}
 	if from == 0 {
 		from = 1 // genesis has no logs
 	}
 	if to < from {
-		return nil, errInvalid("toBlock %d below fromBlock %d", to, from)
+		return 0, 0, nil, nil, errInvalid("toBlock %d below fromBlock %d", to, from)
 	}
 	if to-from+1 > GetLogsMaxRange {
-		return nil, errInvalid("block range %d exceeds %d", to-from+1, GetLogsMaxRange)
+		return 0, 0, nil, nil, errInvalid("block range %d exceeds %d", to-from+1, GetLogsMaxRange)
 	}
 
-	var addrs []common.Address
 	if len(f.Address) > 0 {
 		var one common.Address
 		if err := json.Unmarshal(f.Address, &one); err == nil {
 			addrs = []common.Address{one}
 		} else if err := json.Unmarshal(f.Address, &addrs); err != nil {
-			return nil, errInvalid("bad address: %v", err)
+			return 0, 0, nil, nil, errInvalid("bad address: %v", err)
 		}
 	}
 	// topics[i] = nil (wildcard) | hash | [hash...]
-	var topics [][]common.Hash
 	for _, raw := range f.Topics {
 		if string(raw) == "null" || len(raw) == 0 {
 			topics = append(topics, nil)
@@ -78,14 +86,19 @@ func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 		}
 		var many []common.Hash
 		if err := json.Unmarshal(raw, &many); err != nil {
-			return nil, errInvalid("bad topics entry: %v", err)
+			return 0, 0, nil, nil, errInvalid("bad topics entry: %v", err)
 		}
 		topics = append(topics, many)
 	}
 	for len(topics) > 0 && topics[len(topics)-1] == nil {
 		topics = topics[:len(topics)-1] // trailing wildcards are no-ops
 	}
+	return from, to, addrs, topics, nil
+}
 
+// runGetLogs is the parsed-filter execution path, shared with the filter
+// API (eth_getFilterLogs / eth_getFilterChanges).
+func (s *Server) runGetLogs(from, to uint64, addrs []common.Address, topics [][]common.Hash) ([]*types.Log, *rpcError) {
 	candidates, rerr := s.logCandidates(from, to, addrs, topics)
 	if rerr != nil {
 		return nil, rerr

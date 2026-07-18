@@ -39,7 +39,12 @@ func (c combinedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
 // corpus:
 //
 //	EPOCHDB_TEST_DATA=$PWD/../data EPOCHDB_TEST_NETWORK=mainnet go test -race -run TestConcurrentRequests ./rpc/
-func TestConcurrentRequests(t *testing.T) {
+//
+// newCorpusServer spins a full Server over the corpus named by
+// EPOCHDB_TEST_DATA (skips otherwise). Shared by the concurrency, filter,
+// and websocket tests.
+func newCorpusServer(t *testing.T) (*httptest.Server, uint64, combinedBlocks) {
+	t.Helper()
 	dir := os.Getenv("EPOCHDB_TEST_DATA")
 	if dir == "" {
 		t.Skip("set EPOCHDB_TEST_DATA to a replayed data dir")
@@ -56,17 +61,17 @@ func TestConcurrentRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	hist, err := state.OpenHistory(dir, store, g.Alloc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer hist.Close()
+	t.Cleanup(hist.Close)
 	reader, err := fetch.OpenReader(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Close()
+	t.Cleanup(func() { reader.Close() })
 	rawIdx, err := state.OpenTxIndex(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -76,9 +81,12 @@ func TestConcurrentRequests(t *testing.T) {
 	srv := rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
 	srv.EnableTxAPIs(state.CombinedTxIndex{Raw: rawIdx, Epochs: hist.Epochs()}, blocks, exec.ParseEthBlock)
 	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	t.Cleanup(ts.Close)
+	return ts, hist.Head(), blocks
+}
 
-	head := hist.Head()
+func TestConcurrentRequests(t *testing.T) {
+	ts, head, blocks := newCorpusServer(t)
 	// sample tx hashes + addresses upfront, single-threaded
 	rng := rand.New(rand.NewSource(1))
 	var (
