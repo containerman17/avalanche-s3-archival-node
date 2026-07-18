@@ -50,8 +50,8 @@ type bfEnv struct {
 	end      uint64 // last height to derive (logs.start - 1)
 }
 
-func openBfEnv(dataDir string) (*bfEnv, func()) {
-	g, err := exec.FujiGenesis()
+func openBfEnv(dataDir string, networkID uint32) (*bfEnv, func()) {
+	g, err := exec.NetworkGenesis(networkID)
 	if err != nil {
 		log.Fatalf("backfill-logs: genesis: %v", err)
 	}
@@ -115,12 +115,13 @@ func backfillLogsMain(args []string) {
 	dataDir := fs.String("data", "./data", "shared data directory")
 	workers := fs.Int("workers", 12, "parallel re-execution workers")
 	pprofAddr := fs.String("pprof", "", "pprof listen address (e.g. :6067)")
+	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	fs.Parse(args)
 	if *pprofAddr != "" {
 		go func() { log.Println(http.ListenAndServe(*pprofAddr, nil)) }()
 	}
 
-	env, cleanup := openBfEnv(*dataDir)
+	env, cleanup := openBfEnv(*dataDir, execNetID(*network))
 	defer cleanup()
 	bf, err := state.OpenLogsBackfill(*dataDir)
 	if err != nil {
@@ -239,13 +240,17 @@ func backfillLogsMain(args []string) {
 func verifyLogsMain(args []string) {
 	fs := flag.NewFlagSet("verify-logs", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	remote := fs.String("remote", "https://api.avax-test.network/ext/bc/C/rpc", "reference archive RPC")
+	remote := fs.String("remote", "", "reference archive RPC (default per --network)")
 	n := fs.Int("n", 300, "remote-compared blocks in the backfilled range")
 	parityN := fs.Int("parity", 50, "live-capture parity blocks above logs.start")
 	seed := fs.Int64("seed", time.Now().UnixNano(), "RNG seed")
+	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	fs.Parse(args)
+	if *remote == "" {
+		_, _, *remote = netParams(*network)
+	}
 
-	env, cleanup := openBfEnv(*dataDir)
+	env, cleanup := openBfEnv(*dataDir, execNetID(*network))
 	defer cleanup()
 	// Read-only: safe while a backfill writer is running.
 	bf, err := state.OpenLogsBackfillRO(*dataDir)

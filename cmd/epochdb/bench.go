@@ -33,18 +33,22 @@ func benchMain(args []string) {
 	fs := flag.NewFlagSet("ab-bench", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory (for probe sampling)")
 	local := fs.String("local", "http://127.0.0.1:9650", "local epochdb serve URL")
-	remote := fs.String("remote", "https://api.avax-test.network/ext/bc/C/rpc", "reference archive RPC")
+	remote := fs.String("remote", "", "reference archive RPC (default per --network)")
 	n := fs.Int("n", 1000, "total probes")
 	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
+	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	workers := fs.Int("workers", 8, "concurrent probe workers")
 	fs.Parse(args)
+	if *remote == "" {
+		_, _, *remote = netParams(*network)
+	}
 
 	store, err := state.OpenReadOnly(*dataDir)
 	if err != nil {
 		log.Fatalf("ab-bench: open state layer: %v", err)
 	}
 	defer store.Close()
-	g, err := exec.FujiGenesis()
+	g, err := exec.NetworkGenesis(execNetID(*network))
 	if err != nil {
 		log.Fatalf("ab-bench: genesis: %v", err)
 	}
@@ -221,11 +225,15 @@ func benchTxMain(args []string) {
 	fs := flag.NewFlagSet("ab-bench-tx", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	local := fs.String("local", "http://127.0.0.1:9650", "local epochdb serve URL")
-	remote := fs.String("remote", "https://api.avax-test.network/ext/bc/C/rpc", "reference archive RPC")
+	remote := fs.String("remote", "", "reference archive RPC (default per --network)")
 	n := fs.Int("n", 600, "sampled txs (each probes both methods where state allows)")
+	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
 	workers := fs.Int("workers", 8, "concurrent probe workers")
 	fs.Parse(args)
+	if *remote == "" {
+		_, _, *remote = netParams(*network)
+	}
 
 	fetch.RegisterExtras() // ParseEthBlock needs the coreth/libevm extras
 	rng := rand.New(rand.NewSource(*seed))

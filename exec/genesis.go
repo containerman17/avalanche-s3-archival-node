@@ -11,21 +11,24 @@ import (
 	warpcontract "github.com/ava-labs/avalanchego/graft/coreth/precompile/contracts/warp"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/upgrade"
-	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/triedb"
 )
 
-// loadFujiCChainGenesis parses the C-Chain Fuji genesis (chainId 43113)
-// from avalanchego's embedded config and wires the Avalanche network
-// upgrades BEFORE SetEthUpgrades — without configExtra.NetworkUpgrades the
+// loadCChainGenesis parses the C-Chain genesis for networkID from
+// avalanchego's embedded config and wires the Avalanche network upgrades
+// BEFORE SetEthUpgrades — without configExtra.NetworkUpgrades the
 // Avalanche phases never activate, state roots diverge at the first AP1
-// block, and SetEthUpgrades cannot place Berlin (Fuji block 184985) or
-// London (805078). Mirrors coreth/plugin/evm/vm.go parseGenesis.
-func loadFujiCChainGenesis(snowCtx *snow.Context) (*corethcore.Genesis, error) {
-	cfg := genesis.GetConfig(avaconstants.FujiID)
+// block, and SetEthUpgrades cannot place Berlin or London (Fuji
+// 184985/805078, mainnet 1640340/3308552). Mirrors
+// coreth/plugin/evm/vm.go parseGenesis.
+func loadCChainGenesis(networkID uint32, snowCtx *snow.Context) (*corethcore.Genesis, error) {
+	cfg := genesis.GetConfig(networkID)
+	if cfg == nil {
+		return nil, fmt.Errorf("no embedded genesis config for network %d", networkID)
+	}
 	var g corethcore.Genesis
 	if err := json.Unmarshal([]byte(cfg.CChainGenesis), &g); err != nil {
 		return nil, fmt.Errorf("unmarshal C-Chain genesis: %w", err)
@@ -33,7 +36,7 @@ func loadFujiCChainGenesis(snowCtx *snow.Context) (*corethcore.Genesis, error) {
 
 	configExtra := cparams.GetExtra(g.Config)
 	configExtra.AvalancheContext = extras.AvalancheContext{SnowCtx: snowCtx}
-	configExtra.NetworkUpgrades = extras.GetNetworkUpgrades(upgrade.GetConfig(avaconstants.FujiID))
+	configExtra.NetworkUpgrades = extras.GetNetworkUpgrades(upgrade.GetConfig(networkID))
 
 	// If Durango is scheduled, schedule the Warp precompile at the same
 	// time (its activation writes to state, so roots would diverge at the

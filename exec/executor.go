@@ -31,9 +31,26 @@ import (
 	"github.com/containerman17/epochdb/state"
 )
 
-// FujiAVAXAssetID is required by the atomic-tx state-transfer path to
-// credit imported AVAX to the right account.
-const FujiAVAXAssetID = "U8iRqJoiJm8xZHAacmvYyZVwqQx6uDNtQeP3CQ6fcgQk3JqnK"
+// The AVAX assetID is required by the atomic-tx state-transfer path to
+// credit imported AVAX to the right account. Everything else network-
+// specific (genesis, upgrade schedule) is derived from the network ID.
+const (
+	FujiAVAXAssetID    = "U8iRqJoiJm8xZHAacmvYyZVwqQx6uDNtQeP3CQ6fcgQk3JqnK"
+	MainnetAVAXAssetID = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDGCgxN5Z"
+)
+
+// snowContextFor builds the minimal snow.Context for networkID.
+func snowContextFor(networkID uint32) (*snow.Context, error) {
+	assetStr := FujiAVAXAssetID
+	if networkID == avaconstants.MainnetID {
+		assetStr = MainnetAVAXAssetID
+	}
+	avaxAssetID, err := ids.FromString(assetStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse AVAX asset id: %w", err)
+	}
+	return &snow.Context{NetworkID: networkID, AVAXAssetID: avaxAssetID}, nil
+}
 
 // flushEvery is the group-fsync cadence in blocks: writelog/headers/code/
 // misc are fsynced and executorHead advanced every flushEvery executed
@@ -70,6 +87,9 @@ type Config struct {
 	// per-block bisect on a boundary mismatch). <= 1 means one proposal
 	// per block, the classic path.
 	CommitEvery int
+	// NetworkID selects the chain (constants.FujiID / MainnetID).
+	// 0 defaults to Fuji.
+	NetworkID uint32
 }
 
 // Executor replays Fuji C-Chain blocks against Firewood-backed frontier
@@ -188,16 +208,16 @@ func New(cfg Config) (*Executor, error) {
 	}
 	fetch.RegisterExtras()
 
-	avaxAssetID, err := ids.FromString(FujiAVAXAssetID)
-	if err != nil {
-		return nil, fmt.Errorf("parse AVAX asset id: %w", err)
+	networkID := cfg.NetworkID
+	if networkID == 0 {
+		networkID = avaconstants.FujiID
 	}
-	snowCtx := &snow.Context{
-		NetworkID:   avaconstants.FujiID,
-		AVAXAssetID: avaxAssetID,
+	snowCtx, err := snowContextFor(networkID)
+	if err != nil {
+		return nil, err
 	}
 
-	g, err := loadFujiCChainGenesis(snowCtx)
+	g, err := loadCChainGenesis(networkID, snowCtx)
 	if err != nil {
 		return nil, err
 	}

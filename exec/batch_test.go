@@ -142,7 +142,7 @@ func emptyChain(t *testing.T, e *Executor, n int, badRootAt int) fakeSource {
 
 func loadGenesisHash(t *testing.T, e *Executor) common.Hash {
 	t.Helper()
-	g, err := loadFujiCChainGenesis(e.snowCtx)
+	g, err := loadCChainGenesis(e.snowCtx.NetworkID, e.snowCtx)
 	if err != nil {
 		t.Fatal(err)
 	}

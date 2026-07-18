@@ -82,6 +82,74 @@ func (f *Fetcher) Sync(ctx context.Context, walks int) error {
 	return nil
 }
 
+// Anchor seeds one SyncTo span: a container ID and its expected block
+// height (pre-verified against the fetched container).
+type Anchor struct {
+	ID     ids.ID
+	Height uint64
+}
+
+// Checkpoints returns the embedded checkpoint container IDs for this
+// network's C-chain. Heights are not published; pre-ProposerVM checkpoint
+// IDs equal the eth block hash and can be resolved via any archive RPC.
+func (f *Fetcher) Checkpoints() []ids.ID {
+	cps := genesis.GetCheckpoints(f.networkID, f.chainID)
+	out := make([]ids.ID, 0, cps.Len())
+	for id := range cps {
+		out = append(out, id)
+	}
+	return out
+}
+
+// SyncTo backfills blocks [0..max(anchors)] with NO frontier following:
+// the anchors (a fixed tip override plus any checkpoints at or below it)
+// are sorted descending and each walk covers one span down to the next
+// anchor (the lowest walks to genesis). Each anchor container is fetched
+// and its parsed height verified against Anchor.Height first, so a wrong
+// ID (e.g. an RPC block hash for a post-ProposerVM height) fails loudly
+// instead of staging a bogus chain. Returns when the range is contiguous.
+func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error {
+	if len(anchors) == 0 {
+		return fmt.Errorf("SyncTo: no anchors")
+	}
+	if walks < 1 {
+		walks = 1
+	}
+	go f.probeLoop(ctx)
+
+	for _, a := range anchors {
+		parsed, err := f.getContainer(ctx, a.ID)
+		if err != nil {
+			return fmt.Errorf("fetch anchor %s: %w", a.ID, err)
+		}
+		if parsed.blockNumber != a.Height {
+			return fmt.Errorf("anchor %s parsed to height %d, want %d (pass a real container ID via --tip for post-ProposerVM heights)",
+				a.ID, parsed.blockNumber, a.Height)
+		}
+	}
+	sort.Slice(anchors, func(i, j int) bool { return anchors[i].Height > anchors[j].Height })
+	log.Printf("fetch: sync-to height=%d anchors=%d walks=%d", anchors[0].Height, len(anchors), walks)
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(walks)
+	for i, a := range anchors {
+		var floor uint64
+		if i+1 < len(anchors) {
+			floor = anchors[i+1].Height
+		}
+		g.Go(func() error {
+			f.activeWalks.Add(1)
+			defer f.activeWalks.Add(-1)
+			return f.walkSpan(gctx, a.ID, floor)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	log.Printf("fetch: sync-to complete, %d spans", len(anchors))
+	return nil
+}
+
 // walkSpan walks backward from tip until the span floor, genesis, or block 0.
 func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 	for {

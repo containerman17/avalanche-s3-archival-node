@@ -100,7 +100,7 @@ func TestEmptyBlockFastPathAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	g, err := loadFujiCChainGenesis(e.snowCtx)
+	g, err := loadCChainGenesis(e.snowCtx.NetworkID, e.snowCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
