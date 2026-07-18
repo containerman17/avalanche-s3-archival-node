@@ -116,6 +116,7 @@ type batchItem struct {
 	headerRLP []byte
 	frame     []byte
 	hasFrame  bool
+	logsRec   []byte // nil = no logs in this block
 }
 
 // chainContext is the minimal coreth ChainContext for
@@ -264,6 +265,16 @@ func New(cfg Config) (*Executor, error) {
 	if err := e.reconcile(); err != nil {
 		tdb.Close()
 		return nil, err
+	}
+
+	// Event-log capture starts wherever this build first executes; blocks
+	// below the marker are the backfill job's range. Write-once.
+	if _, ok := cfg.Store.LogsStart(); !ok {
+		if err := cfg.Store.SetLogsStart(e.headNum + 1); err != nil {
+			tdb.Close()
+			return nil, fmt.Errorf("set logs.start: %w", err)
+		}
+		log.Printf("exec: event-log capture starts at height %d (backfill range 0..%d)", e.headNum+1, e.headNum)
 	}
 	return e, nil
 }
@@ -496,11 +507,12 @@ func (e *Executor) Run(ctx context.Context) error {
 			if hits+misses > 0 {
 				hitPct = 100 * float64(hits) / float64(hits+misses)
 			}
-			log.Printf("exec: height=%d blk/s=%.0f mgas/s=%.2f writelog=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
+			log.Printf("exec: height=%d blk/s=%.0f mgas/s=%.2f writelog=%.1fMB logs=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
 				e.headNum,
 				float64(blocksDone-lastBlocks)/dt,
 				float64(e.totalGas-lastGas)/dt/1e6,
 				float64(e.cfg.Store.WritelogBytes())/1e6,
+				float64(e.cfg.Store.LogsBytes())/1e6,
 				e.cfg.Store.CodeCount(),
 				hitPct,
 				float64(e.wrapDB.cacheSize)/1e6,
@@ -584,7 +596,8 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("open statedb: %w", err)
 	}
-	if err := e.runEVM(blk, statedb); err != nil {
+	evmLogs, err := e.runEVM(blk, statedb)
+	if err != nil {
 		return common.Hash{}, err
 	}
 
@@ -612,6 +625,11 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err := e.cfg.Store.AppendHeader(blockNum, headerRLP); err != nil {
 		return common.Hash{}, err
 	}
+	if rec := encodeLogsFrame(evmLogs); rec != nil {
+		if err := e.cfg.Store.AppendLogs(blockNum, rec); err != nil {
+			return common.Hash{}, err
+		}
+	}
 	if err := e.maybeFlush(blockNum); err != nil {
 		return common.Hash{}, err
 	}
@@ -627,28 +645,34 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 }
 
 // runEVM applies upgrades, all transactions, and the atomic ExtData
-// transfers of blk onto statedb. Shared by the per-block and batched
-// paths.
-func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) error {
+// transfers of blk onto statedb, returning every event log emitted (the
+// receipts already exist in memory: capture is free). Shared by the
+// per-block and batched paths.
+func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) ([]*types.Log, error) {
 	header := blk.Header()
 
 	upgradeBlockCtx := corethcore.NewBlockContext(header.Number, header.Time)
 	if err := corethcore.ApplyUpgrades(e.chainCfg, nil, upgradeBlockCtx, statedb); err != nil {
-		return fmt.Errorf("apply upgrades: %w", err)
+		return nil, fmt.Errorf("apply upgrades: %w", err)
 	}
 
 	blockCtx := corethcore.NewEVMBlockContext(header, e.chainCtx, nil)
 	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
-	var usedGas uint64
+	var (
+		usedGas uint64
+		logs    []*types.Log
+	)
 
 	for txIndex, tx := range blk.Transactions() {
 		statedb.SetTxContext(tx.Hash(), txIndex)
-		if _, err := corethcore.ApplyTransaction(
+		receipt, err := corethcore.ApplyTransaction(
 			e.chainCfg, e.chainCtx, blockCtx, gp, statedb,
 			header, tx, &usedGas, vm.Config{},
-		); err != nil {
-			return fmt.Errorf("tx %d: %w", txIndex, err)
+		)
+		if err != nil {
+			return nil, fmt.Errorf("tx %d: %w", txIndex, err)
 		}
+		logs = append(logs, receipt.Logs...)
 	}
 
 	// Atomic txs ride in the block's ExtData; Fuji has real imports and
@@ -661,16 +685,16 @@ func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) error {
 		}
 		atomicTxs, err := atomic.ExtractAtomicTxs(extData, isAP5, atomic.Codec)
 		if err != nil {
-			return fmt.Errorf("extract atomic txs: %w", err)
+			return nil, fmt.Errorf("extract atomic txs: %w", err)
 		}
 		wrapped := extstate.New(statedb)
 		for i, atx := range atomicTxs {
 			if err := atx.UnsignedAtomicTx.EVMStateTransfer(e.snowCtx, wrapped); err != nil {
-				return fmt.Errorf("atomic tx %d: %w", i, err)
+				return nil, fmt.Errorf("atomic tx %d: %w", i, err)
 			}
 		}
 	}
-	return nil
+	return logs, nil
 }
 
 // executeBatched accumulates blk into the open batch (opening one if
@@ -708,7 +732,8 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 			e.wrapDB.setFrame(nil)
 			return fmt.Errorf("open statedb: %w", err)
 		}
-		if err := e.runEVM(blk, statedb); err != nil {
+		evmLogs, err := e.runEVM(blk, statedb)
+		if err != nil {
 			e.wrapDB.setFrame(nil)
 			return err
 		}
@@ -721,7 +746,11 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 		}
 		e.wrapDB.setFrame(nil)
 		e.batchDirty = true
-		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, headerRLP: headerRLP, frame: frame.buf, hasFrame: true})
+		e.batchBuf = append(e.batchBuf, batchItem{
+			num: blockNum, headerRLP: headerRLP,
+			frame: frame.buf, hasFrame: true,
+			logsRec: encodeLogsFrame(evmLogs),
+		})
 	}
 
 	// Intra-batch chaining trusts header roots; the boundary proposal
@@ -777,6 +806,11 @@ func (e *Executor) flushBatch() error {
 		}
 		if err := e.cfg.Store.AppendHeader(it.num, it.headerRLP); err != nil {
 			return err
+		}
+		if it.logsRec != nil {
+			if err := e.cfg.Store.AppendLogs(it.num, it.logsRec); err != nil {
+				return err
+			}
 		}
 		if err := e.maybeFlush(it.num); err != nil {
 			return err

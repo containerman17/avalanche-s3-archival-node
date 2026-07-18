@@ -57,6 +57,77 @@ func (f *blockFrame) recordCodeUse(addr common.Address, codeHash common.Hash) {
 	f.n++
 }
 
+// encodeLogsFrame builds one block's event-log index record: the block's
+// UNIQUE log addresses and UNIQUE topics, first-appearance order. Posting
+// lists are position-agnostic by design, so "appears in this block" is all
+// the future getLogs index needs. nil for blocks without logs.
+//
+//	[uvarint nAddr][addr 20B ...][uvarint nTopic][topic 32B ...]
+//
+// ponytail: no zstd; unique hashes barely compress and dedup already did
+// the real work (~tens of bytes per log-bearing block). Revisit if
+// bytes/block ever rivals the writelog.
+func encodeLogsFrame(logs []*types.Log) []byte {
+	if len(logs) == 0 {
+		return nil
+	}
+	var (
+		addrs     []common.Address
+		topics    []common.Hash
+		addrSeen  = make(map[common.Address]struct{})
+		topicSeen = make(map[common.Hash]struct{})
+	)
+	for _, l := range logs {
+		if _, ok := addrSeen[l.Address]; !ok {
+			addrSeen[l.Address] = struct{}{}
+			addrs = append(addrs, l.Address)
+		}
+		for _, tp := range l.Topics {
+			if _, ok := topicSeen[tp]; !ok {
+				topicSeen[tp] = struct{}{}
+				topics = append(topics, tp)
+			}
+		}
+	}
+	buf := binary.AppendUvarint(nil, uint64(len(addrs)))
+	for _, a := range addrs {
+		buf = append(buf, a[:]...)
+	}
+	buf = binary.AppendUvarint(buf, uint64(len(topics)))
+	for _, tp := range topics {
+		buf = append(buf, tp[:]...)
+	}
+	return buf
+}
+
+// decodeLogsFrame is the inverse of encodeLogsFrame.
+func decodeLogsFrame(rec []byte) (addrs []common.Address, topics []common.Hash, err error) {
+	n, off := binary.Uvarint(rec)
+	if off <= 0 {
+		return nil, nil, fmt.Errorf("logs frame: bad addr count")
+	}
+	for i := uint64(0); i < n; i++ {
+		if off+20 > len(rec) {
+			return nil, nil, fmt.Errorf("logs frame: truncated addr")
+		}
+		addrs = append(addrs, common.BytesToAddress(rec[off:off+20]))
+		off += 20
+	}
+	m, k := binary.Uvarint(rec[off:])
+	if k <= 0 {
+		return nil, nil, fmt.Errorf("logs frame: bad topic count")
+	}
+	off += k
+	for i := uint64(0); i < m; i++ {
+		if off+32 > len(rec) {
+			return nil, nil, fmt.Errorf("logs frame: truncated topic")
+		}
+		topics = append(topics, common.BytesToHash(rec[off:off+32]))
+		off += 32
+	}
+	return addrs, topics, nil
+}
+
 // codeSink receives every contract code blob at write time.
 type codeSink interface {
 	PutCode(hash common.Hash, blob []byte) error

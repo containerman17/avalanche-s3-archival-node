@@ -13,9 +13,11 @@ import (
 //
 //	writelog_NNNNN.log (+_idx_) post-image write capture, one frame per block
 //	headers_NNNNN.log  (+_idx_) RLP headers, one per executed block
+//	logs_NNNNN.log     (+_idx_) per-block unique event-log addrs+topics
 //	code.log                    every contract code blob, by hash
 //	misc.log                    the few non-code rawdb keys
 //	exechead                    executorHead: last group-fsynced height
+//	logs.start                  first height with event-log capture
 //
 // No database. Appends are unfsynced per block; FlushAndSetExecHead fsyncs
 // the whole group and then advances the durable executorHead, so exechead
@@ -24,14 +26,21 @@ type Store struct {
 	dir  string
 	wl   *bucketLog
 	hd   *bucketLog
+	lg   *bucketLog
 	code *codeStore
 	misc *miscStore
 
 	execHead   uint64
 	execHeadOK bool
+
+	logsStart   uint64
+	logsStartOK bool
 }
 
-const execHeadFile = "exechead"
+const (
+	execHeadFile  = "exechead"
+	logsStartFile = "logs.start"
+)
 
 // Open opens (or creates) the state layer inside dir.
 func Open(dir string) (*Store, error) {
@@ -47,20 +56,28 @@ func Open(dir string) (*Store, error) {
 		wl.Close()
 		return nil, fmt.Errorf("open headers: %w", err)
 	}
+	lg, err := openBucketLog(dir, "logs")
+	if err != nil {
+		wl.Close()
+		hd.Close()
+		return nil, fmt.Errorf("open logs: %w", err)
+	}
 	code, err := openCodeStore(dir)
 	if err != nil {
 		wl.Close()
 		hd.Close()
+		lg.Close()
 		return nil, fmt.Errorf("open code store: %w", err)
 	}
 	misc, err := openMiscStore(dir)
 	if err != nil {
 		wl.Close()
 		hd.Close()
+		lg.Close()
 		code.Close()
 		return nil, fmt.Errorf("open misc store: %w", err)
 	}
-	s := &Store{dir: dir, wl: wl, hd: hd, code: code, misc: misc}
+	s := &Store{dir: dir, wl: wl, hd: hd, lg: lg, code: code, misc: misc}
 	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
 	if err == nil && len(raw) == 8 {
 		s.execHead = binary.BigEndian.Uint64(raw)
@@ -69,6 +86,14 @@ func Open(dir string) (*Store, error) {
 		s.Close()
 		return nil, fmt.Errorf("read exechead: %w", err)
 	}
+	raw, err = os.ReadFile(filepath.Join(dir, logsStartFile))
+	if err == nil && len(raw) == 8 {
+		s.logsStart = binary.BigEndian.Uint64(raw)
+		s.logsStartOK = true
+	} else if err != nil && !os.IsNotExist(err) {
+		s.Close()
+		return nil, fmt.Errorf("read logs.start: %w", err)
+	}
 	return s, nil
 }
 
@@ -76,7 +101,7 @@ func Open(dir string) (*Store, error) {
 // exechead: only FlushAndSetExecHead does that.
 func (s *Store) Close() error {
 	var firstErr error
-	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.code.Close, s.misc.Close} {
+	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.code.Close, s.misc.Close} {
 		if err := c(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -90,7 +115,7 @@ func (s *Store) ExecHead() (uint64, bool) { return s.execHead, s.execHeadOK }
 // FlushAndSetExecHead fsyncs every dirty file (writelog, headers, code,
 // misc) and only then persists executorHead = n via tmp+rename.
 func (s *Store) FlushAndSetExecHead(n uint64) error {
-	for _, f := range []func() error{s.wl.Sync, s.hd.Sync, s.code.Sync, s.misc.Sync} {
+	for _, f := range []func() error{s.wl.Sync, s.hd.Sync, s.lg.Sync, s.code.Sync, s.misc.Sync} {
 		if err := f(); err != nil {
 			return err
 		}
@@ -127,6 +152,43 @@ func (s *Store) HeaderRLP(block uint64) ([]byte, bool, error) { return s.hd.Get(
 
 // HeadersMax returns the highest stored header height, ok=false if none.
 func (s *Store) HeadersMax() (uint64, bool) { return s.hd.Max() }
+
+// AppendLogs stores block's event-log index record (unique addrs+topics).
+// Blocks without logs get no record. Idempotent per block.
+func (s *Store) AppendLogs(block uint64, rec []byte) error {
+	return s.lg.Append(block, rec)
+}
+
+// LogsRecord returns the stored event-log record for block. ok=false means
+// no logs in that block (or the block predates capture, see LogsStart).
+func (s *Store) LogsRecord(block uint64) ([]byte, bool, error) { return s.lg.Get(block) }
+
+// LogsBytes returns total logs payload bytes on disk.
+func (s *Store) LogsBytes() uint64 { return s.lg.Bytes() }
+
+// LogsStart returns the first height with event-log capture, ok=false if
+// capture never started.
+func (s *Store) LogsStart() (uint64, bool) { return s.logsStart, s.logsStartOK }
+
+// SetLogsStart persists the capture start height (write-once marker; the
+// backfill job covers blocks 0..start-1).
+func (s *Store) SetLogsStart(h uint64) error {
+	if s.logsStartOK {
+		return nil
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], h)
+	tmp := filepath.Join(s.dir, logsStartFile+".tmp")
+	if err := os.WriteFile(tmp, buf[:], 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(s.dir, logsStartFile)); err != nil {
+		return err
+	}
+	s.logsStart = h
+	s.logsStartOK = true
+	return nil
+}
 
 // PutCode stores a contract code blob by hash (dedup by hash).
 func (s *Store) PutCode(hash common.Hash, blob []byte) error { return s.code.Put(hash, blob) }
