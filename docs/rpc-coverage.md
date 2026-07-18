@@ -23,31 +23,31 @@ N/A = unsupported by design with the reason.
 | eth_estimateGas | DONE | |
 | eth_createAccessList | TODO(other) | |
 | eth_getBlockByNumber / ByHash | DONE | |
-| eth_getHeaderByNumber / ByHash | TODO(phase1) | header JSON from stored RLP |
+| eth_getHeaderByNumber / ByHash | DONE | header JSON; public API does not expose these (-32601), so shape-verified against our getBlockByNumber |
 | eth_getBlockTransactionCountByNumber / ByHash | DONE | |
 | eth_getBlockReceipts | DONE | re-execution |
 | eth_getTransactionByHash | DONE | |
 | eth_getTransactionReceipt | DONE | |
 | eth_getTransactionByBlockNumberAndIndex / BlockHashAndIndex | DONE | |
-| eth_getRawTransactionByHash | TODO(phase1) | tx.MarshalBinary |
-| eth_getRawTransactionByBlockNumberAndIndex / BlockHashAndIndex | TODO(phase1) | |
+| eth_getRawTransactionByHash | DONE | tx.MarshalBinary |
+| eth_getRawTransactionByBlockNumberAndIndex / BlockHashAndIndex | DONE | |
 | eth_getLogs | DONE | 10k range cap (public API caps at 2048) |
 | eth_gasPrice | DONE | |
-| eth_baseFee | DONE | avalanche-specific |
+| eth_baseFee | DONE | avalanche-specific; head base fee (pre-AP3 corpus: 0x0) |
 | eth_maxPriorityFeePerGas | DONE | |
 | eth_feeHistory | DONE | |
 | eth_blobBaseFee | N/A | not served by coreth either; no blobs on the C-chain |
-| eth_newFilter | TODO(phase1) | in-memory registry |
-| eth_newBlockFilter | TODO(phase1) | |
-| eth_newPendingTransactionFilter | TODO(phase1) | no pool: always empty changes |
-| eth_getFilterChanges | TODO(phase1) | static corpus: empty after first poll is correct |
-| eth_getFilterLogs | TODO(phase1) | full query, same engine as eth_getLogs |
-| eth_uninstallFilter | TODO(phase1) | |
-| eth_subscribe / eth_unsubscribe | TODO(phase1) | WS; newHeads/logs/newPendingTransactions accepted, silent on a static corpus, live in phase 3 |
+| eth_newFilter | DONE | in-memory registry |
+| eth_newBlockFilter | DONE | |
+| eth_newPendingTransactionFilter | DONE | no pool: always empty changes |
+| eth_getFilterChanges | DONE | static corpus: empty after first poll is correct |
+| eth_getFilterLogs | DONE | full query, same engine as eth_getLogs |
+| eth_uninstallFilter | DONE | |
+| eth_subscribe / eth_unsubscribe | DONE | WS; newHeads/logs/newPendingTransactions accepted, silent on a static corpus, live in phase 3 |
 | eth_sendRawTransaction | PHASE3 | documented error: no mempool/relay yet |
 | eth_sendTransaction | PHASE3 | also needs accounts; error |
 | eth_fillTransaction / eth_resend | PHASE3 | mempool-adjacent, error |
-| eth_pendingTransactions | TODO(phase1) | empty list (no pool) |
+| eth_pendingTransactions | DONE | empty list (no pool) |
 | eth_accounts | DONE | [] (no keystore) |
 | eth_coinbase | DONE | zero address like coreth |
 | eth_sign / eth_signTransaction | N/A | no keystore by design |
@@ -59,19 +59,19 @@ N/A = unsupported by design with the reason.
 | method | status | notes |
 |---|---|---|
 | web3_clientVersion | DONE | |
-| web3_sha3 | TODO(phase1) | keccak256, deterministic A/B |
+| web3_sha3 | DONE | keccak256, deterministic A/B |
 | net_version | DONE | chain id string |
 | net_listening | DONE | true |
-| net_peerCount | TODO(phase1) | 0x0 (no p2p serving); tolerance: remote reports its own peers |
+| net_peerCount | DONE | 0x0 (no p2p serving); tolerance: remote reports its own peers |
 
 ## txpool
 
 | method | status | notes |
 |---|---|---|
-| txpool_status | TODO(phase1) | {pending:0x0, queued:0x0}; tolerance: remote pool is live |
-| txpool_content | TODO(phase1) | {pending:{}, queued:{}} |
-| txpool_contentFrom | TODO(phase1) | {pending:{}, queued:{}} |
-| txpool_inspect | TODO(phase1) | {pending:{}, queued:{}} |
+| txpool_status | DONE | {pending:0x0, queued:0x0}; tolerance: remote pool is live |
+| txpool_content | DONE | {pending:{}, queued:{}} |
+| txpool_contentFrom | DONE | {pending:{}, queued:{}} |
+| txpool_inspect | DONE | {pending:{}, queued:{}} |
 
 ## personal / admin
 

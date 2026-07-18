@@ -131,6 +131,8 @@ func main() {
 		benchRPCMain(os.Args[2:])
 	case "ab-bench-logs":
 		benchLogsMain(os.Args[2:])
+	case "rpc-bench":
+		rpcBenchMain(os.Args[2:])
 	case "seal":
 		sealMain(os.Args[2:])
 	case "backfill-logs":
