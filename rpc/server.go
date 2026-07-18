@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"sync"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus/dummy"
@@ -41,6 +44,10 @@ type Server struct {
 	txidx  TxCandidateSource
 	blocks BlockSource
 	parse  ContainerParser
+
+	// filter registry (rpc/filters.go), created on first use.
+	filtersOnce sync.Once
+	filters     *filterReg
 
 	// block APIs: eth block hash -> height, wired by EnableBlockAPIs.
 	hashIdx map[common.Hash]uint64
@@ -91,6 +98,10 @@ func errInvalid(format string, args ...any) *rpcError {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if websocket.IsWebSocketUpgrade(r) {
+		s.serveWS(w, r)
+		return
+	}
 	var req rpcRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeReply(w, nil, nil, &rpcError{Code: -32700, Message: "parse error (no batching)"})
@@ -192,6 +203,62 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return nil, nil
 	case "eth_getProof":
 		return nil, &rpcError{Code: -32000, Message: "eth_getProof unsupported by design: epochdb stores no tries"}
+	// debug/trace namespace (debug.go).
+	case "debug_traceTransaction":
+		return s.debugTraceTransaction(req.Params)
+	case "debug_traceBlockByNumber":
+		return s.debugTraceBlock(req.Params, false)
+	case "debug_traceBlockByHash":
+		return s.debugTraceBlock(req.Params, true)
+	case "debug_getRawBlock":
+		return s.debugGetRawBlock(req.Params)
+	case "debug_getRawHeader":
+		return s.debugGetRawHeader(req.Params)
+	case "debug_getRawTransaction":
+		return s.debugGetRawTransaction(req.Params)
+	case "debug_getRawReceipts":
+		return s.debugGetRawReceipts(req.Params)
+	case "eth_createAccessList":
+		return s.createAccessList(req.Params)
+	case "debug_dumpBlock", "debug_accountRange", "debug_storageRangeAt":
+		return nil, &rpcError{Code: -32000, Message: req.Method + " unsupported by design: epochdb stores no tries"}
+	// filters, subscriptions bookkeeping, and audit trivia (filters.go).
+	case "eth_newFilter":
+		return s.newFilter(req.Params)
+	case "eth_newBlockFilter":
+		return s.newBlockFilter()
+	case "eth_newPendingTransactionFilter":
+		return s.newPendingTxFilter()
+	case "eth_getFilterChanges":
+		return s.getFilterChanges(req.Params)
+	case "eth_getFilterLogs":
+		return s.getFilterLogs(req.Params)
+	case "eth_uninstallFilter":
+		return s.uninstallFilter(req.Params)
+	case "web3_sha3":
+		return web3Sha3(req.Params)
+	case "net_peerCount":
+		return "0x0", nil // read server, no p2p peers
+	case "txpool_status", "txpool_content", "txpool_contentFrom", "txpool_inspect":
+		return emptyTxPool(req.Method), nil
+	case "eth_pendingTransactions":
+		return []any{}, nil // no mempool
+	case "eth_baseFee":
+		return s.baseFee()
+	case "eth_getHeaderByNumber":
+		return s.getHeaderBy(req.Params, false)
+	case "eth_getHeaderByHash":
+		return s.getHeaderBy(req.Params, true)
+	case "eth_getRawTransactionByHash":
+		return s.rawTxByHash(req.Params)
+	case "eth_getRawTransactionByBlockNumberAndIndex":
+		return s.rawTxByBlockAndIndex(req.Params, false)
+	case "eth_getRawTransactionByBlockHashAndIndex":
+		return s.rawTxByBlockAndIndex(req.Params, true)
+	case "eth_sendRawTransaction", "eth_sendTransaction", "eth_fillTransaction", "eth_resend":
+		return nil, errTxSubmission(req.Method)
+	case "eth_subscribe", "eth_unsubscribe":
+		return nil, &rpcError{Code: -32000, Message: req.Method + " requires the WebSocket transport"}
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found: " + req.Method}
 	}
