@@ -125,6 +125,8 @@ func main() {
 		benchMain(os.Args[2:])
 	case "ab-bench-tx":
 		benchTxMain(os.Args[2:])
+	case "seal":
+		sealMain(os.Args[2:])
 	case "backfill-logs":
 		backfillLogsMain(os.Args[2:])
 	case "verify-logs":
@@ -142,6 +144,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
+	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--delete-raw]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
 	os.Exit(2)
@@ -154,6 +157,19 @@ func cookMain(args []string) {
 	fs.Parse(args)
 	if err := state.CookIndex(*dataDir); err != nil {
 		log.Fatalf("epochdb: cook-index: %v", err)
+	}
+}
+
+// sealMain cuts sealed epoch files from the raw staging + capture files,
+// strictly behind the exec head.
+func sealMain(args []string) {
+	fs := flag.NewFlagSet("seal", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	deleteRaw := fs.Bool("delete-raw", false, "remove fully sealed raw buckets afterwards (NEVER next to a running fetch/exec)")
+	fs.Parse(args)
+	fetch.RegisterExtras()
+	if err := state.SealEpochs(*dataDir, *deleteRaw); err != nil {
+		log.Fatalf("epochdb: seal: %v", err)
 	}
 }
 
@@ -290,14 +306,34 @@ func resolveTipOverride(f *fetch.Fetcher, rpcURL, v string) []fetch.Anchor {
 		log.Fatalf("epochdb: --tip-override: cannot determine height of %s via %s (post-ProposerVM container? use --tip): ok=%v err=%v", tipID, rpcURL, ok, err)
 	}
 	anchors := []fetch.Anchor{{ID: tipID, Height: tipHeight}}
+	seen := map[uint64]bool{tipHeight: true}
 	for _, cp := range f.Checkpoints() {
 		h, ok, err := rpcBlockNumberByHash(rpcURL, common.Hash(cp))
-		if err != nil || !ok || h > tipHeight || h == 0 {
+		if err != nil || !ok || h > tipHeight || h == 0 || seen[h] {
 			continue // post-ProposerVM, above the override, or genesis
 		}
+		seen[h] = true
 		anchors = append(anchors, fetch.Anchor{ID: cp, Height: h})
 	}
-	log.Printf("fetch: tip-override %s at height %d, %d checkpoint seeds below", tipID, tipHeight, len(anchors)-1)
+	// The walks are round-trip-latency-bound, so synthesize evenly spaced
+	// anchors up to `walks` total: in the pre-ProposerVM era every height
+	// RPC-resolves to a container ID for free.
+	const wantAnchors = 16
+	if len(anchors) < wantAnchors {
+		step := tipHeight / wantAnchors
+		for h := step; h < tipHeight && step > 0; h += step {
+			if seen[h] {
+				continue
+			}
+			bh, err := rpcBlockHash(rpcURL, h)
+			if err != nil {
+				log.Fatalf("epochdb: --tip-override: resolve filler anchor %d: %v", h, err)
+			}
+			seen[h] = true
+			anchors = append(anchors, fetch.Anchor{ID: ids.ID(bh), Height: h})
+		}
+	}
+	log.Printf("fetch: tip-override %s at height %d, %d seeds below", tipID, tipHeight, len(anchors)-1)
 	return anchors
 }
 

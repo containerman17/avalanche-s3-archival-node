@@ -354,13 +354,16 @@ func OpenEpochSet(dir string) (*EpochSet, error) {
 	}
 	sort.Slice(s.Epochs, func(i, j int) bool { return s.Epochs[i].Start < s.Epochs[j].Start })
 	for i, e := range s.Epochs {
-		var wantStart uint64
-		if i > 0 {
-			wantStart = s.Epochs[i-1].End() + 1
+		if i == 0 {
+			if e.Start > 1 { // block 0 is genesis (no container); sealing starts at 1
+				s.Close()
+				return nil, fmt.Errorf("first epoch starts at %d, want 0 or 1", e.Start)
+			}
+			continue
 		}
-		if e.Start != wantStart {
+		if want := s.Epochs[i-1].End() + 1; e.Start != want {
 			s.Close()
-			return nil, fmt.Errorf("epoch gap: %d follows %d", e.Start, wantStart)
+			return nil, fmt.Errorf("epoch gap: %d follows %d", e.Start, want)
 		}
 	}
 	return s, nil
