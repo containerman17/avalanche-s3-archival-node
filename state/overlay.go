@@ -107,9 +107,19 @@ func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) 
 		return nil, 0, fmt.Errorf("bad header")
 	}
 	cookedThrough := binary.BigEndian.Uint64(mm[8:16])
+	wlSize := binary.BigEndian.Uint64(mm[16:24])
 	wl, err := os.Open(filepath.Join(dir, fmt.Sprintf("writelog_%05d.log", bucket)))
 	if err != nil {
 		syscall.Munmap(mm)
+		return nil, 0, err
+	}
+	wst, err := wl.Stat()
+	if err == nil && uint64(wst.Size()) < wlSize {
+		err = fmt.Errorf("stale sorted index: writelog is %d bytes, cooked against %d (re-run epochdb cook-index)", wst.Size(), wlSize)
+	}
+	if err != nil {
+		syscall.Munmap(mm)
+		wl.Close()
 		return nil, 0, err
 	}
 	return &sortedBucket{

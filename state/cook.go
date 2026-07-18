@@ -13,7 +13,8 @@ import (
 
 // Cooked per-bucket sorted index over the writelog: sorted_NNNNN.idx.
 //
-//	header (16B): magic "EDBS" | recSize uint32 BE | cookedThrough uint64 BE
+//	header (24B): magic "EDBS" | recSize uint32 BE | cookedThrough uint64 BE |
+//	              wlSize uint64 BE (writelog data file size at cook time)
 //	records (73B fixed, sorted ascending by (key, block)):
 //	  key[53]  = kind(1: 'a' account | 's' storage) + addr(20) + slot(32,
 //	             zero for accounts)
@@ -25,9 +26,12 @@ import (
 //
 // cookedThrough is the highest block the cook covered (min of bucket end
 // and exechead at cook time). A bucket whose cookedThrough already reaches
-// that target is skipped; the tip bucket is re-cooked as exechead advances.
+// that target AND whose writelog size still matches wlSize is skipped; the
+// tip bucket is re-cooked as exechead advances, and a regenerated writelog
+// (wiped data dir re-executed with different capture behavior) invalidates
+// the stored value offsets, which the wlSize mismatch catches.
 const (
-	sortedHdrSize = 16
+	sortedHdrSize = 24
 	sortedKeySize = 53
 	sortedRecSize = sortedKeySize + 8 + 8 + 4
 )
@@ -44,22 +48,22 @@ const (
 
 func sortedName(bucket uint64) string { return fmt.Sprintf("sorted_%05d.idx", bucket) }
 
-// readCookedThrough returns the cookedThrough of an existing sorted file,
-// ok=false if the file is missing or malformed (malformed = re-cook).
-func readCookedThrough(path string) (uint64, bool) {
+// readSortedHeader returns the cookedThrough and cook-time writelog size of
+// an existing sorted file, ok=false if missing or malformed (= re-cook).
+func readSortedHeader(path string) (cookedThrough, wlSize uint64, ok bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	defer f.Close()
 	var hdr [sortedHdrSize]byte
 	if _, err := f.ReadAt(hdr[:], 0); err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	if !bytes.Equal(hdr[0:4], sortedMagic[:]) || binary.BigEndian.Uint32(hdr[4:8]) != sortedRecSize {
-		return 0, false
+		return 0, 0, false
 	}
-	return binary.BigEndian.Uint64(hdr[8:16]), true
+	return binary.BigEndian.Uint64(hdr[8:16]), binary.BigEndian.Uint64(hdr[16:24]), true
 }
 
 type cookRec struct {
@@ -73,8 +77,8 @@ type cookRec struct {
 // CookIndex external-sorts every writelog bucket that has blocks at or
 // below the durable exechead into sorted_NNNNN.idx. Idempotent and
 // re-runnable: fully cooked buckets are skipped, the partial tip bucket is
-// rewritten (tmp+rename). Run it offline or on a quiesced data dir: it
-// opens the writelog read-write to rebuild the sidecar index.
+// rewritten (tmp+rename). Read-only on the writelog, safe next to a
+// running exec (everything at or below exechead is durable and immutable).
 func CookIndex(dir string) error {
 	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
 	if err != nil {
@@ -85,7 +89,9 @@ func CookIndex(dir string) error {
 	}
 	execHead := binary.BigEndian.Uint64(raw)
 
-	wl, err := openBucketLog(dir, "writelog")
+	// Read-only scan: the writelog may be owned by a live exec; the regular
+	// open would truncate torn tails out from under the writer.
+	wl, err := openBucketLogRO(dir, "writelog")
 	if err != nil {
 		return fmt.Errorf("cook: open writelog: %w", err)
 	}
@@ -111,13 +117,18 @@ func CookIndex(dir string) error {
 		if execHead < target {
 			target = execHead
 		}
+		wlStat, err := os.Stat(filepath.Join(dir, wl.dataName(b)))
+		if err != nil {
+			return fmt.Errorf("cook: bucket %05d: %w", b, err)
+		}
+		wlSize := uint64(wlStat.Size())
 		path := filepath.Join(dir, sortedName(b))
-		if got, ok := readCookedThrough(path); ok && got >= target {
+		if got, gotSize, ok := readSortedHeader(path); ok && got >= target && gotSize == wlSize {
 			fmt.Printf("cook: bucket %05d already cooked through %d, skip\n", b, got)
 			continue
 		}
 		start := time.Now()
-		n, err := cookBucket(dir, wl, b, inBucket[b], target)
+		n, err := cookBucket(dir, wl, b, inBucket[b], target, wlSize)
 		if err != nil {
 			return fmt.Errorf("cook: bucket %05d: %w", b, err)
 		}
@@ -134,7 +145,7 @@ func CookIndex(dir string) error {
 // ponytail: per-bucket in-RAM sort; a bucket is 100k blocks (~100MB of
 // writelog on Fuji), switch to a real external merge sort when a mainnet
 // bucket outgrows RAM.
-func cookBucket(dir string, wl *bucketLog, bucket uint64, blocks []uint64, cookedThrough uint64) (int, error) {
+func cookBucket(dir string, wl *bucketLog, bucket uint64, blocks []uint64, cookedThrough, wlSize uint64) (int, error) {
 	var recs []cookRec
 	for _, block := range blocks {
 		loc := wl.idx[block]
@@ -178,6 +189,7 @@ func cookBucket(dir string, wl *bucketLog, bucket uint64, blocks []uint64, cooke
 	copy(hdr[0:4], sortedMagic[:])
 	binary.BigEndian.PutUint32(hdr[4:8], sortedRecSize)
 	binary.BigEndian.PutUint64(hdr[8:16], cookedThrough)
+	binary.BigEndian.PutUint64(hdr[16:24], wlSize)
 	if _, err := w.Write(hdr[:]); err != nil {
 		f.Close()
 		return 0, err
