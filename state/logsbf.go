@@ -29,10 +29,21 @@ type LogsBackfill struct {
 }
 
 // OpenLogsBackfill opens (or creates) the backfill namespace for writing.
+// Single writer only: the open applies the torn-tail truncation rule.
 func OpenLogsBackfill(dir string) (*LogsBackfill, error) {
 	l, err := openBucketLog(dir, "logsbf")
 	if err != nil {
 		return nil, fmt.Errorf("open logsbf: %w", err)
+	}
+	return &LogsBackfill{dir: dir, l: l}, nil
+}
+
+// OpenLogsBackfillRO opens the namespace read-only (no truncation), safe
+// next to a running backfill writer.
+func OpenLogsBackfillRO(dir string) (*LogsBackfill, error) {
+	l, err := openBucketLogRO(dir, "logsbf")
+	if err != nil {
+		return nil, fmt.Errorf("open logsbf ro: %w", err)
 	}
 	return &LogsBackfill{dir: dir, l: l}, nil
 }

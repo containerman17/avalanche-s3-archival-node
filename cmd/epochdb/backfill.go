@@ -234,7 +234,8 @@ func verifyLogsMain(args []string) {
 
 	env, cleanup := openBfEnv(*dataDir)
 	defer cleanup()
-	bf, err := state.OpenLogsBackfill(*dataDir)
+	// Read-only: safe while a backfill writer is running.
+	bf, err := state.OpenLogsBackfillRO(*dataDir)
 	if err != nil {
 		log.Fatalf("verify-logs: %v", err)
 	}
