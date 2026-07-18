@@ -22,6 +22,8 @@ import (
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
+	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/rlp"
 
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -238,13 +240,32 @@ func serveMain(args []string) {
 	}
 
 	// eth block hash -> height for the *ByHash methods, from the staging
-	// sidecars (~40B/block resident).
+	// sidecars (~40B/block resident). After --delete-raw the sidecars only
+	// cover the raw tail, so fill the sealed range from epoch-served
+	// headers (one decode+hash pass at startup).
 	if hashes, err := fetch.BlockHashes(*dataDir); err != nil {
 		log.Printf("epochdb: block hash index unavailable: %v", err)
 	} else {
-		byHash := make(map[common.Hash]uint64, len(hashes))
+		byHash := make(map[common.Hash]uint64, hist.Head()+1)
 		for h, n := range hashes {
 			byHash[common.Hash(h)] = n
+		}
+		if uint64(len(byHash)) < hist.Head()+1 {
+			filled := 0
+			for n := uint64(0); n <= hist.Head(); n++ {
+				raw, ok, err := hist.HeaderRLP(n)
+				if err != nil || !ok {
+					continue
+				}
+				var h types.Header
+				if rlp.DecodeBytes(raw, &h) == nil {
+					if _, dup := byHash[h.Hash()]; !dup {
+						byHash[h.Hash()] = n
+						filled++
+					}
+				}
+			}
+			log.Printf("epochdb: block hash index: filled %d heights from sealed headers", filled)
 		}
 		srv.EnableBlockAPIs(byHash)
 		log.Printf("epochdb: block hash index: %d blocks", len(byHash))
