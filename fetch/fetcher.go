@@ -44,6 +44,10 @@ const (
 	probeInterval = 15 * time.Second
 	// probeFanout is how many non-archival peers each probe round asks.
 	probeFanout = 3
+	// tipPollInterval paces GetAcceptedFrontier polling in FollowTip mode.
+	tipPollInterval = 30 * time.Second
+	// frontierFanout is how many peers a frontier query asks.
+	frontierFanout = 8
 )
 
 // Config for opening a Fetcher.
@@ -303,6 +307,9 @@ func (f *Fetcher) WalkFrom(ctx context.Context, tip ids.ID) error {
 type peerState struct {
 	archival bool
 	busy     int
+	// rate is an EWMA of blocks/sec per answered request; acquire uses it
+	// as a tie-break so a single walk sticks to the fastest peer.
+	rate float64
 }
 
 type peerPool struct {
@@ -350,7 +357,8 @@ func (p *peerPool) acquire(maxBusy int) (peer ids.NodeID, ok, haveArchival bool)
 		if s.busy >= maxBusy {
 			continue
 		}
-		if best == nil || s.busy < best.busy {
+		if best == nil || s.busy < best.busy ||
+			(s.busy == best.busy && s.rate > best.rate) {
 			best, peer = s, id
 		}
 	}
@@ -382,10 +390,47 @@ func (p *peerPool) setArchival(id ids.NodeID, archival bool) {
 	}
 }
 
+// observe folds a successful answer into the peer's rate EWMA.
+func (p *peerPool) observe(id ids.NodeID, blocks int, elapsed time.Duration) {
+	sec := elapsed.Seconds()
+	if sec < 1e-3 {
+		sec = 1e-3
+	}
+	r := float64(blocks) / sec
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if s, ok := p.peers[id]; ok {
+		if s.rate == 0 {
+			s.rate = r
+		} else {
+			s.rate = 0.8*s.rate + 0.2*r
+		}
+	}
+}
+
 func (p *peerPool) archivalCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.archival
+}
+
+// peersForFrontier returns up to n connected peers, archival first: any
+// peer answers GetAcceptedFrontier, archival ones are just known-alive.
+func (p *peerPool) peersForFrontier(n int) []ids.NodeID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]ids.NodeID, 0, n)
+	for id, s := range p.peers {
+		if s.archival && len(out) < n {
+			out = append(out, id)
+		}
+	}
+	for id, s := range p.peers {
+		if !s.archival && len(out) < n {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // nonArchival returns up to n non-archival peers (map order, effectively
@@ -466,12 +511,14 @@ func (f *Fetcher) fetchAncestors(ctx context.Context, tip ids.ID) (ancestorsResp
 			}
 			continue
 		}
+		start := time.Now()
 		resp, got := f.request(ctx, peer, tip)
 		f.pool.release(peer)
 		if !got || !nonEmpty(resp) {
 			f.pool.setArchival(peer, false)
 			continue
 		}
+		f.pool.observe(peer, len(resp.blocks), time.Since(start))
 		return resp, peer, true
 	}
 }
@@ -553,6 +600,109 @@ func (f *Fetcher) probeLoop(ctx context.Context) {
 			}(p)
 		}
 		wg.Wait()
+	}
+}
+
+// acceptedFrontier asks frontierFanout peers for the chain's accepted
+// frontier and returns the container ID named by the most peers. Peers may
+// disagree by a block or two as the frontier advances; any answer is a
+// valid walk anchor.
+func (f *Fetcher) acceptedFrontier(ctx context.Context) (ids.ID, error) {
+	peers := f.pool.peersForFrontier(frontierFanout)
+	if len(peers) == 0 {
+		return ids.Empty, fmt.Errorf("no connected peers")
+	}
+	results := make(chan ids.ID, len(peers))
+	for _, peer := range peers {
+		go func(peer ids.NodeID) {
+			reqID := f.reqIDCounter.Add(1)
+			ch := make(chan ids.ID, 1)
+			f.handler.registerFrontierRoute(reqID, ch)
+			defer f.handler.unregisterFrontierRoute(reqID)
+			msg, err := f.creator.GetAcceptedFrontier(f.chainID, reqID, defaultRequestTimeout)
+			if err != nil {
+				results <- ids.Empty
+				return
+			}
+			f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, avaconstants.PrimaryNetworkID, subnets.NoOpAllower)
+			t := time.NewTimer(defaultRequestTimeout)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				results <- ids.Empty
+			case <-t.C:
+				results <- ids.Empty
+			case id := <-ch:
+				results <- id
+			}
+		}(peer)
+	}
+	votes := make(map[ids.ID]int, len(peers))
+	var best ids.ID
+	for range peers {
+		id := <-results
+		if id == ids.Empty {
+			continue
+		}
+		votes[id]++
+		if votes[id] > votes[best] {
+			best = id
+		}
+	}
+	if best == ids.Empty {
+		return ids.Empty, fmt.Errorf("no frontier answers from %d peers", len(peers))
+	}
+	return best, nil
+}
+
+// FollowTip anchors at the network's accepted frontier and walks backward
+// with the archival-peer pipeline until it connects to already-stored
+// history, then keeps polling the frontier every tipPollInterval and
+// backfilling from each new frontier, so the store continuously tracks the
+// live tip.
+func (f *Fetcher) FollowTip(ctx context.Context) error {
+	go f.probeLoop(ctx)
+	var floor uint64 // first walk connects to the checkpoint-synced history
+	for {
+		select {
+		case err := <-f.dispatchErrCh:
+			return fmt.Errorf("network stopped: %w", err)
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		tipID, err := f.acceptedFrontier(ctx)
+		if err != nil {
+			log.Printf("fetch: accepted frontier: %v", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+		parsed, err := f.getContainer(ctx, tipID)
+		if err != nil {
+			return fmt.Errorf("fetch frontier container %s: %w", tipID, err)
+		}
+		tipH := parsed.blockNumber
+		if behind := int64(tipH) + 1 - int64(f.store.Count()); behind > 0 {
+			log.Printf("fetch: tip height=%d gap=%d blocks behind", tipH, behind)
+		}
+		f.activeWalks.Add(1)
+		err = f.walkSpan(ctx, tipID, floor)
+		f.activeWalks.Add(-1)
+		if err != nil {
+			return err
+		}
+		floor = tipH
+		log.Printf("fetch: caught up to tip height=%d stored=%d", tipH, f.store.Count())
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(tipPollInterval):
+		}
 	}
 }
 

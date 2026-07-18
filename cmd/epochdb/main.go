@@ -152,6 +152,7 @@ func fetchMain(args []string) {
 	walks := fs.Int("walks", 16, "concurrent backward walks")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
+	fromTip := fs.Bool("from-tip", false, "anchor at the network's accepted frontier, backfill down to stored history, then keep following the live tip")
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -163,7 +164,9 @@ func fetchMain(args []string) {
 	}
 
 	done := make(chan error, 1)
-	if *tip != "" {
+	if *fromTip {
+		go func() { done <- f.FollowTip(ctx) }()
+	} else if *tip != "" {
 		id, err := parseContainerID(*tip)
 		if err != nil {
 			log.Fatalf("epochdb: --tip: %v", err)
@@ -202,8 +205,14 @@ func fetchMain(args []string) {
 			if da := cur.Answers - prev.Answers; da > 0 {
 				pct = 100 * float64(cur.NonEmpty-prev.NonEmpty) / float64(da)
 			}
-			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d archival=%d inflight=%d answers_nonempty=%.0f%%",
-				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, cur.Archival, cur.InFlight, pct)
+			gap := ""
+			if *fromTip {
+				if missing := int64(cur.Head) + 1 - int64(cur.Stored); missing > 0 {
+					gap = fmt.Sprintf(" gap=%d", missing)
+				}
+			}
+			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d archival=%d inflight=%d answers_nonempty=%.0f%%%s",
+				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, cur.Archival, cur.InFlight, pct, gap)
 			prev, prevT = cur, now
 		}
 	}

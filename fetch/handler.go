@@ -22,8 +22,9 @@ type inboundHandler struct {
 	peers       set.Set[ids.NodeID]
 	pool        *peerPool
 
-	routeMu  sync.Mutex
-	routeMap map[uint32]chan ancestorsResponse
+	routeMu     sync.Mutex
+	routeMap    map[uint32]chan ancestorsResponse
+	frontierMap map[uint32]chan ids.ID
 }
 
 func newHandler(peers set.Set[ids.NodeID], pool *peerPool) *inboundHandler {
@@ -32,6 +33,7 @@ func newHandler(peers set.Set[ids.NodeID], pool *peerPool) *inboundHandler {
 		peers:       peers,
 		pool:        pool,
 		routeMap:    make(map[uint32]chan ancestorsResponse),
+		frontierMap: make(map[uint32]chan ids.ID),
 	}
 }
 
@@ -52,6 +54,30 @@ func (h *inboundHandler) Disconnected(nodeID ids.NodeID) {
 
 func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMessage) {
 	defer msg.OnFinishedHandling()
+
+	if msg.Op == message.AcceptedFrontierOp {
+		payload, ok := msg.Message.(*p2p.AcceptedFrontier)
+		if !ok {
+			return
+		}
+		id, err := ids.ToID(payload.ContainerId)
+		if err != nil {
+			return
+		}
+		h.routeMu.Lock()
+		ch, routed := h.frontierMap[payload.RequestId]
+		if routed {
+			delete(h.frontierMap, payload.RequestId)
+		}
+		h.routeMu.Unlock()
+		if routed {
+			select {
+			case ch <- id:
+			default:
+			}
+		}
+		return
+	}
 
 	if msg.Op != message.AncestorsOp {
 		return
@@ -89,5 +115,17 @@ func (h *inboundHandler) registerRoute(reqID uint32, ch chan ancestorsResponse) 
 func (h *inboundHandler) unregisterRoute(reqID uint32) {
 	h.routeMu.Lock()
 	delete(h.routeMap, reqID)
+	h.routeMu.Unlock()
+}
+
+func (h *inboundHandler) registerFrontierRoute(reqID uint32, ch chan ids.ID) {
+	h.routeMu.Lock()
+	h.frontierMap[reqID] = ch
+	h.routeMu.Unlock()
+}
+
+func (h *inboundHandler) unregisterFrontierRoute(reqID uint32) {
+	h.routeMu.Lock()
+	delete(h.frontierMap, reqID)
 	h.routeMu.Unlock()
 }

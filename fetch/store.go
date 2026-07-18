@@ -389,12 +389,14 @@ func (s *Store) Head() (uint64, bool) {
 }
 
 // LowestContiguous walks down from height `from` (which must be stored) and
-// returns the lowest height of the contiguous stored run containing it.
-func (s *Store) LowestContiguous(from uint64) uint64 {
+// returns the lowest height of the contiguous stored run containing it,
+// never scanning below floor (callers that only care whether the run
+// reaches their floor pass it to avoid an O(history) scan).
+func (s *Store) LowestContiguous(from, floor uint64) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := from
-	for h > 0 {
+	for h > floor {
 		if _, ok := s.byHeight[h-1]; !ok {
 			break
 		}

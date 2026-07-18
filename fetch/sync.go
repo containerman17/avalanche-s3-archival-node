@@ -102,7 +102,7 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 			}
 			// Short-circuit: skip past the contiguous stored run in RAM,
 			// re-parse only the bottom container to find its parent.
-			lo := f.store.LowestContiguous(h)
+			lo := f.store.LowestContiguous(h, floor)
 			if lo == 0 || (floor > 0 && lo <= floor+1) {
 				return nil // run connects to the floor checkpoint (or block 0)
 			}
@@ -210,6 +210,7 @@ func (f *Fetcher) fetchAndStore(ctx context.Context, id ids.ID) error {
 // Progress is a snapshot of sync counters for logging.
 type Progress struct {
 	Stored       uint64 // containers in the store
+	Head         uint64 // highest stored block height
 	SessionBytes uint64 // compressed + index bytes written since open
 	SessionRaw   uint64 // container bytes before compression since open
 	Requests     uint64 // GetAncestors requests sent
@@ -221,8 +222,10 @@ type Progress struct {
 }
 
 func (f *Fetcher) Progress() Progress {
+	head, _ := f.store.Head()
 	return Progress{
 		Stored:       f.store.Count(),
+		Head:         head,
 		SessionBytes: f.store.SessionBytes(),
 		SessionRaw:   f.store.SessionRawBytes(),
 		Requests:     f.requestsSent.Load(),

@@ -63,7 +63,7 @@ func TestStoreSegmentsRebuildAndReaders(t *testing.T) {
 	if head, ok := s.Head(); !ok || head != 250_000 {
 		t.Fatalf("head=%d,%v want 250000,true", head, ok)
 	}
-	if lo := s.LowestContiguous(100_001); lo != 99_998 {
+	if lo := s.LowestContiguous(100_001, 0); lo != 99_998 {
 		t.Fatalf("lowestContiguous=%d want 99998", lo)
 	}
 	raw, ok, err := s.GetByHeight(100_000)
