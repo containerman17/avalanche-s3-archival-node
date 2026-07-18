@@ -88,6 +88,28 @@ func TestBatchPendingOverlayReads(t *testing.T) {
 	if sv, err := tr3.GetStorage(addr, slot[:]); err != nil || len(sv) != 0 {
 		t.Fatalf("deleted account slot visible: %x err=%v", sv, err)
 	}
+
+	// Regression (production Fuji block ~7220268): destruct-then-RECREATE
+	// within a batch. Firewood's dirtyKeys lose the destruct boundary once
+	// the account key is rewritten, so without the wrapper tombstone the
+	// old slot read falls through to the stale batch-start revision.
+	if err := tr3.UpdateAccount(addr, acct); err != nil {
+		t.Fatal(err)
+	}
+	newSlot := common.HexToHash("0x08")
+	if err := tr3.UpdateStorage(addr, newSlot[:], []byte{0x44}); err != nil {
+		t.Fatal(err)
+	}
+	tr4, err := d.OpenTrie(e.genesisRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sv, err := tr4.GetStorage(addr, slot[:]); err != nil || len(sv) != 0 {
+		t.Fatalf("recreated account leaked pre-destruct slot: %x err=%v", sv, err)
+	}
+	if sv, err := tr4.GetStorage(addr, newSlot[:]); err != nil || !bytes.Equal(sv, []byte{0x44}) {
+		t.Fatalf("post-recreate slot unreadable: %x err=%v", sv, err)
+	}
 }
 
 func emptyChain(t *testing.T, e *Executor, n int, badRootAt int) fakeSource {

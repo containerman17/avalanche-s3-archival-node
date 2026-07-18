@@ -106,18 +106,28 @@ type wrappedDatabase struct {
 	// without ever proposing (root == origin skips TrieDB().Update).
 	batchRoot common.Hash
 	batchTrie state.Trie
+	// batchDeleted tracks accounts destructed within the open batch and
+	// the slots rewritten for them afterwards. Firewood's dirtyKeys
+	// overlay loses the destruct boundary once the account key is
+	// rewritten (recreation), so storage reads of a destructed-then-
+	// recreated account would fall through to the STALE batch-start
+	// revision. Caught live by the boundary bisect at Fuji block
+	// ~7220268. Mirrors the reference overlay's lastAccountDelete rule.
+	batchDeleted map[common.Address]map[common.Hash][]byte
 }
 
 // beginBatch enters batch mode with the given committed start root.
 func (d *wrappedDatabase) beginBatch(root common.Hash) {
 	d.batchRoot = root
 	d.batchTrie = nil
+	d.batchDeleted = make(map[common.Address]map[common.Hash][]byte)
 }
 
 // endBatch leaves batch mode, discarding the shared trie.
 func (d *wrappedDatabase) endBatch() {
 	d.batchRoot = common.Hash{}
 	d.batchTrie = nil
+	d.batchDeleted = nil
 }
 
 // batchProposalRoot proposes every accumulated batch write to Firewood in
@@ -292,6 +302,11 @@ func (t *wrappingTrie) DeleteAccount(addr common.Address) error {
 			delete(d.cache, addr)
 		}
 	}
+	if d := t.db; d.batchDeleted != nil {
+		// Tombstone (or re-tombstone) the account for the rest of the
+		// batch: only slots written after this point may be read.
+		d.batchDeleted[addr] = make(map[common.Hash][]byte)
+	}
 	return t.inner.DeleteAccount(addr)
 }
 
@@ -299,12 +314,17 @@ func (t *wrappingTrie) UpdateStorage(addr common.Address, key, value []byte) err
 	if f := t.db.frame; f != nil {
 		f.recordStorage(addr, key, value)
 	}
-	if d := t.db; d.cache != nil {
+	if d := t.db; d.cache != nil || d.batchDeleted != nil {
 		var slot common.Hash
 		copy(slot[:], key)
 		v := make([]byte, len(value))
 		copy(v, value)
-		d.entry(addr).setSlot(d, slot, v)
+		if d.cache != nil {
+			d.entry(addr).setSlot(d, slot, v)
+		}
+		if rw, ok := d.batchDeleted[addr]; ok {
+			rw[slot] = v
+		}
 	}
 	return t.inner.UpdateStorage(addr, key, value)
 }
@@ -313,10 +333,15 @@ func (t *wrappingTrie) DeleteStorage(addr common.Address, key []byte) error {
 	if f := t.db.frame; f != nil {
 		f.recordStorage(addr, key, nil)
 	}
-	if d := t.db; d.cache != nil {
+	if d := t.db; d.cache != nil || d.batchDeleted != nil {
 		var slot common.Hash
 		copy(slot[:], key)
-		d.entry(addr).setSlot(d, slot, nil)
+		if d.cache != nil {
+			d.entry(addr).setSlot(d, slot, nil)
+		}
+		if rw, ok := d.batchDeleted[addr]; ok {
+			rw[slot] = nil
+		}
 	}
 	return t.inner.DeleteStorage(addr, key)
 }
@@ -385,7 +410,7 @@ func (t *wrappingTrie) GetStorage(addr common.Address, key []byte) ([]byte, erro
 			}
 		}
 	}
-	v, err := t.inner.GetStorage(addr, key)
+	v, err := t.storageFallthrough(addr, key)
 	if err != nil || d.cache == nil {
 		return v, err
 	}
@@ -394,6 +419,19 @@ func (t *wrappingTrie) GetStorage(addr common.Address, key []byte) ([]byte, erro
 	copy(cv, v)
 	d.entry(addr).setSlot(d, slot, cv)
 	return v, nil
+}
+
+// storageFallthrough is the authoritative miss path. For an account
+// destructed within the open batch, only slots rewritten since count; the
+// inner trie must NOT be consulted (its dirtyKeys lose the destruct
+// boundary on recreation and would serve the stale batch-start value).
+func (t *wrappingTrie) storageFallthrough(addr common.Address, key []byte) ([]byte, error) {
+	if rw, ok := t.db.batchDeleted[addr]; ok {
+		var slot common.Hash
+		copy(slot[:], key)
+		return rw[slot], nil
+	}
+	return t.inner.GetStorage(addr, key)
 }
 
 // verifyAccountHit re-reads addr through Firewood and panics if the
@@ -416,7 +454,7 @@ func (t *wrappingTrie) verifyAccountHit(addr common.Address, e *acctEntry) {
 // verifyStorageHit re-reads a slot through Firewood and panics if the
 // cached view differs. --verify-cache harness only.
 func (t *wrappingTrie) verifyStorageHit(addr common.Address, key, cached []byte) {
-	got, err := t.inner.GetStorage(addr, key)
+	got, err := t.storageFallthrough(addr, key)
 	if err != nil {
 		panic(fmt.Sprintf("verify-cache: storage %x/%x: firewood read error: %v", addr, key, err))
 	}
