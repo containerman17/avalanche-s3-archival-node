@@ -31,6 +31,10 @@ func FujiGenesis() (*corethcore.Genesis, error) {
 // pre-fork) into an eth block, for the read-side tx APIs.
 var ParseEthBlock = parseEthBlock
 
+// EncodeLogsFrame exposes the live capture's event-log record encoder so
+// the log backfill produces byte-identical records.
+var EncodeLogsFrame = encodeLogsFrame
+
 // NewChainContext exposes the executor's headers-log-backed ChainContext so
 // BLOCKHASH inside historical eth_call resolves real hashes. Not
 // goroutine-safe (bucketLog LRU state): callers serialize.

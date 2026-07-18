@@ -8,6 +8,7 @@ import (
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
+	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/core/vm"
 	"github.com/ava-labs/libevm/params"
@@ -106,23 +107,28 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 	return marshalReceipt(receipts[i], blk.Hash(), n, signer, blk.Transactions()[i], i), nil
 }
 
-// executeForReceipts replays every regular tx of blk against the overlay
-// state at the parent height and derives the full receipts. Atomic txs
-// (extdata) execute after regular txs and cannot affect these receipts, so
-// they are skipped entirely.
 func (s *Server) executeForReceipts(blk *types.Block) (types.Receipts, error) {
+	return ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk)
+}
+
+// ReExecuteBlock replays every regular tx of blk against the overlay state
+// at the parent height and derives the full receipts. Atomic txs (extdata)
+// execute after regular txs, emit no EVM logs, and cannot affect these
+// receipts, so they are skipped entirely (matching the live capture's log
+// collection). chainCtx must be safe for the caller's concurrency.
+func ReExecuteBlock(hist *state.History, chainCtx corethcore.ChainContext, chainCfg *params.ChainConfig, blk *types.Block) (types.Receipts, error) {
 	header := blk.Header()
 	n := blk.NumberU64()
-	statedb, rerr := s.stateAt(n - 1)
-	if rerr != nil {
-		return nil, rerr
+	statedb, err := ethstate.New(common.Hash{}, hist.StateAt(n-1), nil)
+	if err != nil {
+		return nil, err
 	}
 	// Precompile activations at this block boundary write state before txs
 	// run (same call the verified executor makes).
-	if err := corethcore.ApplyUpgrades(s.chainCfg, nil, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
+	if err := corethcore.ApplyUpgrades(chainCfg, nil, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
 		return nil, fmt.Errorf("apply upgrades: %w", err)
 	}
-	blockCtx := corethcore.NewEVMBlockContext(header, s.chainCtx, nil)
+	blockCtx := corethcore.NewEVMBlockContext(header, chainCtx, nil)
 	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
 	var (
 		usedGas  uint64
@@ -131,7 +137,7 @@ func (s *Server) executeForReceipts(blk *types.Block) (types.Receipts, error) {
 	for i, tx := range blk.Transactions() {
 		statedb.SetTxContext(tx.Hash(), i)
 		receipt, err := corethcore.ApplyTransaction(
-			s.chainCfg, s.chainCtx, blockCtx, gp, statedb,
+			chainCfg, chainCtx, blockCtx, gp, statedb,
 			header, tx, &usedGas, vm.Config{},
 		)
 		if err != nil {
@@ -139,7 +145,7 @@ func (s *Server) executeForReceipts(blk *types.Block) (types.Receipts, error) {
 		}
 		receipts = append(receipts, receipt)
 	}
-	if err := receipts.DeriveFields(s.chainCfg, blk.Hash(), n, header.Time, header.BaseFee, nil, blk.Transactions()); err != nil {
+	if err := receipts.DeriveFields(chainCfg, blk.Hash(), n, header.Time, header.BaseFee, nil, blk.Transactions()); err != nil {
 		return nil, fmt.Errorf("derive receipt fields: %w", err)
 	}
 	return receipts, nil
