@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/containerman17/epochdb/fetch"
 )
@@ -35,6 +36,12 @@ type bucketLog struct {
 	any         bool
 	useCounter  uint64
 	bytes       uint64 // total payload bytes on disk (for progress logging)
+
+	// mu guards the pair map, its LRU state, and reads through pair file
+	// handles (eviction closes them, so ReadAt must stay under the lock).
+	// Concurrent RPC readers contend only for the microsecond-scale pread;
+	// ponytail: per-pair refcounts if header reads ever top a profile.
+	mu sync.Mutex
 }
 
 type recLoc struct {
@@ -217,11 +224,14 @@ func (l *bucketLog) Has(block uint64) bool {
 
 // Append stores payload for block. No-op if the block is already indexed
 // (replay idempotency). Writes are unbuffered but not fsynced; call Sync
-// after a batch.
+// after a batch. Single writer by design; the lock exists for concurrent
+// readers.
 func (l *bucketLog) Append(block uint64, payload []byte) error {
 	if _, ok := l.idx[block]; ok {
 		return nil
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	p, err := l.pair(block / BucketBlocks)
 	if err != nil {
 		return err
@@ -248,11 +258,14 @@ func (l *bucketLog) Append(block uint64, payload []byte) error {
 }
 
 // Get returns a copy of block's payload. ok=false if not stored.
+// Goroutine-safe: the pair lock covers handle lookup and the pread.
 func (l *bucketLog) Get(block uint64) ([]byte, bool, error) {
 	loc, ok := l.idx[block]
 	if !ok {
 		return nil, false, nil
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	p, err := l.pair(block / BucketBlocks)
 	if err != nil {
 		return nil, false, err
@@ -272,6 +285,8 @@ func (l *bucketLog) Bytes() uint64 { return l.bytes }
 
 // Sync fsyncs every dirty open pair.
 func (l *bucketLog) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, p := range l.pairs {
 		if !p.dirty {
 			continue
@@ -285,6 +300,8 @@ func (l *bucketLog) Sync() error {
 
 // Close flushes and closes every open pair.
 func (l *bucketLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	var firstErr error
 	for bucket := range l.pairs {
 		if err := l.closePair(bucket); err != nil && firstErr == nil {

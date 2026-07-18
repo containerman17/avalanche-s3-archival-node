@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
-	"sync"
 
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus/dummy"
@@ -29,13 +28,11 @@ import (
 // GasCap bounds eth_call execution.
 const GasCap = 50_000_000
 
-// Server serves historical reads at heights [0, hist.Head()].
+// Server serves historical reads at heights [0, hist.Head()]. Requests
+// run fully concurrent: every shared reader underneath is immutable
+// (mmaps, RO maps) or internally locked (bucketLog handle LRU); zstd
+// DecodeAll is concurrent-safe.
 type Server struct {
-	// mu serializes request handling: the headers bucketLog (Hash(),
-	// BLOCKHASH ChainContext) is not goroutine-safe.
-	// ponytail: global lock; move header reads behind their own lock if
-	// concurrent throughput ever matters.
-	mu       sync.Mutex
 	hist     *state.History
 	chainCtx corethcore.ChainContext
 	chainCfg *params.ChainConfig
@@ -99,9 +96,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeReply(w, nil, nil, &rpcError{Code: -32700, Message: "parse error (no batching)"})
 		return
 	}
-	s.mu.Lock()
 	result, rerr := s.dispatch(&req)
-	s.mu.Unlock()
 	writeReply(w, req.ID, result, rerr)
 }
 

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"syscall"
 
 	"github.com/ava-labs/libevm/common"
@@ -34,10 +33,10 @@ var SentinelStorageRoot = crypto.Keccak256Hash([]byte("epochdb: sentinel storage
 var errOverlayReadOnly = errors.New("epochdb overlay: read-only historical view")
 
 // History serves historical account/storage reads from the cooked
-// sorted_NNNNN.idx buckets (mmap binary search), falling through to the
-// genesis alloc for keys never written on-chain. It also owns header-root
-// lookups for Hash() (bucketLog is not goroutine-safe, so those go through
-// a mutex).
+// sorted_NNNNN.idx buckets (mmap binary search) and sealed epochs, falling
+// through to the genesis alloc for keys never written on-chain. Fully
+// goroutine-safe: everything here is immutable after open and the store's
+// bucketLogs are internally locked.
 type History struct {
 	store   *Store
 	genesis types.GenesisAlloc
@@ -50,8 +49,6 @@ type History struct {
 	// enough to keep resident, and it turns the per-read delete check into
 	// a map lookup (a linear run scan here was 96% of backfill CPU).
 	deletes map[string][]uint64
-
-	hdrMu sync.Mutex // guards store header reads (bucketLog LRU state)
 }
 
 type sortedBucket struct {
@@ -131,11 +128,9 @@ func (h *History) Epochs() *EpochSet { return h.epochs }
 
 // LogTuples returns block n's captured log tuple record from the raw logs
 // bucketLog (unsealed-tail getLogs candidates). ok=false = no logs.
-// Mutex-guarded like header reads (shared bucketLog LRU state).
+// Goroutine-safe (bucketLog is internally locked).
 func (h *History) LogTuples(n uint64) (LogRec, bool, error) {
-	h.hdrMu.Lock()
 	rec, ok, err := h.store.LogsRecord(n)
-	h.hdrMu.Unlock()
 	if err != nil || !ok {
 		return LogRec{}, false, err
 	}
@@ -209,12 +204,10 @@ func (h *History) Close() {
 func (h *History) Head() uint64 { return h.head }
 
 // HeaderRLP returns the stored header RLP for block n: raw store first
-// (mutex-guarded: bucketLog mutates LRU state on every read), sealed
-// epochs as the fallback once raw buckets are deleted.
+// (bucketLog is internally locked), sealed epochs as the fallback once raw
+// buckets are deleted. Goroutine-safe.
 func (h *History) HeaderRLP(n uint64) ([]byte, bool, error) {
-	h.hdrMu.Lock()
 	raw, ok, err := h.store.HeaderRLP(n)
-	h.hdrMu.Unlock()
 	if err != nil || ok {
 		return raw, ok, err
 	}

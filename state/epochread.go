@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"syscall"
 
 	"github.com/ava-labs/libevm/common"
@@ -31,10 +30,6 @@ type Epoch struct {
 	bloomK    uint32
 	bloomBits []byte // word view into the section
 
-	// frameMu guards the shared decoder buffers; decompression is cheap
-	// (34us/frame) relative to lock hold times at our request rates.
-	// ponytail: single decoder + mutex, per-CPU decoder pool if it shows up.
-	decMu sync.Mutex
 }
 
 // End returns the last block in the epoch (inclusive).
@@ -153,9 +148,9 @@ func (e *Epoch) Close() {
 	}
 }
 
+// decodeAll is goroutine-safe: zstd Decoder.DecodeAll is documented
+// concurrent-safe ("DecodeAll can be used concurrently").
 func (e *Epoch) decodeAll(frame []byte) ([]byte, error) {
-	e.decMu.Lock()
-	defer e.decMu.Unlock()
 	return e.dec.DecodeAll(frame, nil)
 }
 
