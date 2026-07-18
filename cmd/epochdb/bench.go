@@ -380,6 +380,133 @@ func benchTxMain(args []string) {
 	fmt.Println("RESULT: ZERO mismatches")
 }
 
+// benchLogsMain A/B-probes eth_getLogs vs the archive RPC. Query seeds are
+// real logs pulled from the local server at log-bearing blocks (raw
+// capture records tell us where those are); mixes address-only,
+// topic0-only, address+topic0, address+topic0+topic2 over random ranges.
+// Remote caps ranges at 2048 blocks, so A/B ranges stay <=2000; the 10k
+// local cap is asserted locally.
+func benchLogsMain(args []string) {
+	fs := flag.NewFlagSet("ab-bench-logs", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	local := fs.String("local", "http://127.0.0.1:9650", "local epochdb serve URL")
+	remote := fs.String("remote", "", "reference archive RPC (default per --network)")
+	n := fs.Int("n", 120, "queries")
+	seed := fs.Int64("seed", time.Now().UnixNano(), "RNG seed")
+	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	fs.Parse(args)
+	if *remote == "" {
+		_, _, *remote = netParams(*network)
+	}
+	rng := rand.New(rand.NewSource(*seed))
+
+	store, err := state.OpenReadOnly(*dataDir)
+	if err != nil {
+		log.Fatalf("ab-bench-logs: %v", err)
+	}
+	defer store.Close()
+	res, rerr := rpcCall(*local, "eth_blockNumber", nil, 2)
+	if rerr != nil {
+		log.Fatalf("ab-bench-logs: local head: %v", rerr)
+	}
+	var headHex string
+	json.Unmarshal(res, &headHex)
+	head, _ := hexutil.DecodeUint64(headHex)
+	log.Printf("ab-bench-logs: head=%d seed=%d local=%s remote=%s", head, *seed, *local, *remote)
+
+	// seed logs from log-bearing blocks
+	type seedLog struct {
+		addr   string
+		topics []string
+		block  uint64
+	}
+	var seeds []seedLog
+	for tries := 0; tries < 3000 && len(seeds) < 50; tries++ {
+		b := 1 + uint64(rng.Int63n(int64(head)))
+		if _, ok, _ := store.LogsRecord(b); !ok {
+			continue
+		}
+		q := map[string]string{"fromBlock": hexutil.EncodeUint64(b), "toBlock": hexutil.EncodeUint64(b)}
+		res, rerr := rpcCall(*local, "eth_getLogs", []any{q}, 1)
+		if rerr != nil {
+			log.Fatalf("ab-bench-logs: seed query: %v", rerr)
+		}
+		var logs []struct {
+			Address string   `json:"address"`
+			Topics  []string `json:"topics"`
+		}
+		if json.Unmarshal(res, &logs) != nil || len(logs) == 0 {
+			continue
+		}
+		l := logs[rng.Intn(len(logs))]
+		seeds = append(seeds, seedLog{addr: l.Address, topics: l.Topics, block: b})
+	}
+	if len(seeds) == 0 {
+		log.Fatal("ab-bench-logs: no seed logs found")
+	}
+
+	// local cap check
+	if _, rerr := rpcCall(*local, "eth_getLogs",
+		[]any{map[string]string{"fromBlock": "0x1", "toBlock": hexutil.EncodeUint64(10_002)}}, 1); rerr == nil {
+		log.Fatal("ab-bench-logs: >10k range must error locally")
+	}
+
+	kinds := []string{"addr", "topic0", "addr+topic0", "addr+topic0+topic2"}
+	perKind := map[string]int{}
+	bad := 0
+	widths := []uint64{10, 200, 2000}
+	for i := 0; i < *n; i++ {
+		sl := seeds[rng.Intn(len(seeds))]
+		w := widths[rng.Intn(len(widths))]
+		from := uint64(1)
+		if sl.block > uint64(rng.Int63n(int64(w))) {
+			from = sl.block - uint64(rng.Int63n(int64(w)))
+		}
+		to := min(from+w-1, head)
+		q := map[string]any{
+			"fromBlock": hexutil.EncodeUint64(from),
+			"toBlock":   hexutil.EncodeUint64(to),
+		}
+		kind := kinds[i%4]
+		if kind == "addr+topic0+topic2" && len(sl.topics) < 3 {
+			kind = "addr+topic0"
+		}
+		switch kind {
+		case "addr":
+			q["address"] = sl.addr
+		case "topic0":
+			q["topics"] = []any{sl.topics[0]}
+		case "addr+topic0":
+			q["address"] = sl.addr
+			q["topics"] = []any{sl.topics[0]}
+		case "addr+topic0+topic2":
+			q["address"] = sl.addr
+			q["topics"] = []any{sl.topics[0], nil, sl.topics[2]}
+		}
+		lRes, lErr := rpcCall(*local, "eth_getLogs", []any{q}, 1)
+		rRes, rErr := rpcCall(*remote, "eth_getLogs", []any{q}, 6)
+		perKind[kind]++
+		switch {
+		case (lErr != nil) != (rErr != nil):
+			bad++
+			log.Printf("MISMATCH %s %v: error asymmetry local=%v remote=%v", kind, q, lErr, rErr)
+		case lErr == nil && !jsonEqual(lRes, rRes):
+			bad++
+			log.Printf("MISMATCH %s %v:\n local=%s\n remote=%s", kind, q, lRes, rRes)
+		}
+	}
+	fmt.Printf("\nab-bench-logs: %d queries", *n)
+	for k, c := range perKind {
+		fmt.Printf("  %s=%d", k, c)
+	}
+	fmt.Println()
+	if bad > 0 {
+		fmt.Printf("RESULT: %d MISMATCHES\n", bad)
+		os.Exit(1)
+	}
+	fmt.Println("RESULT: ZERO mismatches")
+}
+
 // jsonEqual compares two JSON documents structurally.
 func jsonEqual(a, b json.RawMessage) bool {
 	var av, bv any

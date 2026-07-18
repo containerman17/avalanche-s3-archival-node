@@ -129,6 +129,23 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 // bodies and tx lookups).
 func (h *History) Epochs() *EpochSet { return h.epochs }
 
+// LogTuples returns block n's captured log tuple record from the raw logs
+// bucketLog (unsealed-tail getLogs candidates). ok=false = no logs.
+// Mutex-guarded like header reads (shared bucketLog LRU state).
+func (h *History) LogTuples(n uint64) (LogRec, bool, error) {
+	h.hdrMu.Lock()
+	rec, ok, err := h.store.LogsRecord(n)
+	h.hdrMu.Unlock()
+	if err != nil || !ok {
+		return LogRec{}, false, err
+	}
+	lr, err := decodeLogRec(n, rec)
+	if err != nil {
+		return LogRec{}, false, err
+	}
+	return lr, true, nil
+}
+
 func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) {
 	f, err := os.Open(filepath.Join(dir, sortedName(bucket)))
 	if err != nil {
