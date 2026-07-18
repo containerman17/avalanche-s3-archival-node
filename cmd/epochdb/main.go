@@ -114,7 +114,7 @@ func execMain(args []string) {
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address (e.g. localhost:6060)")
 	stateCacheGiB := fs.Int("state-cache", 6, "Go-side EVM read cache size in GiB (0 disables)")
 	verifyCache := fs.Bool("verify-cache", false, "re-read every cache hit through Firewood and panic on mismatch (slow, validation only)")
-	commitEvery := fs.Int("commit-every", 1, "blocks per Firewood proposal (root verification at batch boundaries, per-block bisect on mismatch)")
+	commitEvery := fs.Int("commit-every", 1000, "blocks per Firewood proposal (root verification at batch boundaries, per-block bisect on mismatch; 1 = classic per-block)")
 	fs.Parse(args)
 
 	if *pprofAddr != "" {
