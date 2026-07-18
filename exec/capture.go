@@ -95,6 +95,45 @@ type wrappedDatabase struct {
 	cacheSize    uint64
 	verify       bool
 	hits, misses uint64
+
+	// Batch mode (--commit-every > 1): one shared inner account trie per
+	// batch. Firewood's own baseTrie.dirtyKeys IS the pending-batch
+	// overlay: reads check it before the revision at batchRoot, with the
+	// exact deleted-account tombstone semantics we need, and its
+	// accumulated updateOps become the single boundary proposal. The
+	// wrapper's Hash/Commit on the account trie return batchRoot so a
+	// mid-batch statedb.Commit drains writes through the capture path
+	// without ever proposing (root == origin skips TrieDB().Update).
+	batchRoot common.Hash
+	batchTrie state.Trie
+}
+
+// beginBatch enters batch mode with the given committed start root.
+func (d *wrappedDatabase) beginBatch(root common.Hash) {
+	d.batchRoot = root
+	d.batchTrie = nil
+}
+
+// endBatch leaves batch mode, discarding the shared trie.
+func (d *wrappedDatabase) endBatch() {
+	d.batchRoot = common.Hash{}
+	d.batchTrie = nil
+}
+
+// batchProposalRoot proposes every accumulated batch write to Firewood in
+// one shot and returns the resulting root. Only valid mid-batch with at
+// least one write drained into the shared trie.
+func (d *wrappedDatabase) batchProposalRoot() common.Hash {
+	return d.batchTrie.Hash()
+}
+
+// resetCache drops every cached entry (bisect: entries may hold values
+// produced by a bad batch execution).
+func (d *wrappedDatabase) resetCache() {
+	if d.cache != nil {
+		d.cache = make(map[common.Address]*acctEntry)
+		d.cacheSize = 0
+	}
 }
 
 // acctEntry caches one account's frontier state. Per-account nesting is
@@ -162,6 +201,16 @@ func (e *acctEntry) setSlot(d *wrappedDatabase, slot common.Hash, val []byte) {
 func (d *wrappedDatabase) CacheStats() (uint64, uint64) { return d.hits, d.misses }
 
 func (d *wrappedDatabase) OpenTrie(root common.Hash) (state.Trie, error) {
+	if d.batchRoot != (common.Hash{}) && root == d.batchRoot {
+		if d.batchTrie == nil {
+			t, err := d.inner.OpenTrie(root)
+			if err != nil {
+				return nil, err
+			}
+			d.batchTrie = t
+		}
+		return &wrappingTrie{inner: d.batchTrie, db: d, batchAccount: true}, nil
+	}
 	t, err := d.inner.OpenTrie(root)
 	if err != nil {
 		return nil, err
@@ -205,6 +254,13 @@ func (d *wrappedDatabase) TrieDB() *triedb.Database    { return d.inner.TrieDB()
 type wrappingTrie struct {
 	inner state.Trie
 	db    *wrappedDatabase
+	// batchAccount marks the batch-shared ACCOUNT trie: its Hash/Commit
+	// return batchRoot so mid-batch statedb.Commit calls never propose
+	// (and root == origin skips the firewood Update). Storage tries stay
+	// pass-through: firewood's storage Hash is always the zero hash and
+	// that zero is embedded in captured account RLP, which must not
+	// change between batch and per-block modes.
+	batchAccount bool
 }
 
 func (t *wrappingTrie) UpdateAccount(addr common.Address, acc *types.StateAccount) error {
@@ -373,9 +429,17 @@ func (t *wrappingTrie) verifyStorageHit(addr common.Address, key, cached []byte)
 
 func (t *wrappingTrie) GetKey(k []byte) []byte { return t.inner.GetKey(k) }
 
-func (t *wrappingTrie) Hash() common.Hash { return t.inner.Hash() }
+func (t *wrappingTrie) Hash() common.Hash {
+	if t.batchAccount {
+		return t.db.batchRoot
+	}
+	return t.inner.Hash()
+}
 
 func (t *wrappingTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error) {
+	if t.batchAccount {
+		return t.db.batchRoot, trienode.NewNodeSet(common.Hash{}), nil
+	}
 	return t.inner.Commit(collectLeaf)
 }
 

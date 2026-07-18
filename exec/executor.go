@@ -65,6 +65,11 @@ type Config struct {
 	// VerifyCache re-reads every cache hit through Firewood and panics
 	// on mismatch. Validation harness only.
 	VerifyCache bool
+	// CommitEvery batches this many blocks into one Firewood proposal
+	// (root verification moves to batch boundaries, with automatic
+	// per-block bisect on a boundary mismatch). <= 1 means one proposal
+	// per block, the classic path.
+	CommitEvery int
 }
 
 // Executor replays Fuji C-Chain blocks against Firewood-backed frontier
@@ -84,6 +89,33 @@ type Executor struct {
 	headRoot    common.Hash
 	headNum     uint64
 	totalGas    uint64 // session gas, for mgas/s
+
+	// Firewood bookkeeping. fwHeight mirrors Firewood's internal
+	// proposal-height chain (parent.height+1 per committed proposal);
+	// with batching it deliberately diverges from block heights.
+	// lastFwHash is the block hash Firewood's tree currently has
+	// registered, i.e. the parent hash the next proposal must reference.
+	fwHeight   uint64
+	lastFwHash common.Hash
+
+	// Open-batch state (CommitEvery > 1).
+	batchOpen      bool
+	batchStartNum  uint64
+	batchStartRoot common.Hash
+	batchLastHash  common.Hash // hash of the last executed batch block
+	batchDirty     bool        // any non-empty block drained this batch
+	batchCount     int
+	batchBuf       []batchItem
+}
+
+// batchItem is one block's buffered state-layer output. Appends are held
+// back until the batch boundary root verifies so a bad batch never leaves
+// unverified frames on disk.
+type batchItem struct {
+	num       uint64
+	headerRLP []byte
+	frame     []byte
+	hasFrame  bool
 }
 
 // chainContext is the minimal coreth ChainContext for
@@ -144,6 +176,15 @@ func New(cfg Config) (*Executor, error) {
 	// firewood.DefaultConfig nests its own "firewood" subdirectory under
 	// the path we give it, so DataDir -> DataDir/firewood/.
 	fwCfg := firewood.DefaultConfig(cfg.DataDir)
+	// Firewood's DeferredCommitInterval counts COMMITS. With batching,
+	// one commit covers CommitEvery blocks, so the default 64 would let
+	// the persisted root lag 64*CommitEvery blocks behind the walk-back
+	// window (observed live at N=1000: root 64k blocks back, reconcile
+	// failed). Scale it so the persisted root lags at most ~64 blocks'
+	// worth of commits.
+	if cfg.CommitEvery > 1 {
+		fwCfg.DeferredCommitInterval = max(1, 64/uint64(cfg.CommitEvery))
+	}
 	// The default 1MB node cache collapses once state outgrows it: at
 	// height ~3.7M a 60s CPU profile showed ~50% of samples inside the
 	// Rust library (per-SLOAD trie walks re-reading upper nodes), disk
@@ -187,6 +228,7 @@ func New(cfg Config) (*Executor, error) {
 		genesisHash: g.ToBlock().Hash(),
 		headRoot:    genesisRoot,
 		headNum:     0,
+		lastFwHash:  g.ToBlock().Hash(),
 	}
 
 	if err := e.reconcile(); err != nil {
@@ -251,9 +293,16 @@ func (e *Executor) reconcile() error {
 		fwHash common.Hash
 		found  bool
 	)
+	// Budget covers the worst persisted-root lag even for data written
+	// before the DeferredCommitInterval scaling: 64 deferred commits of
+	// CommitEvery blocks each, plus the open batch and fsync-group slack.
+	budget := uint64(walkBackBudget)
+	if e.cfg.CommitEvery > 1 {
+		budget += 64 * uint64(e.cfg.CommitEvery)
+	}
 	lo := uint64(0)
-	if top > walkBackBudget {
-		lo = top - walkBackBudget
+	if top > budget {
+		lo = top - budget
 	}
 	for i := top; ; i-- {
 		h, err := e.loadHeader(i)
@@ -285,6 +334,8 @@ func (e *Executor) reconcile() error {
 	// Tell Firewood what height its on-disk root corresponds to before
 	// proposing new blocks on top of it.
 	e.fwBackend.SetHashAndHeight(fwHash, fwN)
+	e.fwHeight = fwN
+	e.lastFwHash = fwHash
 
 	e.headNum = fwN
 	e.headRoot = e.genesisRoot
@@ -315,7 +366,14 @@ func (e *Executor) reconcile() error {
 			return fmt.Errorf("reconcile: reexecute block %d: %w", i, err)
 		}
 	}
-	// Make the re-executed tail durable immediately.
+	// Close any batch the gap re-execution left open, then make the
+	// re-executed tail durable (exechead must never claim buffered,
+	// unappended blocks).
+	if e.batchOpen && e.batchCount > 0 {
+		if err := e.flushBatch(); err != nil {
+			return fmt.Errorf("reconcile: flush tail batch: %w", err)
+		}
+	}
 	if err := e.cfg.Store.FlushAndSetExecHead(e.headNum); err != nil {
 		return err
 	}
@@ -338,8 +396,15 @@ func (e *Executor) loadHeader(blockNum uint64) (*types.Header, error) {
 	return &h, nil
 }
 
-// Close flushes the state layer watermark and releases Firewood.
+// Close flushes any open batch and the state layer watermark, then
+// releases Firewood.
 func (e *Executor) Close() error {
+	if e.batchOpen && e.batchCount > 0 {
+		if err := e.flushBatch(); err != nil {
+			e.triedb.Close()
+			return fmt.Errorf("close: flush batch: %w", err)
+		}
+	}
 	if err := e.cfg.Store.FlushAndSetExecHead(e.headNum); err != nil {
 		e.triedb.Close()
 		return err
@@ -370,6 +435,13 @@ func (e *Executor) Run(ctx context.Context) error {
 			return err
 		}
 		if !ok {
+			// Stall: close the open batch so tip-following and crash
+			// windows stay bounded even when staging runs dry mid-batch.
+			if e.batchOpen && e.batchCount > 0 {
+				if err := e.flushBatch(); err != nil {
+					return err
+				}
+			}
 			if time.Since(lastWait) > 30*time.Second {
 				log.Printf("exec: waiting for block %d to land in staging", next)
 				lastWait = time.Now()
@@ -418,12 +490,18 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	if got := blk.NumberU64(); got != blockNum {
 		return fmt.Errorf("block %d has internal number %d", blockNum, got)
 	}
-	newRoot, err := e.executeBlock(blk)
-	if err != nil {
-		return fmt.Errorf("block %d: %w", blockNum, err)
+	if e.cfg.CommitEvery > 1 {
+		if err := e.executeBatched(blk); err != nil {
+			return fmt.Errorf("block %d: %w", blockNum, err)
+		}
+	} else {
+		newRoot, err := e.executeBlock(blk)
+		if err != nil {
+			return fmt.Errorf("block %d: %w", blockNum, err)
+		}
+		e.headRoot = newRoot
+		e.headNum = blockNum
 	}
-	e.headRoot = newRoot
-	e.headNum = blockNum
 	e.totalGas += blk.GasUsed()
 	return nil
 }
@@ -463,6 +541,8 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 			return common.Hash{}, err
 		}
 		e.fwBackend.SetHashAndHeight(blk.Hash(), blockNum)
+		e.fwHeight = blockNum
+		e.lastFwHash = blk.Hash()
 		return parentRoot, nil
 	}
 
@@ -474,51 +554,17 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("open statedb: %w", err)
 	}
-
-	upgradeBlockCtx := corethcore.NewBlockContext(header.Number, header.Time)
-	if err := corethcore.ApplyUpgrades(e.chainCfg, nil, upgradeBlockCtx, statedb); err != nil {
-		return common.Hash{}, fmt.Errorf("apply upgrades: %w", err)
-	}
-
-	blockCtx := corethcore.NewEVMBlockContext(header, e.chainCtx, nil)
-	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
-	var usedGas uint64
-
-	for txIndex, tx := range blk.Transactions() {
-		statedb.SetTxContext(tx.Hash(), txIndex)
-		if _, err := corethcore.ApplyTransaction(
-			e.chainCfg, e.chainCtx, blockCtx, gp, statedb,
-			header, tx, &usedGas, vm.Config{},
-		); err != nil {
-			return common.Hash{}, fmt.Errorf("tx %d: %w", txIndex, err)
-		}
-	}
-
-	// Atomic txs ride in the block's ExtData; Fuji has real imports and
-	// exports, so this path is mandatory for root correctness.
-	if extData := ccustomtypes.BlockExtData(blk); len(extData) > 0 {
-		rules := e.chainCfg.Rules(header.Number, cparams.IsMergeTODO, header.Time)
-		isAP5 := false
-		if rulesExtra := cparams.GetRulesExtra(rules); rulesExtra != nil {
-			isAP5 = rulesExtra.AvalancheRules.IsApricotPhase5
-		}
-		atomicTxs, err := atomic.ExtractAtomicTxs(extData, isAP5, atomic.Codec)
-		if err != nil {
-			return common.Hash{}, fmt.Errorf("extract atomic txs: %w", err)
-		}
-		wrapped := extstate.New(statedb)
-		for i, atx := range atomicTxs {
-			if err := atx.UnsignedAtomicTx.EVMStateTransfer(e.snowCtx, wrapped); err != nil {
-				return common.Hash{}, fmt.Errorf("atomic tx %d: %w", i, err)
-			}
-		}
+	if err := e.runEVM(blk, statedb); err != nil {
+		return common.Hash{}, err
 	}
 
 	// Commit triggers the trie interceptor: post-images accumulate into
-	// frame during this call.
+	// frame during this call. The block number handed to Commit is
+	// Firewood's proposal height (tree height + 1), which equals the
+	// real block height in per-block mode.
 	triedbOpt := stateconf.WithTrieDBUpdatePayload(header.ParentHash, blk.Hash())
 	newRoot, err := statedb.Commit(
-		blockNum,
+		e.fwHeight+1,
 		e.chainCfg.IsEIP158(header.Number),
 		stateconf.WithTrieDBUpdateOpts(triedbOpt),
 	)
@@ -545,5 +591,207 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err := e.triedb.Commit(newRoot, false); err != nil {
 		return common.Hash{}, fmt.Errorf("triedb commit: %w", err)
 	}
+	e.fwHeight++
+	e.lastFwHash = blk.Hash()
 	return newRoot, nil
+}
+
+// runEVM applies upgrades, all transactions, and the atomic ExtData
+// transfers of blk onto statedb. Shared by the per-block and batched
+// paths.
+func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) error {
+	header := blk.Header()
+
+	upgradeBlockCtx := corethcore.NewBlockContext(header.Number, header.Time)
+	if err := corethcore.ApplyUpgrades(e.chainCfg, nil, upgradeBlockCtx, statedb); err != nil {
+		return fmt.Errorf("apply upgrades: %w", err)
+	}
+
+	blockCtx := corethcore.NewEVMBlockContext(header, e.chainCtx, nil)
+	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
+	var usedGas uint64
+
+	for txIndex, tx := range blk.Transactions() {
+		statedb.SetTxContext(tx.Hash(), txIndex)
+		if _, err := corethcore.ApplyTransaction(
+			e.chainCfg, e.chainCtx, blockCtx, gp, statedb,
+			header, tx, &usedGas, vm.Config{},
+		); err != nil {
+			return fmt.Errorf("tx %d: %w", txIndex, err)
+		}
+	}
+
+	// Atomic txs ride in the block's ExtData; Fuji has real imports and
+	// exports, so this path is mandatory for root correctness.
+	if extData := ccustomtypes.BlockExtData(blk); len(extData) > 0 {
+		rules := e.chainCfg.Rules(header.Number, cparams.IsMergeTODO, header.Time)
+		isAP5 := false
+		if rulesExtra := cparams.GetRulesExtra(rules); rulesExtra != nil {
+			isAP5 = rulesExtra.AvalancheRules.IsApricotPhase5
+		}
+		atomicTxs, err := atomic.ExtractAtomicTxs(extData, isAP5, atomic.Codec)
+		if err != nil {
+			return fmt.Errorf("extract atomic txs: %w", err)
+		}
+		wrapped := extstate.New(statedb)
+		for i, atx := range atomicTxs {
+			if err := atx.UnsignedAtomicTx.EVMStateTransfer(e.snowCtx, wrapped); err != nil {
+				return fmt.Errorf("atomic tx %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+// executeBatched accumulates blk into the open batch (opening one if
+// needed) and, when the batch reaches CommitEvery blocks, flushes it as a
+// single Firewood proposal. Mid-batch blocks drain their writes through
+// the capture wrapper into the shared trie (Firewood untouched); reads
+// see them via the read cache and the shared trie's dirtyKeys overlay.
+// State-layer appends are buffered until the boundary root verifies.
+func (e *Executor) executeBatched(blk *types.Block) error {
+	header := blk.Header()
+	blockNum := blk.NumberU64()
+
+	if !e.batchOpen {
+		e.batchOpen = true
+		e.batchStartNum = e.headNum
+		e.batchStartRoot = e.headRoot
+		e.batchDirty = false
+		e.batchCount = 0
+		e.wrapDB.beginBatch(e.headRoot)
+	}
+
+	headerRLP, err := rlp.EncodeToBytes(header)
+	if err != nil {
+		return fmt.Errorf("encode header: %w", err)
+	}
+
+	if header.Root == e.headRoot {
+		// Empty block: header only, no EVM, no Firewood.
+		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, headerRLP: headerRLP})
+	} else {
+		frame := &blockFrame{}
+		e.wrapDB.setFrame(frame)
+		statedb, err := ethstate.New(e.batchStartRoot, e.wrapDB, nil)
+		if err != nil {
+			e.wrapDB.setFrame(nil)
+			return fmt.Errorf("open statedb: %w", err)
+		}
+		if err := e.runEVM(blk, statedb); err != nil {
+			e.wrapDB.setFrame(nil)
+			return err
+		}
+		// Drain commit: the batch-account trie reports Hash == origin, so
+		// statedb skips TrieDB().Update entirely; writes flow through the
+		// capture wrapper into the shared trie's pending ops.
+		if _, err := statedb.Commit(blockNum, e.chainCfg.IsEIP158(header.Number)); err != nil {
+			e.wrapDB.setFrame(nil)
+			return fmt.Errorf("statedb drain commit: %w", err)
+		}
+		e.wrapDB.setFrame(nil)
+		e.batchDirty = true
+		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, headerRLP: headerRLP, frame: frame.buf, hasFrame: true})
+	}
+
+	// Intra-batch chaining trusts header roots; the boundary proposal
+	// verifies the whole chain (roots chain, so any bad write corrupts
+	// the boundary root).
+	e.headRoot = header.Root
+	e.headNum = blockNum
+	e.batchLastHash = blk.Hash()
+	e.batchCount++
+
+	if e.batchCount >= e.cfg.CommitEvery {
+		return e.flushBatch()
+	}
+	return nil
+}
+
+// flushBatch closes the open batch: ONE Firewood proposal for all
+// accumulated writes, boundary root verified against the boundary block's
+// header root (bisecting per block on mismatch), then the buffered
+// state-layer appends land.
+func (e *Executor) flushBatch() error {
+	boundaryNum, boundaryRoot, boundaryHash := e.headNum, e.headRoot, e.batchLastHash
+
+	computed := e.batchStartRoot
+	if e.batchDirty {
+		computed = e.wrapDB.batchProposalRoot()
+	}
+	if computed != boundaryRoot {
+		return e.bisect(computed, boundaryNum, boundaryRoot)
+	}
+
+	if e.batchDirty {
+		opt := stateconf.WithTrieDBUpdatePayload(e.lastFwHash, boundaryHash)
+		if err := e.triedb.Update(computed, e.batchStartRoot, e.fwHeight+1, nil, nil, opt); err != nil {
+			return fmt.Errorf("batch update [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
+		}
+		if err := e.triedb.Commit(computed, false); err != nil {
+			return fmt.Errorf("batch commit [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
+		}
+		e.fwHeight++
+	} else {
+		// Whole batch empty: no proposal, just register the boundary hash.
+		e.fwBackend.SetHashAndHeight(boundaryHash, boundaryNum)
+		e.fwHeight = boundaryNum
+	}
+	e.lastFwHash = boundaryHash
+
+	for _, it := range e.batchBuf {
+		if it.hasFrame {
+			if err := e.cfg.Store.AppendWrites(it.num, it.frame); err != nil {
+				return err
+			}
+		}
+		if err := e.cfg.Store.AppendHeader(it.num, it.headerRLP); err != nil {
+			return err
+		}
+		if err := e.maybeFlush(it.num); err != nil {
+			return err
+		}
+	}
+
+	e.batchOpen = false
+	e.batchDirty = false
+	e.batchBuf = nil
+	e.wrapDB.endBatch()
+	return nil
+}
+
+// bisect re-executes a root-mismatched batch per block to name the exact
+// offending block, then errors out either way (hard stop preserved).
+func (e *Executor) bisect(computed common.Hash, boundaryNum uint64, boundaryRoot common.Hash) error {
+	from, to := e.batchStartNum+1, boundaryNum
+	log.Printf("exec: BATCH ROOT MISMATCH [%d..%d]: computed %x want %x; bisecting per block", from, to, computed, boundaryRoot)
+
+	// Discard the batch and any possibly poisoned cache entries; Firewood
+	// was never updated, so per-block re-execution starts clean from the
+	// last committed boundary.
+	e.batchOpen = false
+	e.batchDirty = false
+	e.batchBuf = nil
+	e.wrapDB.endBatch()
+	e.wrapDB.resetCache()
+	e.headNum = e.batchStartNum
+	e.headRoot = e.batchStartRoot
+
+	for i := from; i <= to; i++ {
+		raw, ok, err := e.cfg.Blocks.GetByHeight(i)
+		if err != nil || !ok {
+			return fmt.Errorf("bisect: read container %d: ok=%v err=%v", i, ok, err)
+		}
+		blk, err := parseEthBlock(raw)
+		if err != nil {
+			return fmt.Errorf("bisect: parse block %d: %w", i, err)
+		}
+		newRoot, err := e.executeBlock(blk)
+		if err != nil {
+			return fmt.Errorf("bisect: offending block %d: %w", i, err)
+		}
+		e.headRoot = newRoot
+		e.headNum = i
+	}
+	return fmt.Errorf("batch [%d..%d] root mismatch (computed %x want %x) but per-block re-execution verified clean: batching bug", from, to, computed, boundaryRoot)
 }
