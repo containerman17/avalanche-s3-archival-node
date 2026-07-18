@@ -10,6 +10,8 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/ava-labs/libevm/common/hexutil"
 
 	"github.com/containerman17/epochdb/exec"
+	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
 
@@ -36,7 +39,7 @@ func benchMain(args []string) {
 	workers := fs.Int("workers", 8, "concurrent probe workers")
 	fs.Parse(args)
 
-	store, err := state.Open(*dataDir)
+	store, err := state.OpenReadOnly(*dataDir)
 	if err != nil {
 		log.Fatalf("ab-bench: open state layer: %v", err)
 	}
@@ -207,6 +210,166 @@ func discoverERC20s(rng *rand.Rand, hist *state.History, remote string, head uin
 		found = append(found, addr)
 	}
 	return found
+}
+
+// benchTxMain A/B-probes eth_getTransactionByHash and
+// eth_getTransactionReceipt against the archive RPC. Tx hashes are sampled
+// from random staged blocks: receipts only within the replayed head (they
+// need state), byHash also above it. Results are compared as decoded JSON
+// (reflect.DeepEqual); no field normalization beyond JSON decoding.
+func benchTxMain(args []string) {
+	fs := flag.NewFlagSet("ab-bench-tx", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	local := fs.String("local", "http://127.0.0.1:9650", "local epochdb serve URL")
+	remote := fs.String("remote", "https://api.avax-test.network/ext/bc/C/rpc", "reference archive RPC")
+	n := fs.Int("n", 600, "sampled txs (each probes both methods where state allows)")
+	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
+	workers := fs.Int("workers", 8, "concurrent probe workers")
+	fs.Parse(args)
+
+	fetch.RegisterExtras() // ParseEthBlock needs the coreth/libevm extras
+	rng := rand.New(rand.NewSource(*seed))
+	reader, err := fetch.OpenReader(*dataDir)
+	if err != nil {
+		log.Fatalf("ab-bench-tx: open reader: %v", err)
+	}
+	defer reader.Close()
+
+	// Replayed head from the local server, staging ceiling from the bucket files.
+	res, rerr := rpcCall(*local, "eth_blockNumber", nil, 2)
+	if rerr != nil {
+		log.Fatalf("ab-bench-tx: local eth_blockNumber: %v", rerr)
+	}
+	var headHex string
+	json.Unmarshal(res, &headHex)
+	head, _ := hexutil.DecodeUint64(headHex)
+	buckets, _ := filepath.Glob(filepath.Join(*dataDir, "index_*.log"))
+	var maxStaged uint64
+	for _, b := range buckets {
+		var bn uint64
+		if _, err := fmt.Sscanf(filepath.Base(b), "index_%d.log", &bn); err == nil && (bn+1)*100_000 > maxStaged {
+			maxStaged = (bn + 1) * 100_000
+		}
+	}
+	log.Printf("ab-bench-tx: head=%d maxStaged~%d seed=%d local=%s", head, maxStaged, *seed, *local)
+
+	// Sample txs. withState => also probe the receipt.
+	type txProbe struct {
+		hash      common.Hash
+		withState bool
+	}
+	var samples []txProbe
+	aboveMisses, attempts := 0, 0
+	for len(samples) < *n {
+		if attempts++; attempts > 200*(*n)+10_000 {
+			log.Fatalf("ab-bench-tx: sampling stuck after %d attempts (%d/%d sampled)", attempts, len(samples), *n)
+		}
+		withState := len(samples)%5 != 4 // ~80% within the replayed range
+		if aboveMisses > 1000 {
+			withState = true // nothing usable staged above head, stop trying
+		}
+		var h uint64
+		if withState {
+			h = 1 + uint64(rng.Int63n(int64(head)))
+		} else {
+			h = head + 1 + uint64(rng.Int63n(int64(maxStaged-head)))
+		}
+		raw, ok, err := reader.GetByHeight(h)
+		if err != nil || !ok {
+			if !withState {
+				aboveMisses++
+			}
+			continue // staging gap
+		}
+		blk, err := exec.ParseEthBlock(raw)
+		if err != nil || len(blk.Transactions()) == 0 {
+			if !withState {
+				aboveMisses++
+			}
+			continue
+		}
+		tx := blk.Transactions()[rng.Intn(len(blk.Transactions()))]
+		samples = append(samples, txProbe{hash: tx.Hash(), withState: withState})
+	}
+
+	type job struct {
+		method string
+		hash   common.Hash
+	}
+	var jobs []job
+	for _, s := range samples {
+		jobs = append(jobs, job{"eth_getTransactionByHash", s.hash})
+		if s.withState {
+			jobs = append(jobs, job{"eth_getTransactionReceipt", s.hash})
+		}
+	}
+
+	var (
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+		perMethod  = map[string]int{}
+		mismatches = map[string]int{}
+		localTotal time.Duration
+	)
+	ch := make(chan job)
+	for w := 0; w < *workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range ch {
+				params := []any{j.hash.Hex()}
+				t0 := time.Now()
+				lRes, lErr := rpcCall(*local, j.method, params, 1)
+				ld := time.Since(t0)
+				rRes, rErr := rpcCall(*remote, j.method, params, 6)
+				bad := ""
+				switch {
+				case (lErr != nil) != (rErr != nil):
+					bad = fmt.Sprintf("error asymmetry local=%v remote=%v localRes=%s remoteRes=%s", lErr, rErr, lRes, rRes)
+				case lErr == nil && !jsonEqual(lRes, rRes):
+					bad = fmt.Sprintf("local=%s\nremote=%s", lRes, rRes)
+				}
+				mu.Lock()
+				perMethod[j.method]++
+				localTotal += ld
+				if bad != "" {
+					mismatches[j.method]++
+					log.Printf("MISMATCH %s %s: %s", j.method, j.hash, bad)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	start := time.Now()
+	for _, j := range jobs {
+		ch <- j
+	}
+	close(ch)
+	wg.Wait()
+
+	total, bad := 0, 0
+	fmt.Printf("\nab-bench-tx: %d probes (%d txs) in %s\n", len(jobs), len(samples), time.Since(start).Round(time.Millisecond))
+	for m, c := range perMethod {
+		fmt.Printf("  %-28s %5d probes, %d mismatches\n", m, c, mismatches[m])
+		total += c
+		bad += mismatches[m]
+	}
+	fmt.Printf("  local latency: avg=%s (%.0f calls/s local-only)\n",
+		(localTotal / time.Duration(total)).Round(time.Microsecond), float64(total)/localTotal.Seconds())
+	if bad > 0 {
+		fmt.Printf("RESULT: %d MISMATCHES\n", bad)
+		os.Exit(1)
+	}
+	fmt.Println("RESULT: ZERO mismatches")
+}
+
+// jsonEqual compares two JSON documents structurally.
+func jsonEqual(a, b json.RawMessage) bool {
+	var av, bv any
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
 }
 
 type remoteError struct {

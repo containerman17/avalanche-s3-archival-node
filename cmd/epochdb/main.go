@@ -48,10 +48,14 @@ func main() {
 		execMain(os.Args[2:])
 	case "cook-index":
 		cookMain(os.Args[2:])
+	case "cook-txindex":
+		cookTxMain(os.Args[2:])
 	case "serve":
 		serveMain(os.Args[2:])
 	case "ab-bench":
 		benchMain(os.Args[2:])
+	case "ab-bench-tx":
+		benchTxMain(os.Args[2:])
 	default:
 		usage()
 	}
@@ -61,8 +65,10 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>] [--tip <containerID>]")
 	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
+	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
+	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
 	os.Exit(2)
 }
 
@@ -76,15 +82,27 @@ func cookMain(args []string) {
 	}
 }
 
-// serveMain serves historical JSON-RPC reads over the cooked index. Run it
-// against a quiesced data dir (it shares files with fetch/exec).
+// cookTxMain builds the per-bucket tx-hash indexes over the staging
+// segments. Read-only on the staging files, safe next to running processes.
+func cookTxMain(args []string) {
+	fs := flag.NewFlagSet("cook-txindex", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	fs.Parse(args)
+	if err := state.CookTxIndex(*dataDir); err != nil {
+		log.Fatalf("epochdb: cook-txindex: %v", err)
+	}
+}
+
+// serveMain serves historical JSON-RPC reads over the cooked indexes. The
+// state layer is opened read-only, so it is safe next to a running
+// fetch/exec; the view is pinned to what was durable at startup.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	port := fs.Int("port", 9650, "HTTP listen port")
 	fs.Parse(args)
 
-	store, err := state.Open(*dataDir)
+	store, err := state.OpenReadOnly(*dataDir)
 	if err != nil {
 		log.Fatalf("epochdb: open state layer: %v", err)
 	}
@@ -101,6 +119,19 @@ func serveMain(args []string) {
 	defer hist.Close()
 
 	srv := rpc.NewServer(hist, exec.NewChainContext(store), g.Config)
+
+	if txidx, err := state.OpenTxIndex(*dataDir); err != nil {
+		log.Printf("epochdb: tx index unavailable: %v", err)
+	} else if txidx.NumTx() > 0 {
+		reader, err := fetch.OpenReader(*dataDir)
+		if err != nil {
+			log.Fatalf("epochdb: open staging reader: %v", err)
+		}
+		defer reader.Close()
+		srv.EnableTxAPIs(txidx, reader, exec.ParseEthBlock)
+		log.Printf("epochdb: tx index loaded, %d txs", txidx.NumTx())
+	}
+
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("epochdb: serving historical RPC on %s, head=%d chainId=%s", addr, hist.Head(), g.Config.ChainID)
 	log.Fatal(srv.ListenAndServe(addr))
