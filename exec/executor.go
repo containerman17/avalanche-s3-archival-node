@@ -90,6 +90,9 @@ type Config struct {
 	// NetworkID selects the chain (constants.FujiID / MainnetID).
 	// 0 defaults to Fuji.
 	NetworkID uint32
+	// StopAt makes Run return cleanly after executing this height
+	// (fixed-corpus builds; staging above it is disposable). 0 = never.
+	StopAt uint64
 }
 
 // Executor replays Fuji C-Chain blocks against Firewood-backed frontier
@@ -490,6 +493,15 @@ func (e *Executor) Run(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if e.cfg.StopAt > 0 && next > e.cfg.StopAt {
+			if e.batchOpen && e.batchCount > 0 {
+				if err := e.flushBatch(); err != nil {
+					return err
+				}
+			}
+			log.Printf("exec: reached --stop height %d", e.cfg.StopAt)
+			return nil
 		}
 		raw, ok, err := e.cfg.Blocks.GetByHeight(next)
 		if err != nil {

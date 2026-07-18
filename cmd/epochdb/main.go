@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/upgrade"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
@@ -85,8 +86,9 @@ func rpcBlockNumberByHash(rpcURL string, h common.Hash) (uint64, bool, error) {
 }
 
 type rpcBlockHeader struct {
-	Hash   string `json:"hash"`
-	Number string `json:"number"`
+	Hash      string `json:"hash"`
+	Number    string `json:"number"`
+	Timestamp string `json:"timestamp"`
 }
 
 func rpcHeaderCall(rpcURL, method, param string) (*rpcBlockHeader, error) {
@@ -302,6 +304,7 @@ func execMain(args []string) {
 	stateCacheGiB := fs.Int("state-cache", 6, "Go-side EVM read cache size in GiB (0 disables)")
 	verifyCache := fs.Bool("verify-cache", false, "re-read every cache hit through Firewood and panic on mismatch (slow, validation only)")
 	commitEvery := fs.Int("commit-every", 1000, "blocks per Firewood proposal (root verification at batch boundaries, per-block bisect on mismatch; 1 = classic per-block)")
+	stopAt := fs.Uint64("stop", 0, "stop after executing this height (0 = follow staging forever)")
 	fs.Parse(args)
 
 	if *pprofAddr != "" {
@@ -331,6 +334,7 @@ func execMain(args []string) {
 		VerifyCache:     *verifyCache,
 		CommitEvery:     *commitEvery,
 		NetworkID:       execNetID(*network),
+		StopAt:          *stopAt,
 	})
 	if err != nil {
 		log.Fatalf("epochdb: exec.New: %v", err)
@@ -349,42 +353,79 @@ func execMain(args []string) {
 // pre-ProposerVM container IDs equal the eth block hash, so checkpoint
 // heights resolve the same way (post-ProposerVM checkpoints don't resolve
 // and are skipped, they sit above any pre-fork override by construction).
-func resolveTipOverride(f *fetch.Fetcher, rpcURL, v string) []fetch.Anchor {
+func resolveTipOverride(ctx context.Context, f *fetch.Fetcher, rpcURL, v string, networkID uint32) []fetch.Anchor {
+	ceiling := preForkCeiling(rpcURL, networkID)
+
 	var (
-		tipID ids.ID
-		err   error
+		tipID     ids.ID
+		tipHeight uint64
+		anchors   []fetch.Anchor
+		seen      = map[uint64]bool{}
 	)
-	if height, herr := strconv.ParseUint(v, 10, 64); herr == nil {
-		h, err := rpcBlockHash(rpcURL, height)
+	if height, herr := strconv.ParseUint(v, 10, 64); herr == nil && height >= ceiling {
+		// Post-ProposerVM target: heights don't RPC-resolve to container
+		// IDs. Anchor at the nearest embedded checkpoint at/above the
+		// target (blocks between target and checkpoint stage as
+		// disposable extra; exec --stop caps the corpus).
+		cps, err := f.ResolveCheckpoints(ctx)
 		if err != nil {
-			log.Fatalf("epochdb: --tip-override: resolve height %d: %v", height, err)
+			log.Fatalf("epochdb: --tip-override: %v", err)
 		}
-		tipID = ids.ID(h)
-		log.Printf("fetch: tip-override height %d -> container %s", height, tipID)
-	} else if tipID, err = parseContainerID(v); err != nil {
-		log.Fatalf("epochdb: --tip-override: %v", err)
-	}
-	tipHeight, ok, err := rpcBlockNumberByHash(rpcURL, common.Hash(tipID))
-	if err != nil || !ok {
-		log.Fatalf("epochdb: --tip-override: cannot determine height of %s via %s (post-ProposerVM container? use --tip): ok=%v err=%v", tipID, rpcURL, ok, err)
-	}
-	anchors := []fetch.Anchor{{ID: tipID, Height: tipHeight}}
-	seen := map[uint64]bool{tipHeight: true}
-	for _, cp := range f.Checkpoints() {
-		h, ok, err := rpcBlockNumberByHash(rpcURL, common.Hash(cp))
-		if err != nil || !ok || h > tipHeight || h == 0 || seen[h] {
-			continue // post-ProposerVM, above the override, or genesis
+		for _, cp := range cps {
+			switch {
+			case cp.Height >= height && tipHeight == 0:
+				tipID, tipHeight = cp.ID, cp.Height
+				anchors = append(anchors, cp)
+				seen[cp.Height] = true
+			case cp.Height < height && cp.Height > 0 && !seen[cp.Height]:
+				anchors = append(anchors, cp)
+				seen[cp.Height] = true
+			}
 		}
-		seen[h] = true
-		anchors = append(anchors, fetch.Anchor{ID: cp, Height: h})
+		if tipHeight == 0 {
+			log.Fatalf("epochdb: --tip-override: no embedded checkpoint at/above %d", height)
+		}
+		log.Printf("fetch: tip-override %d is post-ProposerVM (ceiling %d): anchored at checkpoint %s height %d",
+			height, ceiling, tipID, tipHeight)
+	} else {
+		if herr == nil {
+			h, err := rpcBlockHash(rpcURL, height)
+			if err != nil {
+				log.Fatalf("epochdb: --tip-override: resolve height %d: %v", height, err)
+			}
+			tipID = ids.ID(h)
+			log.Printf("fetch: tip-override height %d -> container %s", height, tipID)
+		} else {
+			var err error
+			if tipID, err = parseContainerID(v); err != nil {
+				log.Fatalf("epochdb: --tip-override: %v", err)
+			}
+		}
+		var ok bool
+		var err error
+		tipHeight, ok, err = rpcBlockNumberByHash(rpcURL, common.Hash(tipID))
+		if err != nil || !ok {
+			log.Fatalf("epochdb: --tip-override: cannot determine height of %s via %s (post-ProposerVM container? use --tip): ok=%v err=%v", tipID, rpcURL, ok, err)
+		}
+		anchors = append(anchors, fetch.Anchor{ID: tipID, Height: tipHeight})
+		seen[tipHeight] = true
+		for _, cp := range f.Checkpoints() {
+			h, ok, err := rpcBlockNumberByHash(rpcURL, common.Hash(cp))
+			if err != nil || !ok || h > tipHeight || h == 0 || seen[h] {
+				continue // post-ProposerVM, above the override, or genesis
+			}
+			seen[h] = true
+			anchors = append(anchors, fetch.Anchor{ID: cp, Height: h})
+		}
 	}
+
 	// The walks are round-trip-latency-bound, so synthesize evenly spaced
-	// anchors up to `walks` total: in the pre-ProposerVM era every height
-	// RPC-resolves to a container ID for free.
-	const wantAnchors = 16
-	if len(anchors) < wantAnchors {
-		step := tipHeight / wantAnchors
-		for h := step; h < tipHeight && step > 0; h += step {
+	// pre-fork anchors (below the ProposerVM ceiling every height
+	// RPC-resolves to a container ID for free).
+	const wantAnchors = 24
+	if fillTop := min(tipHeight, ceiling); len(anchors) < wantAnchors {
+		step := fillTop / wantAnchors
+		for h := step; h < fillTop && step > 0; h += step {
 			if seen[h] {
 				continue
 			}
@@ -398,6 +439,43 @@ func resolveTipOverride(f *fetch.Fetcher, rpcURL, v string) []fetch.Anchor {
 	}
 	log.Printf("fetch: tip-override %s at height %d, %d seeds below", tipID, tipHeight, len(anchors)-1)
 	return anchors
+}
+
+// preForkCeiling binary-searches the archive for the first block at/after
+// the network's ApricotPhase4 activation (ProposerVM starts there):
+// below it, container ID == eth block hash.
+func preForkCeiling(rpcURL string, networkID uint32) uint64 {
+	ap4 := uint64(upgrade.GetConfig(networkID).ApricotPhase4Time.Unix())
+	// Find an upper bound: double until the block is missing (beyond
+	// head) or its timestamp reaches AP4.
+	lo, hi := uint64(1), uint64(0)
+	for probe := uint64(1 << 20); ; probe <<= 1 {
+		ts, ok := rpcBlockTime(rpcURL, probe)
+		if !ok || ts >= ap4 {
+			hi = probe
+			break
+		}
+		lo = probe
+	}
+	for lo < hi {
+		mid := (lo + hi) / 2
+		ts, ok := rpcBlockTime(rpcURL, mid)
+		if ok && ts >= ap4 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
+func rpcBlockTime(rpcURL string, height uint64) (uint64, bool) {
+	res, err := rpcHeaderCall(rpcURL, "eth_getBlockByNumber", fmt.Sprintf("%q", hexutil.EncodeUint64(height)))
+	if err != nil || res == nil || res.Timestamp == "" {
+		return 0, false
+	}
+	ts, err := hexutil.DecodeUint64(res.Timestamp)
+	return ts, err == nil
 }
 
 // execNetID maps --network to a network ID.
@@ -442,7 +520,7 @@ func fetchMain(args []string) {
 	case *follow:
 		go func() { done <- f.Follow(ctx) }()
 	case *tipOverride != "":
-		anchors := resolveTipOverride(f, rpcURL, *tipOverride)
+		anchors := resolveTipOverride(ctx, f, rpcURL, *tipOverride, execNetID(*network))
 		go func() { done <- f.SyncTo(ctx, anchors, *walks) }()
 	case *fromTip:
 		go func() { done <- f.FollowTip(ctx) }()

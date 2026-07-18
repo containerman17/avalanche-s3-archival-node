@@ -101,6 +101,25 @@ func (f *Fetcher) Checkpoints() []ids.ID {
 	return out
 }
 
+// ResolveCheckpoints fetches every embedded checkpoint container over p2p
+// and returns them with parsed heights, ascending. Post-ProposerVM
+// checkpoint IDs cannot be height-resolved via RPC, so this is the way to
+// anchor above the activation height. Fetched containers (and the
+// ancestor batches that ride along) land in the store; staging above the
+// corpus ceiling is disposable.
+func (f *Fetcher) ResolveCheckpoints(ctx context.Context) ([]Anchor, error) {
+	var anchors []Anchor
+	for _, id := range f.Checkpoints() {
+		parsed, err := f.getContainer(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("resolve checkpoint %s: %w", id, err)
+		}
+		anchors = append(anchors, Anchor{ID: id, Height: parsed.blockNumber})
+	}
+	sort.Slice(anchors, func(i, j int) bool { return anchors[i].Height < anchors[j].Height })
+	return anchors, nil
+}
+
 // SyncTo backfills blocks [0..max(anchors)] with NO frontier following:
 // the anchors (a fixed tip override plus any checkpoints at or below it)
 // are sorted descending and each walk covers one span down to the next
