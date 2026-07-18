@@ -554,6 +554,23 @@ func openTxBucket(path string, bucket uint64) (*txBucket, error) {
 	}, nil
 }
 
+// BlocksWithTxs returns a bitmap (indexed by height - bucket*BucketBlocks)
+// of blocks in the bucket that contain at least one regular tx. Blocks
+// without regular txs cannot emit logs, so the log backfill skips them
+// without touching the container.
+func (t *TxIndex) BlocksWithTxs(bucket uint64) []bool {
+	out := make([]bool, BucketBlocks)
+	for _, tb := range t.buckets {
+		if tb.bucket != bucket {
+			continue
+		}
+		for i := 0; i < tb.e.n; i++ {
+			out[tb.blk.get(i)] = true
+		}
+	}
+	return out
+}
+
 // Candidates returns every block height that may contain a tx with this
 // hash (48-bit fingerprint match; the caller must verify against the full
 // block). Duplicate fingerprints yield multiple candidates.

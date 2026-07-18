@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -112,7 +114,11 @@ func backfillLogsMain(args []string) {
 	fs := flag.NewFlagSet("backfill-logs", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	workers := fs.Int("workers", 12, "parallel re-execution workers")
+	pprofAddr := fs.String("pprof", "", "pprof listen address (e.g. :6067)")
 	fs.Parse(args)
+	if *pprofAddr != "" {
+		go func() { log.Println(http.ListenAndServe(*pprofAddr, nil)) }()
+	}
 
 	env, cleanup := openBfEnv(*dataDir)
 	defer cleanup()
@@ -122,16 +128,23 @@ func backfillLogsMain(args []string) {
 	}
 	defer bf.Close()
 
-	// Non-empty block <=> it has a writelog frame (root-changing); empty
-	// blocks cannot emit logs and are skipped without re-execution.
-	totalWork := uint64(0)
+	// Logs come only from regular txs, so only blocks the tx index lists
+	// need re-execution; everything else (empty and atomic-only blocks,
+	// most of early Fuji) is skipped without touching the container.
+	txidx, err := state.OpenTxIndex(*dataDir)
+	if err != nil {
+		log.Fatalf("backfill-logs: open tx index (run cook-txindex first): %v", err)
+	}
 	lastBucket := env.end / state.BucketBlocks
+	withTxs := make([][]bool, lastBucket+1)
+	totalWork := uint64(0)
 	for b := uint64(0); b <= lastBucket; b++ {
+		withTxs[b] = txidx.BlocksWithTxs(b)
 		if bf.BucketDone(b) {
 			continue
 		}
 		for n := max(b*state.BucketBlocks, 1); n <= min((b+1)*state.BucketBlocks-1, env.end); n++ {
-			if env.store.HasWrites(n) {
+			if withTxs[b][n-b*state.BucketBlocks] {
 				totalWork++
 			}
 		}
@@ -191,7 +204,7 @@ func backfillLogsMain(args []string) {
 		}
 		go func() {
 			for n := lo; n <= hi; n++ {
-				if env.store.HasWrites(n) {
+				if withTxs[b][n-b*state.BucketBlocks] {
 					jobs <- n
 				}
 			}

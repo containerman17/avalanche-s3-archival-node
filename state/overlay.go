@@ -44,6 +44,12 @@ type History struct {
 	buckets []*sortedBucket // ascending bucket number
 	head    uint64          // highest cooked block
 
+	// deletes: account key -> ascending blocks of explicit account-delete
+	// records (SELFDESTRUCT). Built by one sequential scan at open; rare
+	// enough to keep resident, and it turns the per-read delete check into
+	// a map lookup (a linear run scan here was 96% of backfill CPU).
+	deletes map[string][]uint64
+
 	hdrMu sync.Mutex // guards store header reads (bucketLog LRU state)
 }
 
@@ -80,6 +86,18 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 	sort.Slice(h.buckets, func(i, j int) bool { return h.buckets[i].bucket < h.buckets[j].bucket })
 	if len(h.buckets) == 0 {
 		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets in %s (run epochdb cook-index)", dir)
+	}
+	// Ascending buckets + per-bucket (key, block) order = ascending blocks
+	// per key without sorting.
+	h.deletes = make(map[string][]uint64)
+	for _, b := range h.buckets {
+		for i := 0; i < b.n; i++ {
+			r := b.rec(i)
+			if r[0] == recKindAccount && binary.BigEndian.Uint32(r[69:73]) == 0 {
+				k := string(r[:sortedKeySize])
+				h.deletes[k] = append(h.deletes[k], binary.BigEndian.Uint64(r[53:61]))
+			}
+		}
 	}
 	return h, nil
 }
@@ -190,24 +208,6 @@ func (b *sortedBucket) lookup(key []byte, n uint64) (val []byte, blk uint64, fou
 	return val, blk, true, nil
 }
 
-// lastDelete scans this bucket's run of key backwards from (key, n) for the
-// most recent explicit delete <= n.
-//
-// ponytail: linear backward scan over the key's run; add a per-key delete
-// index if hot-account runs (100k records) ever show up in a profile.
-func (b *sortedBucket) lastDelete(key []byte, n uint64) (uint64, bool) {
-	for i := b.upperBound(key, n) - 1; i >= 0; i-- {
-		r := b.rec(i)
-		if !bytes.Equal(r[:sortedKeySize], key) {
-			return 0, false
-		}
-		if binary.BigEndian.Uint32(r[69:73]) == 0 {
-			return binary.BigEndian.Uint64(r[53:61]), true
-		}
-	}
-	return 0, false
-}
-
 // search descends buckets from bucket(n) downward for the largest write <=
 // n of key. A key missing from a bucket falls through to the next lower
 // bucket; nothing anywhere = (found=false), i.e. genesis/zero territory.
@@ -226,22 +226,14 @@ func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bo
 }
 
 // lastAccountDelete finds the largest block <= n where addr's account was
-// deleted, stopping the descent once buckets can no longer hold a block >
-// floor (the caller's best storage write).
-func (h *History) lastAccountDelete(key []byte, n, floor uint64) (uint64, bool) {
-	for i := len(h.buckets) - 1; i >= 0; i-- {
-		b := h.buckets[i]
-		if b.bucket*BucketBlocks > n {
-			continue
-		}
-		if (b.bucket+1)*BucketBlocks <= floor {
-			return 0, false // everything below here is < floor
-		}
-		if d, ok := b.lastDelete(key, n); ok {
-			return d, ok
-		}
+// deleted (map lookup over the open-time delete index).
+func (h *History) lastAccountDelete(key []byte, n uint64) (uint64, bool) {
+	ds := h.deletes[string(key)]
+	i := sort.Search(len(ds), func(i int) bool { return ds[i] > n }) - 1
+	if i < 0 {
+		return 0, false
 	}
-	return 0, false
+	return ds[i], true
 }
 
 func accountKey(addr common.Address) []byte {
@@ -309,12 +301,12 @@ func (h *History) StorageAt(addr common.Address, slot []byte, n uint64) ([]byte,
 		return nil, err
 	}
 	if found {
-		if d, ok := h.lastAccountDelete(aKey, n, wblk); ok && d > wblk {
+		if d, ok := h.lastAccountDelete(aKey, n); ok && d > wblk {
 			return nil, nil
 		}
 		return val, nil
 	}
-	if _, ok := h.lastAccountDelete(aKey, n, 0); ok {
+	if _, ok := h.lastAccountDelete(aKey, n); ok {
 		return nil, nil // account deleted at some point <= n, genesis storage is dead
 	}
 	ga, ok := h.genesis[addr]
