@@ -27,6 +27,10 @@ func FujiGenesis() (*corethcore.Genesis, error) {
 	return loadFujiCChainGenesis(snowCtx)
 }
 
+// ParseEthBlock decodes a raw staging container (ProposerVM-wrapped or
+// pre-fork) into an eth block, for the read-side tx APIs.
+var ParseEthBlock = parseEthBlock
+
 // NewChainContext exposes the executor's headers-log-backed ChainContext so
 // BLOCKHASH inside historical eth_call resolves real hashes. Not
 // goroutine-safe (bucketLog LRU state): callers serialize.

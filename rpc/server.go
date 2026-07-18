@@ -37,6 +37,11 @@ type Server struct {
 	hist     *state.History
 	chainCtx corethcore.ChainContext
 	chainCfg *params.ChainConfig
+
+	// tx APIs, wired by EnableTxAPIs (nil = methods unavailable).
+	txidx  *state.TxIndex
+	blocks BlockSource
+	parse  ContainerParser
 }
 
 func NewServer(hist *state.History, chainCtx corethcore.ChainContext, chainCfg *params.ChainConfig) *Server {
@@ -109,6 +114,14 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.getStorageAt(req.Params)
 	case "eth_call":
 		return s.ethCall(req.Params)
+	case "eth_getTransactionByHash", "eth_getTransactionReceipt":
+		if s.txidx == nil {
+			return nil, &rpcError{Code: -32000, Message: "tx index not available (run epochdb cook-txindex)"}
+		}
+		if req.Method == "eth_getTransactionByHash" {
+			return s.getTransactionByHash(req.Params)
+		}
+		return s.getTransactionReceipt(req.Params)
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found: " + req.Method}
 	}
