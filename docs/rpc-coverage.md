@@ -14,7 +14,7 @@ N/A = unsupported by design with the reason.
 |---|---|---|
 | eth_chainId | DONE | |
 | eth_blockNumber | DONE | = readable head |
-| eth_syncing | DONE | false |
+| eth_syncing | DONE | returns false (geth-compatible); coreth itself errors "not implemented in coreth", tolerance documented |
 | eth_getBalance | DONE | |
 | eth_getTransactionCount | DONE | |
 | eth_getCode | DONE | |
