@@ -575,7 +575,10 @@ func (t *TxIndex) BlocksWithTxs(bucket uint64) []bool {
 // hash (48-bit fingerprint match; the caller must verify against the full
 // block). Duplicate fingerprints yield multiple candidates.
 func (t *TxIndex) Candidates(hash common.Hash) []uint64 {
-	fp := txFingerprint(hash)
+	return t.candidatesFP(txFingerprint(hash))
+}
+
+func (t *TxIndex) candidatesFP(fp uint64) []uint64 {
 	var out []uint64
 	for _, tb := range t.buckets {
 		lo, hi := tb.e.lookup(fp)

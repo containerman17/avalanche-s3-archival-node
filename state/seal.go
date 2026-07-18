@@ -68,8 +68,22 @@ func sealEpochs(dir string, deleteRaw bool, epochTxs uint64) error {
 		st, _ := os.Stat(path)
 		log.Printf("seal: %s blocks=%d txs=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
 			filepath.Base(path), len(in.Containers), in.TxCount,
-			float64(rawBytes)/1e6, float64(st.Size())/1e6,
-			float64(rawBytes)/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
+			float64(rawBytes.total())/1e6, float64(st.Size())/1e6,
+			float64(rawBytes.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
+		if e, err := OpenEpoch(path); err == nil {
+			s := e.SectionSizes()
+			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB",
+				float64(rawBytes.containers)/1e6, float64(rawBytes.headers)/1e6,
+				float64(rawBytes.writelog)/1e6, float64(rawBytes.logs)/1e6)
+			log.Printf("seal:   sealed: dict=%.2fMB bodies=%.2fMB(+idx %.2f) headers=%.2fMB(+idx %.2f) sst=%.2fMB(+idx %.2f) deletes=%.2fMB txidx=%.2fMB logidx=%.2fMB bloom=%.2fMB",
+				float64(s["dict"])/1e6,
+				float64(s["bodies"])/1e6, float64(s["bodiesIdx"])/1e6,
+				float64(s["headers"])/1e6, float64(s["headersIdx"])/1e6,
+				float64(s["sst"])/1e6, float64(s["sstIdx"])/1e6,
+				float64(s["deletes"])/1e6, float64(s["txidx"])/1e6,
+				float64(s["logidx"])/1e6, float64(s["keybloom"])/1e6)
+			e.Close()
+		}
 		next = in.Start + uint64(len(in.Containers))
 	}
 
@@ -79,33 +93,38 @@ func sealEpochs(dir string, deleteRaw bool, epochTxs uint64) error {
 	return nil
 }
 
+// rawSizes are the uncompressed raw equivalents consumed by one epoch, for
+// the compression scoreboard.
+type rawSizes struct{ containers, headers, writelog, logs uint64 }
+
+func (r rawSizes) total() uint64 { return r.containers + r.headers + r.writelog + r.logs }
+
 // gatherEpoch collects blocks from start until the cumulative tx count
 // reaches EpochTxs (that block included). nil input = not enough txs
-// materialized yet (tail stays raw). rawBytes counts the uncompressed raw
-// equivalents (containers + headers + writelog frames + logs records) for
-// the compression scoreboard.
-func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uint64) (*EpochInput, uint64, error) {
+// materialized yet (tail stays raw).
+func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uint64) (*EpochInput, rawSizes, error) {
 	in := &EpochInput{Start: start, TxHashes: map[uint64][][32]byte{}}
-	var rawBytes uint64
+	var rawBytes rawSizes
 	for n := start; n <= execHead; n++ {
 		container, ok, err := reader.GetByHeight(n)
 		if err != nil {
-			return nil, 0, err
+			return nil, rawSizes{}, err
 		}
 		if !ok {
-			return nil, 0, nil // staging gap below exec head should not happen, but never seal past one
+			return nil, rawSizes{}, nil // staging gap below exec head should not happen, but never seal past one
 		}
 		headerRLP, ok, err := store.HeaderRLP(n)
 		if err != nil || !ok {
-			return nil, 0, fmt.Errorf("seal: header %d: ok=%v err=%v", n, ok, err)
+			return nil, rawSizes{}, fmt.Errorf("seal: header %d: ok=%v err=%v", n, ok, err)
 		}
 		in.Containers = append(in.Containers, container)
 		in.Headers = append(in.Headers, headerRLP)
-		rawBytes += uint64(len(container) + len(headerRLP))
+		rawBytes.containers += uint64(len(container))
+		rawBytes.headers += uint64(len(headerRLP))
 
 		hashes, err := extractTxHashes(innerEthBlock(container), nil)
 		if err != nil {
-			return nil, 0, fmt.Errorf("seal: block %d txs: %w", n, err)
+			return nil, rawSizes{}, fmt.Errorf("seal: block %d txs: %w", n, err)
 		}
 		if len(hashes) > 0 {
 			hs := make([][32]byte, len(hashes))
@@ -117,9 +136,9 @@ func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs u
 		}
 
 		if frame, ok, err := store.wl.Get(n); err != nil {
-			return nil, 0, err
+			return nil, rawSizes{}, err
 		} else if ok {
-			rawBytes += uint64(len(frame))
+			rawBytes.writelog += uint64(len(frame))
 			seq := 0
 			if err := parseFrame(frame, func(kind byte, key [sortedKeySize]byte, valOff int, vlen uint32) {
 				if kind == recKindCodeUse {
@@ -133,17 +152,17 @@ func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs u
 				})
 				seq++
 			}); err != nil {
-				return nil, 0, fmt.Errorf("seal: writelog frame %d: %w", n, err)
+				return nil, rawSizes{}, fmt.Errorf("seal: writelog frame %d: %w", n, err)
 			}
 		}
 
 		if rec, ok, err := store.LogsRecord(n); err != nil {
-			return nil, 0, err
+			return nil, rawSizes{}, err
 		} else if ok {
-			rawBytes += uint64(len(rec))
+			rawBytes.logs += uint64(len(rec))
 			lr, err := decodeLogRec(n, rec)
 			if err != nil {
-				return nil, 0, fmt.Errorf("seal: logs record %d: %w", n, err)
+				return nil, rawSizes{}, fmt.Errorf("seal: logs record %d: %w", n, err)
 			}
 			in.Logs = append(in.Logs, lr)
 		}
@@ -152,7 +171,7 @@ func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs u
 			return in, rawBytes, nil
 		}
 	}
-	return nil, 0, nil // ran out of replayed blocks before the boundary
+	return nil, rawSizes{}, nil // ran out of replayed blocks before the boundary
 }
 
 // decodeLogRec decodes one capture-format logs record (exec encodeLogsFrame

@@ -210,23 +210,45 @@ func serveMain(args []string) {
 	}
 	defer hist.Close()
 
-	srv := rpc.NewServer(hist, exec.NewChainContext(store), g.Config)
+	srv := rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
 
-	if txidx, err := state.OpenTxIndex(*dataDir); err != nil {
-		log.Printf("epochdb: tx index unavailable: %v", err)
-	} else if txidx.NumTx() > 0 {
+	epochs := hist.Epochs()
+	rawIdx, err := state.OpenTxIndex(*dataDir)
+	if err != nil {
+		log.Printf("epochdb: raw tx index unavailable: %v", err)
+	}
+	if (rawIdx != nil && rawIdx.NumTx() > 0) || len(epochs.Epochs) > 0 {
 		reader, err := fetch.OpenReader(*dataDir)
 		if err != nil {
 			log.Fatalf("epochdb: open staging reader: %v", err)
 		}
 		defer reader.Close()
-		srv.EnableTxAPIs(txidx, reader, exec.ParseEthBlock)
-		log.Printf("epochdb: tx index loaded, %d txs", txidx.NumTx())
+		blocks := sealedBlocks{epochs: epochs, reader: reader}
+		srv.EnableTxAPIs(state.CombinedTxIndex{Raw: rawIdx, Epochs: epochs}, blocks, exec.ParseEthBlock)
+		var rawTx uint64
+		if rawIdx != nil {
+			rawTx = rawIdx.NumTx()
+		}
+		log.Printf("epochdb: tx lookup: %d raw-indexed txs, %d sealed epochs", rawTx, len(epochs.Epochs))
 	}
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("epochdb: serving historical RPC on %s, head=%d chainId=%s", addr, hist.Head(), g.Config.ChainID)
 	log.Fatal(srv.ListenAndServe(addr))
+}
+
+// sealedBlocks serves containers from sealed epochs first, raw staging as
+// the fallback for the unsealed tail.
+type sealedBlocks struct {
+	epochs *state.EpochSet
+	reader *fetch.Reader
+}
+
+func (s sealedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
+	if raw, ok, err := s.epochs.GetByHeight(n); ok || err != nil {
+		return raw, ok, err
+	}
+	return s.reader.GetByHeight(n)
 }
 
 // execMain replays blocks ascending from genesis out of the (possibly

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"syscall"
 
+	"github.com/ava-labs/libevm/common"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -37,6 +39,17 @@ type Epoch struct {
 
 // End returns the last block in the epoch (inclusive).
 func (e *Epoch) End() uint64 { return e.Start + e.Count - 1 }
+
+// SectionSizes returns section byte sizes by name (compression scoreboard).
+func (e *Epoch) SectionSizes() map[string]uint64 {
+	names := []string{"dict", "bodies", "bodiesIdx", "headers", "headersIdx",
+		"sst", "sstIdx", "deletes", "txidx", "logidx", "keybloom"}
+	out := make(map[string]uint64, epochNumSections)
+	for i, n := range names {
+		out[n] = uint64(len(e.sec[i]))
+	}
+	return out
+}
 
 // OpenEpoch mmaps and validates one epoch file.
 func OpenEpoch(path string) (*Epoch, error) {
@@ -326,6 +339,39 @@ func (e *Epoch) LogAddrBlocks(addr [20]byte) ([]uint64, error) { return e.logidx
 // LogTopicBlocks returns the absolute blocks where topic appeared.
 func (e *Epoch) LogTopicBlocks(topic [32]byte) ([]uint64, error) { return e.logidxLookup(topic[:]) }
 
+// sampleSSTRow returns a random (key, block) row for bench probing.
+func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64, ok bool) {
+	idx := e.sec[secSSTIdx]
+	nEntries := len(idx) / sstIdxEntrySize
+	if nEntries == 0 {
+		return key, 0, false
+	}
+	bi := r.Intn(nEntries)
+	lo := binary.LittleEndian.Uint64(idx[bi*sstIdxEntrySize+sortedKeySize+8:])
+	hi := uint64(len(e.sec[secSST]))
+	if bi+1 < nEntries {
+		hi = binary.LittleEndian.Uint64(idx[(bi+1)*sstIdxEntrySize+sortedKeySize+8:])
+	}
+	raw, err := e.decodeAll(e.sec[secSST][lo:hi])
+	if err != nil {
+		return key, 0, false
+	}
+	// reservoir-pick a row while walking the block
+	pos, seen := 0, 0
+	for pos < len(raw) {
+		rb := binary.BigEndian.Uint64(raw[pos+sortedKeySize:])
+		vlen, vn := binary.Uvarint(raw[pos+sortedKeySize+8:])
+		seen++
+		if r.Intn(seen) == 0 {
+			copy(key[:], raw[pos:pos+sortedKeySize])
+			blk = rb
+			ok = true
+		}
+		pos += sortedKeySize + 8 + vn + int(vlen)
+	}
+	return key, blk, ok
+}
+
 // ---------- epoch set ----------
 
 // EpochSet is every sealed epoch in a directory, ascending and contiguous
@@ -391,4 +437,48 @@ func (s *EpochSet) At(n uint64) (*Epoch, bool) {
 		return nil, false
 	}
 	return s.Epochs[i], true
+}
+
+// GetByHeight serves raw containers from sealed epochs (rpc.BlockSource
+// shape). ok=false when the block is not sealed.
+func (s *EpochSet) GetByHeight(n uint64) ([]byte, bool, error) {
+	e, ok := s.At(n)
+	if !ok {
+		return nil, false, nil
+	}
+	c, err := e.Container(n)
+	if err != nil {
+		return nil, false, err
+	}
+	return c, true, nil
+}
+
+// CombinedTxIndex answers tx-hash candidate queries over sealed epochs
+// plus the raw per-bucket index (the unsealed tail; may overlap epochs
+// until --delete-raw, so candidates are deduped).
+type CombinedTxIndex struct {
+	Raw    *TxIndex
+	Epochs *EpochSet
+}
+
+func (c CombinedTxIndex) Candidates(hash common.Hash) []uint64 {
+	fp := txFingerprint(hash)
+	var out []uint64
+	for _, e := range c.Epochs.Epochs {
+		out = append(out, e.TxCandidates(fp)...)
+	}
+	if c.Raw != nil {
+		out = append(out, c.Raw.candidatesFP(fp)...)
+	}
+	if len(out) < 2 {
+		return out
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	dedup := out[:1]
+	for _, b := range out[1:] {
+		if b != dedup[len(dedup)-1] {
+			dedup = append(dedup, b)
+		}
+	}
+	return dedup
 }

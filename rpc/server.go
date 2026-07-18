@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
+	"github.com/ava-labs/avalanchego/graft/coreth/consensus/dummy"
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
@@ -39,9 +41,31 @@ type Server struct {
 	chainCfg *params.ChainConfig
 
 	// tx APIs, wired by EnableTxAPIs (nil = methods unavailable).
-	txidx  *state.TxIndex
+	txidx  TxCandidateSource
 	blocks BlockSource
 	parse  ContainerParser
+}
+
+// HistoryChainContext serves BLOCKHASH headers through the epochs-aware
+// History (raw store first, sealed epochs after --delete-raw).
+func HistoryChainContext(hist *state.History) corethcore.ChainContext {
+	return histChainCtx{hist}
+}
+
+type histChainCtx struct{ hist *state.History }
+
+func (c histChainCtx) Engine() consensus.Engine { return dummy.NewFullFaker() }
+
+func (c histChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
+	raw, ok, err := c.hist.HeaderRLP(n)
+	if err != nil || !ok {
+		return nil
+	}
+	var h types.Header
+	if err := rlp.DecodeBytes(raw, &h); err != nil {
+		return nil
+	}
+	return &h
 }
 
 func NewServer(hist *state.History, chainCtx corethcore.ChainContext, chainCfg *params.ChainConfig) *Server {

@@ -237,11 +237,17 @@ func benchTxMain(args []string) {
 
 	fetch.RegisterExtras() // ParseEthBlock needs the coreth/libevm extras
 	rng := rand.New(rand.NewSource(*seed))
-	reader, err := fetch.OpenReader(*dataDir)
+	fr, err := fetch.OpenReader(*dataDir)
 	if err != nil {
 		log.Fatalf("ab-bench-tx: open reader: %v", err)
 	}
-	defer reader.Close()
+	defer fr.Close()
+	epochs, err := state.OpenEpochSet(*dataDir)
+	if err != nil {
+		log.Fatalf("ab-bench-tx: open epochs: %v", err)
+	}
+	defer epochs.Close()
+	reader := sealedBlocks{epochs: epochs, reader: fr} // sample sealed + raw
 
 	// Replayed head from the local server, staging ceiling from the bucket files.
 	res, rerr := rpcCall(*local, "eth_blockNumber", nil, 2)
@@ -268,6 +274,9 @@ func benchTxMain(args []string) {
 	}
 	var samples []txProbe
 	aboveMisses, attempts := 0, 0
+	if maxStaged <= head+1 {
+		aboveMisses = 1 << 30 // nothing staged above head, all probes in range
+	}
 	for len(samples) < *n {
 		if attempts++; attempts > 200*(*n)+10_000 {
 			log.Fatalf("ab-bench-tx: sampling stuck after %d attempts (%d/%d sampled)", attempts, len(samples), *n)

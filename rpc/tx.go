@@ -16,18 +16,25 @@ import (
 	"github.com/containerman17/epochdb/state"
 )
 
-// BlockSource yields raw staging containers by height (a fetch.Reader).
+// BlockSource yields raw containers by height (a fetch.Reader, an epoch
+// set, or a composition of both).
 type BlockSource interface {
 	GetByHeight(n uint64) ([]byte, bool, error)
+}
+
+// TxCandidateSource maps a tx hash to candidate block heights
+// (state.TxIndex or state.CombinedTxIndex).
+type TxCandidateSource interface {
+	Candidates(hash common.Hash) []uint64
 }
 
 // ContainerParser decodes a raw container into an eth block (exec.ParseEthBlock).
 type ContainerParser func([]byte) (*types.Block, error)
 
-// EnableTxAPIs wires the tx-hash index, the staging reader, and the
+// EnableTxAPIs wires the tx-hash index, the container source, and the
 // container parser into the server, enabling eth_getTransactionByHash and
 // eth_getTransactionReceipt.
-func (s *Server) EnableTxAPIs(idx *state.TxIndex, blocks BlockSource, parse ContainerParser) {
+func (s *Server) EnableTxAPIs(idx TxCandidateSource, blocks BlockSource, parse ContainerParser) {
 	s.txidx, s.blocks, s.parse = idx, blocks, parse
 }
 

@@ -42,7 +42,8 @@ type History struct {
 	store   *Store
 	genesis types.GenesisAlloc
 	buckets []*sortedBucket // ascending bucket number
-	head    uint64          // highest cooked block
+	epochs  *EpochSet       // sealed epochs (may be empty)
+	head    uint64          // highest readable block
 
 	// deletes: account key -> ascending blocks of explicit account-delete
 	// records (SELFDESTRUCT). Built by one sequential scan at open; rare
@@ -84,12 +85,22 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 		}
 	}
 	sort.Slice(h.buckets, func(i, j int) bool { return h.buckets[i].bucket < h.buckets[j].bucket })
-	if len(h.buckets) == 0 {
-		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets in %s (run epochdb cook-index)", dir)
+	if h.epochs, err = OpenEpochSet(dir); err != nil {
+		h.Close()
+		return nil, err
 	}
-	// Ascending buckets + per-bucket (key, block) order = ascending blocks
-	// per key without sorting.
+	if end, ok := h.epochs.SealedEnd(); ok && end > h.head {
+		h.head = end
+	}
+	if len(h.buckets) == 0 && len(h.epochs.Epochs) == 0 {
+		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets or epochs in %s (run epochdb cook-index or seal)", dir)
+	}
 	h.deletes = make(map[string][]uint64)
+	for _, e := range h.epochs.Epochs {
+		e.AccountDeletes(func(key []byte, blk uint64) {
+			h.deletes[string(key)] = append(h.deletes[string(key)], blk)
+		})
+	}
 	for _, b := range h.buckets {
 		for i := 0; i < b.n; i++ {
 			r := b.rec(i)
@@ -99,8 +110,24 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 			}
 		}
 	}
+	// Raw buckets can overlap sealed epochs until --delete-raw runs:
+	// sort + dedupe each key's delete blocks.
+	for k, ds := range h.deletes {
+		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+		out := ds[:0]
+		for i, d := range ds {
+			if i == 0 || d != ds[i-1] {
+				out = append(out, d)
+			}
+		}
+		h.deletes[k] = out
+	}
 	return h, nil
 }
+
+// Epochs exposes the sealed epoch set (shared with the serve wiring for
+// bodies and tx lookups).
+func (h *History) Epochs() *EpochSet { return h.epochs }
 
 func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) {
 	f, err := os.Open(filepath.Join(dir, sortedName(bucket)))
@@ -148,24 +175,40 @@ func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) 
 	}, cookedThrough, nil
 }
 
-// Close unmaps and closes every bucket.
+// Close unmaps and closes every bucket and epoch.
 func (h *History) Close() {
 	for _, b := range h.buckets {
 		syscall.Munmap(b.mm)
 		b.wl.Close()
 	}
 	h.buckets = nil
+	if h.epochs != nil {
+		h.epochs.Close()
+		h.epochs = nil
+	}
 }
 
 // Head returns the highest block the cooked index covers.
 func (h *History) Head() uint64 { return h.head }
 
-// HeaderRLP returns the stored header RLP for block n (mutex-guarded: the
-// underlying bucketLog mutates LRU state on every read).
+// HeaderRLP returns the stored header RLP for block n: raw store first
+// (mutex-guarded: bucketLog mutates LRU state on every read), sealed
+// epochs as the fallback once raw buckets are deleted.
 func (h *History) HeaderRLP(n uint64) ([]byte, bool, error) {
 	h.hdrMu.Lock()
-	defer h.hdrMu.Unlock()
-	return h.store.HeaderRLP(n)
+	raw, ok, err := h.store.HeaderRLP(n)
+	h.hdrMu.Unlock()
+	if err != nil || ok {
+		return raw, ok, err
+	}
+	if e, ok := h.epochs.At(n); ok {
+		hdr, err := e.HeaderRLP(n)
+		if err != nil {
+			return nil, false, err
+		}
+		return hdr, true, nil
+	}
+	return nil, false, nil
 }
 
 func (b *sortedBucket) rec(i int) []byte {
@@ -209,8 +252,11 @@ func (b *sortedBucket) lookup(key []byte, n uint64) (val []byte, blk uint64, fou
 }
 
 // search descends buckets from bucket(n) downward for the largest write <=
-// n of key. A key missing from a bucket falls through to the next lower
-// bucket; nothing anywhere = (found=false), i.e. genesis/zero territory.
+// n of key, then the sealed epochs newest-to-oldest (bloom-gated). A key
+// missing from a bucket/epoch falls through to the next lower one; nothing
+// anywhere = (found=false), i.e. genesis/zero territory. Raw buckets may
+// overlap sealed epochs until --delete-raw runs; the data is identical, so
+// whichever side hits first wins.
 func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bool, err error) {
 	for i := len(h.buckets) - 1; i >= 0; i-- {
 		b := h.buckets[i]
@@ -218,6 +264,19 @@ func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bo
 			continue
 		}
 		val, blk, found, err = b.lookup(key, n)
+		if err != nil || found {
+			return val, blk, found, err
+		}
+	}
+	for i := len(h.epochs.Epochs) - 1; i >= 0; i-- {
+		e := h.epochs.Epochs[i]
+		if e.Start > n {
+			continue
+		}
+		if !e.MayContainKey(key) {
+			continue
+		}
+		val, blk, found, err = e.StateSearch(key, n)
 		if err != nil || found {
 			return val, blk, found, err
 		}
@@ -352,15 +411,16 @@ func (h *History) CodeAt(addr common.Address, n uint64) ([]byte, error) {
 	return h.CodeByHash(common.BytesToHash(acc.CodeHash))
 }
 
-// SampleRecord returns a random cooked record for bench probing:
-// kind 'a' with a zero slot, or kind 's' with the slot key.
+// SampleRecord returns a random state record for bench probing: kind 'a'
+// with a zero slot, or kind 's' with the slot key. Samples raw cooked
+// buckets when present, sealed epochs otherwise (post --delete-raw).
 func (h *History) SampleRecord(r *rand.Rand) (kind byte, addr common.Address, slot common.Hash, block uint64, ok bool) {
 	total := 0
 	for _, b := range h.buckets {
 		total += b.n
 	}
 	if total == 0 {
-		return 0, addr, slot, 0, false
+		return h.sampleEpochRecord(r)
 	}
 	i := r.Intn(total)
 	for _, b := range h.buckets {
@@ -374,6 +434,23 @@ func (h *History) SampleRecord(r *rand.Rand) (kind byte, addr common.Address, sl
 		return rec[0], addr, slot, binary.BigEndian.Uint64(rec[53:61]), true
 	}
 	return 0, addr, slot, 0, false
+}
+
+// sampleEpochRecord picks a random sparse-index entry from a random epoch
+// SST and a random row inside its block.
+func (h *History) sampleEpochRecord(r *rand.Rand) (kind byte, addr common.Address, slot common.Hash, block uint64, ok bool) {
+	eps := h.epochs.Epochs
+	if len(eps) == 0 {
+		return 0, addr, slot, 0, false
+	}
+	e := eps[r.Intn(len(eps))]
+	key, blk, ok := e.sampleSSTRow(r)
+	if !ok {
+		return 0, addr, slot, 0, false
+	}
+	copy(addr[:], key[1:21])
+	copy(slot[:], key[21:53])
+	return key[0], addr, slot, blk, true
 }
 
 // StateAt returns a read-only libevm state.Database serving the historical

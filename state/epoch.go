@@ -73,9 +73,10 @@ func trainDictCLI(samples [][]byte, dictID uint32) []byte {
 const (
 	// EpochTxs is the epoch boundary: an epoch seals at the first block
 	// whose cumulative tx count reaches it. PRE-FREEZE TUNABLE; sized for
-	// the mainnet 0-100k measurement corpus so it yields several epochs
-	// (mainnet target per DESIGN.md is 10M).
-	EpochTxs = 50_000
+	// the mainnet 0-100k measurement corpus (93,870 regular txs measured
+	// 2026-07-18) so it yields 3 sealed epochs plus a raw tail. The
+	// full-mainnet target per DESIGN.md is 10M.
+	EpochTxs = 25_000
 
 	framedGroup     = 16        // containers/headers per zstd frame (07-17: 2.24x, 34us access)
 	dictTargetSize  = 512 << 10 // 07-17 experiment optimum
