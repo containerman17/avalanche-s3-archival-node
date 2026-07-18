@@ -551,7 +551,11 @@ func (f *Fetcher) bootstrapRound(ctx context.Context, tip ids.ID) (ancestorsResp
 	if f.pool.archivalCount() > 0 {
 		return ancestorsResponse{}, ids.EmptyNodeID, false // someone else bootstrapped; re-acquire
 	}
-	peers := f.pool.nonArchival(1 << 30)
+	// Capped fanout: peers throttle a zero-weight non-validator hard, and a
+	// full-network burst (582 peers x ~1.6MB on mainnet) got every response
+	// stream cut off for minutes, stalling consensus polls (measured live
+	// 2026-07-18). 64 concurrent probes bootstrap plenty of archival peers.
+	peers := f.pool.nonArchival(64)
 	if len(peers) == 0 {
 		time.Sleep(200 * time.Millisecond)
 		return ancestorsResponse{}, ids.EmptyNodeID, false
