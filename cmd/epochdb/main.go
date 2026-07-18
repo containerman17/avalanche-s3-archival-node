@@ -414,6 +414,8 @@ func fetchMain(args []string) {
 	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
 	fromTip := fs.Bool("from-tip", false, "anchor at the network's accepted frontier, backfill down to stored history, then keep following the live tip")
 	tipOverride := fs.String("tip-override", "", "fixed corpus ceiling replacing frontier following: a block HEIGHT (RPC-resolved; pre-ProposerVM only) or a container ID; backfills [0..height] using checkpoints at or below it as parallel seeds, then exits")
+	follow := fs.Bool("follow", false, "consensus-verified tip following: real snowman polls against the weighted validator set (replaces --from-tip's frontier voting)")
+	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set (--follow); default: --node URI only, with a warning")
 	fs.Parse(args)
 
 	_, defNode, rpcURL := netParams(*network)
@@ -424,13 +426,19 @@ func fetchMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	f, err := fetch.New(fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer})
+	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer}
+	if *vdrSources != "" {
+		cfg.VdrSources = strings.Split(*vdrSources, ",")
+	}
+	f, err := fetch.New(cfg)
 	if err != nil {
 		log.Fatalf("epochdb: %v", err)
 	}
 
 	done := make(chan error, 1)
 	switch {
+	case *follow:
+		go func() { done <- f.Follow(ctx) }()
 	case *tipOverride != "":
 		anchors := resolveTipOverride(f, rpcURL, *tipOverride)
 		go func() { done <- f.SyncTo(ctx, anchors, *walks) }()

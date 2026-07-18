@@ -36,12 +36,15 @@ var registerExtras = sync.OnceFunc(func() {
 	extstate.RegisterExtras()
 })
 
-// parsedContainer holds everything we need to store and continue walking.
+// parsedContainer holds everything we need to store and continue walking,
+// plus what the consensus follower needs (parent hash, timestamp).
 type parsedContainer struct {
 	containerID ids.ID
 	blockNumber uint64
 	blockHash   ids.ID
 	parentID    ids.ID
+	parentHash  ids.ID // inner eth block's parent hash
+	blockTime   uint64 // inner eth block timestamp (unix seconds)
 }
 
 // parseContainer decodes a raw container (ProposerVM-wrapped or pre-fork eth)
@@ -62,6 +65,8 @@ func parseContainer(raw []byte) (parsedContainer, error) {
 			blockNumber: inner.NumberU64(),
 			blockHash:   ids.ID(inner.Hash()),
 			parentID:    proposerBlk.ParentID(),
+			parentHash:  ids.ID(inner.ParentHash()),
+			blockTime:   inner.Time(),
 		}, nil
 	}
 
@@ -81,5 +86,7 @@ func parseContainer(raw []byte) (parsedContainer, error) {
 		blockNumber: inner.NumberU64(),
 		blockHash:   ids.ID(inner.Hash()),
 		parentID:    ids.ID(inner.ParentHash()),
+		parentHash:  ids.ID(inner.ParentHash()),
+		blockTime:   inner.Time(),
 	}, nil
 }

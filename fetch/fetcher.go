@@ -62,6 +62,11 @@ type Config struct {
 	// PerPeer is the max outstanding GetAncestors requests per archival
 	// peer. 0 means 1.
 	PerPeer int
+	// VdrSources are platform RPC URIs used ONLY to load and cross-check
+	// the validator set for consensus tip following (Follow). Empty falls
+	// back to NodeURI alone, with a warning: the recorded ruling wants
+	// multiple independent sources.
+	VdrSources []string
 }
 
 // Fetcher owns a flat-file store of raw C-Chain containers and a P2P
@@ -406,6 +411,13 @@ func (p *peerPool) observe(id ids.NodeID, blocks int, elapsed time.Duration) {
 			s.rate = 0.8*s.rate + 0.2*r
 		}
 	}
+}
+
+func (p *peerPool) isConnected(id ids.NodeID) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.peers[id]
+	return ok
 }
 
 func (p *peerPool) archivalCount() int {

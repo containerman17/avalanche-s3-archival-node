@@ -25,6 +25,22 @@ type inboundHandler struct {
 	routeMu     sync.Mutex
 	routeMap    map[uint32]chan ancestorsResponse
 	frontierMap map[uint32]chan ids.ID
+
+	// Consensus follower callbacks (nil = drop). Set once via
+	// setConsensusCallbacks before the follower starts.
+	cbMu        sync.RWMutex
+	onContainer func(nodeID ids.NodeID, container []byte)
+	onChits     func(nodeID ids.NodeID, requestID uint32, preferred, preferredAtHeight, accepted ids.ID, acceptedHeight uint64)
+}
+
+func (h *inboundHandler) setConsensusCallbacks(
+	onContainer func(ids.NodeID, []byte),
+	onChits func(ids.NodeID, uint32, ids.ID, ids.ID, ids.ID, uint64),
+) {
+	h.cbMu.Lock()
+	h.onContainer = onContainer
+	h.onChits = onChits
+	h.cbMu.Unlock()
 }
 
 func newHandler(peers set.Set[ids.NodeID], pool *peerPool) *inboundHandler {
@@ -54,6 +70,47 @@ func (h *inboundHandler) Disconnected(nodeID ids.NodeID) {
 
 func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMessage) {
 	defer msg.OnFinishedHandling()
+
+	switch msg.Op {
+	case message.PutOp:
+		h.cbMu.RLock()
+		cb := h.onContainer
+		h.cbMu.RUnlock()
+		if p, ok := msg.Message.(*p2p.Put); ok && cb != nil {
+			cb(msg.NodeID, p.Container)
+		}
+		return
+	case message.PushQueryOp:
+		h.cbMu.RLock()
+		cb := h.onContainer
+		h.cbMu.RUnlock()
+		if p, ok := msg.Message.(*p2p.PushQuery); ok && cb != nil {
+			cb(msg.NodeID, p.Container)
+		}
+		return
+	case message.ChitsOp:
+		h.cbMu.RLock()
+		cb := h.onChits
+		h.cbMu.RUnlock()
+		p, ok := msg.Message.(*p2p.Chits)
+		if !ok || cb == nil {
+			return
+		}
+		preferred, err := ids.ToID(p.PreferredId)
+		if err != nil {
+			return
+		}
+		preferredAtHeight, err := ids.ToID(p.PreferredIdAtHeight)
+		if err != nil {
+			preferredAtHeight = preferred
+		}
+		accepted, err := ids.ToID(p.AcceptedId)
+		if err != nil {
+			return
+		}
+		cb(msg.NodeID, p.RequestId, preferred, preferredAtHeight, accepted, p.AcceptedHeight)
+		return
+	}
 
 	if msg.Op == message.AcceptedFrontierOp {
 		payload, ok := msg.Message.(*p2p.AcceptedFrontier)
