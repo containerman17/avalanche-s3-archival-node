@@ -122,26 +122,54 @@ type batchItem struct {
 // corethcore.NewEVMBlockContext / ApplyTransaction. GetHeader is served
 // from the headers log so the BLOCKHASH opcode returns real hashes across
 // its 256-block window (the reference's zero-hash stub bug documented in
-// its LOG.md is exactly what this avoids).
+// its LOG.md is exactly what this avoids). With batching, headers of the
+// OPEN batch are buffered rather than appended, so those must be served
+// from the buffer: a BLOCKHASH reaching into the open batch otherwise
+// returned the zero hash and diverged execution (second live batch
+// mismatch at Fuji ~7220368, per-block re-execution clean).
 type chainContext struct {
-	store *state.Store
+	e     *Executor    // nil outside the executor (historical eth_call)
+	store *state.Store // headers log
 }
 
 func (c chainContext) Engine() consensus.Engine { return dummy.NewFullFaker() }
 
 func (c chainContext) GetHeader(_ common.Hash, num uint64) *types.Header {
-	if c.store == nil {
-		return nil
+	var (
+		raw []byte
+		ok  bool
+	)
+	if c.e != nil {
+		raw, ok = c.e.batchHeaderRLP(num)
 	}
-	raw, ok, err := c.store.HeaderRLP(num)
-	if err != nil || !ok {
-		return nil
+	if !ok {
+		if c.store == nil {
+			return nil
+		}
+		var err error
+		raw, ok, err = c.store.HeaderRLP(num)
+		if err != nil || !ok {
+			return nil
+		}
 	}
 	var h types.Header
 	if err := rlp.DecodeBytes(raw, &h); err != nil {
 		return nil
 	}
 	return &h
+}
+
+// batchHeaderRLP serves a header buffered in the open batch. Batch blocks
+// are contiguous from batchStartNum+1, so the buffer index is direct.
+func (e *Executor) batchHeaderRLP(num uint64) ([]byte, bool) {
+	if !e.batchOpen || num <= e.batchStartNum {
+		return nil, false
+	}
+	idx := num - e.batchStartNum - 1
+	if idx >= uint64(len(e.batchBuf)) {
+		return nil, false
+	}
+	return e.batchBuf[idx].headerRLP, true
 }
 
 // New opens Firewood under cfg.DataDir/firewood, materialises the Fuji
@@ -223,13 +251,15 @@ func New(cfg Config) (*Executor, error) {
 		triedb:      tdb,
 		fwBackend:   fwBackend,
 		snowCtx:     snowCtx,
-		chainCtx:    chainContext{store: cfg.Store},
+		chainCtx:    chainContext{},
 		genesisRoot: genesisRoot,
 		genesisHash: g.ToBlock().Hash(),
 		headRoot:    genesisRoot,
 		headNum:     0,
 		lastFwHash:  g.ToBlock().Hash(),
 	}
+
+	e.chainCtx = chainContext{e: e, store: cfg.Store}
 
 	if err := e.reconcile(); err != nil {
 		tdb.Close()
