@@ -81,7 +81,11 @@ func OpenEpoch(path string) (*Epoch, error) {
 		}
 		e.sec[i] = mm[off : off+ln]
 	}
-	e.dec, err = zstd.NewReader(nil, zstd.WithDecoderDicts(e.sec[secDict]))
+	var decOpts []zstd.DOption
+	if len(e.sec[secDict]) > 0 {
+		decOpts = append(decOpts, zstd.WithDecoderDicts(e.sec[secDict]))
+	}
+	e.dec, err = zstd.NewReader(nil, decOpts...)
 	if err != nil {
 		syscall.Munmap(mm)
 		return nil, err
@@ -285,9 +289,9 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	lists := li[topicHdr+4+nTopic*(32+8):]
 
 	var (
-		table    []byte
-		count    int
-		stride   int
+		table  []byte
+		count  int
+		stride int
 	)
 	switch len(key) {
 	case 20:

@@ -1,0 +1,247 @@
+package state
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"os"
+	"testing"
+)
+
+// synthEpoch builds a deterministic synthetic epoch: 100 blocks from start,
+// containers/headers with repetitive structure (so the dict has something
+// to learn), state rows incl. exact-boundary and delete cases, txs, logs.
+func synthEpoch(t *testing.T, dir string, start uint64) (*EpochInput, string) {
+	t.Helper()
+	rng := rand.New(rand.NewSource(int64(start) + 7))
+	const nBlocks = 100
+	in := &EpochInput{Start: start, TxHashes: map[uint64][][32]byte{}}
+	for i := 0; i < nBlocks; i++ {
+		blk := start + uint64(i)
+		body := make([]byte, 300+rng.Intn(200))
+		copy(body, []byte(fmt.Sprintf("container-%d-", blk)))
+		for j := 20; j < len(body); j++ {
+			body[j] = byte(j % 37) // repetitive: compressible
+		}
+		in.Containers = append(in.Containers, body)
+		hdr := make([]byte, 120)
+		copy(hdr, []byte(fmt.Sprintf("header-%d-", blk)))
+		in.Headers = append(in.Headers, hdr)
+
+		nTx := rng.Intn(4)
+		for j := 0; j < nTx; j++ {
+			var h [32]byte
+			rng.Read(h[:])
+			in.TxHashes[blk] = append(in.TxHashes[blk], h)
+			in.TxCount++
+		}
+	}
+	// duplicate tx fingerprint across two blocks
+	var dup [32]byte
+	copy(dup[:], []byte("duplicated-fingerprint-hash!!"))
+	in.TxHashes[start+10] = append(in.TxHashes[start+10], dup)
+	in.TxHashes[start+90] = append(in.TxHashes[start+90], dup)
+	in.TxCount += 2
+
+	key := synthKey
+	// state rows: k1 written at start+5 and start+50; k2 deleted at start+60;
+	// same (key,block) double write (seq dedupe, last wins)
+	k1, k2 := key('s', 1), key('a', 2)
+	in.StateRows = []StateRow{
+		{Key: k1, Block: start + 5, Value: []byte{0x11}, Seq: 0},
+		{Key: k1, Block: start + 5, Value: []byte{0x12}, Seq: 1}, // last wins
+		{Key: k1, Block: start + 50, Value: []byte{0x22}},
+		{Key: k2, Block: start + 20, Value: []byte{0xaa, 0xbb}},
+		{Key: k2, Block: start + 60, Value: nil}, // account delete
+	}
+	// filler rows to force multiple SST blocks
+	for i := 0; i < 5000; i++ {
+		v := make([]byte, 40)
+		rng.Read(v)
+		in.StateRows = append(in.StateRows, StateRow{
+			Key: key('s', 100+i), Block: start + uint64(rng.Intn(nBlocks)), Value: v,
+		})
+	}
+	in.Logs = []LogRec{
+		{Block: start + 7, Addrs: [][20]byte{addr20(1)}, Topics: [][32]byte{topic32(9)}},
+		{Block: start + 77, Addrs: [][20]byte{addr20(1), addr20(2)}, Topics: [][32]byte{topic32(9)}},
+	}
+
+	path, err := BuildEpoch(dir, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return in, path
+}
+
+func addr20(seed byte) (a [20]byte)  { a[0], a[19] = seed, seed; return }
+func topic32(seed byte) (h [32]byte) { h[0], h[31] = seed, seed; return }
+
+func synthKey(kind byte, seed int) (k [sortedKeySize]byte) {
+	k[0] = kind
+	copy(k[1:], []byte(fmt.Sprintf("key-%c-%08d-padpadpadpadpadpadpadpadpadpadpadpad", kind, seed)))
+	return
+}
+
+func TestEpochRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	in, path := synthEpoch(t, dir, 1000)
+	e, err := OpenEpoch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.Start != 1000 || e.Count != 100 || e.TxCount != in.TxCount {
+		t.Fatalf("footer: %+v", e)
+	}
+
+	// bodies + headers, every block incl. frame boundaries (15,16,17, last)
+	for i := range in.Containers {
+		n := in.Start + uint64(i)
+		got, err := e.Container(n)
+		if err != nil || !bytes.Equal(got, in.Containers[i]) {
+			t.Fatalf("container %d mismatch (err=%v)", n, err)
+		}
+		gh, err := e.HeaderRLP(n)
+		if err != nil || !bytes.Equal(gh, in.Headers[i]) {
+			t.Fatalf("header %d mismatch (err=%v)", n, err)
+		}
+	}
+	if _, err := e.Container(in.Start - 1); err == nil {
+		t.Fatal("container below epoch must error")
+	}
+	if _, err := e.Container(e.End() + 1); err == nil {
+		t.Fatal("container above epoch must error")
+	}
+
+	// state: exact boundary, in-between, delete row, bloom
+	// (BuildEpoch sorts StateRows in place: use the generator keys)
+	k1 := synthKey('s', 1)
+	if _, _, found, _ := e.StateSearch(k1[:], 1004); found {
+		t.Fatal("write must be invisible below its block")
+	}
+	if v, blk, found, _ := e.StateSearch(k1[:], 1005); !found || blk != 1005 || !bytes.Equal(v, []byte{0x12}) {
+		t.Fatalf("at 1005: v=%x blk=%d found=%v (seq dedupe: last write wins)", v, blk, found)
+	}
+	if v, _, found, _ := e.StateSearch(k1[:], 1049); !found || !bytes.Equal(v, []byte{0x12}) {
+		t.Fatalf("at 1049: %x %v", v, found)
+	}
+	if v, blk, found, _ := e.StateSearch(k1[:], 1099); !found || blk != 1050 || !bytes.Equal(v, []byte{0x22}) {
+		t.Fatalf("at 1099: v=%x blk=%d", v, blk)
+	}
+	k2 := synthKey('a', 2)
+	if v, blk, found, _ := e.StateSearch(k2[:], 1099); !found || blk != 1060 || v != nil {
+		t.Fatalf("delete row: v=%x blk=%d found=%v", v, blk, found)
+	}
+	if !e.MayContainKey(k1[:]) || !e.MayContainKey(k2[:]) {
+		t.Fatal("bloom must contain written keys")
+	}
+	miss := 0
+	for i := 0; i < 2000; i++ {
+		k := [sortedKeySize]byte{}
+		binary.BigEndian.PutUint64(k[1:], uint64(1e12)+uint64(i))
+		if !e.MayContainKey(k[:]) {
+			miss++
+		}
+	}
+	if miss < 1900 { // ~10 bits/key => <1% FP
+		t.Fatalf("bloom too dense: only %d/2000 misses", miss)
+	}
+	dels := 0
+	e.AccountDeletes(func(key []byte, blk uint64) {
+		if !bytes.Equal(key, k2[:]) || blk != 1060 {
+			t.Fatalf("unexpected delete row %x@%d", key, blk)
+		}
+		dels++
+	})
+	if dels != 1 {
+		t.Fatalf("deletes: %d", dels)
+	}
+
+	// txidx: every hash resolves to its block; duplicate fp yields both
+	for blk, hashes := range in.TxHashes {
+		for _, h := range hashes {
+			fp := binary.BigEndian.Uint64(h[:8]) >> 16
+			cands := e.TxCandidates(fp)
+			ok := false
+			for _, c := range cands {
+				ok = ok || c == blk
+			}
+			if !ok {
+				t.Fatalf("tx %x: candidates %v missing block %d", h[:6], cands, blk)
+			}
+		}
+	}
+	var dup [32]byte
+	copy(dup[:], []byte("duplicated-fingerprint-hash!!"))
+	dupC := e.TxCandidates(binary.BigEndian.Uint64(dup[:8]) >> 16)
+	if len(dupC) != 2 {
+		t.Fatalf("duplicate fp: %v", dupC)
+	}
+
+	// logidx
+	b1, err := e.LogAddrBlocks(addr20(1))
+	if err != nil || len(b1) != 2 || b1[0] != 1007 || b1[1] != 1077 {
+		t.Fatalf("addr1 blocks: %v %v", b1, err)
+	}
+	b2, _ := e.LogAddrBlocks(addr20(2))
+	if len(b2) != 1 || b2[0] != 1077 {
+		t.Fatalf("addr2 blocks: %v", b2)
+	}
+	bt, _ := e.LogTopicBlocks(topic32(9))
+	if len(bt) != 2 {
+		t.Fatalf("topic blocks: %v", bt)
+	}
+	if bn, _ := e.LogAddrBlocks(addr20(99)); bn != nil {
+		t.Fatalf("absent addr: %v", bn)
+	}
+}
+
+func TestEpochSetContiguity(t *testing.T) {
+	dir := t.TempDir()
+	synthEpoch(t, dir, 0)
+	synthEpoch(t, dir, 100)
+	s, err := OpenEpochSet(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end, ok := s.SealedEnd(); !ok || end != 199 {
+		t.Fatalf("sealed end: %d %v", end, ok)
+	}
+	if ep, ok := s.At(150); !ok || ep.Start != 100 {
+		t.Fatalf("At(150): %+v %v", ep, ok)
+	}
+	if _, ok := s.At(200); ok {
+		t.Fatal("At(200) must miss")
+	}
+	s.Close()
+
+	// A gap must refuse to open.
+	dir2 := t.TempDir()
+	synthEpoch(t, dir2, 0)
+	synthEpoch(t, dir2, 300)
+	if _, err := OpenEpochSet(dir2); err == nil {
+		t.Fatal("gapped epoch set must error")
+	}
+}
+
+func TestEpochDeterminism(t *testing.T) {
+	d1, d2 := t.TempDir(), t.TempDir()
+	_, p1 := synthEpoch(t, d1, 500)
+	_, p2 := synthEpoch(t, d2, 500)
+	b1, _ := readFileT(t, p1)
+	b2, _ := readFileT(t, p2)
+	if !bytes.Equal(b1, b2) {
+		t.Fatal("same input must produce bit-identical epoch files")
+	}
+}
+
+func readFileT(t *testing.T, p string) ([]byte, error) {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b, nil
+}

@@ -4,15 +4,48 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math/bits"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/klauspost/compress/dict"
 	"github.com/klauspost/compress/zstd"
 )
+
+// trainDictCLI trains a zstd dictionary with the system zstd CLI (pinned:
+// v1.5.7; rebuilds on another version are not guaranteed bit-identical,
+// decompression always is). Returns nil when training is impossible
+// (missing binary or a corpus too small to train on): the epoch is then
+// written dict-less, which stays valid and deterministic.
+func trainDictCLI(samples [][]byte, dictID uint32) []byte {
+	tmp, err := os.MkdirTemp("", "epochdict")
+	if err != nil {
+		return nil
+	}
+	defer os.RemoveAll(tmp)
+	args := []string{"--train", "-q", "-o", filepath.Join(tmp, "dict.bin"),
+		fmt.Sprintf("--maxdict=%d", dictTargetSize),
+		fmt.Sprintf("--dictID=%d", dictID)}
+	for i, s := range samples {
+		p := filepath.Join(tmp, fmt.Sprintf("s%06d", i))
+		if err := os.WriteFile(p, s, 0o644); err != nil {
+			return nil
+		}
+		args = append(args, p)
+	}
+	if out, err := exec.Command("zstd", args...).CombinedOutput(); err != nil {
+		log.Printf("epoch: dict training skipped (%v: %s), sealing dict-less", err, bytes.TrimSpace(out))
+		return nil
+	}
+	d, err := os.ReadFile(filepath.Join(tmp, "dict.bin"))
+	if err != nil {
+		return nil
+	}
+	return d
+}
 
 // Sealed epoch file: epoch_<startblock>_<blockcount>.epoch. Immutable,
 // self-described, bit-identical when rebuilt from the same chain content.
@@ -44,10 +77,10 @@ const (
 	// (mainnet target per DESIGN.md is 10M).
 	EpochTxs = 50_000
 
-	framedGroup    = 16        // containers/headers per zstd frame (07-17: 2.24x, 34us access)
-	dictTargetSize = 512 << 10 // 07-17 experiment optimum
-	dictMaxSamples = 4096      // training sample cap, keeps seal-time bounded
-	sstBlockTarget = 64 << 10  // raw bytes per compressed SST block
+	framedGroup     = 16        // containers/headers per zstd frame (07-17: 2.24x, 34us access)
+	dictTargetSize  = 512 << 10 // 07-17 experiment optimum
+	dictMaxSamples  = 4096      // training sample cap, keeps seal-time bounded
+	sstBlockTarget  = 64 << 10  // raw bytes per compressed SST block
 	bloomBitsPerKey = 10
 	bloomHashes     = 7
 
@@ -126,7 +159,10 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 		return "", fmt.Errorf("epoch build: %d containers, %d headers", len(in.Containers), len(in.Headers))
 	}
 
-	// Deterministic dictionary: sample containers evenly, fixed dict ID.
+	// Deterministic dictionary: sample containers evenly, fixed dict ID,
+	// zstd CLI trainer (pinned v1.5.7). klauspost's dict.BuildZstdDict is
+	// internally map-iteration nondeterministic (verified 2026-07-18) and
+	// would break bit-identical epoch files.
 	samples := in.Containers
 	if len(samples) > dictMaxSamples {
 		step := len(samples) / dictMaxSamples
@@ -136,19 +172,13 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 		}
 		samples = sub
 	}
-	epochDict, err := dict.BuildZstdDict(samples, dict.Options{
-		MaxDictSize: dictTargetSize,
-		HashBytes:   6,
-		ZstdDictID:  uint32(in.Start%0xfffffffe) + 1, // deterministic, nonzero
-		ZstdLevel:   zstd.SpeedBestCompression,
-	})
-	if err != nil {
-		return "", fmt.Errorf("train dict: %w", err)
-	}
+	epochDict := trainDictCLI(samples, uint32(in.Start%0xfffffffe)+1)
 
-	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
-		zstd.WithEncoderDict(epochDict))
+	encOpts := []zstd.EOption{zstd.WithEncoderLevel(zstd.SpeedBestCompression)}
+	if len(epochDict) > 0 {
+		encOpts = append(encOpts, zstd.WithEncoderDict(epochDict))
+	}
+	enc, err := zstd.NewWriter(nil, encOpts...)
 	if err != nil {
 		return "", err
 	}
@@ -228,8 +258,8 @@ func buildFramed(enc *zstd.Encoder, blobs [][]byte) (data, index []byte) {
 }
 
 const (
-	sstIdxEntrySize  = sortedKeySize + 8 + 8 // key, first block, section offset
-	deleteEntrySize  = sortedKeySize + 8
+	sstIdxEntrySize = sortedKeySize + 8 + 8 // key, first block, section offset
+	deleteEntrySize = sortedKeySize + 8
 )
 
 // buildSST sorts and dedupes the epoch's post-image rows, packs them into
@@ -248,10 +278,10 @@ func buildSST(enc *zstd.Encoder, rows []StateRow) (sst, sstIdx, deletes []byte, 
 	})
 
 	var (
-		raw       []byte
-		firstKey  []byte
-		firstBlk  uint64
-		lastKey   []byte
+		raw      []byte
+		firstKey []byte
+		firstBlk uint64
+		lastKey  []byte
 	)
 	flush := func() {
 		if len(raw) == 0 {
