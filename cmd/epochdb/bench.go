@@ -414,6 +414,9 @@ func benchLogsMain(args []string) {
 	head, _ := hexutil.DecodeUint64(headHex)
 	log.Printf("ab-bench-logs: head=%d seed=%d local=%s remote=%s", head, *seed, *local, *remote)
 
+	rawLogBuckets, _ := filepath.Glob(filepath.Join(*dataDir, "logs_*"))
+	hasRawLogs := len(rawLogBuckets) > 0
+
 	// seed logs from log-bearing blocks
 	type seedLog struct {
 		addr   string
@@ -423,7 +426,10 @@ func benchLogsMain(args []string) {
 	var seeds []seedLog
 	for tries := 0; tries < 3000 && len(seeds) < 50; tries++ {
 		b := 1 + uint64(rng.Int63n(int64(head)))
-		if _, ok, _ := store.LogsRecord(b); !ok {
+		// LogsRecord only sees raw staging sidecars; on an epoch-only dir
+		// it is always empty, so treat it as advisory and let the local
+		// eth_getLogs answer (served from sealed epochs) decide.
+		if _, ok, _ := store.LogsRecord(b); !ok && hasRawLogs {
 			continue
 		}
 		q := map[string]string{"fromBlock": hexutil.EncodeUint64(b), "toBlock": hexutil.EncodeUint64(b)}
