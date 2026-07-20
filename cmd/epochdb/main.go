@@ -189,32 +189,29 @@ func sealMain(args []string) {
 	dataDir := fs.String("data", "./data", "shared data directory")
 	deleteRaw := fs.Bool("delete-raw", false, "remove fully sealed raw buckets afterwards (NEVER next to a running fetch/exec)")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
-	storeLogs := fs.Bool("store-logs", true, "seal the stored-logs sections (v2); also upgrades existing epochs lacking them (idempotent re-seal in place)")
 	workers := fs.Int("workers", 12, "re-execution workers for the stored-logs derivation")
 	fs.Parse(args)
 	fetch.RegisterExtras()
 
-	var derive state.DeriveStored
-	if *storeLogs {
-		g, err := exec.NetworkGenesis(execNetID(*network))
-		if err != nil {
-			log.Fatalf("epochdb: seal: genesis: %v", err)
-		}
-		store, err := state.OpenReadOnly(*dataDir)
-		if err != nil {
-			log.Fatalf("epochdb: seal: %v", err)
-		}
-		defer store.Close()
-		hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
-		if err != nil {
-			log.Fatalf("epochdb: seal: %v", err)
-		}
-		defer hist.Close()
-		derive = rpc.NewDeriveStored(hist, rpc.HistoryChainContext(hist), g.Config, exec.ParseEthBlock, *workers)
-		// Upgrade pass first: old epochs get the sections in place.
-		if err := state.ReSealStoredLogs(*dataDir, derive); err != nil {
-			log.Fatalf("epochdb: reseal: %v", err)
-		}
+	// Stored logs are unconditional (user ruling 2026-07-20): every seal
+	// derives the sections, and v1 epochs are upgraded in place first.
+	g, err := exec.NetworkGenesis(execNetID(*network))
+	if err != nil {
+		log.Fatalf("epochdb: seal: genesis: %v", err)
+	}
+	store, err := state.OpenReadOnly(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: seal: %v", err)
+	}
+	defer store.Close()
+	hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
+	if err != nil {
+		log.Fatalf("epochdb: seal: %v", err)
+	}
+	defer hist.Close()
+	derive := rpc.NewDeriveStored(hist, rpc.HistoryChainContext(hist), g.Config, exec.ParseEthBlock, *workers)
+	if err := state.ReSealStoredLogs(*dataDir, derive); err != nil {
+		log.Fatalf("epochdb: reseal: %v", err)
 	}
 	if err := state.SealEpochs(*dataDir, *deleteRaw, derive); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
@@ -308,7 +305,6 @@ func serveMain(args []string) {
 	dataDir := fs.String("data", "./data", "shared data directory")
 	port := fs.Int("port", 9650, "HTTP listen port")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
-	storeLogs := fs.Bool("store-logs", true, "REQUIRE the stored-logs sections in every sealed epoch (crash at boot otherwise; no silent re-execution fallback)")
 	fetchEpochs := fs.Bool("fetch-epochs", false, "at startup, torrent-leech manifest epochs missing from --data")
 	manifestPath := fs.String("manifest", "", "epoch manifest path (default <data>/epochs.manifest)")
 	epochTimeout := fs.Duration("epoch-timeout", 5*time.Minute, "per-epoch give-up when leeching")
@@ -353,13 +349,11 @@ func serveMain(args []string) {
 	}
 	defer hist.Close()
 
-	// --store-logs boot invariant (user directive): the flag is valid
-	// forever; if set, every sealed epoch must carry the sections.
-	if *storeLogs {
-		for _, e := range hist.Epochs().Epochs {
-			if !e.HasStoredLogs() {
-				log.Fatalf("epochdb: --store-logs is set but epoch %d..%d lacks the stored-logs sections; run `epochdb seal --store-logs` to upgrade it in place, or start with --store-logs=false", e.Start, e.End())
-			}
+	// Stored logs are unconditional (user ruling 2026-07-20): a sealed
+	// epoch without the sections is an unsupported format.
+	for _, e := range hist.Epochs().Epochs {
+		if !e.HasStoredLogs() {
+			log.Fatalf("epochdb: epoch %s is unsupported format v1 (no stored-logs sections); upgrade it in place: epochdb seal --data %s --network %s", state.EpochFileName(e.Start, e.Count), *dataDir, *network)
 		}
 	}
 

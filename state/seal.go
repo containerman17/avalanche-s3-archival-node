@@ -19,7 +19,8 @@ import (
 // fetch/exec (they own those files).
 // DeriveStored fills EpochInput's stored-logs sections (FullLogs/RcptRecs,
 // plus the posting-list tuples when nil) by re-execution. Implemented in
-// rpc (state cannot import the EVM); nil = seal without the sections.
+// rpc (state cannot import the EVM). Stored logs are unconditional: only
+// unit tests pass nil (seal without the sections).
 type DeriveStored func(in *EpochInput) error
 
 func SealEpochs(dir string, deleteRaw bool, derive DeriveStored) error {

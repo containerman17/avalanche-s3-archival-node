@@ -163,10 +163,11 @@ type EpochInput struct {
 	Logs       []LogRec
 	TxCount    uint64
 
-	// Stored-logs sections (v2, --store-logs): per-block encoded records
+	// Stored-logs sections (v2, unconditional): per-block encoded records
 	// derived by re-execution (rpc.EncodeStoredLogs/EncodeStoredReceipts).
-	// nil maps = seal without the sections. A non-nil empty map is valid
-	// (epoch genuinely has no logs) and still marks the sections present.
+	// nil maps = seal without the sections (unit tests only; production
+	// sealing always derives them). A non-nil empty map is valid (epoch
+	// genuinely has no logs) and still marks the sections present.
 	FullLogs map[uint64][]byte // log-bearing block -> logs record
 	RcptRecs map[uint64][]byte // tx-bearing block -> receipt-fields record
 }
@@ -371,7 +372,7 @@ func (e *Epoch) appendStoredSections(dir string, in *EpochInput) (string, error)
 //
 // Members sorted by relBlock; the index header is always written, so a
 // present-but-empty section (epoch without logs) stays distinguishable
-// from a v2 epoch sealed without --store-logs.
+// from a v2 epoch sealed without the sections (unit tests only).
 func buildStoredFrames(enc *zstd.Encoder, start uint64, recs map[uint64][]byte) (data, index []byte) {
 	blocks := make([]uint64, 0, len(recs))
 	for b := range recs {

@@ -22,10 +22,10 @@ type logsFilter struct {
 	BlockHash *common.Hash      `json:"blockHash"`
 }
 
-// getLogs: posting-list candidates (sealed epochs) / raw record scan
-// (unsealed tail) -> re-execute candidate blocks -> exact positional
-// filter. The posting lists are position-agnostic by design, so they only
-// ever produce a candidate superset; re-execution provides ground truth.
+// getLogs: posting-list candidates (sealed epochs) -> stored-logs sections
+// -> exact positional filter. The posting lists are position-agnostic by
+// design, so they only ever produce a candidate superset; the stored
+// sections provide ground truth. Never re-executes.
 func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 	if len(params) < 1 {
 		return nil, errInvalid("need [filter]")
@@ -106,6 +106,22 @@ func (s *Server) runGetLogs(from, to uint64, addrs []common.Address, topics [][]
 
 	out := []*types.Log{}
 	for _, n := range candidates {
+		e, inEpoch := s.hist.Epochs().At(n)
+		if !inEpoch {
+			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("block %d is not sealed into an epoch yet; stored logs are the only source", n)}
+		}
+		rec, hasLogs, err := e.StoredLogsRecord(n)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		if !hasLogs {
+			continue
+		}
+		stored, err := DecodeStoredLogs(rec)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		// txHash/blockHash are derived from the block body at read time.
 		raw, ok, err := s.blocks.GetByHeight(n)
 		if err != nil || !ok {
 			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("container %d: ok=%v err=%v", n, ok, err)}
@@ -114,50 +130,21 @@ func (s *Server) runGetLogs(from, to uint64, addrs []common.Address, topics [][]
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
-		if len(blk.Transactions()) == 0 {
-			continue
-		}
-		// Stored-logs epochs answer without the EVM.
-		if e, ok := s.hist.Epochs().At(n); ok && e.HasStoredLogs() {
-			rec, hasLogs, err := e.StoredLogsRecord(n)
-			if err != nil {
-				return nil, &rpcError{Code: -32000, Message: err.Error()}
+		blockHash := blk.Hash()
+		txs := blk.Transactions()
+		for pos, sl := range stored {
+			l := &types.Log{
+				Address:     sl.Address,
+				Topics:      sl.Topics,
+				Data:        sl.Data,
+				BlockNumber: n,
+				TxHash:      txs[sl.TxIndex].Hash(),
+				TxIndex:     sl.TxIndex,
+				BlockHash:   blockHash,
+				Index:       uint(pos),
 			}
-			if !hasLogs {
-				continue
-			}
-			stored, err := DecodeStoredLogs(rec)
-			if err != nil {
-				return nil, &rpcError{Code: -32000, Message: err.Error()}
-			}
-			blockHash := blk.Hash()
-			txs := blk.Transactions()
-			for pos, sl := range stored {
-				l := &types.Log{
-					Address:     sl.Address,
-					Topics:      sl.Topics,
-					Data:        sl.Data,
-					BlockNumber: n,
-					TxHash:      txs[sl.TxIndex].Hash(),
-					TxIndex:     sl.TxIndex,
-					BlockHash:   blockHash,
-					Index:       uint(pos),
-				}
-				if logMatches(l, addrs, topics) {
-					out = append(out, l)
-				}
-			}
-			continue
-		}
-		receipts, err := s.executeForReceipts(blk)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}
-		}
-		for _, r := range receipts {
-			for _, l := range r.Logs {
-				if logMatches(l, addrs, topics) {
-					out = append(out, l)
-				}
+			if logMatches(l, addrs, topics) {
+				out = append(out, l)
 			}
 		}
 	}

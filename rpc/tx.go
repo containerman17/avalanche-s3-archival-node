@@ -108,55 +108,52 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 	}
 	header := blk.Header()
 	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
-
-	// Stored-logs epochs answer without the EVM.
-	if e, ok := s.hist.Epochs().At(n); ok && e.HasStoredLogs() {
-		receipt, rerr := s.storedReceipt(e, blk, i)
-		if rerr != nil {
-			return nil, rerr
-		}
-		return marshalReceipt(receipt, blk.Hash(), n, signer, blk.Transactions()[i], i), nil
-	}
-
-	if n > s.hist.Head() {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("receipt needs state: block %d beyond replayed head %d", n, s.hist.Head())}
-	}
-	receipts, err := s.executeForReceipts(blk)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}
+	receipts, rerr := s.storedBlockReceipts(blk)
+	if rerr != nil {
+		return nil, rerr
 	}
 	return marshalReceipt(receipts[i], blk.Hash(), n, signer, blk.Transactions()[i], i), nil
 }
 
-// storedReceipt reconstructs tx i's receipt from the epoch's stored
-// sections: gasUsed/status/cumulative from the receipt-fields record, logs
-// from the stored-logs record, everything else derived from the tx itself.
-func (s *Server) storedReceipt(e *state.Epoch, blk *types.Block, i int) (*types.Receipt, *rpcError) {
+// storedBlockReceipts reconstructs every receipt of blk from its epoch's
+// stored sections (the ONLY receipt source, no re-execution): gasUsed /
+// status / cumulative from the receipt-fields record, logs from the
+// stored-logs record, everything else derived from the txs themselves.
+// Blocks outside a sealed epoch (the raw tail) are a clean error.
+func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcError) {
 	n := blk.NumberU64()
-	tx := blk.Transactions()[i]
+	e, ok := s.hist.Epochs().At(n)
+	if !ok {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("block %d is not sealed into an epoch yet; stored receipts are the only source", n)}
+	}
+	txs := blk.Transactions()
 	rcptRec, ok, err := e.StoredRcptRecord(n)
 	if err != nil || !ok {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts for block %d: ok=%v err=%v", n, ok, err)}
 	}
 	entries, err := DecodeStoredReceipts(rcptRec)
-	if err != nil || i >= len(entries) {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts decode for block %d: %v", n, err)}
+	if err != nil || len(entries) != len(txs) {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts decode for block %d: %d entries for %d txs: %v", n, len(entries), len(txs), err)}
 	}
-	en := entries[i]
-	r := &types.Receipt{
-		Type:              tx.Type(),
-		Status:            en.Status,
-		CumulativeGasUsed: en.CumulativeGas,
-		GasUsed:           en.GasUsed,
-		TxHash:            tx.Hash(),
-		EffectiveGasPrice: effectiveGasPrice(tx, blk.BaseFee()),
-		Logs:              []*types.Log{},
-	}
-	if tx.To() == nil {
-		header := blk.Header()
-		signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
-		from, _ := types.Sender(signer, tx)
-		r.ContractAddress = crypto.CreateAddress(from, tx.Nonce())
+	header := blk.Header()
+	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
+	blockHash := blk.Hash()
+	receipts := make(types.Receipts, len(txs))
+	for i, tx := range txs {
+		r := &types.Receipt{
+			Type:              tx.Type(),
+			Status:            entries[i].Status,
+			CumulativeGasUsed: entries[i].CumulativeGas,
+			GasUsed:           entries[i].GasUsed,
+			TxHash:            tx.Hash(),
+			EffectiveGasPrice: effectiveGasPrice(tx, blk.BaseFee()),
+			Logs:              []*types.Log{},
+		}
+		if tx.To() == nil {
+			from, _ := types.Sender(signer, tx)
+			r.ContractAddress = crypto.CreateAddress(from, tx.Nonce())
+		}
+		receipts[i] = r
 	}
 	if logsRec, hasLogs, err := e.StoredLogsRecord(n); err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
@@ -165,29 +162,24 @@ func (s *Server) storedReceipt(e *state.Epoch, blk *types.Block, i int) (*types.
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
-		blockHash := blk.Hash()
 		for pos, sl := range stored {
-			if sl.TxIndex != uint(i) {
-				continue
-			}
+			r := receipts[sl.TxIndex]
 			r.Logs = append(r.Logs, &types.Log{
 				Address:     sl.Address,
 				Topics:      sl.Topics,
 				Data:        sl.Data,
 				BlockNumber: n,
 				TxHash:      r.TxHash,
-				TxIndex:     uint(i),
+				TxIndex:     sl.TxIndex,
 				BlockHash:   blockHash,
 				Index:       uint(pos),
 			})
 		}
 	}
-	r.Bloom = types.CreateBloom(types.Receipts{r})
-	return r, nil
-}
-
-func (s *Server) executeForReceipts(blk *types.Block) (types.Receipts, error) {
-	return ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk)
+	for _, r := range receipts {
+		r.Bloom = types.CreateBloom(types.Receipts{r})
+	}
+	return receipts, nil
 }
 
 // ReExecuteBlock replays every regular tx of blk against the overlay state

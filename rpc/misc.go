@@ -263,7 +263,11 @@ func (s *Server) rewardRow(n uint64, header *types.Header, percentiles []float64
 		}
 		return row, nil
 	}
-	receipts, err := s.executeForReceipts(blk)
+	// ponytail: gas weights come from one re-execution; feeHistory must
+	// cover the unsealed raw tail (incl. "latest"), which has no stored
+	// receipt-fields yet. Switch to the stored sections when the unified
+	// follower stores them for the tail too.
+	receipts, err := ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}
 	}

@@ -221,7 +221,9 @@ func (s *Server) debugGetRawReceipts(params []json.RawMessage) (any, *rpcError) 
 	if blk.NumberU64() == 0 || len(blk.Transactions()) == 0 {
 		return []hexutil.Bytes{}, nil
 	}
-	receipts, err := s.executeForReceipts(blk)
+	// debug namespace: raw consensus receipts come from re-execution
+	// (allowed alongside traces; the eth receipt/log methods never do).
+	receipts, err := ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}

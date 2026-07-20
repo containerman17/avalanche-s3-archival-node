@@ -25,7 +25,7 @@ N/A = unsupported by design with the reason.
 | eth_getBlockByNumber / ByHash | DONE | |
 | eth_getHeaderByNumber / ByHash | DONE | header JSON; public API does not expose these (-32601), so shape-verified against our getBlockByNumber |
 | eth_getBlockTransactionCountByNumber / ByHash | DONE | |
-| eth_getBlockReceipts | DONE | re-execution |
+| eth_getBlockReceipts | DONE | stored epoch sections, no re-execution |
 | eth_getTransactionByHash | DONE | |
 | eth_getTransactionReceipt | DONE | |
 | eth_getTransactionByBlockNumberAndIndex / BlockHashAndIndex | DONE | |

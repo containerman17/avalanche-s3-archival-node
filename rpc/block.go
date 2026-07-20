@@ -206,9 +206,9 @@ func (s *Server) blockParam(params []json.RawMessage, byHash bool) (*types.Block
 	return blk, true, nil
 }
 
-// getBlockReceipts re-executes the block once and returns every receipt
-// (coreth's public API does not expose this method; shape matches geth's,
-// entries match coreth's per-tx eth_getTransactionReceipt).
+// getBlockReceipts returns every receipt of the block from the stored
+// epoch sections (coreth's public API does not expose this method; shape
+// matches geth's, entries match coreth's per-tx eth_getTransactionReceipt).
 func (s *Server) getBlockReceipts(params []json.RawMessage) (any, *rpcError) {
 	blk, ok, rerr := s.blockParam(params, false)
 	if rerr != nil || !ok {
@@ -218,9 +218,12 @@ func (s *Server) getBlockReceipts(params []json.RawMessage) (any, *rpcError) {
 	if n == 0 || len(blk.Transactions()) == 0 {
 		return []any{}, nil
 	}
-	receipts, err := s.executeForReceipts(blk)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}
+	if err := s.hist.Epochs().RequireCovered(n); err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	receipts, rerr := s.storedBlockReceipts(blk)
+	if rerr != nil {
+		return nil, rerr
 	}
 	header := blk.Header()
 	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
