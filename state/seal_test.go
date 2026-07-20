@@ -67,7 +67,7 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// 3 txs/block, boundary 10 => blocks 1-4 (12 txs), 5-8 (12 txs); 9,10
 	// beyond the exec head.
-	if err := sealEpochs(dir, false, 10, nil); err != nil {
+	if err := sealEpochs(dir, dir, false, 10, nil); err != nil {
 		t.Fatal(err)
 	}
 	set, err := OpenEpochSet(dir)
@@ -110,7 +110,7 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// resume: nothing new to seal
 	before, _ := os.ReadDir(dir)
-	if err := sealEpochs(dir, false, 10, nil); err != nil {
+	if err := sealEpochs(dir, dir, false, 10, nil); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadDir(dir)

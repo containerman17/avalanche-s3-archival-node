@@ -163,7 +163,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
-	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--delete-raw]")
+	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--epoch-txs <n>] [--delete-raw]")
 	fmt.Fprintln(os.Stderr, "       epochdb manifest [--data <dir>] [--out <file>]")
 	fmt.Fprintln(os.Stderr, "       epochdb seed [--data <dir>] [--manifest <file>] [--listen-port 42069]")
 	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--manifest <file>] [--rounds 20]")
@@ -190,7 +190,14 @@ func sealMain(args []string) {
 	deleteRaw := fs.Bool("delete-raw", false, "remove fully sealed raw buckets afterwards (NEVER next to a running fetch/exec)")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	workers := fs.Int("workers", 12, "re-execution workers for the stored-logs derivation")
+	outDir := fs.String("out", "", "directory for the sealed epoch files (default --data; a separate dir cuts an alternate epoch size from the same raws)")
+	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "epoch boundary tx count override")
 	fs.Parse(args)
+	if *outDir == "" {
+		*outDir = *dataDir
+	} else if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		log.Fatalf("epochdb: seal: %v", err)
+	}
 	fetch.RegisterExtras()
 
 	// Stored logs are unconditional (user ruling 2026-07-20): every seal
@@ -210,10 +217,10 @@ func sealMain(args []string) {
 	}
 	defer hist.Close()
 	derive := rpc.NewDeriveStored(hist, rpc.HistoryChainContext(hist), g.Config, exec.ParseEthBlock, *workers)
-	if err := state.ReSealStoredLogs(*dataDir, derive); err != nil {
+	if err := state.ReSealStoredLogs(*outDir, derive); err != nil {
 		log.Fatalf("epochdb: reseal: %v", err)
 	}
-	if err := state.SealEpochs(*dataDir, *deleteRaw, derive); err != nil {
+	if err := state.SealEpochs(*dataDir, *outDir, *deleteRaw, *epochTxs, derive); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
 }

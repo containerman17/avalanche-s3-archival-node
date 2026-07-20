@@ -23,11 +23,14 @@ import (
 // unit tests pass nil (seal without the sections).
 type DeriveStored func(in *EpochInput) error
 
-func SealEpochs(dir string, deleteRaw bool, derive DeriveStored) error {
-	return sealEpochs(dir, deleteRaw, EpochTxs, derive)
+// outDir is where sealed epoch files land (usually dir itself; a separate
+// dir cuts an alternate epoch size from the same raw captures without
+// touching existing epochs).
+func SealEpochs(dir, outDir string, deleteRaw bool, epochTxs uint64, derive DeriveStored) error {
+	return sealEpochs(dir, outDir, deleteRaw, epochTxs, derive)
 }
 
-func sealEpochs(dir string, deleteRaw bool, epochTxs uint64, derive DeriveStored) error {
+func sealEpochs(dir, outDir string, deleteRaw bool, epochTxs uint64, derive DeriveStored) error {
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return err
@@ -43,7 +46,7 @@ func sealEpochs(dir string, deleteRaw bool, epochTxs uint64, derive DeriveStored
 	}
 	defer reader.Close()
 
-	set, err := OpenEpochSet(dir)
+	set, err := OpenEpochSet(outDir)
 	if err != nil {
 		return err
 	}
@@ -72,7 +75,7 @@ func sealEpochs(dir string, deleteRaw bool, epochTxs uint64, derive DeriveStored
 				return fmt.Errorf("seal epoch at %d: derive stored logs: %w", in.Start, err)
 			}
 		}
-		path, err := BuildEpoch(dir, in)
+		path, err := BuildEpoch(outDir, in)
 		if err != nil {
 			return fmt.Errorf("seal epoch at %d: %w", in.Start, err)
 		}
