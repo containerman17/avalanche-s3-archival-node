@@ -265,7 +265,13 @@ func benchTxMain(args []string) {
 			maxStaged = (bn + 1) * 100_000
 		}
 	}
-	log.Printf("ab-bench-tx: head=%d maxStaged~%d seed=%d local=%s", head, maxStaged, *seed, *local)
+	// Receipts are stored-only: probe them within the sealed range (the
+	// raw tail above it errors by design).
+	receiptCeil := head
+	if end, ok := epochs.SealedEnd(); ok && end < receiptCeil {
+		receiptCeil = end
+	}
+	log.Printf("ab-bench-tx: head=%d receiptCeil=%d maxStaged~%d seed=%d local=%s", head, receiptCeil, maxStaged, *seed, *local)
 
 	// Sample txs. withState => also probe the receipt.
 	type txProbe struct {
@@ -287,7 +293,7 @@ func benchTxMain(args []string) {
 		}
 		var h uint64
 		if withState {
-			h = 1 + uint64(rng.Int63n(int64(head)))
+			h = 1 + uint64(rng.Int63n(int64(receiptCeil)))
 		} else {
 			h = head + 1 + uint64(rng.Int63n(int64(maxStaged-head)))
 		}
@@ -412,7 +418,21 @@ func benchLogsMain(args []string) {
 	var headHex string
 	json.Unmarshal(res, &headHex)
 	head, _ := hexutil.DecodeUint64(headHex)
-	log.Printf("ab-bench-logs: head=%d seed=%d local=%s remote=%s", head, *seed, *local, *remote)
+	// Logs are stored-only: sample and query within the sealed range (the
+	// raw tail above it errors by design). Epoch files are self-described,
+	// so the filenames alone give the sealed end.
+	if names, _ := filepath.Glob(filepath.Join(*dataDir, "epoch_*.epoch")); len(names) > 0 {
+		var end uint64
+		for _, p := range names {
+			if start, count, ok := state.ParseEpochFileName(filepath.Base(p)); ok && start+count-1 > end {
+				end = start + count - 1
+			}
+		}
+		if end < head {
+			head = end
+		}
+	}
+	log.Printf("ab-bench-logs: head=%d (sealed) seed=%d local=%s remote=%s", head, *seed, *local, *remote)
 
 	rawLogBuckets, _ := filepath.Glob(filepath.Join(*dataDir, "logs_*"))
 	hasRawLogs := len(rawLogBuckets) > 0

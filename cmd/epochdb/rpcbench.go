@@ -63,6 +63,11 @@ func rpcBenchMain(args []string) {
 	defer fr.Close()
 	blocks := sealedBlocks{epochs: hist.Epochs(), reader: fr}
 	head := hist.Head()
+	// Logs/receipts are stored-only: bench within the sealed range (the
+	// raw tail above it errors by design).
+	if end, ok := hist.Epochs().SealedEnd(); ok && end < head {
+		head = end
+	}
 
 	var (
 		addrs       []common.Address
