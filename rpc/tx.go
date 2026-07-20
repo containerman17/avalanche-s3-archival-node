@@ -103,6 +103,9 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 		return nil, nil
 	}
 	n := blk.NumberU64()
+	if err := s.hist.Epochs().RequireCovered(n); err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
 	header := blk.Header()
 	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
 

@@ -268,6 +268,11 @@ func (b *sortedBucket) lookup(key []byte, n uint64) (val []byte, blk uint64, fou
 // overlap sealed epochs until --delete-raw runs; the data is identical, so
 // whichever side hits first wins.
 func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bool, err error) {
+	// State correctness requires full descent to genesis: refuse above a
+	// coverage hole instead of silently skipping missing history.
+	if err := h.epochs.RequireCovered(n); err != nil {
+		return nil, 0, false, err
+	}
 	for i := len(h.buckets) - 1; i >= 0; i-- {
 		b := h.buckets[i]
 		if b.bucket*BucketBlocks > n {

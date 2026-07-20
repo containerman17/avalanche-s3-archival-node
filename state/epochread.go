@@ -484,10 +484,17 @@ func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64,
 
 // ---------- epoch set ----------
 
-// EpochSet is every sealed epoch in a directory, ascending and contiguous
-// from block 0 upward (gaps are an error: sealing is strictly sequential).
+// EpochSet is every sealed epoch in a directory, ascending. Sealing is
+// strictly sequential, but a torrent-fetched set may have holes: coverage
+// is the contiguous prefix from genesis. Epochs above the first gap stay
+// open (their data is epoch-local and valid for body/tx-by-hash reads),
+// but full-descent reads (state, receipts, logs) must call RequireCovered.
 type EpochSet struct {
 	Epochs []*Epoch // ascending by Start
+
+	covered  uint64 // last block of the contiguous prefix from genesis
+	gapStart uint64 // expected Start of the first missing epoch (covered+1)
+	gapped   bool   // true when at least one epoch above the prefix exists
 }
 
 // OpenEpochSet opens every epoch_*.epoch in dir. An empty set is valid.
@@ -509,20 +516,43 @@ func OpenEpochSet(dir string) (*EpochSet, error) {
 		s.Epochs = append(s.Epochs, e)
 	}
 	sort.Slice(s.Epochs, func(i, j int) bool { return s.Epochs[i].Start < s.Epochs[j].Start })
+	// Coverage = contiguous prefix from genesis. Anything after the first
+	// gap (including a first epoch that does not start at 0/1) stays open
+	// for epoch-local reads but is outside coverage.
 	for i, e := range s.Epochs {
-		if i == 0 {
-			if e.Start > 1 { // block 0 is genesis (no container); sealing starts at 1
-				s.Close()
-				return nil, fmt.Errorf("first epoch starts at %d, want 0 or 1", e.Start)
-			}
+		want := uint64(0)
+		if i > 0 {
+			want = s.Epochs[i-1].End() + 1
+		}
+		if i == 0 && e.Start <= 1 { // block 0 is genesis (no container); sealing starts at 1
+			s.covered = e.End()
 			continue
 		}
-		if want := s.Epochs[i-1].End() + 1; e.Start != want {
-			s.Close()
-			return nil, fmt.Errorf("epoch gap: %d follows %d", e.Start, want)
+		if e.Start != want {
+			s.gapped, s.gapStart = true, want
+			break
 		}
+		s.covered = e.End()
+	}
+	if !s.gapped {
+		s.gapStart = s.covered + 1
 	}
 	return s, nil
+}
+
+// CoveredEnd returns the last block of the contiguous sealed prefix from
+// genesis (0 when nothing is covered).
+func (s *EpochSet) CoveredEnd() uint64 { return s.covered }
+
+// RequireCovered errors when block n is beyond the contiguous prefix while
+// later epochs exist (a hole): state, receipt, and log reads at n would
+// silently skip missing history. Bodies/tx-by-hash are epoch-local and may
+// still be served above the gap without this check.
+func (s *EpochSet) RequireCovered(n uint64) error {
+	if s.gapped && n > s.covered {
+		return fmt.Errorf("missing epoch epoch_%d: sealed coverage is contiguous only through block %d", s.gapStart, s.covered)
+	}
+	return nil
 }
 
 func (s *EpochSet) Close() {

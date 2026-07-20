@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -218,12 +219,31 @@ func TestEpochSetContiguity(t *testing.T) {
 	}
 	s.Close()
 
-	// A gap must refuse to open.
+	// A gap opens as a contiguous prefix: epoch-local reads above the gap
+	// stay available, full-descent reads must refuse via RequireCovered.
 	dir2 := t.TempDir()
 	synthEpoch(t, dir2, 0)
 	synthEpoch(t, dir2, 300)
-	if _, err := OpenEpochSet(dir2); err == nil {
-		t.Fatal("gapped epoch set must error")
+	s2, err := OpenEpochSet(dir2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got := s2.CoveredEnd(); got != 99 {
+		t.Fatalf("covered end: %d, want 99", got)
+	}
+	if err := s2.RequireCovered(99); err != nil {
+		t.Fatalf("RequireCovered(99): %v", err)
+	}
+	err = s2.RequireCovered(150)
+	if err == nil || !strings.Contains(err.Error(), "missing epoch epoch_100") {
+		t.Fatalf("RequireCovered(150): %v, want missing epoch epoch_100", err)
+	}
+	if _, ok := s2.At(350); !ok {
+		t.Fatal("epoch-local At(350) above the gap must still resolve")
+	}
+	if end, ok := s2.SealedEnd(); !ok || end != 399 {
+		t.Fatalf("sealed end: %d %v", end, ok)
 	}
 }
 
