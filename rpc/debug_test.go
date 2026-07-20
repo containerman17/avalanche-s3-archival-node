@@ -16,10 +16,15 @@ import (
 	"github.com/containerman17/epochdb/state"
 )
 
-// corpusDir points at the fixed mainnet 0-1M corpus; tracer-plumbing tests
-// skip when it is absent (they need real txs: a transfer, a logging call,
-// a creation).
-const corpusDir = "../data"
+// corpusDir points at the fixed mainnet corpus (EPOCHDB_CORPUS overrides);
+// tracer-plumbing tests skip when it is absent (they need real txs: a
+// transfer, a logging call, a creation).
+var corpusDir = func() string {
+	if d := os.Getenv("EPOCHDB_CORPUS"); d != "" {
+		return d
+	}
+	return "../data"
+}()
 
 type corpusEnv struct {
 	srv    *Server
