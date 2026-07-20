@@ -39,7 +39,7 @@ Flatstate (fast tip) and epochdb (compact history) merge into ONE codebase: one 
 
 Config surface:
 - --history: archive yes/no (epoch sealing + historical RPC vs tip-only).
-- --store-logs: minimal vs re-execution-free logs/receipts (epoch format v2 section).
+- stored logs + receipt fields: UNCONDITIONAL (user decision 2026-07-20: no flag, ~+18% is fine, 620 vs 800GB changes no machine class). getLogs/receipts NEVER re-execute; v1 epochs (no logs sections) are an unsupported format at open. Re-execution remains only for traces/createAccessList and verification.
 - --pin-state: latest-state acceleration contract: PINNED MAP (flatstate discipline) vs bounded cache (epochdb style).
 - Entry points: HTTP/WS RPC is the default door; the in-process Go API is a FIRST-CLASS second door (not EVM-only: in-process indexers get wire-free speed against the same store).
 
