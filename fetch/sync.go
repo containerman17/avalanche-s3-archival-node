@@ -151,7 +151,11 @@ func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(walks)
-	for i, a := range anchors {
+	// Launch lowest spans first: a forward consumer (exec) follows the
+	// contiguous-from-genesis prefix, so feeding the bottom of history
+	// first lets replay overlap the fetch instead of trailing it.
+	for i := len(anchors) - 1; i >= 0; i-- {
+		a := anchors[i]
 		var floor uint64
 		if i+1 < len(anchors) {
 			floor = anchors[i+1].Height
