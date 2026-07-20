@@ -82,7 +82,13 @@ func newCorpusServer(t *testing.T) (*httptest.Server, uint64, combinedBlocks) {
 	srv.EnableTxAPIs(state.CombinedTxIndex{Raw: rawIdx, Epochs: hist.Epochs()}, blocks, exec.ParseEthBlock)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
-	return ts, hist.Head(), blocks
+	// Receipts/logs are stored-only: sample within the sealed range (the
+	// raw tail above it errors by design).
+	head := hist.Head()
+	if end, ok := hist.Epochs().SealedEnd(); ok && end < head {
+		head = end
+	}
+	return ts, head, blocks
 }
 
 func TestConcurrentRequests(t *testing.T) {
