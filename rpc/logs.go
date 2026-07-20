@@ -117,6 +117,38 @@ func (s *Server) runGetLogs(from, to uint64, addrs []common.Address, topics [][]
 		if len(blk.Transactions()) == 0 {
 			continue
 		}
+		// Stored-logs epochs answer without the EVM.
+		if e, ok := s.hist.Epochs().At(n); ok && e.HasStoredLogs() {
+			rec, hasLogs, err := e.StoredLogsRecord(n)
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: err.Error()}
+			}
+			if !hasLogs {
+				continue
+			}
+			stored, err := DecodeStoredLogs(rec)
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: err.Error()}
+			}
+			blockHash := blk.Hash()
+			txs := blk.Transactions()
+			for pos, sl := range stored {
+				l := &types.Log{
+					Address:     sl.Address,
+					Topics:      sl.Topics,
+					Data:        sl.Data,
+					BlockNumber: n,
+					TxHash:      txs[sl.TxIndex].Hash(),
+					TxIndex:     sl.TxIndex,
+					BlockHash:   blockHash,
+					Index:       uint(pos),
+				}
+				if logMatches(l, addrs, topics) {
+					out = append(out, l)
+				}
+			}
+			continue
+		}
 		receipts, err := s.executeForReceipts(blk)
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}

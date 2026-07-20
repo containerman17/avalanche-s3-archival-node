@@ -35,6 +35,10 @@ type Epoch struct {
 // End returns the last block in the epoch (inclusive).
 func (e *Epoch) End() uint64 { return e.Start + e.Count - 1 }
 
+// Dict returns the epoch's trained zstd dictionary (empty for dict-less
+// epochs).
+func (e *Epoch) Dict() []byte { return e.sec[secDict] }
+
 // SectionSizes returns section byte sizes by name (compression scoreboard).
 func (e *Epoch) SectionSizes() map[string]uint64 {
 	names := []string{"dict", "bodies", "bodiesIdx", "headers", "headersIdx",
@@ -65,14 +69,31 @@ func OpenEpoch(path string) (*Epoch, error) {
 	if err != nil {
 		return nil, err
 	}
-	ft := mm[size-epochFooterSize:]
-	if !bytes.Equal(ft[0:4], epochMagic[:]) || !bytes.Equal(ft[epochFooterSize-4:], epochMagic[:]) {
-		syscall.Munmap(mm)
-		return nil, fmt.Errorf("epoch %s: bad footer magic", path)
+	// Footer size depends on the format version: probe v2 first, then v1
+	// (a candidate is valid only if BOTH magics and the version agree).
+	probe := func(footerSize, nSections int, version uint32) []byte {
+		if size < footerSize {
+			return nil
+		}
+		ft := mm[size-footerSize:]
+		if !bytes.Equal(ft[0:4], epochMagic[:]) || !bytes.Equal(ft[footerSize-4:], epochMagic[:]) {
+			return nil
+		}
+		if binary.LittleEndian.Uint32(ft[4:8]) != version {
+			return nil
+		}
+		return ft
 	}
-	if v := binary.LittleEndian.Uint32(ft[4:8]); v != epochVersion {
+	nSections := epochNumSections
+	footerSize := epochFooterSize
+	ft := probe(epochFooterSize, epochNumSections, 2)
+	if ft == nil {
+		ft = probe(epochV1Footer, epochV1Sections, 1)
+		nSections, footerSize = epochV1Sections, epochV1Footer
+	}
+	if ft == nil {
 		syscall.Munmap(mm)
-		return nil, fmt.Errorf("epoch %s: version %d, want %d", path, v, epochVersion)
+		return nil, fmt.Errorf("epoch %s: unrecognized footer (not v1 or v2)", path)
 	}
 	e := &Epoch{
 		Start:   binary.LittleEndian.Uint64(ft[8:16]),
@@ -80,18 +101,25 @@ func OpenEpoch(path string) (*Epoch, error) {
 		TxCount: binary.LittleEndian.Uint64(ft[24:32]),
 		mm:      mm,
 	}
-	for i := 0; i < epochNumSections; i++ {
+	for i := 0; i < nSections; i++ {
 		off := binary.LittleEndian.Uint64(ft[32+i*16:])
 		ln := binary.LittleEndian.Uint64(ft[40+i*16:])
-		if off+ln > uint64(size-epochFooterSize) {
+		if off+ln > uint64(size-footerSize) {
 			syscall.Munmap(mm)
 			return nil, fmt.Errorf("epoch %s: section %d out of bounds", path, i)
 		}
 		e.sec[i] = mm[off : off+ln]
 	}
-	var decOpts []zstd.DOption
+	var dicts [][]byte
 	if len(e.sec[secDict]) > 0 {
-		decOpts = append(decOpts, zstd.WithDecoderDicts(e.sec[secDict]))
+		dicts = append(dicts, e.sec[secDict])
+	}
+	if len(e.sec[secLogsDict]) > 0 {
+		dicts = append(dicts, e.sec[secLogsDict]) // DecodeAll picks by frame dictID
+	}
+	var decOpts []zstd.DOption
+	if len(dicts) > 0 {
+		decOpts = append(decOpts, zstd.WithDecoderDicts(dicts...))
 	}
 	e.dec, err = zstd.NewReader(nil, decOpts...)
 	if err != nil {
@@ -264,6 +292,38 @@ func (e *Epoch) StateSearch(key []byte, n uint64) (val []byte, blk uint64, found
 	return val, blk, found, nil
 }
 
+// WalkStateRows streams every SST row (re-seal input reconstruction).
+// Values are views into a transient decode buffer: copy to retain.
+func (e *Epoch) WalkStateRows(fn func(StateRow)) error {
+	idx := e.sec[secSSTIdx]
+	nEntries := len(idx) / sstIdxEntrySize
+	for bi := 0; bi < nEntries; bi++ {
+		lo := binary.LittleEndian.Uint64(idx[bi*sstIdxEntrySize+sortedKeySize+8:])
+		hi := uint64(len(e.sec[secSST]))
+		if bi+1 < nEntries {
+			hi = binary.LittleEndian.Uint64(idx[(bi+1)*sstIdxEntrySize+sortedKeySize+8:])
+		}
+		raw, err := e.decodeAll(e.sec[secSST][lo:hi])
+		if err != nil {
+			return err
+		}
+		pos := 0
+		for pos < len(raw) {
+			var r StateRow
+			copy(r.Key[:], raw[pos:pos+sortedKeySize])
+			r.Block = binary.BigEndian.Uint64(raw[pos+sortedKeySize:])
+			vlen, vn := binary.Uvarint(raw[pos+sortedKeySize+8:])
+			vstart := pos + sortedKeySize + 8 + vn
+			if vlen > 0 {
+				r.Value = raw[vstart : vstart+int(vlen)]
+			}
+			fn(r)
+			pos = vstart + int(vlen)
+		}
+	}
+	return nil
+}
+
 // AccountDeletes calls fn for every account-delete row in this epoch.
 func (e *Epoch) AccountDeletes(fn func(key []byte, block uint64)) {
 	d := e.sec[secDeletes]
@@ -333,6 +393,61 @@ func (e *Epoch) LogAddrBlocks(addr [20]byte) ([]uint64, error) { return e.logidx
 
 // LogTopicBlocks returns the absolute blocks where topic appeared.
 func (e *Epoch) LogTopicBlocks(topic [32]byte) ([]uint64, error) { return e.logidxLookup(topic[:]) }
+
+// HasStoredLogs reports whether this epoch carries the v2 stored-logs
+// sections (index headers present; an epoch with zero logs still counts).
+func (e *Epoch) HasStoredLogs() bool {
+	return len(e.sec[secFullLogsIdx]) >= 4 && len(e.sec[secRcptIdx]) >= 4
+}
+
+// storedRecord fetches block n's record from a stored-frames section pair.
+func (e *Epoch) storedRecord(data, index []byte, n uint64) ([]byte, bool, error) {
+	if len(index) < 4 {
+		return nil, false, fmt.Errorf("epoch %d: stored section absent", e.Start)
+	}
+	nMembers := int(binary.LittleEndian.Uint32(index[0:4]))
+	members := index[4 : 4+nMembers*12]
+	offs := index[4+nMembers*12:]
+	rel := uint32(n - e.Start)
+	i := sort.Search(nMembers, func(i int) bool {
+		return binary.LittleEndian.Uint32(members[i*12:]) >= rel
+	})
+	if i == nMembers || binary.LittleEndian.Uint32(members[i*12:]) != rel {
+		return nil, false, nil
+	}
+	frame := binary.LittleEndian.Uint32(members[i*12+4:])
+	slot := binary.LittleEndian.Uint32(members[i*12+8:])
+	lo := binary.LittleEndian.Uint64(offs[frame*8:])
+	hi := binary.LittleEndian.Uint64(offs[(frame+1)*8:])
+	raw, err := e.decodeAll(data[lo:hi])
+	if err != nil {
+		return nil, false, err
+	}
+	pos := 0
+	for s := uint32(0); ; s++ {
+		ln, k := binary.Uvarint(raw[pos:])
+		if k <= 0 {
+			return nil, false, fmt.Errorf("epoch %d: bad stored frame", e.Start)
+		}
+		pos += k
+		if s == slot {
+			return raw[pos : pos+int(ln)], true, nil
+		}
+		pos += int(ln)
+	}
+}
+
+// StoredLogsRecord returns block n's full-logs record (rpc.DecodeStoredLogs
+// layout). ok=false = block has no logs.
+func (e *Epoch) StoredLogsRecord(n uint64) ([]byte, bool, error) {
+	return e.storedRecord(e.sec[secFullLogs], e.sec[secFullLogsIdx], n)
+}
+
+// StoredRcptRecord returns block n's receipt-fields record (per tx:
+// uvarint gasUsed + status byte). ok=false = block has no txs.
+func (e *Epoch) StoredRcptRecord(n uint64) ([]byte, bool, error) {
+	return e.storedRecord(e.sec[secRcpt], e.sec[secRcptIdx], n)
+}
 
 // sampleSSTRow returns a random (key, block) row for bench probing.
 func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64, ok bool) {

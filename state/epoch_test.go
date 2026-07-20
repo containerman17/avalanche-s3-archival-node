@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -244,4 +245,59 @@ func readFileT(t *testing.T, p string) ([]byte, error) {
 		t.Fatal(err)
 	}
 	return b, nil
+}
+
+func TestEpochStoredLogsSections(t *testing.T) {
+	dir := t.TempDir()
+	in, _ := synthEpoch(t, dir, 3000) // v2 without stored sections
+	e0, err := OpenEpoch(filepath.Join(dir, EpochFileName(3000, 100)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e0.HasStoredLogs() {
+		t.Fatal("sections must be absent when inputs were nil")
+	}
+	e0.Close()
+
+	// reseal-style: same input plus stored records for two blocks
+	in.FullLogs = map[uint64][]byte{
+		3007: {9, 9, 9},
+		3077: {1, 2, 3, 4},
+	}
+	in.RcptRecs = map[uint64][]byte{
+		3007: {0x21, 1},
+		3042: {0x33, 0},
+	}
+	if _, err := BuildEpoch(dir, in); err != nil {
+		t.Fatal(err)
+	}
+	e, err := OpenEpoch(filepath.Join(dir, EpochFileName(3000, 100)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if !e.HasStoredLogs() {
+		t.Fatal("sections must be present")
+	}
+	if rec, ok, err := e.StoredLogsRecord(3077); err != nil || !ok || !bytes.Equal(rec, []byte{1, 2, 3, 4}) {
+		t.Fatalf("stored logs 3077: %x %v %v", rec, ok, err)
+	}
+	if _, ok, _ := e.StoredLogsRecord(3042); ok {
+		t.Fatal("3042 has no logs record")
+	}
+	if rec, ok, _ := e.StoredRcptRecord(3042); !ok || !bytes.Equal(rec, []byte{0x33, 0}) {
+		t.Fatalf("stored rcpt 3042: %x %v", rec, ok)
+	}
+	// old blocks still readable (v2 full roundtrip sanity)
+	if _, err := e.Container(3010); err != nil {
+		t.Fatal(err)
+	}
+	// state rows survive a walk (reseal input source)
+	rows := 0
+	if err := e.WalkStateRows(func(StateRow) { rows++ }); err != nil {
+		t.Fatal(err)
+	}
+	if rows == 0 {
+		t.Fatal("no SST rows walked")
+	}
 }

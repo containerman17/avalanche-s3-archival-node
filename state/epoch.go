@@ -20,14 +20,14 @@ import (
 // decompression always is). Returns nil when training is impossible
 // (missing binary or a corpus too small to train on): the epoch is then
 // written dict-less, which stays valid and deterministic.
-func trainDictCLI(samples [][]byte, dictID uint32) []byte {
+func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 	tmp, err := os.MkdirTemp("", "epochdict")
 	if err != nil {
 		return nil
 	}
 	defer os.RemoveAll(tmp)
 	args := []string{"--train", "-q", "-o", filepath.Join(tmp, "dict.bin"),
-		fmt.Sprintf("--maxdict=%d", dictTargetSize),
+		fmt.Sprintf("--maxdict=%d", maxDict),
 		fmt.Sprintf("--dictID=%d", dictID)}
 	for i, s := range samples {
 		p := filepath.Join(tmp, fmt.Sprintf("s%06d", i))
@@ -85,9 +85,17 @@ const (
 	bloomBitsPerKey = 10
 	bloomHashes     = 7
 
-	epochVersion     = 1
-	epochNumSections = 11
+	// Format v2 adds the stored-logs sections (2026-07-20 user decision:
+	// measured +14.4% of sealed size with a dedicated logs dict on the
+	// full 10M corpus => flag-gated, default on). v1 files stay readable;
+	// re-sealing rewrites them in place with the sections added.
+	epochVersion     = 2
+	epochNumSections = 16
 	epochFooterSize  = 4 + 4 + 8 + 8 + 8 + epochNumSections*16 + 4 // magics + version + start/count/txs + table
+	epochV1Sections  = 11
+	epochV1Footer    = 4 + 4 + 8 + 8 + 8 + epochV1Sections*16 + 4
+
+	logsDictTarget = 128 << 10 // dedicated logs dict (measured better than container dict)
 )
 
 // Section indexes into the footer table.
@@ -103,6 +111,12 @@ const (
 	secTxidx
 	secLogidx
 	secKeybloom
+	// v2 additions: full stored logs + per-tx receipt fields.
+	secLogsDict
+	secFullLogs
+	secFullLogsIdx
+	secRcpt
+	secRcptIdx
 )
 
 var epochMagic = [4]byte{'E', 'P', 'O', 'C'}
@@ -148,7 +162,17 @@ type EpochInput struct {
 	TxHashes   map[uint64][][32]byte // block -> tx hashes (fp48 source)
 	Logs       []LogRec
 	TxCount    uint64
+
+	// Stored-logs sections (v2, --store-logs): per-block encoded records
+	// derived by re-execution (rpc.EncodeStoredLogs/EncodeStoredReceipts).
+	// nil maps = seal without the sections. A non-nil empty map is valid
+	// (epoch genuinely has no logs) and still marks the sections present.
+	FullLogs map[uint64][]byte // log-bearing block -> logs record
+	RcptRecs map[uint64][]byte // tx-bearing block -> receipt-fields record
 }
+
+// HasStoredLogInputs reports whether this input seals the v2 sections.
+func (in *EpochInput) HasStoredLogInputs() bool { return in.FullLogs != nil && in.RcptRecs != nil }
 
 // ---------- builder ----------
 
@@ -173,7 +197,7 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 		}
 		samples = sub
 	}
-	epochDict := trainDictCLI(samples, uint32(in.Start%0xfffffffe)+1)
+	epochDict := trainDictCLI(samples, uint32(in.Start%0xfffffffe)+1, dictTargetSize)
 
 	encOpts := []zstd.EOption{zstd.WithEncoderLevel(zstd.SpeedBestCompression)}
 	if len(epochDict) > 0 {
@@ -214,6 +238,47 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 	section(secLogidx, buildLogidx(in.Logs, in.Start, count))
 	section(secKeybloom, buildBloom(keys))
 
+	// v2 stored-logs sections. Present (nonempty index headers) whenever
+	// the inputs were supplied, even for epochs with zero logs.
+	if in.HasStoredLogInputs() {
+		var logsDict []byte
+		var recSamples [][]byte
+		for _, r := range in.FullLogs {
+			recSamples = append(recSamples, r)
+		}
+		sort.Slice(recSamples, func(i, j int) bool { return bytes.Compare(recSamples[i], recSamples[j]) < 0 }) // deterministic training set
+		if len(recSamples) > dictMaxSamples {
+			step := len(recSamples) / dictMaxSamples
+			sub := make([][]byte, 0, dictMaxSamples)
+			for i := 0; i < len(recSamples); i += step {
+				sub = append(sub, recSamples[i])
+			}
+			recSamples = sub
+		}
+		if len(recSamples) > 0 {
+			logsDict = trainDictCLI(recSamples, uint32(in.Start%0xfffffffe)+2, logsDictTarget)
+		}
+		encL := enc
+		if len(logsDict) > 0 {
+			encL, err = zstd.NewWriter(nil,
+				zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+				zstd.WithEncoderDict(logsDict))
+			if err != nil {
+				return "", err
+			}
+			defer encL.Close()
+		}
+		section(secLogsDict, logsDict)
+		flData, flIdx := buildStoredFrames(encL, in.Start, in.FullLogs)
+		section(secFullLogs, flData)
+		section(secFullLogsIdx, flIdx)
+		// receipt fields compress fine with the container dict (+1.6%
+		// measured); no third dict.
+		rcData, rcIdx := buildStoredFrames(enc, in.Start, in.RcptRecs)
+		section(secRcpt, rcData)
+		section(secRcptIdx, rcIdx)
+	}
+
 	// Footer.
 	var ft [epochFooterSize]byte
 	copy(ft[0:4], epochMagic[:])
@@ -234,6 +299,53 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 		return "", err
 	}
 	return path, os.Rename(tmp, path)
+}
+
+// buildStoredFrames packs sparse per-block records (stored logs / receipt
+// fields) into zstd frames of framedGroup records. Index layout:
+//
+//	u32 nMembers | members (12B: relBlock u32, frame u32, slot u32) |
+//	frame offsets u64 x (nFrames+1)
+//
+// Members sorted by relBlock; the index header is always written, so a
+// present-but-empty section (epoch without logs) stays distinguishable
+// from a v2 epoch sealed without --store-logs.
+func buildStoredFrames(enc *zstd.Encoder, start uint64, recs map[uint64][]byte) (data, index []byte) {
+	blocks := make([]uint64, 0, len(recs))
+	for b := range recs {
+		blocks = append(blocks, b)
+	}
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
+
+	var (
+		members []byte
+		offs    []byte
+		payload []byte
+		inFrame int
+		frame   uint32
+	)
+	offs = binary.LittleEndian.AppendUint64(offs, 0)
+	for _, b := range blocks {
+		members = binary.LittleEndian.AppendUint32(members, uint32(b-start))
+		members = binary.LittleEndian.AppendUint32(members, frame)
+		members = binary.LittleEndian.AppendUint32(members, uint32(inFrame))
+		payload = binary.AppendUvarint(payload, uint64(len(recs[b])))
+		payload = append(payload, recs[b]...)
+		if inFrame++; inFrame == framedGroup {
+			data = enc.EncodeAll(payload, data)
+			offs = binary.LittleEndian.AppendUint64(offs, uint64(len(data)))
+			payload, inFrame = payload[:0], 0
+			frame++
+		}
+	}
+	if len(payload) > 0 {
+		data = enc.EncodeAll(payload, data)
+		offs = binary.LittleEndian.AppendUint64(offs, uint64(len(data)))
+	}
+	index = binary.LittleEndian.AppendUint32(nil, uint32(len(blocks)))
+	index = append(index, members...)
+	index = append(index, offs...)
+	return data, index
 }
 
 // buildFramed packs blobs into zstd frames of framedGroup entries each:

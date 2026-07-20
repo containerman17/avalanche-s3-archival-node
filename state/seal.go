@@ -17,11 +17,16 @@ import (
 // via tmp+rename. With deleteRaw, raw bucket files whose whole range is
 // sealed are removed afterwards; NEVER enable that next to a running
 // fetch/exec (they own those files).
-func SealEpochs(dir string, deleteRaw bool) error {
-	return sealEpochs(dir, deleteRaw, EpochTxs)
+// DeriveStored fills EpochInput's stored-logs sections (FullLogs/RcptRecs,
+// plus the posting-list tuples when nil) by re-execution. Implemented in
+// rpc (state cannot import the EVM); nil = seal without the sections.
+type DeriveStored func(in *EpochInput) error
+
+func SealEpochs(dir string, deleteRaw bool, derive DeriveStored) error {
+	return sealEpochs(dir, deleteRaw, EpochTxs, derive)
 }
 
-func sealEpochs(dir string, deleteRaw bool, epochTxs uint64) error {
+func sealEpochs(dir string, deleteRaw bool, epochTxs uint64, derive DeriveStored) error {
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return err
@@ -61,6 +66,11 @@ func sealEpochs(dir string, deleteRaw bool, epochTxs uint64) error {
 			break
 		}
 		t0 := time.Now()
+		if derive != nil {
+			if err := derive(in); err != nil {
+				return fmt.Errorf("seal epoch at %d: derive stored logs: %w", in.Start, err)
+			}
+		}
 		path, err := BuildEpoch(dir, in)
 		if err != nil {
 			return fmt.Errorf("seal epoch at %d: %w", in.Start, err)
@@ -206,6 +216,73 @@ func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
 		off += 32
 	}
 	return lr, nil
+}
+
+// ReSealStoredLogs upgrades existing epochs lacking the stored-logs
+// sections: every section input is reconstructed from the old epoch file
+// itself (bodies, headers, SST rows, tx hashes) plus derive's re-execution
+// for the logs; the rebuilt v2 file atomically replaces the old one.
+// Idempotent: epochs that already carry the sections are skipped.
+func ReSealStoredLogs(dir string, derive DeriveStored) error {
+	set, err := OpenEpochSet(dir)
+	if err != nil {
+		return err
+	}
+	defer set.Close()
+	for _, e := range set.Epochs {
+		if e.HasStoredLogs() {
+			continue
+		}
+		t0 := time.Now()
+		in := &EpochInput{
+			Start:    e.Start,
+			TxCount:  e.TxCount,
+			TxHashes: map[uint64][][32]byte{},
+		}
+		for n := e.Start; n <= e.End(); n++ {
+			c, err := e.Container(n)
+			if err != nil {
+				return fmt.Errorf("reseal %d: container %d: %w", e.Start, n, err)
+			}
+			h, err := e.HeaderRLP(n)
+			if err != nil {
+				return fmt.Errorf("reseal %d: header %d: %w", e.Start, n, err)
+			}
+			// copy: sections are views into the mmap the rebuild replaces
+			in.Containers = append(in.Containers, append([]byte(nil), c...))
+			in.Headers = append(in.Headers, append([]byte(nil), h...))
+			hashes, err := extractTxHashes(innerEthBlock(in.Containers[len(in.Containers)-1]), nil)
+			if err != nil {
+				return fmt.Errorf("reseal %d: txs of %d: %w", e.Start, n, err)
+			}
+			if len(hashes) > 0 {
+				hs := make([][32]byte, len(hashes))
+				for i, hh := range hashes {
+					hs[i] = [32]byte(hh)
+				}
+				in.TxHashes[n] = hs
+			}
+		}
+		if err := e.WalkStateRows(func(r StateRow) {
+			r.Value = append([]byte(nil), r.Value...)
+			in.StateRows = append(in.StateRows, r)
+		}); err != nil {
+			return fmt.Errorf("reseal %d: sst walk: %w", e.Start, err)
+		}
+		// in.Logs stays nil: derive rebuilds the posting-list tuples from
+		// re-execution (capture-parity proven).
+		if err := derive(in); err != nil {
+			return fmt.Errorf("reseal %d: derive: %w", e.Start, err)
+		}
+		path, err := BuildEpoch(dir, in)
+		if err != nil {
+			return fmt.Errorf("reseal %d: %w", e.Start, err)
+		}
+		st, _ := os.Stat(path)
+		log.Printf("reseal: %s v2 stored-logs, %.1fMB, in %s",
+			filepath.Base(path), float64(st.Size())/1e6, time.Since(t0).Round(time.Millisecond))
+	}
+	return nil
 }
 
 // deleteSealedRaw removes raw bucket files whose entire block range is at

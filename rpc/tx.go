@@ -11,6 +11,7 @@ import (
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/core/vm"
+	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/params"
 
 	"github.com/containerman17/epochdb/state"
@@ -102,6 +103,18 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 		return nil, nil
 	}
 	n := blk.NumberU64()
+	header := blk.Header()
+	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
+
+	// Stored-logs epochs answer without the EVM.
+	if e, ok := s.hist.Epochs().At(n); ok && e.HasStoredLogs() {
+		receipt, rerr := s.storedReceipt(e, blk, i)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return marshalReceipt(receipt, blk.Hash(), n, signer, blk.Transactions()[i], i), nil
+	}
+
 	if n > s.hist.Head() {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("receipt needs state: block %d beyond replayed head %d", n, s.hist.Head())}
 	}
@@ -109,9 +122,65 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}
 	}
-	header := blk.Header()
-	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
 	return marshalReceipt(receipts[i], blk.Hash(), n, signer, blk.Transactions()[i], i), nil
+}
+
+// storedReceipt reconstructs tx i's receipt from the epoch's stored
+// sections: gasUsed/status/cumulative from the receipt-fields record, logs
+// from the stored-logs record, everything else derived from the tx itself.
+func (s *Server) storedReceipt(e *state.Epoch, blk *types.Block, i int) (*types.Receipt, *rpcError) {
+	n := blk.NumberU64()
+	tx := blk.Transactions()[i]
+	rcptRec, ok, err := e.StoredRcptRecord(n)
+	if err != nil || !ok {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts for block %d: ok=%v err=%v", n, ok, err)}
+	}
+	entries, err := DecodeStoredReceipts(rcptRec)
+	if err != nil || i >= len(entries) {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts decode for block %d: %v", n, err)}
+	}
+	en := entries[i]
+	r := &types.Receipt{
+		Type:              tx.Type(),
+		Status:            en.Status,
+		CumulativeGasUsed: en.CumulativeGas,
+		GasUsed:           en.GasUsed,
+		TxHash:            tx.Hash(),
+		EffectiveGasPrice: effectiveGasPrice(tx, blk.BaseFee()),
+		Logs:              []*types.Log{},
+	}
+	if tx.To() == nil {
+		header := blk.Header()
+		signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
+		from, _ := types.Sender(signer, tx)
+		r.ContractAddress = crypto.CreateAddress(from, tx.Nonce())
+	}
+	if logsRec, hasLogs, err := e.StoredLogsRecord(n); err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	} else if hasLogs {
+		stored, err := DecodeStoredLogs(logsRec)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		blockHash := blk.Hash()
+		for pos, sl := range stored {
+			if sl.TxIndex != uint(i) {
+				continue
+			}
+			r.Logs = append(r.Logs, &types.Log{
+				Address:     sl.Address,
+				Topics:      sl.Topics,
+				Data:        sl.Data,
+				BlockNumber: n,
+				TxHash:      r.TxHash,
+				TxIndex:     uint(i),
+				BlockHash:   blockHash,
+				Index:       uint(pos),
+			})
+		}
+	}
+	r.Bloom = types.CreateBloom(types.Receipts{r})
+	return r, nil
 }
 
 func (s *Server) executeForReceipts(blk *types.Block) (types.Receipts, error) {
@@ -185,6 +254,9 @@ type rpcTransaction struct {
 }
 
 func effectiveGasPrice(tx *types.Transaction, baseFee *big.Int) *big.Int {
+	if baseFee == nil {
+		return tx.GasPrice() // pre-AP3: the gas price is the whole fee
+	}
 	fee := tx.GasTipCap()
 	fee = fee.Add(fee, baseFee)
 	if tx.GasFeeCapIntCmp(fee) < 0 {
