@@ -33,3 +33,15 @@ Proven prior art: ~/deforestationdb (fetch+execute+overlay, 0 mismatches on 15k 
 - Guarantee: epoch bodies store VERBATIM proposervm-wrapped containers (already true in the format). Never switch to extras-reconstruction without an atomic-fidelity plan.
 - Derived-data latency: minimal node stays re-execute-on-demand; optional on-disk caches for receipts/logs may come later behind flags.
 - Tech debt (recorded, unbuilt): eth_sendRawTransaction + mempool relay, filters/WS subscriptions, pending-block semantics; serving GetAncestors to peers (be a peer, not a leech); avax_* API namespace + atomic tx lookup; RPC server global lock -> concurrent reads.
+
+## Unified node direction (user decision 2026-07-20, IMPORTANT)
+Flatstate (fast tip) and epochdb (compact history) merge into ONE codebase: one snowman follower, one post-image capture stream, N sinks behind flags (both projects are post-image; capture.Sink is the merge point; flatstate's LMDB tip store and the epoch sealer are sibling sinks). Two repos maintaining two followers is the wrong option. Single process only if the history/seal sink sits behind async backpressure and can NEVER stall block application (chain pace is the tip invariant); fallback: one binary, two configs, two processes.
+
+Config surface:
+- --history: archive yes/no (epoch sealing + historical RPC vs tip-only).
+- --store-logs: minimal vs re-execution-free logs/receipts (epoch format v2 section).
+- --pin-state: latest-state acceleration contract: PINNED MAP (flatstate discipline) vs bounded cache (epochdb style).
+- Entry points: HTTP/WS RPC is the default door; the in-process Go API is a FIRST-CLASS second door (not EVM-only: in-process indexers get wire-free speed against the same store).
+
+Pinned map contract (NOT an LRU, deliberately): lazily populated, pin-forever, plain pointer-free Go maps, presence = knowledge (pinned zeros make negative caching free), no per-read bookkeeping. RAM bound = touched working set <= live state size.
+OOM valve (user decision): if the process nears out-of-memory (~98% used), DROP THE ENTIRE MAP and let it refill lazily. No restart, no monitoring machinery, no partial eviction (partial eviction breaks presence=knowledge; a full drop resets it correctly: empty map = know nothing = every read falls through to the authoritative store).
