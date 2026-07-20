@@ -24,6 +24,7 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/storage"
 )
 
 // PieceLength suits 10-15MB epochs now and multi-GB epochs later.
@@ -317,6 +318,92 @@ func FetchMissing(dataDir, manifestPath string, o FetchOpts) (missing []string, 
 	os.RemoveAll(tmp)
 	sort.Strings(missing)
 	return missing, nil
+}
+
+// Bootstrap leeches until the local set exactly matches the manifest,
+// retrying failed epochs in rounds (this mode's whole job is
+// completeness), and seeds every verified epoch while at it. Returns nil
+// only when nothing is missing; errors with a summary after maxRounds.
+func Bootstrap(dataDir, manifestPath string, maxRounds int, o FetchOpts) error {
+	entries, err := LoadManifest(manifestPath)
+	if err != nil {
+		return err
+	}
+	if o.Timeout <= 0 {
+		o.Timeout = 5 * time.Minute
+	}
+	tmp := filepath.Join(dataDir, ".epochfetch")
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	cl, err := newClient(tmp, o.Client)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+	seedStore := storage.NewFile(dataDir) // seed torrents read the real files
+	defer seedStore.Close()
+	seed := func(e Entry) {
+		mi, ih, err := metainfoFor(filepath.Join(dataDir, e.Name))
+		if err != nil || ih != e.Infohash {
+			log.Printf("bootstrap: not seeding %s: err=%v infohash=%s want %s", e.Name, err, ih, e.Infohash)
+			return
+		}
+		spec := torrent.TorrentSpecFromMetaInfo(mi)
+		spec.Storage = seedStore
+		if _, _, err := cl.AddTorrentSpec(spec); err != nil {
+			log.Printf("bootstrap: not seeding %s: %v", e.Name, err)
+		}
+	}
+
+	var missing []Entry
+	for _, e := range entries {
+		if _, err := os.Stat(filepath.Join(dataDir, e.Name)); err != nil {
+			missing = append(missing, e)
+		} else {
+			seed(e) // be a good citizen: present epochs seed immediately
+		}
+	}
+	log.Printf("bootstrap: %d/%d epochs present, %d to fetch (listen port %d)",
+		len(entries)-len(missing), len(entries), len(missing), cl.LocalPort())
+
+	for round := 1; len(missing) > 0 && round <= maxRounds; round++ {
+		sem := make(chan struct{}, 4)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var failed []Entry
+		for _, e := range missing {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				if err := fetchOne(cl, dataDir, tmp, e, o); err != nil {
+					log.Printf("bootstrap: round %d: %s: %v", round, e.Name, err)
+					mu.Lock()
+					failed = append(failed, e)
+					mu.Unlock()
+					return
+				}
+				log.Printf("bootstrap: %s fetched and verified", e.Name)
+				seed(e)
+			}()
+		}
+		wg.Wait()
+		log.Printf("bootstrap: round %d done: %d fetched, %d still missing", round, len(missing)-len(failed), len(failed))
+		missing = failed
+	}
+	if len(missing) > 0 {
+		names := make([]string, len(missing))
+		for i, e := range missing {
+			names[i] = e.Name
+		}
+		sort.Strings(names)
+		return fmt.Errorf("bootstrap incomplete after %d rounds: %d/%d epochs still missing: %v", maxRounds, len(missing), len(entries), names)
+	}
+	log.Printf("bootstrap: complete, local set matches the manifest (%d epochs)", len(entries))
+	return nil
 }
 
 func fetchOne(cl *torrent.Client, dataDir, tmp string, e Entry, o FetchOpts) error {

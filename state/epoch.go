@@ -241,42 +241,15 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 	// v2 stored-logs sections. Present (nonempty index headers) whenever
 	// the inputs were supplied, even for epochs with zero logs.
 	if in.HasStoredLogInputs() {
-		var logsDict []byte
-		var recSamples [][]byte
-		for _, r := range in.FullLogs {
-			recSamples = append(recSamples, r)
+		secs, err := buildStoredSections(in, epochDict)
+		if err != nil {
+			return "", err
 		}
-		sort.Slice(recSamples, func(i, j int) bool { return bytes.Compare(recSamples[i], recSamples[j]) < 0 }) // deterministic training set
-		if len(recSamples) > dictMaxSamples {
-			step := len(recSamples) / dictMaxSamples
-			sub := make([][]byte, 0, dictMaxSamples)
-			for i := 0; i < len(recSamples); i += step {
-				sub = append(sub, recSamples[i])
-			}
-			recSamples = sub
-		}
-		if len(recSamples) > 0 {
-			logsDict = trainDictCLI(recSamples, uint32(in.Start%0xfffffffe)+2, logsDictTarget)
-		}
-		encL := enc
-		if len(logsDict) > 0 {
-			encL, err = zstd.NewWriter(nil,
-				zstd.WithEncoderLevel(zstd.SpeedBestCompression),
-				zstd.WithEncoderDict(logsDict))
-			if err != nil {
-				return "", err
-			}
-			defer encL.Close()
-		}
-		section(secLogsDict, logsDict)
-		flData, flIdx := buildStoredFrames(encL, in.Start, in.FullLogs)
-		section(secFullLogs, flData)
-		section(secFullLogsIdx, flIdx)
-		// receipt fields compress fine with the container dict (+1.6%
-		// measured); no third dict.
-		rcData, rcIdx := buildStoredFrames(enc, in.Start, in.RcptRecs)
-		section(secRcpt, rcData)
-		section(secRcptIdx, rcIdx)
+		section(secLogsDict, secs[0])
+		section(secFullLogs, secs[1])
+		section(secFullLogsIdx, secs[2])
+		section(secRcpt, secs[3])
+		section(secRcptIdx, secs[4])
 	}
 
 	// Footer.
@@ -296,6 +269,95 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 	path := filepath.Join(dir, EpochFileName(in.Start, count))
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		return "", err
+	}
+	return path, os.Rename(tmp, path)
+}
+
+// buildStoredSections derives the five v2 sections from filled stored-log
+// inputs. containerDict compresses the receipt frames (measured fine);
+// the logs get their own freshly trained dict.
+func buildStoredSections(in *EpochInput, containerDict []byte) (secs [5][]byte, err error) {
+	var recSamples [][]byte
+	for _, r := range in.FullLogs {
+		recSamples = append(recSamples, r)
+	}
+	sort.Slice(recSamples, func(i, j int) bool { return bytes.Compare(recSamples[i], recSamples[j]) < 0 })
+	if len(recSamples) > dictMaxSamples {
+		step := len(recSamples) / dictMaxSamples
+		sub := make([][]byte, 0, dictMaxSamples)
+		for i := 0; i < len(recSamples); i += step {
+			sub = append(sub, recSamples[i])
+		}
+		recSamples = sub
+	}
+	var logsDict []byte
+	if len(recSamples) > 0 {
+		logsDict = trainDictCLI(recSamples, uint32(in.Start%0xfffffffe)+2, logsDictTarget)
+	}
+	newEnc := func(dict []byte) (*zstd.Encoder, error) {
+		opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.SpeedBestCompression)}
+		if len(dict) > 0 {
+			opts = append(opts, zstd.WithEncoderDict(dict))
+		}
+		return zstd.NewWriter(nil, opts...)
+	}
+	encL, err := newEnc(logsDict)
+	if err != nil {
+		return secs, err
+	}
+	defer encL.Close()
+	encC, err := newEnc(containerDict)
+	if err != nil {
+		return secs, err
+	}
+	defer encC.Close()
+	secs[0] = logsDict
+	secs[1], secs[2] = buildStoredFrames(encL, in.Start, in.FullLogs)
+	secs[3], secs[4] = buildStoredFrames(encC, in.Start, in.RcptRecs)
+	return secs, nil
+}
+
+// appendStoredSections upgrades a v1 epoch in place: the old file's bytes
+// (all sections, offsets unchanged) are kept verbatim, the five derived
+// stored-logs sections are appended, and a v2 footer replaces the v1 one.
+func (e *Epoch) appendStoredSections(dir string, in *EpochInput) (string, error) {
+	if !in.HasStoredLogInputs() {
+		return "", fmt.Errorf("append sections: inputs not derived")
+	}
+	secs, err := buildStoredSections(in, e.sec[secDict])
+	if err != nil {
+		return "", err
+	}
+	body := e.mm[:len(e.mm)-epochV1Footer] // every old section, offsets intact
+	oldFt := e.mm[len(e.mm)-epochV1Footer:]
+
+	var ft [epochFooterSize]byte
+	copy(ft[0:4], epochMagic[:])
+	binary.LittleEndian.PutUint32(ft[4:8], epochVersion)
+	copy(ft[8:32], oldFt[8:32])                                         // start, count, txCount
+	copy(ft[32:32+epochV1Sections*16], oldFt[32:32+epochV1Sections*16]) // old table
+	off := uint64(len(body))
+	for i, s := range secs {
+		binary.LittleEndian.PutUint64(ft[32+(epochV1Sections+i)*16:], off)
+		binary.LittleEndian.PutUint64(ft[40+(epochV1Sections+i)*16:], uint64(len(s)))
+		off += uint64(len(s))
+	}
+	copy(ft[epochFooterSize-4:], epochMagic[:])
+
+	path := filepath.Join(dir, EpochFileName(e.Start, e.Count))
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return "", err
+	}
+	for _, b := range append([][]byte{body}, append(secs[:], ft[:])...) {
+		if _, err := f.Write(b); err != nil {
+			f.Close()
+			return "", err
+		}
+	}
+	if err := f.Close(); err != nil {
 		return "", err
 	}
 	return path, os.Rename(tmp, path)

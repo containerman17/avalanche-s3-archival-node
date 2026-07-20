@@ -143,6 +143,8 @@ func main() {
 		manifestMain(os.Args[2:])
 	case "seed":
 		seedMain(os.Args[2:])
+	case "bootstrap":
+		bootstrapMain(os.Args[2:])
 	case "backfill-logs":
 		backfillLogsMain(os.Args[2:])
 	case "verify-logs":
@@ -164,6 +166,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--delete-raw]")
 	fmt.Fprintln(os.Stderr, "       epochdb manifest [--data <dir>] [--out <file>]")
 	fmt.Fprintln(os.Stderr, "       epochdb seed [--data <dir>] [--manifest <file>] [--listen-port 42069]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--manifest <file>] [--rounds 20]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
 	os.Exit(2)
@@ -269,6 +272,31 @@ func seedMain(args []string) {
 		ListenPort: *listenPort, NoDHT: *noDHT, NoTrackers: *noDHT, NoUpnp: *noDHT, DisableIPv6: *noDHT,
 	}); err != nil {
 		log.Fatalf("epochdb: seed: %v", err)
+	}
+}
+
+// bootstrapMain leeches until the local epoch set exactly matches the
+// manifest (retrying in rounds, seeding completed epochs meanwhile), then
+// exits 0. Operator flow on a new machine: bootstrap, then serve.
+func bootstrapMain(args []string) {
+	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	manifestPath := fs.String("manifest", "", "epoch manifest path (default <data>/epochs.manifest)")
+	epochTimeout := fs.Duration("epoch-timeout", 5*time.Minute, "per-epoch attempt timeout within a round")
+	rounds := fs.Int("rounds", 20, "give up after this many retry rounds")
+	peer := fs.String("peer", "", "explicit seeder host:port (tests, boost)")
+	noDHT := fs.Bool("no-dht", false, "disable DHT+trackers (tests)")
+	listenPort := fs.Int("listen-port", 0, "BitTorrent listen port (0 = random)")
+	fs.Parse(args)
+	if *manifestPath == "" {
+		*manifestPath = filepath.Join(*dataDir, "epochs.manifest")
+	}
+	if err := dist.Bootstrap(*dataDir, *manifestPath, *rounds, dist.FetchOpts{
+		Timeout: *epochTimeout,
+		Peer:    *peer,
+		Client:  dist.ClientOpts{ListenPort: *listenPort, NoDHT: *noDHT, NoTrackers: *noDHT, NoUpnp: *noDHT, DisableIPv6: *noDHT},
+	}); err != nil {
+		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
 }
 

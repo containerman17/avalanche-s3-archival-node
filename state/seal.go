@@ -219,10 +219,12 @@ func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
 }
 
 // ReSealStoredLogs upgrades existing epochs lacking the stored-logs
-// sections: every section input is reconstructed from the old epoch file
-// itself (bodies, headers, SST rows, tx hashes) plus derive's re-execution
-// for the logs; the rebuilt v2 file atomically replaces the old one.
-// Idempotent: epochs that already carry the sections are skipped.
+// sections by SECTION SURGERY: the old file's sections are copied
+// byte-verbatim (their offsets do not move), only the five new sections
+// are derived (re-execution) and appended, then the v2 footer replaces
+// the old one. No dict retraining, no SST recompression, no bodies work:
+// re-seal time is derive time. Idempotent: epochs that already carry the
+// sections are skipped.
 func ReSealStoredLogs(dir string, derive DeriveStored) error {
 	set, err := OpenEpochSet(dir)
 	if err != nil {
@@ -234,47 +236,21 @@ func ReSealStoredLogs(dir string, derive DeriveStored) error {
 			continue
 		}
 		t0 := time.Now()
-		in := &EpochInput{
-			Start:    e.Start,
-			TxCount:  e.TxCount,
-			TxHashes: map[uint64][][32]byte{},
-		}
+		in := &EpochInput{Start: e.Start, TxCount: e.TxCount}
 		for n := e.Start; n <= e.End(); n++ {
 			c, err := e.Container(n)
 			if err != nil {
 				return fmt.Errorf("reseal %d: container %d: %w", e.Start, n, err)
 			}
-			h, err := e.HeaderRLP(n)
-			if err != nil {
-				return fmt.Errorf("reseal %d: header %d: %w", e.Start, n, err)
-			}
-			// copy: sections are views into the mmap the rebuild replaces
-			in.Containers = append(in.Containers, append([]byte(nil), c...))
-			in.Headers = append(in.Headers, append([]byte(nil), h...))
-			hashes, err := extractTxHashes(innerEthBlock(in.Containers[len(in.Containers)-1]), nil)
-			if err != nil {
-				return fmt.Errorf("reseal %d: txs of %d: %w", e.Start, n, err)
-			}
-			if len(hashes) > 0 {
-				hs := make([][32]byte, len(hashes))
-				for i, hh := range hashes {
-					hs[i] = [32]byte(hh)
-				}
-				in.TxHashes[n] = hs
-			}
+			in.Containers = append(in.Containers, c)
 		}
-		if err := e.WalkStateRows(func(r StateRow) {
-			r.Value = append([]byte(nil), r.Value...)
-			in.StateRows = append(in.StateRows, r)
-		}); err != nil {
-			return fmt.Errorf("reseal %d: sst walk: %w", e.Start, err)
-		}
-		// in.Logs stays nil: derive rebuilds the posting-list tuples from
-		// re-execution (capture-parity proven).
+		// Only the stored-logs inputs are needed; posting lists already
+		// exist in the old file. Suppress tuple rebuilding.
+		in.Logs = []LogRec{}
 		if err := derive(in); err != nil {
 			return fmt.Errorf("reseal %d: derive: %w", e.Start, err)
 		}
-		path, err := BuildEpoch(dir, in)
+		path, err := e.appendStoredSections(dir, in)
 		if err != nil {
 			return fmt.Errorf("reseal %d: %w", e.Start, err)
 		}
