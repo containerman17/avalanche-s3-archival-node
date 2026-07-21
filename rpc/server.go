@@ -194,8 +194,9 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return false, nil // no p2p listener on the read server
 	case "eth_accounts":
 		return []common.Address{}, nil
-	case "eth_coinbase":
-		// Coreth's fixed blackhole coinbase, matching the public API.
+	case "eth_coinbase", "eth_etherbase":
+		// Coreth's fixed blackhole coinbase, matching the public API
+		// (eth_etherbase is its coreth-served alias).
 		return common.HexToAddress("0x0100000000000000000000000000000000000000"), nil
 	case "eth_getUncleCountByBlockNumber", "eth_getUncleCountByBlockHash":
 		return hexutil.Uint(0), nil // no uncles on Avalanche
@@ -220,6 +221,14 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.debugGetRawReceipts(req.Params)
 	case "eth_createAccessList":
 		return s.createAccessList(req.Params)
+	case "debug_traceCall":
+		return s.debugTraceCall(req.Params)
+	case "debug_getModifiedAccountsByNumber":
+		return s.debugGetModifiedAccounts(req.Params, false)
+	case "debug_getModifiedAccountsByHash":
+		return s.debugGetModifiedAccounts(req.Params, true)
+	case "debug_getBadBlocks":
+		return []any{}, nil // root-verified replay retains no bad blocks
 	case "debug_dumpBlock", "debug_accountRange", "debug_storageRangeAt":
 		return nil, &rpcError{Code: -32000, Message: req.Method + " unsupported by design: epochdb stores no tries"}
 	// filters, subscriptions bookkeeping, and audit trivia (filters.go).

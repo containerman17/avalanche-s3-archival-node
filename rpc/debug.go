@@ -238,6 +238,132 @@ func (s *Server) debugGetRawReceipts(params []json.RawMessage) (any, *rpcError) 
 	return out, nil
 }
 
+// debugTraceCall executes an eth_call-shaped message on the post-state of
+// the given block under a tracer (geth's debug_traceCall; same state base
+// as eth_call at that tag).
+func (s *Server) debugTraceCall(params []json.RawMessage) (any, *rpcError) {
+	if len(params) < 1 {
+		return nil, errInvalid("need [callArgs, blockTag, traceConfig]")
+	}
+	var args callArgs
+	if err := json.Unmarshal(params[0], &args); err != nil {
+		return nil, errInvalid("bad call args: %v", err)
+	}
+	var tag json.RawMessage
+	if len(params) > 1 {
+		tag = params[1]
+	}
+	n, rerr := s.blockNumber(tag)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if n == 0 {
+		return nil, errInvalid("debug_traceCall needs an executed block (>=1)")
+	}
+	cfg, rerr := parseTraceConfig(params, 2)
+	if rerr != nil {
+		return nil, rerr
+	}
+	tracer, err := newTracer(cfg, &tracers.Context{BlockNumber: new(big.Int).SetUint64(n)})
+	if err != nil {
+		return nil, errInvalid("tracer: %v", err)
+	}
+	gas := uint64(GasCap)
+	if args.Gas != nil && uint64(*args.Gas) < gas {
+		gas = uint64(*args.Gas)
+	}
+	if _, rerr := s.runCall(&args, n, gas, tracer); rerr != nil {
+		return nil, rerr
+	}
+	res, err := tracer.GetResult()
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	return res, nil
+}
+
+// --- debug_getModifiedAccountsByNumber / ByHash --------------------------------
+
+// modifiedAccountsBlock resolves one parameter of the method: a plain JSON
+// number (geth's signature), a hex/named tag, or a block hash.
+func (s *Server) modifiedAccountsBlock(raw json.RawMessage, byHash bool) (uint64, *rpcError) {
+	if byHash {
+		n, ok, rerr := s.heightByHash(raw)
+		if rerr != nil {
+			return 0, rerr
+		}
+		if !ok {
+			return 0, &rpcError{Code: -32000, Message: "block not found"}
+		}
+		return n, nil
+	}
+	var num uint64
+	if err := json.Unmarshal(raw, &num); err == nil {
+		if num > s.hist.Head() {
+			return 0, errInvalid("block %d beyond head %d", num, s.hist.Head())
+		}
+		return num, nil
+	}
+	return s.blockNumber(raw)
+}
+
+// debugGetModifiedAccounts serves debug_getModifiedAccountsByNumber/ByHash
+// from the per-block write capture, at ANY height. One param: accounts
+// modified in that block. Two params: union over (start, end] (geth diffs
+// the two tries instead, so a value rewritten to its original across
+// blocks still counts here; addresses come in capture order, not hash
+// order).
+func (s *Server) debugGetModifiedAccounts(params []json.RawMessage, byHash bool) (any, *rpcError) {
+	if len(params) < 1 {
+		return nil, errInvalid("need [startBlock, endBlock?]")
+	}
+	start, rerr := s.modifiedAccountsBlock(params[0], byHash)
+	if rerr != nil {
+		return nil, rerr
+	}
+	lo, hi := start, start
+	if len(params) > 1 && string(params[1]) != "null" {
+		end, rerr := s.modifiedAccountsBlock(params[1], byHash)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if end <= start {
+			return nil, errInvalid("end block %d must be after start block %d", end, start)
+		}
+		lo, hi = start+1, end
+	}
+	if hi-lo+1 > GetLogsMaxRange {
+		return nil, errInvalid("block range %d exceeds %d", hi-lo+1, GetLogsMaxRange)
+	}
+	seen := map[common.Address]bool{}
+	out := []common.Address{}
+	for n := lo; n <= hi; n++ {
+		addrs, ok, err := s.hist.ModifiedAccounts(n)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		if !ok {
+			// No frame: fine for an empty block, an error if txs ran
+			// (write capture absent, e.g. an epoch-only node).
+			blk, rerr := s.blockAt(n)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if len(blk.Transactions()) > 0 {
+				return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("write capture missing for block %d (raw writelog absent on this node)", n)}
+			}
+			continue
+		}
+		for _, a := range addrs {
+			if !seen[a] {
+				seen[a] = true
+				out = append(out, a)
+			}
+		}
+	}
+	return out, nil
+}
+
 // --- eth_createAccessList -----------------------------------------------------
 
 type accessListArgs struct {

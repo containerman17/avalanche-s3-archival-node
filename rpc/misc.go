@@ -11,6 +11,7 @@ import (
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/core/vm"
+	"github.com/ava-labs/libevm/eth/tracers"
 	ethparams "github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 )
@@ -34,9 +35,10 @@ func (s *Server) headerAt(n uint64) (*types.Header, *rpcError) {
 	return &h, nil
 }
 
-// runCall executes args as a message at height n with the given gas limit.
-// Kept separate from server.go's ethCall (file discipline); same semantics.
-func (s *Server) runCall(args *callArgs, n, gas uint64) (*corethcore.ExecutionResult, *rpcError) {
+// runCall executes args as a message at height n with the given gas limit,
+// optionally under a tracer (debug_traceCall). Kept separate from
+// server.go's ethCall (file discipline); same semantics.
+func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (*corethcore.ExecutionResult, *rpcError) {
 	header, rerr := s.headerAt(n)
 	if rerr != nil {
 		return nil, rerr
@@ -67,7 +69,11 @@ func (s *Server) runCall(args *callArgs, n, gas uint64) (*corethcore.ExecutionRe
 		msg.Data = *args.Data
 	}
 	blockCtx := corethcore.NewEVMBlockContext(header, s.chainCtx, nil)
-	evm := vm.NewEVM(blockCtx, corethcore.NewEVMTxContext(msg), st, s.chainCfg, vm.Config{NoBaseFee: true})
+	vmCfg := vm.Config{NoBaseFee: true}
+	if tracer != nil {
+		vmCfg.Tracer = tracer
+	}
+	evm := vm.NewEVM(blockCtx, corethcore.NewEVMTxContext(msg), st, s.chainCfg, vmCfg)
 	gp := new(corethcore.GasPool).AddGas(gas)
 	res, err := corethcore.ApplyMessage(evm, msg, gp)
 	if err != nil {
@@ -108,7 +114,7 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 	}
 
 	// The ceiling must execute at all, or the call fails regardless of gas.
-	res, rerr := s.runCall(&args, n, hi)
+	res, rerr := s.runCall(&args, n, hi, nil)
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -123,7 +129,7 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 	}
 
 	return hexutil.EncodeUint64(searchGas(ethparams.TxGas-1, hi, func(gas uint64) bool {
-		res, rerr := s.runCall(&args, n, gas)
+		res, rerr := s.runCall(&args, n, gas, nil)
 		return rerr == nil && res.Err == nil
 	})), nil
 }

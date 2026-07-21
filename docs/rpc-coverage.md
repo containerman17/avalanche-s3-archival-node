@@ -21,7 +21,8 @@ N/A = unsupported by design with the reason.
 | eth_getStorageAt | DONE | |
 | eth_call | DONE | |
 | eth_estimateGas | DONE | |
-| eth_createAccessList | TODO(other) | |
+| eth_createAccessList | DONE | geth fixed-point AccessListTracer loop |
+| eth_etherbase | DONE | = eth_coinbase (coreth alias); public API refuses it (-32601, internal-eth namespace off), value transitively A/B-verified via eth_coinbase |
 | eth_getBlockByNumber / ByHash | DONE | |
 | eth_getHeaderByNumber / ByHash | DONE | header JSON; public API does not expose these (-32601), so shape-verified against our getBlockByNumber |
 | eth_getBlockTransactionCountByNumber / ByHash | DONE | |
@@ -49,9 +50,9 @@ N/A = unsupported by design with the reason.
 | eth_fillTransaction / eth_resend | PHASE3 | mempool-adjacent, error |
 | eth_pendingTransactions | DONE | empty list (no pool) |
 | eth_accounts | DONE | [] (no keystore) |
-| eth_coinbase | DONE | zero address like coreth |
+| eth_coinbase | DONE | coreth's fixed blackhole 0x0100..00, A/B-verified |
 | eth_sign / eth_signTransaction | N/A | no keystore by design |
-| eth_getProof | N/A | impossible by construction: no per-block tries (DESIGN.md) |
+| eth_getProof | N/A | historically impossible by construction (no per-block tries, DESIGN.md); at the tip it is a Firewood limitation, not ours: ffi v0.3.1 only produces Firewood-native RangeProof/ChangeProof (proprietary encoding for merkle sync), no EIP-1186 MPT path proofs, and graft/evm's firewood trie hard-errors Prove/NodeIterator (base_trie.go), so even real Firewood coreth nodes cannot serve it |
 | eth_getUncle{By,CountBy}* | DONE | zero/null (no uncles on avalanche) |
 
 ## web3 / net
@@ -78,16 +79,24 @@ N/A = unsupported by design with the reason.
 All N/A by design: no keystore (personal_*), no node ops surface
 (admin_importChain etc. are operator tools of a full node, not archive reads).
 
-## debug (other session's lane)
+## debug
 
-debug_traceTransaction, debug_traceBlockByNumber/ByHash, debug_traceCall,
-debug_getRawBlock/Header/Receipts/Transaction, debug_dumpBlock,
-debug_accountRange, debug_storageRangeAt, debug_getModifiedAccountsBy*,
-debug_getBadBlocks, debug_preimage: TODO(other). debug_setHead,
-debug_chaindbCompact and other mutating/ops calls: N/A by design.
+| method | status | notes |
+|---|---|---|
+| debug_traceTransaction | DONE | replay block to tx + tracer (struct logger and named tracers) |
+| debug_traceBlockByNumber / ByHash | DONE | |
+| debug_traceCall | DONE | traces on the post-state of the tag, same base as eth_call; gate: 40 real-tx samples, structLogger/callTracer/eth_call parity on returnValue, failed, gasUsed; public API refuses (-32601) |
+| debug_getRawBlock / Header / Transaction / Receipts | DONE | receipts by re-execution (debug lane) |
+| debug_getModifiedAccountsByNumber / ByHash | DONE | served from the per-block write capture at ANY height (geth needs both boundary states live; here it is one writelog frame per block). Caveats: union-of-writes counts a value rewritten to its original across a range (geth trie-diff would not); capture order, not hash order; needs the raw writelogs, epoch-only/bootstrap nodes get a clean error; two-param range capped at 10k blocks. Gate: 100 random tx-bearing blocks (every tx sender present, ByHash == ByNumber, range == union of singles) + 5 empty blocks; public API refuses (-32601) |
+| debug_getBadBlocks | DONE | always []: the root-verified replay retains no bad blocks; public API refuses (-32601) |
+| debug_dumpBlock / accountRange / storageRangeAt | N/A (this release) | tip-POSSIBLE: ffi Revision.Iter can range-read the Firewood frontier at head, but the replay process holds the exclusive Firewood handle (single-writer), so a serving process cannot open it alongside; revisit when the unified node owns one handle |
+| debug_printBlock / traceChain / traceBadBlock / intermediateRoots / getAccessibleState | N/A | default-off debug surface in coreth; no epochdb use case |
+| debug_preimage | N/A | no preimage store by design |
+| debug_setHead / chaindbCompact / mutating ops | N/A by design | |
 
 ## avax-specific (plugin/evm service)
 
-avax_getAtomicTx, avax_getAtomicTxStatus, avax_issueTx etc.: N/A for this
-phase; atomic txs live in extdata and are indexed nowhere (DESIGN.md caveat),
-issuance is phase-3 territory at the earliest.
+avax_getAtomicTx, avax_getAtomicTxStatus, avax_getUTXOs, avax_issueTx etc.:
+N/A for this phase; atomic txs/UTXOs live in extdata and the shared memory
+UTXO set, indexed nowhere (DESIGN.md caveat), issuance is phase-3 territory
+at the earliest.

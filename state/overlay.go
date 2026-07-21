@@ -141,6 +141,34 @@ func (h *History) LogTuples(n uint64) (LogRec, bool, error) {
 	return lr, true, nil
 }
 
+// ModifiedAccounts returns the unique addresses whose account record or
+// storage changed in block n, in capture order (code-use records are reads,
+// not modifications). ok=false = no write frame captured for n: an empty
+// block, or the raw writelog is absent (epoch-only node after --delete-raw).
+// Goroutine-safe (bucketLog is internally locked).
+func (h *History) ModifiedAccounts(n uint64) ([]common.Address, bool, error) {
+	frame, ok, err := h.store.wl.Get(n)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	var out []common.Address
+	seen := map[common.Address]bool{}
+	if err := parseFrame(frame, func(kind byte, key [sortedKeySize]byte, _ int, _ uint32) {
+		if kind == recKindCodeUse {
+			return
+		}
+		var a common.Address
+		copy(a[:], key[1:21])
+		if !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}); err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
 func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) {
 	f, err := os.Open(filepath.Join(dir, sortedName(bucket)))
 	if err != nil {
