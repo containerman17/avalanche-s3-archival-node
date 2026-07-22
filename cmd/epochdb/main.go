@@ -32,6 +32,7 @@ import (
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/verify"
 )
 
 // parseContainerID accepts a cb58 container ID or a 0x-hex 32-byte eth
@@ -145,6 +146,8 @@ func main() {
 		seedMain(os.Args[2:])
 	case "bootstrap":
 		bootstrapMain(os.Args[2:])
+	case "verify":
+		verifyMain(os.Args[2:])
 	case "backfill-logs":
 		backfillLogsMain(os.Args[2:])
 	case "verify-logs":
@@ -166,7 +169,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--epoch-txs <n>] [--delete-raw]")
 	fmt.Fprintln(os.Stderr, "       epochdb manifest [--data <dir>] [--out <file>]")
 	fmt.Fprintln(os.Stderr, "       epochdb seed [--data <dir>] [--manifest <file>] [--listen-port 42069]")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--manifest <file>] [--rounds 20]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--manifest <file>] [--rounds 20] [--verify] [--network mainnet]")
+	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
 	os.Exit(2)
@@ -291,17 +295,79 @@ func bootstrapMain(args []string) {
 	peer := fs.String("peer", "", "explicit seeder host:port (tests, boost)")
 	noDHT := fs.Bool("no-dht", false, "disable DHT+trackers (tests)")
 	listenPort := fs.Int("listen-port", 0, "BitTorrent listen port (0 = random)")
+	doVerify := fs.Bool("verify", false, "pipelined no-execution verification: verify the contiguous epoch prefix as downloads complete; exit 0 only when all manifest epochs are downloaded AND verified")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (--verify genesis anchor)")
+	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
 	if *manifestPath == "" {
 		*manifestPath = filepath.Join(*dataDir, "epochs.manifest")
 	}
-	if err := dist.Bootstrap(*dataDir, *manifestPath, *rounds, dist.FetchOpts{
+	opts := dist.FetchOpts{
 		Timeout: *epochTimeout,
 		Peer:    *peer,
 		Client:  dist.ClientOpts{ListenPort: *listenPort, NoDHT: *noDHT, NoTrackers: *noDHT, NoUpnp: *noDHT, DisableIPv6: *noDHT},
-	}); err != nil {
+	}
+	if !*doVerify {
+		if err := dist.Bootstrap(*dataDir, *manifestPath, *rounds, opts); err != nil {
+			log.Fatalf("epochdb: bootstrap: %v", err)
+		}
+		return
+	}
+
+	entries, err := dist.LoadManifest(*manifestPath)
+	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
+	tmp, err := os.MkdirTemp(*dataDir, ".verify-")
+	if err != nil {
+		log.Fatalf("epochdb: bootstrap: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+	cur := verify.StartCursor(*dataDir, tmp, execNetID(*network), *workers, len(entries))
+	opts.OnEpoch = cur.Notify
+	bootErr := make(chan error, 1)
+	go func() { bootErr <- dist.Bootstrap(*dataDir, *manifestPath, *rounds, opts) }()
+	bootDone, verDone := false, false
+	for !bootDone || !verDone {
+		select {
+		case err := <-bootErr:
+			if err != nil {
+				os.RemoveAll(tmp)
+				log.Fatalf("epochdb: bootstrap: %v", err)
+			}
+			bootDone = true
+		case err := <-cur.Done():
+			if err != nil {
+				os.RemoveAll(tmp)
+				log.Fatalf("epochdb: bootstrap: %v", err)
+			}
+			verDone = true
+		}
+	}
+	log.Printf("bootstrap: all %d epochs downloaded and verified", len(entries))
+}
+
+// verifyMain runs the no-execution verification over an already-downloaded
+// epoch set: diff-applied state roots, txRoot, reconstructed receiptsRoot,
+// and the header parent-hash chain, per block from genesis.
+func verifyMain(args []string) {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "directory with the sealed epochs")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (genesis anchor)")
+	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
+	fs.Parse(args)
+
+	tmp, err := os.MkdirTemp(*dataDir, ".verify-")
+	if err != nil {
+		log.Fatalf("epochdb: verify: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+	blocks, wall, err := verify.VerifySet(*dataDir, tmp, execNetID(*network), *workers)
+	if err != nil {
+		os.RemoveAll(tmp)
+		log.Fatalf("epochdb: verify: FAIL after %d blocks in %s: %v", blocks, wall.Round(time.Second), err)
+	}
+	log.Printf("verify: PASS %d blocks in %s (%.0f blk/s)", blocks, wall.Round(time.Second), float64(blocks)/wall.Seconds())
 }
 
 // serveMain serves historical JSON-RPC reads over the cooked indexes. The

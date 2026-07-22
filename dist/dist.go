@@ -259,6 +259,11 @@ type FetchOpts struct {
 	Peer    string        // optional explicit host:port seeder (tests, boost)
 	Max     int           // fetch at most N missing epochs (0 = all; tests)
 	Client  ClientOpts
+	// OnEpoch, when set, is called with each manifest epoch's file name as
+	// it becomes locally present during Bootstrap: immediately for epochs
+	// already on disk, after the sha256-verified rename for fetched ones.
+	// Called from multiple goroutines; must not block for long.
+	OnEpoch func(name string)
 }
 
 // FetchMissing leeches manifest epochs absent from dataDir into place
@@ -363,6 +368,9 @@ func Bootstrap(dataDir, manifestPath string, maxRounds int, o FetchOpts) error {
 			missing = append(missing, e)
 		} else {
 			seed(e) // be a good citizen: present epochs seed immediately
+			if o.OnEpoch != nil {
+				o.OnEpoch(e.Name)
+			}
 		}
 	}
 	log.Printf("bootstrap: %d/%d epochs present, %d to fetch (listen port %d)",
@@ -388,6 +396,9 @@ func Bootstrap(dataDir, manifestPath string, maxRounds int, o FetchOpts) error {
 				}
 				log.Printf("bootstrap: %s fetched and verified", e.Name)
 				seed(e)
+				if o.OnEpoch != nil {
+					o.OnEpoch(e.Name)
+				}
 			}()
 		}
 		wg.Wait()
