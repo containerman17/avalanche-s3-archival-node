@@ -50,6 +50,15 @@ func (s *Server) heightByHash(raw json.RawMessage) (uint64, bool, *rpcError) {
 		return 0, false, &rpcError{Code: -32000, Message: "block hash index not available"}
 	}
 	n, ok := s.hashIdx[h]
+	if !ok {
+		// Same failure mode as tx-by-hash: the index starts at the floor, so
+		// an unknown hash on a pruned node may well be a real block below it.
+		if floor := s.hist.Floor(); floor > 0 {
+			return 0, false, &rpcError{Code: errCodePruned, Message: fmt.Sprintf(
+				"block hash not found at or above block %d; this node is pruned below %d and cannot tell an unknown hash from a pruned one (limited-history mode)",
+				floor, floor)}
+		}
+	}
 	return n, ok, nil
 }
 
@@ -219,7 +228,7 @@ func (s *Server) getBlockReceipts(params []json.RawMessage) (any, *rpcError) {
 		return []any{}, nil
 	}
 	if err := s.hist.Epochs().RequireCovered(n); err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+		return nil, coverageError(err)
 	}
 	receipts, rerr := s.storedBlockReceipts(blk)
 	if rerr != nil {

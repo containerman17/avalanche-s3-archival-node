@@ -192,8 +192,12 @@ func logMatches(l *types.Log, addrs []common.Address, topics [][]common.Hash) bo
 func (s *Server) logCandidates(from, to uint64, addrs []common.Address, topics [][]common.Hash) ([]uint64, *rpcError) {
 	inSet := map[uint64]bool{}
 	epochs := s.hist.Epochs()
+	// from first: a range starting below the floor is pruned, not empty.
+	if err := epochs.RequireCovered(from); err != nil {
+		return nil, coverageError(err)
+	}
 	if err := epochs.RequireCovered(to); err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+		return nil, coverageError(err)
 	}
 	sealedEnd := uint64(0)
 	if end, ok := epochs.SealedEnd(); ok {

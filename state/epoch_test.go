@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -244,6 +245,44 @@ func TestEpochSetContiguity(t *testing.T) {
 	}
 	if end, ok := s2.SealedEnd(); !ok || end != 399 {
 		t.Fatalf("sealed end: %d %v", end, ok)
+	}
+}
+
+// TestEpochSetFloorCoverage: in limited-history mode coverage anchors at
+// the base file's block, not genesis.
+func TestEpochSetFloorCoverage(t *testing.T) {
+	dir := t.TempDir()
+	synthEpoch(t, dir, 500) // [500,599]
+	synthEpoch(t, dir, 600) // [600,699]
+	synthEpoch(t, dir, 900) // hole at 700
+	s, err := OpenEpochSet(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Without a floor a set that skips genesis is entirely gapped.
+	if got := s.CoveredEnd(); got != 0 {
+		t.Fatalf("covered end without floor: %d, want 0", got)
+	}
+
+	s.SetFloor(499)
+	if got := s.CoveredEnd(); got != 699 {
+		t.Fatalf("covered end with floor 499: %d, want 699", got)
+	}
+	if err := s.RequireCovered(500); err != nil {
+		t.Fatalf("RequireCovered(500): %v", err)
+	}
+	// Below the floor is pruned, and typed.
+	var pe *PrunedError
+	err = s.RequireCovered(498)
+	if !errors.As(err, &pe) || pe.Floor != 499 || pe.Block != 498 {
+		t.Fatalf("RequireCovered(498): %v, want *PrunedError{498,499}", err)
+	}
+	// A hole above the floor is still a hole, not a pruned read.
+	err = s.RequireCovered(750)
+	if err == nil || errors.As(err, &pe) || !strings.Contains(err.Error(), "missing epoch epoch_700") {
+		t.Fatalf("RequireCovered(750): %v, want missing epoch epoch_700", err)
 	}
 }
 

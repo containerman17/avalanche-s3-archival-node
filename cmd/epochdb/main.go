@@ -148,6 +148,8 @@ func main() {
 		bootstrapMain(os.Args[2:])
 	case "verify":
 		verifyMain(os.Args[2:])
+	case "snapshot":
+		snapshotMain(os.Args[2:])
 	case "backfill-logs":
 		backfillLogsMain(os.Args[2:])
 	case "verify-logs":
@@ -459,13 +461,15 @@ func serveMain(args []string) {
 	if hashes, err := fetch.BlockHashes(*dataDir); err != nil {
 		log.Printf("epochdb: block hash index unavailable: %v", err)
 	} else {
-		byHash := make(map[common.Hash]uint64, hist.Head()+1)
+		// Nothing below the floor exists, so the scan starts there.
+		floor := hist.Floor()
+		byHash := make(map[common.Hash]uint64, hist.Head()+1-floor)
 		for h, n := range hashes {
 			byHash[common.Hash(h)] = n
 		}
-		if uint64(len(byHash)) < hist.Head()+1 {
+		if uint64(len(byHash)) < hist.Head()+1-floor {
 			filled := 0
-			for n := uint64(0); n <= hist.Head(); n++ {
+			for n := floor; n <= hist.Head(); n++ {
 				raw, ok, err := hist.HeaderRLP(n)
 				if err != nil || !ok {
 					continue
@@ -485,7 +489,10 @@ func serveMain(args []string) {
 	}
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("epochdb: serving historical RPC on %s, head=%d chainId=%s", addr, hist.Head(), g.Config.ChainID)
+	if floor := hist.Floor(); floor > 0 {
+		log.Printf("epochdb: LIMITED HISTORY: floor=%d (base file), nothing below block %d is served", floor, floor)
+	}
+	log.Printf("epochdb: serving historical RPC on %s, head=%d floor=%d chainId=%s", addr, hist.Head(), hist.Floor(), g.Config.ChainID)
 	log.Fatal(srv.ListenAndServe(addr))
 }
 

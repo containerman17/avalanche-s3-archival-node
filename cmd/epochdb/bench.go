@@ -38,6 +38,7 @@ func benchMain(args []string) {
 	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	workers := fs.Int("workers", 8, "concurrent probe workers")
+	floor := fs.Uint64("floor", 0, "limited-history floor of --local: probe only at or above it, and assert --local refuses below it (point --remote at a full epochdb node)")
 	fs.Parse(args)
 	if *remote == "" {
 		_, _, *remote = netParams(*network)
@@ -64,7 +65,10 @@ func benchMain(args []string) {
 	erc20s := discoverERC20s(rng, hist, *remote, head)
 	log.Printf("ab-bench: discovered %d ERC20-ish contracts for eth_call probes: %v", len(erc20s), erc20s)
 
-	probes := buildProbes(rng, hist, erc20s, head, *n)
+	probes := buildProbes(rng, hist, erc20s, head, *n, *floor)
+	if *floor > 0 {
+		probes = append(probes, floorProbes(rng, hist, *floor, head)...)
+	}
 
 	type outcome struct {
 		method   string
@@ -123,11 +127,39 @@ func benchMain(args []string) {
 		localTotal.Round(time.Millisecond),
 		(localTotal / time.Duration(len(out))).Round(time.Microsecond),
 		float64(len(out))/localTotal.Seconds())
+	if *floor > 0 {
+		bad += belowFloorRefusals(rng, hist, *local, *floor)
+	}
 	if bad > 0 {
 		fmt.Printf("RESULT: %d MISMATCHES\n", bad)
 		os.Exit(1)
 	}
 	fmt.Println("RESULT: ZERO mismatches")
+}
+
+// belowFloorRefusals asserts the limited-history node REFUSES state reads
+// below its floor. Answering (a zero balance, empty code) instead of
+// erroring is the silent-corruption failure this whole mode exists to
+// avoid, so an answer counts as a mismatch.
+func belowFloorRefusals(rng *rand.Rand, hist *state.History, local string, floor uint64) int {
+	bad, probes := 0, 0
+	for i := 0; i < 20; i++ {
+		_, addr, _, _, ok := hist.SampleRecord(rng)
+		if !ok {
+			break
+		}
+		h := hexBlock(uint64(rng.Int63n(int64(floor))))
+		for _, m := range []string{"eth_getBalance", "eth_getCode"} {
+			probes++
+			res, err := rpcCall(local, m, []any{addr.Hex(), h}, 1)
+			if err == nil {
+				bad++
+				log.Printf("MISMATCH %s at %s: pruned node ANSWERED below floor %d: %s", m, h, floor, res)
+			}
+		}
+	}
+	fmt.Printf("  below-floor refusals: %d probes, %d answered (want 0)\n", probes, bad)
+	return bad
 }
 
 type probe struct {
@@ -138,22 +170,43 @@ type probe struct {
 func hexBlock(n uint64) string { return hexutil.EncodeUint64(n) }
 
 // probeHeight mixes uniform-random heights with exact write-boundary
-// heights and just-below-boundary heights.
-func probeHeight(rng *rand.Rand, writeBlock, head uint64) uint64 {
+// heights and just-below-boundary heights, never below floor (a
+// limited-history --local refuses those by design; floorProbes covers them).
+func probeHeight(rng *rand.Rand, writeBlock, head, floor uint64) uint64 {
 	switch rng.Intn(4) {
 	case 0:
-		if writeBlock <= head {
+		if writeBlock <= head && writeBlock >= floor {
 			return writeBlock // exact boundary: write must be visible
 		}
 	case 1:
-		if writeBlock > 1 && writeBlock-1 <= head {
+		if writeBlock > 1 && writeBlock-1 <= head && writeBlock-1 >= floor {
 			return writeBlock - 1 // one below: write must NOT be visible
 		}
 	}
-	return 1 + uint64(rng.Int63n(int64(head)))
+	return floor + uint64(rng.Int63n(int64(head-floor)+1))
 }
 
-func buildProbes(rng *rand.Rand, hist *state.History, erc20s []common.Address, head uint64, n int) []probe {
+// floorProbes pins the heights a limited-history node is most likely to get
+// wrong: the floor itself, and the edge of the 256-header BLOCKHASH window
+// the base file has to carry.
+func floorProbes(rng *rand.Rand, hist *state.History, floor, head uint64) []probe {
+	var probes []probe
+	for _, h := range []uint64{floor, floor + 1, floor + 255, floor + 256} {
+		if h > head {
+			continue
+		}
+		_, addr, _, _, ok := hist.SampleRecord(rng)
+		if !ok {
+			break
+		}
+		probes = append(probes,
+			probe{"eth_getBalance", []any{addr.Hex(), hexBlock(h)}},
+			probe{"eth_getCode", []any{addr.Hex(), hexBlock(h)}})
+	}
+	return probes
+}
+
+func buildProbes(rng *rand.Rand, hist *state.History, erc20s []common.Address, head uint64, n int, floor uint64) []probe {
 	var probes []probe
 	balanceOfSel := "0x70a08231"
 	totalSupplySel := "0x18160ddd"
@@ -162,7 +215,7 @@ func buildProbes(rng *rand.Rand, hist *state.History, erc20s []common.Address, h
 		if !ok {
 			log.Fatal("ab-bench: no records to sample")
 		}
-		h := hexBlock(probeHeight(rng, blk, head))
+		h := hexBlock(probeHeight(rng, blk, head, floor))
 		switch {
 		case kind == 's':
 			probes = append(probes, probe{"eth_getStorageAt", []any{addr.Hex(), common.Hash(slot).Hex(), h}})
