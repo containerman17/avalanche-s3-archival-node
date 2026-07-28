@@ -86,6 +86,9 @@ func (e *Epoch) SpillDiffs(tmpDir string) (*DiffCursor, error) {
 		if spillErr != nil {
 			return
 		}
+		if r.Key[0] == recKindCodeUse {
+			return // v3 code blob row, not a state diff
+		}
 		if r.Block < e.Start || r.Block > e.End() {
 			spillErr = fmt.Errorf("SST row for block %d outside epoch [%d,%d]", r.Block, e.Start, e.End())
 			return

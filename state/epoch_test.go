@@ -297,6 +297,22 @@ func TestEpochDeterminism(t *testing.T) {
 	}
 }
 
+// TestOpenEpochRefusesOldFormat: there is no upgrade path, so an older file
+// must be named as such at open rather than half-read.
+func TestOpenEpochRefusesOldFormat(t *testing.T) {
+	dir := t.TempDir()
+	_, path := synthEpoch(t, dir, 700)
+	raw, _ := readFileT(t, path)
+	binary.LittleEndian.PutUint32(raw[len(raw)-epochFooterSize+4:], 2)
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := OpenEpoch(path)
+	if err == nil || !strings.Contains(err.Error(), "format v2, unsupported") {
+		t.Fatalf("OpenEpoch on a v2 file: %v, want a format refusal", err)
+	}
+}
+
 func readFileT(t *testing.T, p string) ([]byte, error) {
 	t.Helper()
 	b, err := os.ReadFile(p)
@@ -308,7 +324,7 @@ func readFileT(t *testing.T, p string) ([]byte, error) {
 
 func TestEpochStoredLogsSections(t *testing.T) {
 	dir := t.TempDir()
-	in, _ := synthEpoch(t, dir, 3000) // v2 without stored sections
+	in, _ := synthEpoch(t, dir, 3000) // sealed without the stored sections
 	e0, err := OpenEpoch(filepath.Join(dir, EpochFileName(3000, 100)))
 	if err != nil {
 		t.Fatal(err)

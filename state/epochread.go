@@ -69,31 +69,20 @@ func OpenEpoch(path string) (*Epoch, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Footer size depends on the format version: probe v2 first, then v1
-	// (a candidate is valid only if BOTH magics and the version agree).
-	probe := func(footerSize, nSections int, version uint32) []byte {
-		if size < footerSize {
-			return nil
-		}
-		ft := mm[size-footerSize:]
-		if !bytes.Equal(ft[0:4], epochMagic[:]) || !bytes.Equal(ft[footerSize-4:], epochMagic[:]) {
-			return nil
-		}
-		if binary.LittleEndian.Uint32(ft[4:8]) != version {
-			return nil
-		}
-		return ft
-	}
-	nSections := epochNumSections
-	footerSize := epochFooterSize
-	ft := probe(epochFooterSize, epochNumSections, 2)
-	if ft == nil {
-		ft = probe(epochV1Footer, epochV1Sections, 1)
-		nSections, footerSize = epochV1Sections, epochV1Footer
-	}
-	if ft == nil {
+	// v3 is the only supported format. Older files are recognized far
+	// enough to say so and no further: there is no upgrade path (user
+	// ruling 2026-07-28), the corpus is disposable and gets resynced.
+	// A v2 footer has this layout, so its version reads out directly; v1's
+	// footer was shorter, so its leading magic lands elsewhere and it falls
+	// into the generic refusal.
+	ft := mm[size-epochFooterSize:]
+	if !bytes.Equal(ft[0:4], epochMagic[:]) || !bytes.Equal(ft[epochFooterSize-4:], epochMagic[:]) {
 		syscall.Munmap(mm)
-		return nil, fmt.Errorf("epoch %s: unrecognized footer (not v1 or v2)", path)
+		return nil, fmt.Errorf("epoch %s: unrecognized footer, not format v%d (older formats are unsupported: delete the corpus and resync)", path, epochVersion)
+	}
+	if v := binary.LittleEndian.Uint32(ft[4:8]); v != epochVersion {
+		syscall.Munmap(mm)
+		return nil, fmt.Errorf("epoch %s is format v%d, unsupported: delete the corpus and resync", path, v)
 	}
 	e := &Epoch{
 		Start:   binary.LittleEndian.Uint64(ft[8:16]),
@@ -101,10 +90,10 @@ func OpenEpoch(path string) (*Epoch, error) {
 		TxCount: binary.LittleEndian.Uint64(ft[24:32]),
 		mm:      mm,
 	}
-	for i := 0; i < nSections; i++ {
+	for i := 0; i < epochNumSections; i++ {
 		off := binary.LittleEndian.Uint64(ft[32+i*16:])
 		ln := binary.LittleEndian.Uint64(ft[40+i*16:])
-		if off+ln > uint64(size-footerSize) {
+		if off+ln > uint64(size-epochFooterSize) {
 			syscall.Munmap(mm)
 			return nil, fmt.Errorf("epoch %s: section %d out of bounds", path, i)
 		}
@@ -292,7 +281,19 @@ func (e *Epoch) StateSearch(key []byte, n uint64) (val []byte, blk uint64, found
 	return val, blk, found, nil
 }
 
-// WalkStateRows streams every SST row (re-seal input reconstruction).
+// Code returns the contract code blob for hash from this epoch's 'c' rows
+// (format v3). found=false on a v2 file, or when this epoch wrote no account
+// carrying that code.
+func (e *Epoch) Code(hash common.Hash) ([]byte, bool, error) {
+	k := epochCodeKey(hash)
+	if !e.MayContainKey(k[:]) {
+		return nil, false, nil
+	}
+	val, _, found, err := e.StateSearch(k[:], ^uint64(0))
+	return val, found, err
+}
+
+// WalkStateRows streams every SST row (verification, diff spill).
 // Values are views into a transient decode buffer: copy to retain.
 func (e *Epoch) WalkStateRows(fn func(StateRow)) error {
 	idx := e.sec[secSSTIdx]
@@ -394,7 +395,7 @@ func (e *Epoch) LogAddrBlocks(addr [20]byte) ([]uint64, error) { return e.logidx
 // LogTopicBlocks returns the absolute blocks where topic appeared.
 func (e *Epoch) LogTopicBlocks(topic [32]byte) ([]uint64, error) { return e.logidxLookup(topic[:]) }
 
-// HasStoredLogs reports whether this epoch carries the v2 stored-logs
+// HasStoredLogs reports whether this epoch carries the stored-logs
 // sections (index headers present; an epoch with zero logs still counts).
 func (e *Epoch) HasStoredLogs() bool {
 	return len(e.sec[secFullLogsIdx]) >= 4 && len(e.sec[secRcptIdx]) >= 4
@@ -466,16 +467,19 @@ func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64,
 	if err != nil {
 		return key, 0, false
 	}
-	// reservoir-pick a row while walking the block
+	// reservoir-pick a row while walking the block (code rows are not state:
+	// a block can be all code, hence the caller's retry)
 	pos, seen := 0, 0
 	for pos < len(raw) {
 		rb := binary.BigEndian.Uint64(raw[pos+sortedKeySize:])
 		vlen, vn := binary.Uvarint(raw[pos+sortedKeySize+8:])
-		seen++
-		if r.Intn(seen) == 0 {
-			copy(key[:], raw[pos:pos+sortedKeySize])
-			blk = rb
-			ok = true
+		if raw[pos] != recKindCodeUse {
+			seen++
+			if r.Intn(seen) == 0 {
+				copy(key[:], raw[pos:pos+sortedKeySize])
+				blk = rb
+				ok = true
+			}
 		}
 		pos += sortedKeySize + 8 + vn + int(vlen)
 	}

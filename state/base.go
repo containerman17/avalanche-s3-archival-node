@@ -508,6 +508,11 @@ func (b *baseEmitter) setAddr(key []byte) {
 }
 
 func (b *baseEmitter) emit(key []byte, blk uint64, val []byte) error {
+	if key[0] == baseKindCode {
+		// A v3 epoch's own code row: the base rebuilds its code section from
+		// the live accounts it emits (emitCode), so these are not merge input.
+		return nil
+	}
 	b.setAddr(key)
 	switch key[0] {
 	case recKindAccount:
@@ -552,20 +557,11 @@ func (b *baseEmitter) emitCode(hash common.Hash) error {
 		return nil
 	}
 	b.codeSeen[hash] = true
-	blob, ok, err := b.h.store.code.Get(hash)
+	// Full descent (code.log, v3 epochs, genesis alloc): a folded corpus can
+	// have had its code.log dropped once the epochs carry the blobs.
+	blob, err := b.h.CodeByHash(hash)
 	if err != nil {
-		return err
-	}
-	if !ok {
-		for _, ga := range b.h.genesis {
-			if len(ga.Code) > 0 && crypto.Keccak256Hash(ga.Code) == hash {
-				blob, ok = ga.Code, true
-				break
-			}
-		}
-	}
-	if !ok {
-		return fmt.Errorf("base: code %x referenced by a live account is not in code.log", hash)
+		return fmt.Errorf("base: code %x referenced by a live account: %w", hash, err)
 	}
 	return b.sp.add(baseCodeKey(hash), blob)
 }

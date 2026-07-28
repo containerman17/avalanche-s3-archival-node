@@ -208,7 +208,7 @@ func sealMain(args []string) {
 	fetch.RegisterExtras()
 
 	// Stored logs are unconditional (user ruling 2026-07-20): every seal
-	// derives the sections, and v1 epochs are upgraded in place first.
+	// derives the sections.
 	g, err := exec.NetworkGenesis(execNetID(*network))
 	if err != nil {
 		log.Fatalf("epochdb: seal: genesis: %v", err)
@@ -224,9 +224,6 @@ func sealMain(args []string) {
 	}
 	defer hist.Close()
 	derive := rpc.NewDeriveStored(hist, rpc.HistoryChainContext(hist), g.Config, exec.ParseEthBlock, *workers)
-	if err := state.ReSealStoredLogs(*outDir, derive); err != nil {
-		log.Fatalf("epochdb: reseal: %v", err)
-	}
 	if err := state.SealEpochs(*dataDir, *outDir, *deleteRaw, *epochTxs, derive); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
@@ -425,14 +422,8 @@ func serveMain(args []string) {
 	}
 	defer hist.Close()
 
-	// Stored logs are unconditional (user ruling 2026-07-20): a sealed
-	// epoch without the sections is an unsupported format.
-	for _, e := range hist.Epochs().Epochs {
-		if !e.HasStoredLogs() {
-			log.Fatalf("epochdb: epoch %s is unsupported format v1 (no stored-logs sections); upgrade it in place: epochdb seal --data %s --network %s", state.EpochFileName(e.Start, e.Count), *dataDir, *network)
-		}
-	}
-
+	// Format v3 is the only served format; OpenHistory above already
+	// refused anything older (state.OpenEpoch), so there is no check here.
 	srv := rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
 
 	epochs := hist.Epochs()

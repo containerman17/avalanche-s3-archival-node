@@ -132,7 +132,7 @@ func (s *miscStore) Delete(key []byte) error {
 }
 
 func (s *miscStore) Sync() error {
-	if !s.dirty {
+	if !s.dirty || s.f == nil { // nil file = absent misc.log (read-only, empty)
 		return nil
 	}
 	if err := s.f.Sync(); err != nil {
@@ -143,6 +143,9 @@ func (s *miscStore) Sync() error {
 }
 
 func (s *miscStore) Close() error {
+	if s.f == nil {
+		return nil
+	}
 	if err := s.Sync(); err != nil {
 		s.f.Close()
 		return err

@@ -541,10 +541,14 @@ func (h *History) StorageAt(addr common.Address, slot []byte, n uint64) ([]byte,
 	return enc, nil
 }
 
-// CodeByHash serves contract code from the code.log RAM map, falling back
-// to the base file's code section (a limited-history node never captured
-// the deploys below its floor), never any frontier. EmptyCodeHash resolves
-// to nil.
+// CodeByHash serves contract code from code.log (the hot tail: everything
+// deployed above the sealed end), then the sealed epochs newest-to-oldest,
+// then the base file's code section, then the genesis alloc. Never any
+// frontier. EmptyCodeHash resolves to nil.
+//
+// The epoch descent is what makes a torrent-bootstrapped node (no code.log
+// at all) serve eth_getCode: a v3 epoch carries the code of every account it
+// wrote, so whichever epoch answered the account read carries the blob too.
 func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 	if codeHash == types.EmptyCodeHash || codeHash == (common.Hash{}) {
 		return nil, nil
@@ -553,6 +557,11 @@ func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	for i := len(h.epochs.Epochs) - 1; !ok && i >= 0; i-- {
+		if blob, ok, err = h.epochs.Epochs[i].Code(codeHash); err != nil {
+			return nil, err
+		}
+	}
 	if !ok && h.base != nil {
 		blob, ok, err = h.base.Code(codeHash)
 		if err != nil {
@@ -560,7 +569,14 @@ func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 		}
 	}
 	if !ok {
-		return nil, fmt.Errorf("code %x not in code.log", codeHash)
+		// Genesis alloc code was never deployed by a block, so no epoch
+		// carries it; the alloc ships with the binary.
+		for _, ga := range h.genesis {
+			if len(ga.Code) > 0 && crypto.Keccak256Hash(ga.Code) == codeHash {
+				return ga.Code, nil
+			}
+		}
+		return nil, fmt.Errorf("code %x not in code.log, the sealed epochs or the base file", codeHash)
 	}
 	return blob, nil
 }
@@ -607,8 +623,15 @@ func (h *History) sampleEpochRecord(r *rand.Rand) (kind byte, addr common.Addres
 	if len(eps) == 0 {
 		return 0, addr, slot, 0, false
 	}
-	e := eps[r.Intn(len(eps))]
-	key, blk, ok := e.sampleSSTRow(r)
+	// An SST block can hold nothing but code rows, which are not state:
+	// resample instead of reporting an empty corpus.
+	var (
+		key [sortedKeySize]byte
+		blk uint64
+	)
+	for try := 0; try < 10 && !ok; try++ {
+		key, blk, ok = eps[r.Intn(len(eps))].sampleSSTRow(r)
+	}
 	if !ok {
 		return 0, addr, slot, 0, false
 	}

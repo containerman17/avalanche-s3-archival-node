@@ -110,7 +110,7 @@ func (c *codeStore) Has(hash common.Hash) bool {
 func (c *codeStore) Count() int { return len(c.idx) }
 
 func (c *codeStore) Sync() error {
-	if !c.dirty {
+	if !c.dirty || c.f == nil { // nil file = absent code.log (read-only, empty)
 		return nil
 	}
 	if err := c.f.Sync(); err != nil {
@@ -121,6 +121,9 @@ func (c *codeStore) Sync() error {
 }
 
 func (c *codeStore) Close() error {
+	if c.f == nil {
+		return nil
+	}
 	if err := c.Sync(); err != nil {
 		c.f.Close()
 		return err

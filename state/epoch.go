@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/rlp"
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/zstd"
 )
@@ -59,7 +61,8 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 //	headers    RLP headers, same framing
 //	headersIdx u64 LE frame offsets
 //	sst        post-image rows sorted by (key53, block), values inline,
-//	           dict-compressed blocks of ~sstBlockTarget raw bytes
+//	           dict-compressed blocks of ~sstBlockTarget raw bytes; v3 also
+//	           carries the epoch's contract code as 'c' | hash rows here
 //	sstIdx     sparse index: 69B entries key53|firstBlock u64|off u64
 //	deletes    raw sorted 61B rows key53|block u64 of account-delete
 //	           records (rare; feeds the open-time delete map without
@@ -85,15 +88,15 @@ const (
 	bloomBitsPerKey = 10
 	bloomHashes     = 7
 
-	// Format v2 adds the stored-logs sections (2026-07-20 user decision:
-	// measured +14.4% of sealed size with a dedicated logs dict on the
-	// full 10M corpus => flag-gated, default on). v1 files stay readable;
-	// re-sealing rewrites them in place with the sections added.
-	epochVersion     = 2
+	// Format v3 is the ONLY supported format: stored-logs sections (v2,
+	// 2026-07-20) plus contract code as 'c' rows in the SST (v3,
+	// 2026-07-28), so an epoch is self-contained and a torrent-bootstrapped
+	// node serves eth_getCode. There is no upgrade path: OpenEpoch refuses
+	// an older file and the corpus is rebuilt by a fresh sync (user ruling
+	// 2026-07-28).
+	epochVersion     = 3
 	epochNumSections = 16
 	epochFooterSize  = 4 + 4 + 8 + 8 + 8 + epochNumSections*16 + 4 // magics + version + start/count/txs + table
-	epochV1Sections  = 11
-	epochV1Footer    = 4 + 4 + 8 + 8 + 8 + epochV1Sections*16 + 4
 
 	logsDictTarget = 128 << 10 // dedicated logs dict (measured better than container dict)
 )
@@ -136,6 +139,44 @@ func ParseEpochFileName(name string) (uint64, uint64, bool) {
 
 // ---------- builder input ----------
 
+// epochCodeKey keys a contract code blob by its hash inside the epoch's SST
+// keyspace: 'c' | hash32 | 20 zero bytes. Since 'a' < 'c' < 's', code rows
+// share the one sorted keyspace, sparse index and bloom with the state rows,
+// the same trick state/base.go uses. The kind byte is free here because the
+// write capture's code-USE records ('c' | addr | hash) are dropped at cook
+// and seal time and never reach an SST.
+func epochCodeKey(hash common.Hash) (k [sortedKeySize]byte) {
+	k[0] = recKindCodeUse
+	copy(k[1:33], hash[:])
+	return
+}
+
+// accountCodeHash pulls field 3 (CodeHash) out of a captured account RLP
+// without decoding the struct: libevm appends registered extras after the
+// four core fields, so the code hash is neither the last field nor at a
+// fixed offset. ok=false for a delete row or an unparsable value.
+func accountCodeHash(val []byte) (common.Hash, bool) {
+	var h common.Hash
+	rest, _, err := rlp.SplitList(val)
+	if err != nil {
+		return h, false
+	}
+	for i := 0; i < 4; i++ {
+		_, content, r, err := rlp.Split(rest)
+		if err != nil {
+			return h, false
+		}
+		if i == 3 {
+			if len(content) != common.HashLength {
+				return h, false
+			}
+			return common.BytesToHash(content), true
+		}
+		rest = r
+	}
+	return h, false
+}
+
 // StateRow is one post-image write: key53 = kind+addr+slot (cook.go
 // layout), Value nil for explicit deletes/zero writes.
 type StateRow struct {
@@ -170,10 +211,62 @@ type EpochInput struct {
 	// genuinely has no logs) and still marks the sections present.
 	FullLogs map[uint64][]byte // log-bearing block -> logs record
 	RcptRecs map[uint64][]byte // tx-bearing block -> receipt-fields record
+
+	// Code (v3) is every contract code blob referenced by an account row
+	// this epoch writes, keyed by hash. THE PLACEMENT RULE, user decision
+	// 2026-07-28 after measuring both candidates on the mainnet 0-10M
+	// corpus: an epoch carries the code of every account it wrote, NOT
+	// only of the code first deployed inside it. Rule (a), first-deploying
+	// epoch, would cost 288MB over the 7 production epochs; this rule
+	// costs 478MB, i.e. +190MB (+0.6%) on a 32.6GB corpus, which buys the
+	// invariant that WHICHEVER epoch answers an account read also carries
+	// that account's code, derived from the epoch's own account rows (no
+	// earlier epoch needed).
+	//
+	// DETERMINISM: the set is a pure function of this epoch's own post-image
+	// rows (chain content), the blobs are content-addressed, and buildSST
+	// sorts them by key, so map iteration order, wall time and local file
+	// layout cannot reach the bytes.
+	Code map[common.Hash][]byte
 }
 
 // HasStoredLogInputs reports whether this input seals the v2 sections.
 func (in *EpochInput) HasStoredLogInputs() bool { return in.FullLogs != nil && in.RcptRecs != nil }
+
+// codeCursor emits the v3 code rows in key order as an SST write walks past
+// them ('c' sorts between the 'a' and 's' rows, so they form one contiguous
+// run). Kept separate from the state rows because a production epoch holds
+// ~100M of those in RAM and merging into that slice would reallocate it.
+// The row's block number is the epoch start: a blob has no meaningful write
+// height (the same bytes can be deployed by many blocks) and the code lookup
+// ignores it, so the epoch's own first block is the deterministic choice.
+type codeCursor struct {
+	hashes []common.Hash // ascending
+	code   map[common.Hash][]byte
+	block  uint64
+	i      int
+}
+
+func newCodeCursor(code map[common.Hash][]byte, block uint64) *codeCursor {
+	hashes := make([]common.Hash, 0, len(code))
+	for h := range code {
+		hashes = append(hashes, h)
+	}
+	sort.Slice(hashes, func(i, j int) bool { return bytes.Compare(hashes[i][:], hashes[j][:]) < 0 })
+	return &codeCursor{hashes: hashes, code: code, block: block}
+}
+
+// upTo writes every remaining code row that sorts before key (nil = all).
+func (c *codeCursor) upTo(w *sstWriter, key []byte) {
+	for c.i < len(c.hashes) {
+		k := epochCodeKey(c.hashes[c.i])
+		if key != nil && bytes.Compare(k[:], key) >= 0 {
+			return
+		}
+		w.add(k[:], c.block, c.code[c.hashes[c.i]])
+		c.i++
+	}
+}
 
 // ---------- builder ----------
 
@@ -230,7 +323,7 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 	section(secHeaders, headers)
 	section(secHeadersIdx, headersIdx)
 
-	sst, sstIdx, deletes, keys := buildSST(enc, in.StateRows)
+	sst, sstIdx, deletes, keys := buildSST(enc, in.StateRows, newCodeCursor(in.Code, in.Start))
 	section(secSST, sst)
 	section(secSSTIdx, sstIdx)
 	section(secDeletes, deletes)
@@ -239,19 +332,21 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 	section(secLogidx, buildLogidx(in.Logs, in.Start, count))
 	section(secKeybloom, buildBloom(keys))
 
-	// v2 stored-logs sections. Present (nonempty index headers) whenever
-	// the inputs were supplied, even for epochs with zero logs.
+	// Stored-logs sections. Present (nonempty index headers) whenever the
+	// inputs were supplied, even for epochs with zero logs. Without them
+	// (unit tests only) the five sections are empty but still get their
+	// offsets, so the section layout never varies.
+	var stored [5][]byte
 	if in.HasStoredLogInputs() {
-		secs, err := buildStoredSections(in, epochDict)
-		if err != nil {
+		if stored, err = buildStoredSections(in, epochDict); err != nil {
 			return "", err
 		}
-		section(secLogsDict, secs[0])
-		section(secFullLogs, secs[1])
-		section(secFullLogsIdx, secs[2])
-		section(secRcpt, secs[3])
-		section(secRcptIdx, secs[4])
 	}
+	section(secLogsDict, stored[0])
+	section(secFullLogs, stored[1])
+	section(secFullLogsIdx, stored[2])
+	section(secRcpt, stored[3])
+	section(secRcptIdx, stored[4])
 
 	// Footer.
 	var ft [epochFooterSize]byte
@@ -317,51 +412,6 @@ func buildStoredSections(in *EpochInput, containerDict []byte) (secs [5][]byte, 
 	secs[1], secs[2] = buildStoredFrames(encL, in.Start, in.FullLogs)
 	secs[3], secs[4] = buildStoredFrames(encC, in.Start, in.RcptRecs)
 	return secs, nil
-}
-
-// appendStoredSections upgrades a v1 epoch in place: the old file's bytes
-// (all sections, offsets unchanged) are kept verbatim, the five derived
-// stored-logs sections are appended, and a v2 footer replaces the v1 one.
-func (e *Epoch) appendStoredSections(dir string, in *EpochInput) (string, error) {
-	if !in.HasStoredLogInputs() {
-		return "", fmt.Errorf("append sections: inputs not derived")
-	}
-	secs, err := buildStoredSections(in, e.sec[secDict])
-	if err != nil {
-		return "", err
-	}
-	body := e.mm[:len(e.mm)-epochV1Footer] // every old section, offsets intact
-	oldFt := e.mm[len(e.mm)-epochV1Footer:]
-
-	var ft [epochFooterSize]byte
-	copy(ft[0:4], epochMagic[:])
-	binary.LittleEndian.PutUint32(ft[4:8], epochVersion)
-	copy(ft[8:32], oldFt[8:32])                                         // start, count, txCount
-	copy(ft[32:32+epochV1Sections*16], oldFt[32:32+epochV1Sections*16]) // old table
-	off := uint64(len(body))
-	for i, s := range secs {
-		binary.LittleEndian.PutUint64(ft[32+(epochV1Sections+i)*16:], off)
-		binary.LittleEndian.PutUint64(ft[40+(epochV1Sections+i)*16:], uint64(len(s)))
-		off += uint64(len(s))
-	}
-	copy(ft[epochFooterSize-4:], epochMagic[:])
-
-	path := filepath.Join(dir, EpochFileName(e.Start, e.Count))
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return "", err
-	}
-	for _, b := range append([][]byte{body}, append(secs[:], ft[:])...) {
-		if _, err := f.Write(b); err != nil {
-			f.Close()
-			return "", err
-		}
-	}
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	return path, os.Rename(tmp, path)
 }
 
 // buildStoredFrames packs sparse per-block records (stored logs / receipt
@@ -438,11 +488,62 @@ const (
 	deleteEntrySize = sortedKeySize + 8
 )
 
-// buildSST sorts and dedupes the epoch's post-image rows, packs them into
-// dict-compressed blocks, and returns the sst data, sparse index, the raw
-// account-delete rows, and every unique written key (bloom input).
+// sstWriter packs rows into dict-compressed blocks. Rows must arrive in
+// final (key, block) order, already deduped: the packing rule is what makes
+// two independent seals of the same chain content produce the same bytes.
 // Row wire format inside a block: key53 | block u64 BE | uvarint vlen | value.
-func buildSST(enc *zstd.Encoder, rows []StateRow) (sst, sstIdx, deletes []byte, keys [][]byte) {
+type sstWriter struct {
+	enc *zstd.Encoder
+
+	sst      []byte
+	sstIdx   []byte
+	deletes  []byte
+	keys     [][]byte
+	raw      []byte
+	firstKey []byte
+	firstBlk uint64
+	lastKey  []byte
+}
+
+func (w *sstWriter) flush() {
+	if len(w.raw) == 0 {
+		return
+	}
+	w.sstIdx = append(w.sstIdx, w.firstKey...)
+	w.sstIdx = binary.BigEndian.AppendUint64(w.sstIdx, w.firstBlk)
+	w.sstIdx = binary.LittleEndian.AppendUint64(w.sstIdx, uint64(len(w.sst)))
+	w.sst = w.enc.EncodeAll(w.raw, w.sst)
+	w.raw = w.raw[:0]
+	w.firstKey = nil
+}
+
+func (w *sstWriter) add(key []byte, block uint64, val []byte) {
+	if w.lastKey == nil || !bytes.Equal(w.lastKey, key) {
+		k := append([]byte(nil), key...)
+		w.keys = append(w.keys, k)
+		w.lastKey = k
+	}
+	if key[0] == recKindAccount && len(val) == 0 {
+		w.deletes = append(w.deletes, key...)
+		w.deletes = binary.BigEndian.AppendUint64(w.deletes, block)
+	}
+	if w.firstKey == nil {
+		w.firstKey = append([]byte(nil), key...)
+		w.firstBlk = block
+	}
+	w.raw = append(w.raw, key...)
+	w.raw = binary.BigEndian.AppendUint64(w.raw, block)
+	w.raw = binary.AppendUvarint(w.raw, uint64(len(val)))
+	w.raw = append(w.raw, val...)
+	if len(w.raw) >= sstBlockTarget {
+		w.flush()
+	}
+}
+
+// buildSST sorts and dedupes the epoch's post-image rows, merges in the v3
+// code rows, and returns the sst data, sparse index, the raw account-delete
+// rows, and every unique written key (bloom input).
+func buildSST(enc *zstd.Encoder, rows []StateRow, cc *codeCursor) (sst, sstIdx, deletes []byte, keys [][]byte) {
 	sort.Slice(rows, func(i, j int) bool {
 		if c := bytes.Compare(rows[i].Key[:], rows[j].Key[:]); c != 0 {
 			return c < 0
@@ -453,52 +554,19 @@ func buildSST(enc *zstd.Encoder, rows []StateRow) (sst, sstIdx, deletes []byte, 
 		return rows[i].Seq < rows[j].Seq
 	})
 
-	var (
-		raw      []byte
-		firstKey []byte
-		firstBlk uint64
-		lastKey  []byte
-	)
-	flush := func() {
-		if len(raw) == 0 {
-			return
-		}
-		sstIdx = append(sstIdx, firstKey...)
-		sstIdx = binary.BigEndian.AppendUint64(sstIdx, firstBlk)
-		sstIdx = binary.LittleEndian.AppendUint64(sstIdx, uint64(len(sst)))
-		sst = enc.EncodeAll(raw, sst)
-		raw = raw[:0]
-		firstKey = nil
-	}
+	w := &sstWriter{enc: enc}
 	for i := range rows {
 		r := &rows[i]
 		// last write of the same (key, block) wins (post-image semantics)
 		if i+1 < len(rows) && rows[i+1].Block == r.Block && rows[i+1].Key == r.Key {
 			continue
 		}
-		if lastKey == nil || !bytes.Equal(lastKey, r.Key[:]) {
-			k := append([]byte(nil), r.Key[:]...)
-			keys = append(keys, k)
-			lastKey = k
-		}
-		if r.Key[0] == recKindAccount && len(r.Value) == 0 {
-			deletes = append(deletes, r.Key[:]...)
-			deletes = binary.BigEndian.AppendUint64(deletes, r.Block)
-		}
-		if firstKey == nil {
-			firstKey = append([]byte(nil), r.Key[:]...)
-			firstBlk = r.Block
-		}
-		raw = append(raw, r.Key[:]...)
-		raw = binary.BigEndian.AppendUint64(raw, r.Block)
-		raw = binary.AppendUvarint(raw, uint64(len(r.Value)))
-		raw = append(raw, r.Value...)
-		if len(raw) >= sstBlockTarget {
-			flush()
-		}
+		cc.upTo(w, r.Key[:])
+		w.add(r.Key[:], r.Block, r.Value)
 	}
-	flush()
-	return sst, sstIdx, deletes, keys
+	cc.upTo(w, nil)
+	w.flush()
+	return w.sst, w.sstIdx, w.deletes, w.keys
 }
 
 // buildEpochTxidx encodes the epoch's tx fingerprints exactly like the raw

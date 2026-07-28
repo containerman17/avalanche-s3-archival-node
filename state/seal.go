@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core/types"
 	"github.com/containerman17/epochdb/fetch"
 )
 
@@ -80,8 +82,8 @@ func sealEpochs(dir, outDir string, deleteRaw bool, epochTxs uint64, derive Deri
 			return fmt.Errorf("seal epoch at %d: %w", in.Start, err)
 		}
 		st, _ := os.Stat(path)
-		log.Printf("seal: %s blocks=%d txs=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
-			filepath.Base(path), len(in.Containers), in.TxCount,
+		log.Printf("seal: %s blocks=%d txs=%d code=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
+			filepath.Base(path), len(in.Containers), in.TxCount, len(in.Code),
 			float64(rawBytes.total())/1e6, float64(st.Size())/1e6,
 			float64(rawBytes.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
 		if e, err := OpenEpoch(path); err == nil {
@@ -182,10 +184,39 @@ func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs u
 		}
 
 		if in.TxCount >= epochTxs {
-			return in, rawBytes, nil
+			return in, rawBytes, fillEpochCode(in, store)
 		}
 	}
 	return nil, rawSizes{}, nil // ran out of replayed blocks before the boundary
+}
+
+// fillEpochCode resolves the code of every account row this epoch writes,
+// pulled from code.log. This loop IS the v3 placement rule (see
+// EpochInput.Code).
+func fillEpochCode(in *EpochInput, store *Store) error {
+	in.Code = map[common.Hash][]byte{}
+	for i := range in.StateRows {
+		r := &in.StateRows[i]
+		if r.Key[0] != recKindAccount || len(r.Value) == 0 {
+			continue
+		}
+		hash, ok := accountCodeHash(r.Value)
+		if !ok || hash == types.EmptyCodeHash || hash == (common.Hash{}) {
+			continue
+		}
+		if _, done := in.Code[hash]; done {
+			continue
+		}
+		blob, ok, err := store.code.Get(hash)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("seal epoch at %d: code %x referenced by an account row is not in code.log", in.Start, hash)
+		}
+		in.Code[hash] = blob
+	}
+	return nil
 }
 
 // decodeLogRec decodes one capture-format logs record (exec encodeLogsFrame
@@ -220,49 +251,6 @@ func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
 		off += 32
 	}
 	return lr, nil
-}
-
-// ReSealStoredLogs upgrades existing epochs lacking the stored-logs
-// sections by SECTION SURGERY: the old file's sections are copied
-// byte-verbatim (their offsets do not move), only the five new sections
-// are derived (re-execution) and appended, then the v2 footer replaces
-// the old one. No dict retraining, no SST recompression, no bodies work:
-// re-seal time is derive time. Idempotent: epochs that already carry the
-// sections are skipped.
-func ReSealStoredLogs(dir string, derive DeriveStored) error {
-	set, err := OpenEpochSet(dir)
-	if err != nil {
-		return err
-	}
-	defer set.Close()
-	for _, e := range set.Epochs {
-		if e.HasStoredLogs() {
-			continue
-		}
-		t0 := time.Now()
-		in := &EpochInput{Start: e.Start, TxCount: e.TxCount}
-		for n := e.Start; n <= e.End(); n++ {
-			c, err := e.Container(n)
-			if err != nil {
-				return fmt.Errorf("reseal %d: container %d: %w", e.Start, n, err)
-			}
-			in.Containers = append(in.Containers, c)
-		}
-		// Only the stored-logs inputs are needed; posting lists already
-		// exist in the old file. Suppress tuple rebuilding.
-		in.Logs = []LogRec{}
-		if err := derive(in); err != nil {
-			return fmt.Errorf("reseal %d: derive: %w", e.Start, err)
-		}
-		path, err := e.appendStoredSections(dir, in)
-		if err != nil {
-			return fmt.Errorf("reseal %d: %w", e.Start, err)
-		}
-		st, _ := os.Stat(path)
-		log.Printf("reseal: %s v2 stored-logs, %.1fMB, in %s",
-			filepath.Base(path), float64(st.Size())/1e6, time.Since(t0).Round(time.Millisecond))
-	}
-	return nil
 }
 
 // deleteSealedRaw removes raw bucket files whose entire block range is at
