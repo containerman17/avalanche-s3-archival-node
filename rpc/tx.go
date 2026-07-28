@@ -67,6 +67,9 @@ func (s *Server) prunedTxError() *rpcError {
 // candidates against the actual blocks. found=false is a clean "unknown tx".
 func (s *Server) findTx(hash common.Hash) (blk *types.Block, txIndex int, found bool, err error) {
 	for _, h := range s.txidx.Candidates(hash) {
+		if h < s.hist.Floor() {
+			continue // below the floor nothing is served, even if the container is still on disk
+		}
 		raw, ok, err := s.blocks.GetByHeight(h)
 		if err != nil {
 			return nil, 0, false, err

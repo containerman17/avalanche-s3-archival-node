@@ -36,6 +36,13 @@ func (s *Server) blockAt(n uint64) (*types.Block, *rpcError) {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if !ok {
+		// Block F itself is the asymmetric case: the base file is state AT F,
+		// but F's body lived in the epoch that pruning dropped, so state reads
+		// at F answer while the block does not exist here.
+		if floor := s.hist.Floor(); floor > 0 && n <= floor {
+			return nil, &rpcError{Code: errCodePruned, Message: fmt.Sprintf(
+				"block %d is pruned: this node holds state from block %d but block bodies only above it (limited-history mode)", n, floor)}
+		}
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("container %d missing", n)}
 	}
 	blk, err := s.parse(raw)
