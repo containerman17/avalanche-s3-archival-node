@@ -4,6 +4,15 @@ THE single design file: current implementation plus planned work, kept edited in
 
 Repo: `~/epochdb` (module github.com/containerman17/epochdb, LOCAL ONLY, never pushed).
 
+## Order of work (kept current: anything deferred in conversation lands here immediately)
+1. IN FLIGHT: epoch format v3, code into the epoch file (see Torrent distribution). Placement rule (first-deploying epoch vs every referencing epoch) is being decided by measurement on the real corpus; determinism is the non-negotiable.
+2. THEN: re-seal the 7 production epochs to v3 (~2h each, ~14h total, unattended) and regenerate the manifest. Infohashes change, expected. Not started, deliberately kept out of the v3 implementation task.
+3. THEN: Helicon dep bump (v1.15.0-fuji, saevm execution path, settled-root ring, v1.15 handshake). No rush and no conflicts per the user, but it must get done, and it is the long pole. Nothing needs parking for the Fuji activation on 2026-07-29: no live Fuji follower runs here and the mainnet corpus is pinned to v1.14.2.
+4. THEN: limited-history step 3, port flatstate's `follower/sync` so the base file comes from network state sync instead of a local fold. Blocked on nothing but sequencing; open question is whether SAE changes the state-sync protocol, which is why it sits after Helicon.
+5. THEN: limited-history step 4, follow and seal above B on Fuji, A/B gated at tip.
+
+Deferred deliberately, with the reason: fold-down/eviction of old epochs (a hash-keyed bottom cannot fold preimage-keyed epoch rows; user ruling 2026-07-28 is that ~4GB per 10 days of growth is fine because it is still ~20x more compact than a merkleized archive node, and a node can simply be resynced from scratch when it matters). EPOCH_TXS stays 10M forever on every node type (user ruling 2026-07-28: the raw-tail savings from smaller epochs do not justify managing multiple sizes). Lazy-attach of old epochs on query. Published state snapshots at intervals. Torrent+fold as a bottom-layer source.
+
 ## Principle [BUILT]
 Bodies + headers + proposervm extras are the only ground truth. State history, receipts, logs, all indexes are caches rebuildable by re-execution (~5-6k blk/s). Re-executing one block was the universal primitive; after the 2026-07-20 ruling logs/receipts are STORED, and re-execution remains only for traces, createAccessList, and verification.
 
