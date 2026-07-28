@@ -137,10 +137,21 @@ func benchMain(args []string) {
 	fmt.Println("RESULT: ZERO mismatches")
 }
 
-// belowFloorRefusals asserts the limited-history node REFUSES state reads
-// below its floor. Answering (a zero balance, empty code) instead of
+// refuse asserts one below-floor call is REFUSED by the limited-history
+// node. Answering (a zero balance, an empty log set, a null tx) instead of
 // erroring is the silent-corruption failure this whole mode exists to
 // avoid, so an answer counts as a mismatch.
+func refuse(local, method string, params []any, floor uint64) int {
+	res, err := rpcCall(local, method, params, 1)
+	if err != nil {
+		return 0
+	}
+	log.Printf("MISMATCH %s %v: pruned node ANSWERED below floor %d: %s", method, params, floor, res)
+	return 1
+}
+
+// belowFloorRefusals asserts the limited-history node refuses state reads
+// below its floor.
 func belowFloorRefusals(rng *rand.Rand, hist *state.History, local string, floor uint64) int {
 	bad, probes := 0, 0
 	for i := 0; i < 20; i++ {
@@ -151,15 +162,21 @@ func belowFloorRefusals(rng *rand.Rand, hist *state.History, local string, floor
 		h := hexBlock(uint64(rng.Int63n(int64(floor))))
 		for _, m := range []string{"eth_getBalance", "eth_getCode"} {
 			probes++
-			res, err := rpcCall(local, m, []any{addr.Hex(), h}, 1)
-			if err == nil {
-				bad++
-				log.Printf("MISMATCH %s at %s: pruned node ANSWERED below floor %d: %s", m, h, floor, res)
-			}
+			bad += refuse(local, m, []any{addr.Hex(), h}, floor)
 		}
 	}
 	fmt.Printf("  below-floor refusals: %d probes, %d answered (want 0)\n", probes, bad)
 	return bad
+}
+
+// atOrAboveFloor picks a uniform random height in [max(floor,1), head]: the
+// range a limited-history --local can actually answer.
+func atOrAboveFloor(rng *rand.Rand, floor, head uint64) uint64 {
+	lo := max(floor, 1)
+	if head <= lo {
+		return lo
+	}
+	return lo + uint64(rng.Int63n(int64(head-lo)+1))
 }
 
 type probe struct {
@@ -283,6 +300,7 @@ func benchTxMain(args []string) {
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
 	workers := fs.Int("workers", 8, "concurrent probe workers")
+	floor := fs.Uint64("floor", 0, "limited-history floor of --local: sample txs only at or above it, and assert --local refuses a tx below it (point --remote at a full epochdb node)")
 	fs.Parse(args)
 	if *remote == "" {
 		_, _, *remote = netParams(*network)
@@ -324,7 +342,7 @@ func benchTxMain(args []string) {
 	if end, ok := epochs.SealedEnd(); ok && end < receiptCeil {
 		receiptCeil = end
 	}
-	log.Printf("ab-bench-tx: head=%d receiptCeil=%d maxStaged~%d seed=%d local=%s", head, receiptCeil, maxStaged, *seed, *local)
+	log.Printf("ab-bench-tx: head=%d receiptCeil=%d maxStaged~%d floor=%d seed=%d local=%s", head, receiptCeil, maxStaged, *floor, *seed, *local)
 
 	// Sample txs. withState => also probe the receipt.
 	type txProbe struct {
@@ -346,7 +364,7 @@ func benchTxMain(args []string) {
 		}
 		var h uint64
 		if withState {
-			h = 1 + uint64(rng.Int63n(int64(receiptCeil)))
+			h = atOrAboveFloor(rng, *floor, receiptCeil)
 		} else {
 			h = head + 1 + uint64(rng.Int63n(int64(maxStaged-head)))
 		}
@@ -432,11 +450,44 @@ func benchTxMain(args []string) {
 	}
 	fmt.Printf("  local latency: avg=%s (%.0f calls/s local-only)\n",
 		(localTotal / time.Duration(total)).Round(time.Microsecond), float64(total)/localTotal.Seconds())
+	if *floor > 0 {
+		bad += belowFloorTxRefusals(rng, *local, *remote, *floor)
+	}
 	if bad > 0 {
 		fmt.Printf("RESULT: %d MISMATCHES\n", bad)
 		os.Exit(1)
 	}
 	fmt.Println("RESULT: ZERO mismatches")
+}
+
+// belowFloorTxRefusals asserts the limited-history node refuses tx hashes
+// that only exist below its floor. The hashes are real ones read back from
+// --remote (the full node), so a null answer here would be exactly the
+// "real tx reported as never existing" failure the mode forbids.
+func belowFloorTxRefusals(rng *rand.Rand, local, remote string, floor uint64) int {
+	bad, probes := 0, 0
+	for tries := 0; tries < 40 && probes < 10; tries++ {
+		h := hexBlock(uint64(rng.Int63n(int64(floor))))
+		res, err := rpcCall(remote, "eth_getBlockByNumber", []any{h, true}, 4)
+		if err != nil {
+			continue
+		}
+		var blk struct {
+			Transactions []struct {
+				Hash string `json:"hash"`
+			} `json:"transactions"`
+		}
+		if json.Unmarshal(res, &blk) != nil || len(blk.Transactions) == 0 {
+			continue
+		}
+		txh := blk.Transactions[rng.Intn(len(blk.Transactions))].Hash
+		for _, m := range []string{"eth_getTransactionByHash", "eth_getTransactionReceipt"} {
+			probes++
+			bad += refuse(local, m, []any{txh}, floor)
+		}
+	}
+	fmt.Printf("  below-floor tx refusals: %d probes, %d answered (want 0)\n", probes, bad)
+	return bad
 }
 
 // benchLogsMain A/B-probes eth_getLogs vs the archive RPC. Query seeds are
@@ -453,6 +504,7 @@ func benchLogsMain(args []string) {
 	n := fs.Int("n", 120, "queries")
 	seed := fs.Int64("seed", time.Now().UnixNano(), "RNG seed")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	floor := fs.Uint64("floor", 0, "limited-history floor of --local: seed and query only at or above it, and assert --local refuses ranges reaching below it (point --remote at a full epochdb node)")
 	fs.Parse(args)
 	if *remote == "" {
 		_, _, *remote = netParams(*network)
@@ -485,7 +537,7 @@ func benchLogsMain(args []string) {
 			head = end
 		}
 	}
-	log.Printf("ab-bench-logs: head=%d (sealed) seed=%d local=%s remote=%s", head, *seed, *local, *remote)
+	log.Printf("ab-bench-logs: head=%d (sealed) floor=%d seed=%d local=%s remote=%s", head, *floor, *seed, *local, *remote)
 
 	rawLogBuckets, _ := filepath.Glob(filepath.Join(*dataDir, "logs_*"))
 	hasRawLogs := len(rawLogBuckets) > 0
@@ -498,7 +550,7 @@ func benchLogsMain(args []string) {
 	}
 	var seeds []seedLog
 	for tries := 0; tries < 3000 && len(seeds) < 50; tries++ {
-		b := 1 + uint64(rng.Int63n(int64(head)))
+		b := atOrAboveFloor(rng, *floor, head)
 		// LogsRecord only sees raw staging sidecars; on an epoch-only dir
 		// it is always empty, so treat it as advisory and let the local
 		// eth_getLogs answer (served from sealed epochs) decide.
@@ -508,6 +560,9 @@ func benchLogsMain(args []string) {
 		q := map[string]string{"fromBlock": hexutil.EncodeUint64(b), "toBlock": hexutil.EncodeUint64(b)}
 		res, rerr := rpcCall(*local, "eth_getLogs", []any{q}, 1)
 		if rerr != nil {
+			if *floor > 0 {
+				continue // pruned node: a refusal near the floor is expected, keep seeding
+			}
 			log.Fatalf("ab-bench-logs: seed query: %v", rerr)
 		}
 		var logs []struct {
@@ -541,6 +596,7 @@ func benchLogsMain(args []string) {
 		if sl.block > uint64(rng.Int63n(int64(w))) {
 			from = sl.block - uint64(rng.Int63n(int64(w)))
 		}
+		from = max(from, *floor) // a range reaching below the floor is refused by design
 		to := min(from+w-1, head)
 		q := map[string]any{
 			"fromBlock": hexutil.EncodeUint64(from),
@@ -579,11 +635,34 @@ func benchLogsMain(args []string) {
 		fmt.Printf("  %s=%d", k, c)
 	}
 	fmt.Println()
+	if *floor > 0 {
+		bad += belowFloorLogRefusals(rng, *local, *floor)
+	}
 	if bad > 0 {
 		fmt.Printf("RESULT: %d MISMATCHES\n", bad)
 		os.Exit(1)
 	}
 	fmt.Println("RESULT: ZERO mismatches")
+}
+
+// belowFloorLogRefusals asserts the limited-history node refuses getLogs
+// ranges that reach below its floor, both fully below and straddling it.
+// An empty result there is indistinguishable from "no matching logs", which
+// is the silent failure the mode forbids.
+func belowFloorLogRefusals(rng *rand.Rand, local string, floor uint64) int {
+	bad, probes := 0, 0
+	ranges := [][2]uint64{{floor - min(floor, 5), floor + 5}} // straddling, narrow enough to clear the 10k range cap
+	for i := 0; i < 5; i++ {
+		from := uint64(rng.Int63n(int64(floor)))
+		ranges = append(ranges, [2]uint64{from, min(from+9, floor-1)})
+	}
+	for _, r := range ranges {
+		probes++
+		q := map[string]string{"fromBlock": hexBlock(r[0]), "toBlock": hexBlock(r[1])}
+		bad += refuse(local, "eth_getLogs", []any{q}, floor)
+	}
+	fmt.Printf("  below-floor log refusals: %d probes, %d answered (want 0)\n", probes, bad)
+	return bad
 }
 
 // jsonEqual compares two JSON documents structurally.

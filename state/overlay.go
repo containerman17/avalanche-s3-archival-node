@@ -64,9 +64,11 @@ type History struct {
 	// records (SELFDESTRUCT) ABOVE the floor. Built by one sequential scan
 	// at open; rare enough to keep resident, and it turns the per-read
 	// delete check into a map lookup (a linear run scan here was 96% of
-	// backfill CPU). Nothing below the floor is needed: the base file is a
-	// post-image of live state at B, so no pre-B deletion or resurrected
-	// slot can exist.
+	// backfill CPU). Nothing below the floor is needed, and that is only
+	// true because searchAboveFloor treats a row at or below the floor as a
+	// miss: the base file is a post-image of live state at B, so every pre-B
+	// deletion is already folded into it (the destructed account and its
+	// slots are simply absent) and no read can be answered from down there.
 	deletes map[string][]uint64
 }
 
@@ -363,28 +365,9 @@ func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bo
 	if err := h.epochs.RequireCovered(n); err != nil {
 		return nil, 0, false, err
 	}
-	for i := len(h.buckets) - 1; i >= 0; i-- {
-		b := h.buckets[i]
-		if b.bucket*BucketBlocks > n {
-			continue
-		}
-		val, blk, found, err = b.lookup(key, n)
-		if err != nil || found {
-			return val, blk, found, err
-		}
-	}
-	for i := len(h.epochs.Epochs) - 1; i >= 0; i-- {
-		e := h.epochs.Epochs[i]
-		if e.Start > n {
-			continue
-		}
-		if !e.MayContainKey(key) {
-			continue
-		}
-		val, blk, found, err = e.StateSearch(key, n)
-		if err != nil || found {
-			return val, blk, found, err
-		}
+	val, blk, found, err = h.searchAboveFloor(key, n)
+	if err != nil || found {
+		return val, blk, found, err
 	}
 	if h.base != nil {
 		// The base is live state at the floor, so a hit dates from <= floor:
@@ -399,6 +382,54 @@ func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bo
 			val, found, err = h.base.Storage(addr, key[21:53])
 		}
 		return val, h.floor, found, err
+	}
+	return nil, 0, false, nil
+}
+
+// searchAboveFloor is the descent proper: buckets newest-to-oldest, then the
+// sealed epochs. A row at or BELOW the floor is not an answer, it is a miss,
+// so search falls through to the base: the base file is live state at B, it
+// already folded that write in (a below-B SELFDESTRUCT included) and the
+// deletes map deliberately carries nothing from down there. Buckets and
+// epochs can STRADDLE the floor, so the rule is per row, not per source; and
+// since the first hit wins the descent, every remaining source below it is
+// older still and can be skipped.
+func (h *History) searchAboveFloor(key []byte, n uint64) (val []byte, blk uint64, found bool, err error) {
+	belowFloor := func(blk uint64) bool { return h.floor > 0 && blk <= h.floor }
+	for i := len(h.buckets) - 1; i >= 0; i-- {
+		b := h.buckets[i]
+		if b.bucket*BucketBlocks > n {
+			continue
+		}
+		val, blk, found, err = b.lookup(key, n)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if found {
+			if belowFloor(blk) {
+				return nil, 0, false, nil
+			}
+			return val, blk, true, nil
+		}
+	}
+	for i := len(h.epochs.Epochs) - 1; i >= 0; i-- {
+		e := h.epochs.Epochs[i]
+		if e.Start > n {
+			continue
+		}
+		if !e.MayContainKey(key) {
+			continue
+		}
+		val, blk, found, err = e.StateSearch(key, n)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if found {
+			if belowFloor(blk) {
+				return nil, 0, false, nil
+			}
+			return val, blk, true, nil
+		}
 	}
 	return nil, 0, false, nil
 }

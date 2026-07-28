@@ -228,14 +228,15 @@ func TestBaseBuildAndRead(t *testing.T) {
 		t.Fatal("unknown code hash reported found")
 	}
 
-	// The BLOCKHASH window is the 256 blocks BELOW B (here 0..64).
-	for _, n := range []uint64{0, 1, 64} {
+	// The BLOCKHASH window is [B-256, B] (here 0..65): header(B) is in the
+	// file so a base-only node is self-contained at its own floor.
+	for _, n := range []uint64{0, 1, 64, 65} {
 		raw, ok, err := b.HeaderRLP(n)
 		if err != nil || !ok || !bytes.Equal(raw, baseHdr(t, n, baseRoot(n))) {
 			t.Fatalf("header %d: ok=%v err=%v", n, ok, err)
 		}
 	}
-	for _, n := range []uint64{65, 66, 90} {
+	for _, n := range []uint64{66, 90} {
 		if _, ok, _ := b.HeaderRLP(n); ok {
 			t.Fatalf("header %d must be outside the window", n)
 		}
@@ -293,6 +294,33 @@ func TestBaseMergesEpochsAndBuckets(t *testing.T) {
 	}
 	if v, ok, _ := b.Storage(baseC, baseSlot2[:]); !ok || !bytes.Equal(v, baseV2) {
 		t.Fatalf("epoch-only slot = %x ok=%v, want %x", v, ok, baseV2)
+	}
+}
+
+// TestBuildBaseRefusesPrunedSource: an existing base file is not a merge
+// source, so re-flooring a dir that already has one would silently drop
+// every key last written at or below the old floor.
+func TestBuildBaseRefusesPrunedSource(t *testing.T) {
+	h, _ := baseCorpus(t)
+	h.Close()
+
+	fb := &fakeBase{block: 65, acc: map[common.Address][]byte{baseA: accRLP(t, 2, 200)}}
+	withBase(t, fb)
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pruned, err := OpenHistory(dir, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pruned.Close()
+
+	if _, err := BuildBase(pruned, t.TempDir(), 65, nil); err == nil ||
+		!strings.Contains(err.Error(), "already pruned") {
+		t.Fatalf("BuildBase over a pruned source: err=%v, want a refusal", err)
 	}
 }
 

@@ -17,7 +17,7 @@ package state
 //	         ~sstBlockTarget raw bytes
 //	sstIdx   sparse index: 73B entries key65|off u64
 //	keybloom bloom over every key in the file (bloomBitsPerKey)
-//	headers  one zstd frame of the 256 RLP headers below B (uvarint len +
+//	headers  one zstd frame of the RLP headers in [B-256, B] (uvarint len +
 //	         bytes each), decoded once at open: ~150KB resident, so
 //	         BLOCKHASH inside eth_call costs nothing at read time
 //
@@ -52,7 +52,7 @@ const (
 	baseVersion      = 1
 	baseNumSections  = 4
 	baseFooterSize   = 4 + 4 + 8 + 8 + 32 + baseNumSections*16 + 4
-	baseHeaderWindow = 256 // BLOCKHASH reach of eth_call in [B, B+256)
+	baseHeaderWindow = 256 // headers carried are [B-256, B]: BLOCKHASH reach of eth_call in [B, B+256]
 
 	// baseKindCode keys a code blob by its hash. Code lives in the same
 	// sorted keyspace as state ('a' < 'c' < 's'), which costs one extra
@@ -277,8 +277,9 @@ func (b *Base) Code(hash common.Hash) ([]byte, bool, error) {
 	return b.lookup(baseCodeKey(hash))
 }
 
-// HeaderRLP returns the stored header for block n. Only the
-// baseHeaderWindow blocks below B are carried.
+// HeaderRLP returns the stored header for block n. Only [B-256, B] is
+// carried: header(B) is included so a base-only node is self-contained at
+// its own floor.
 func (b *Base) HeaderRLP(n uint64) ([]byte, bool, error) {
 	if n < b.hdrFrom || n-b.hdrFrom >= uint64(len(b.headers)) {
 		return nil, false, nil
@@ -358,6 +359,13 @@ func BuildBase(h *History, outDir string, at uint64, sink BaseSink) (string, err
 	if at == 0 || at > h.head {
 		return "", fmt.Errorf("base at %d: corpus covers blocks up to %d", at, h.head)
 	}
+	// An existing base file is NOT a merge source here (openBaseCursors walks
+	// buckets and epochs only), so re-flooring would drop every key whose
+	// last write was at or below the old floor. The fold-down step DESIGN
+	// defers is what would make this work; until it exists, refuse.
+	if h.Floor() > 0 {
+		return "", fmt.Errorf("base at %d: source is already pruned below block %d; re-flooring an already-pruned dir is unsupported (the existing base cannot be a merge source)", at, h.Floor())
+	}
 	if err := h.epochs.RequireCovered(at); err != nil {
 		return "", err
 	}
@@ -385,12 +393,12 @@ func BuildBase(h *History, outDir string, at uint64, sink BaseSink) (string, err
 	}
 	log.Printf("base: %d live rows spilled, writing base_%d", sp.rows, at)
 
-	headers := make([][]byte, 0, baseHeaderWindow)
+	headers := make([][]byte, 0, baseHeaderWindow+1)
 	from := uint64(0)
 	if at > baseHeaderWindow {
 		from = at - baseHeaderWindow
 	}
-	for n := from; n < at; n++ {
+	for n := from; n <= at; n++ {
 		raw, ok, err := h.HeaderRLP(n)
 		if err != nil {
 			return "", fmt.Errorf("base at %d: header %d: %w", at, n, err)

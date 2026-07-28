@@ -25,6 +25,12 @@ func (s *Server) blockAt(n uint64) (*types.Block, *rpcError) {
 	if n > s.hist.Head() {
 		return nil, errInvalid("block %d beyond head %d", n, s.hist.Head())
 	}
+	// Below the floor the container is gone, not missing: name the floor like
+	// block-by-hash, tx-by-hash and getLogs do.
+	if floor := s.hist.Floor(); n < floor {
+		return nil, &rpcError{Code: errCodePruned, Message: fmt.Sprintf(
+			"block %d is pruned below block %d: this node serves history from block %d up (limited-history mode)", n, floor, floor)}
+	}
 	raw, ok, err := s.blocks.GetByHeight(n)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}

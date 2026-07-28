@@ -336,6 +336,69 @@ func TestOverlayBaseFloor(t *testing.T) {
 	}
 }
 
+// TestOverlayBelowFloorRowsNeverAnswer: a row at or below the floor is a
+// MISS, never an answer. Both source rows here sit below the floor inside
+// bucket 1, which STRADDLES it (150000..199999 with floor 150015), so
+// skipping whole below-floor buckets would not be enough.
+func TestOverlayBelowFloorRowsNeverAnswer(t *testing.T) {
+	const floor = 150015
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	dead := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	stale := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	slot := common.HexToHash("0x05")
+
+	app := func(block uint64, frame []byte) {
+		t.Helper()
+		if err := st.AppendWrites(block, frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app(20, frAccount(nil, dead, accRLP(t, 1, 100)))
+	app(30, frStorage(nil, dead, slot, []byte{0x77}))
+	app(150005, frStorage(nil, stale, slot, []byte{0x66})) // below the floor, straddling bucket
+	app(150010, frAccount(nil, dead, nil))                 // SELFDESTRUCT below the floor
+	if err := st.FlushAndSetExecHead(160000); err != nil {
+		t.Fatal(err)
+	}
+	if err := CookIndex(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// The base is live state at the floor: `dead` and its storage are gone
+	// (the SELFDESTRUCT folded them away), `stale`'s slot carries the value
+	// the fold kept.
+	fb := &fakeBase{
+		block: floor,
+		acc:   map[common.Address][]byte{stale: accRLP(t, 1, 1)},
+		slots: map[string][]byte{string(append(stale.Bytes(), slot[:]...)): {0x88}},
+	}
+	withBase(t, fb)
+
+	h, err := OpenHistory(dir, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	// The account is gone and its pre-destruct storage must be gone with it.
+	if acc, err := h.AccountAt(dead, 160000); err != nil || acc != nil {
+		t.Fatalf("account destructed below the floor is visible: %+v %v", acc, err)
+	}
+	if got, err := h.StorageAt(dead, slot[:], 160000); err != nil || got != nil {
+		t.Fatalf("storage of an account destructed below the floor: %x %v, want nil", got, err)
+	}
+	// A plain below-floor write loses to the base, which is the authority.
+	if got, err := h.StorageAt(stale, slot[:], 160000); err != nil || !bytes.Equal(got, []byte{0x88}) {
+		t.Fatalf("below-floor row answered: %x %v, want the base value 88", got, err)
+	}
+}
+
 // TestOpenHistoryBaseOnly: a freshly state-synced node has a base file and
 // nothing else.
 func TestOpenHistoryBaseOnly(t *testing.T) {
