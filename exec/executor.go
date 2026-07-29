@@ -64,6 +64,17 @@ const flushEvery = 256
 // can lag appends by flushEvery; the budget comfortably covers both.
 const walkBackBudget = 4096
 
+// walkBackBudgetFor is how far back reconcile may need CONTAINERS to still
+// exist: the base budget plus 64 deferred commits of CommitEvery blocks each.
+// Both reconcile and New's refusal read it, so they cannot drift apart.
+func walkBackBudgetFor(commitEvery int) uint64 {
+	budget := uint64(walkBackBudget)
+	if commitEvery > 1 {
+		budget += 64 * uint64(commitEvery)
+	}
+	return budget
+}
+
 // baseLoadBatch is how many base rows go into one Firewood Update when a
 // state-synced node loads its frontier. Bounded so a full-mainnet base
 // (tens of millions of rows) does not build one giant cgo batch.
@@ -239,6 +250,16 @@ func New(cfg Config) (*Executor, error) {
 	}
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("config: Store required")
+	}
+	// The crash walk-back re-reads containers from staging, and both raw
+	// deleters (seal, and the pruning node's fold) retire whole 100k-block
+	// buckets behind the sealed/folded end. If the budget can reach past one
+	// bucket, a crash right after a retirement lands on "container missing
+	// from staging" and the node cannot start. Unconditional: seal has the
+	// same latent exposure, it was only ever hidden by a numeric coincidence.
+	if budget := walkBackBudgetFor(cfg.CommitEvery); budget >= state.BucketBlocks {
+		return nil, fmt.Errorf("config: commit-every %d puts the crash walk-back %d blocks back, past one raw bucket (%d): max is %d",
+			cfg.CommitEvery, budget, state.BucketBlocks, (state.BucketBlocks-1-walkBackBudget)/64)
 	}
 	fetch.RegisterExtras()
 
@@ -520,10 +541,7 @@ func (e *Executor) reconcile() error {
 	// Budget covers the worst persisted-root lag even for data written
 	// before the DeferredCommitInterval scaling: 64 deferred commits of
 	// CommitEvery blocks each, plus the open batch and fsync-group slack.
-	budget := uint64(walkBackBudget)
-	if e.cfg.CommitEvery > 1 {
-		budget += 64 * uint64(e.cfg.CommitEvery)
-	}
+	budget := walkBackBudgetFor(e.cfg.CommitEvery)
 	lo := uint64(0)
 	if top > budget {
 		lo = top - budget

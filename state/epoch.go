@@ -716,14 +716,32 @@ func (e *ef) values() []uint64 {
 
 // ---------- bloom ----------
 
-// buildBloom: m = 10 bits/key rounded to words, k = bloomHashes,
-// double hashing over xxhash. Layout: m u64 | k u32 | pad u32 | words.
-func buildBloom(keys [][]byte) []byte {
-	m := uint64(len(keys)) * bloomBitsPerKey
+// bloomBits: m = 10 bits/key rounded up to whole words. Split out of
+// buildBloom so a streaming writer that knows only the row count up front
+// (state/base.go's baseWriter) sizes the filter identically.
+func bloomBits(nKeys uint64) uint64 {
+	m := nKeys * bloomBitsPerKey
 	if m < 64 {
 		m = 64
 	}
-	m = (m + 63) / 64 * 64
+	return (m + 63) / 64 * 64
+}
+
+// encodeBloom serializes the filter: m u64 | k u32 | pad u32 | words.
+func encodeBloom(m uint64, words []uint64) []byte {
+	out := binary.LittleEndian.AppendUint64(nil, m)
+	out = binary.LittleEndian.AppendUint32(out, bloomHashes)
+	out = binary.LittleEndian.AppendUint32(out, 0)
+	for _, w := range words {
+		out = binary.LittleEndian.AppendUint64(out, w)
+	}
+	return out
+}
+
+// buildBloom: k = bloomHashes, double hashing over xxhash. Bits are
+// OR-accumulated, so insertion order cannot reach the bytes.
+func buildBloom(keys [][]byte) []byte {
+	m := bloomBits(uint64(len(keys)))
 	words := make([]uint64, m/64)
 	for _, k := range keys {
 		h1, h2 := bloomHash(k)
@@ -732,13 +750,7 @@ func buildBloom(keys [][]byte) []byte {
 			words[bit/64] |= 1 << (bit % 64)
 		}
 	}
-	out := binary.LittleEndian.AppendUint64(nil, m)
-	out = binary.LittleEndian.AppendUint32(out, bloomHashes)
-	out = binary.LittleEndian.AppendUint32(out, 0)
-	for _, w := range words {
-		out = binary.LittleEndian.AppendUint64(out, w)
-	}
-	return out
+	return encodeBloom(m, words)
 }
 
 func bloomHash(key []byte) (h1, h2 uint64) {

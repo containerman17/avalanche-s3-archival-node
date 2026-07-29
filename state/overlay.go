@@ -269,11 +269,15 @@ func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) 
 	}, cookedThrough, nil
 }
 
+func (b *sortedBucket) close() {
+	syscall.Munmap(b.mm)
+	b.wl.Close()
+}
+
 // Close unmaps and closes every bucket and epoch.
 func (h *History) Close() {
 	for _, b := range h.buckets {
-		syscall.Munmap(b.mm)
-		b.wl.Close()
+		b.close()
 	}
 	h.buckets = nil
 	if h.epochs != nil {

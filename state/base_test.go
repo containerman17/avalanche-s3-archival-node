@@ -308,14 +308,52 @@ func TestOpenBaseFailsLoudly(t *testing.T) {
 	bad[len(bad)-baseFooterSize+4] = 1
 	corrupt("v1 base file", bad, "format v1, unsupported")
 
-	// Two base files in one directory: ambiguous floor, refuse to guess.
+	// Two base files in one directory: NEWEST WINS, not an error. The fold
+	// renames the new snapshot in and unlinks the old one after, so this is
+	// the normal transient state after a kill -9 in that window, and
+	// refusing to guess left exec and serve unable to start at all. The
+	// rename is ordered after the new file's fsync, so the highest B is
+	// always the complete one.
 	two := t.TempDir()
-	for _, n := range []string{"base_65", "base_66"} {
-		if err := os.WriteFile(filepath.Join(two, n), good, 0o644); err != nil {
-			t.Fatal(err)
-		}
+	writeTestBase(t, two, 65)
+	writeTestBase(t, two, 66)
+	b, ok, err := OpenBase(two)
+	if err != nil || !ok {
+		t.Fatalf("two base files: ok=%v err=%v", ok, err)
 	}
-	if _, _, err := OpenBase(two); err == nil || !strings.Contains(err.Error(), "ambiguous") {
-		t.Fatalf("two base files: err=%v", err)
+	defer b.Close()
+	if b.Block() != 66 {
+		t.Fatalf("two base files: opened block %d, want the newest (66)", b.Block())
+	}
+	if blk, ok, err := PeekBase(two); err != nil || !ok || blk != 66 {
+		t.Fatalf("PeekBase with two base files: %d ok=%v err=%v, want 66", blk, ok, err)
+	}
+}
+
+// TestBaseWriterRejectsBadOrder pins the streaming writer's one invariant:
+// the fold feeds it a merged stream and a duplicate or out-of-order key would
+// make the file answer two values for one key (the sparse index and the
+// lookup binary search both assume strict ascent).
+func TestBaseWriterRejectsBadOrder(t *testing.T) {
+	dir := t.TempDir()
+	w, err := newBaseWriter(dir, BaseMeta{Block: 5}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	k := accountKey(baseB)
+	if err := w.Add(k, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Add(k, []byte{2}); err == nil {
+		t.Fatal("duplicate key accepted")
+	}
+	if err := w.Add(accountKey(baseA), []byte{3}); err == nil {
+		t.Fatal("descending key accepted")
+	}
+	// The announced row count is what sizes the bloom: a mismatch would make
+	// the file silently differ from an identical row set written elsewhere.
+	if _, err := w.Finish(); err == nil || !strings.Contains(err.Error(), "announced") {
+		t.Fatalf("wrong row count accepted: %v", err)
 	}
 }

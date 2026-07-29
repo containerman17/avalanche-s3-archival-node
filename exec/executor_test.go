@@ -2,6 +2,7 @@ package exec
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ava-labs/avalanchego/upgrade"
@@ -255,5 +256,42 @@ func TestHeliconBoundaryRule(t *testing.T) {
 	blk := saeTestBlock(t, e, 2, common.Hash{}, helicon, false)
 	if sae, err := me.saeExecuted(blk, helicon); err != nil || sae {
 		t.Fatalf("mainnet at Fuji's Helicon time: sae=%v err=%v, want false/nil", sae, err)
+	}
+}
+
+// TestCommitEveryWalkBackGuard: raw retirement (seal's, and the pruning
+// node's fold) deletes whole 100k-block buckets behind the sealed/folded end,
+// while a crash walk-back re-reads containers 4096 + 64*CommitEvery blocks
+// back. A CommitEvery large enough to reach past one bucket turns a kill -9
+// after a retirement into an unstartable node ("container missing from
+// staging"), so New refuses it up front instead of leaving the safety margin
+// to a numeric coincidence.
+func TestCommitEveryWalkBackGuard(t *testing.T) {
+	fetch.RegisterExtras()
+	newAt := func(commitEvery int) error {
+		dir := t.TempDir()
+		store, err := state.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		e, err := New(Config{DataDir: dir, Blocks: fakeSource{}, Store: store, CommitEvery: commitEvery})
+		if err == nil {
+			e.Close()
+		}
+		return err
+	}
+	if err := newAt(1500); err == nil || !strings.Contains(err.Error(), "commit-every") {
+		t.Fatalf("commit-every 1500 accepted: %v", err)
+	}
+	// 1498 is the documented maximum: 4096 + 64*1498 = 99,968 < 100,000.
+	if budget := walkBackBudgetFor(1498); budget >= state.BucketBlocks {
+		t.Fatalf("1498 budget is %d, expected under one bucket (%d)", budget, state.BucketBlocks)
+	}
+	if budget := walkBackBudgetFor(1499); budget < state.BucketBlocks {
+		t.Fatalf("1499 budget is %d, expected at or past one bucket (%d)", budget, state.BucketBlocks)
+	}
+	if err := newAt(1000); err != nil {
+		t.Fatalf("commit-every 1000 (the production default) refused: %v", err)
 	}
 }

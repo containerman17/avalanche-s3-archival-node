@@ -40,6 +40,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -106,33 +107,64 @@ type Base struct {
 	headers [][]byte // hdrFrom..hdrFrom+len-1, nil entry = absent
 }
 
-// OpenBase opens the single base_<block> file in dir. ok=false means the
+// OpenBase opens the newest base_<block> file in dir. ok=false means the
 // directory has no base file (a full-history node); a present but corrupt
 // file is an error, never a silent miss.
+//
+// NEWEST WINS, deliberately (fold's crash table): the fold commits a new
+// snapshot by renaming base_<B>.tmp into place and only then unlinks the
+// older one, so two base files is a normal transient state after a kill -9
+// in that window. The rename is ordered strictly after the new file's fsync,
+// so the highest B on disk is always the complete one. Refusing to guess
+// here (the pre-fold rule) left exec and serve unable to start at all until
+// the next fold ran; the fold's own sweep is what removes the loser.
 func OpenBase(dir string) (*Base, bool, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	name, _, ok, err := newestBase(dir)
+	if err != nil || !ok {
 		return nil, false, err
 	}
-	var names []string
-	for _, en := range entries {
-		if _, ok := ParseBaseFileName(en.Name()); ok {
-			names = append(names, en.Name())
-		}
-	}
-	if len(names) == 0 {
-		return nil, false, nil
-	}
-	if len(names) > 1 {
-		sort.Strings(names)
-		return nil, false, fmt.Errorf("ambiguous floor: %d base files in %s (%v)", len(names), dir, names)
-	}
-	b, err := openBaseFile(filepath.Join(dir, names[0]))
+	b, err := openBaseFile(filepath.Join(dir, name))
 	if err != nil {
 		return nil, false, err
 	}
 	return b, true, nil
 }
+
+// newestBase returns the highest-numbered base file in dir, plus every base
+// file name found (ascending by block) so the fold can unlink the losers.
+func newestBase(dir string) (name string, all []string, ok bool, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", nil, false, err
+	}
+	type bf struct {
+		blk  uint64
+		name string
+	}
+	var found []bf
+	for _, en := range entries {
+		if blk, ok := ParseBaseFileName(en.Name()); ok {
+			found = append(found, bf{blk, en.Name()})
+		}
+	}
+	if len(found) == 0 {
+		return "", nil, false, nil
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].blk < found[j].blk })
+	for _, f := range found {
+		all = append(all, f.name)
+	}
+	if len(found) > 1 {
+		log.Printf("state: %d base files in %s (%v): a fold was killed between its rename and its cleanup; using the newest, %s",
+			len(all), dir, all, all[len(all)-1])
+	}
+	return all[len(all)-1], all, true, nil
+}
+
+// OpenBaseFile opens one base file by path. Unlike OpenBase it does not scan
+// a directory, which is what the fold's pre-rename gate needs: it verifies
+// base_<B>.tmp before that name ever becomes visible.
+func OpenBaseFile(path string) (*Base, error) { return openBaseFile(path) }
 
 func openBaseFile(path string) (*Base, error) {
 	f, err := os.Open(path)
@@ -247,10 +279,14 @@ func (b *Base) Close() {
 	b.headers = nil
 }
 
-// Account returns the account RLP of addr at B (the stored StorageRoot is
-// the real one captured on chain; substituting the sentinel is the caller's
-// job, exactly as for epoch rows). found=false = the account does not exist.
-// One direct probe, no hashing: the key IS the address.
+// Account returns the account RLP of addr at B, verbatim as the write
+// capture recorded it, which means its StorageRoot field is the ZERO hash:
+// firewood-ethhash manages storage roots internally (its storage tries hash
+// to zero) and the RPC read path substitutes SentinelStorageRoot, exactly as
+// for epoch rows. (The v1 text here claimed a real captured storage root;
+// that was leaf-sync's hash-keyed format, which is deleted.) found=false =
+// the account does not exist. One direct probe, no hashing: the key IS the
+// address.
 func (b *Base) Account(addr common.Address) ([]byte, bool, error) {
 	return b.lookup(accountKey(addr))
 }
@@ -321,36 +357,61 @@ func (b *Base) WalkRows(fn func(key, val []byte) error) error {
 
 // walk streams the raw preimage-keyed rows in key order.
 func (b *Base) walk(fn func(key, val []byte) error) error {
-	idx := b.sec[secBaseSSTIdx]
-	n := len(idx) / baseIdxEntrySize
-	var buf []byte
-	for bi := 0; bi < n; bi++ {
-		lo := binary.LittleEndian.Uint64(idx[bi*baseIdxEntrySize+baseKeySize:])
-		hi := uint64(len(b.sec[secBaseSST]))
-		if bi+1 < n {
-			hi = binary.LittleEndian.Uint64(idx[(bi+1)*baseIdxEntrySize+baseKeySize:])
+	it := b.iter()
+	for {
+		key, val, ok, err := it.next()
+		if err != nil || !ok {
+			return err
 		}
-		raw, err := b.dec.DecodeAll(b.sec[secBaseSST][lo:hi], buf[:0])
-		if err != nil {
-			return fmt.Errorf("base block %d: decode sst block %d: %w", b.block, bi, err)
-		}
-		buf = raw
-		for pos := 0; pos+baseKeySize < len(raw); {
-			vlen, vn := binary.Uvarint(raw[pos+baseKeySize:])
-			if vn <= 0 {
-				return fmt.Errorf("base block %d: bad row at %d", b.block, pos)
-			}
-			vstart := pos + baseKeySize + vn
-			if vstart+int(vlen) > len(raw) {
-				return fmt.Errorf("base block %d: truncated row at %d", b.block, pos)
-			}
-			if err := fn(raw[pos:pos+baseKeySize], raw[vstart:vstart+int(vlen)]); err != nil {
-				return err
-			}
-			pos = vstart + int(vlen)
+		if err := fn(key, val); err != nil {
+			return err
 		}
 	}
-	return nil
+}
+
+// baseIter is walk() turned inside out: the fold merges the base against a
+// delta stream, and a merge needs a pull cursor, not a callback. One decoded
+// 64KB SST block is resident; key and val alias it, so copy to retain.
+type baseIter struct {
+	b   *Base
+	bi  int    // next SST block to decode
+	raw []byte // current decoded block
+	pos int
+}
+
+func (b *Base) iter() *baseIter { return &baseIter{b: b} }
+
+func (it *baseIter) next() (key, val []byte, ok bool, err error) {
+	for {
+		if it.pos+baseKeySize < len(it.raw) {
+			vlen, vn := binary.Uvarint(it.raw[it.pos+baseKeySize:])
+			if vn <= 0 {
+				return nil, nil, false, fmt.Errorf("base block %d: bad row at %d", it.b.block, it.pos)
+			}
+			vstart := it.pos + baseKeySize + vn
+			if vstart+int(vlen) > len(it.raw) {
+				return nil, nil, false, fmt.Errorf("base block %d: truncated row at %d", it.b.block, it.pos)
+			}
+			key, val = it.raw[it.pos:it.pos+baseKeySize], it.raw[vstart:vstart+int(vlen)]
+			it.pos = vstart + int(vlen)
+			return key, val, true, nil
+		}
+		idx := it.b.sec[secBaseSSTIdx]
+		n := len(idx) / baseIdxEntrySize
+		if it.bi >= n {
+			return nil, nil, false, nil
+		}
+		lo := binary.LittleEndian.Uint64(idx[it.bi*baseIdxEntrySize+baseKeySize:])
+		hi := uint64(len(it.b.sec[secBaseSST]))
+		if it.bi+1 < n {
+			hi = binary.LittleEndian.Uint64(idx[(it.bi+1)*baseIdxEntrySize+baseKeySize:])
+		}
+		raw, err := it.b.dec.DecodeAll(it.b.sec[secBaseSST][lo:hi], it.raw[:0])
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("base block %d: decode sst block %d: %w", it.b.block, it.bi, err)
+		}
+		it.raw, it.pos, it.bi = raw, 0, it.bi+1
+	}
 }
 
 func (b *Base) mayContain(key []byte) bool {
@@ -409,34 +470,236 @@ func (b *Base) lookup(key []byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-// PeekBase reports whether dir carries a base file, without mapping it.
+// PeekBase reports the floor block of dir's newest base file, without
+// mapping it. Newest-wins for the same reason OpenBase is.
 func PeekBase(dir string) (uint64, bool, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	name, _, ok, err := newestBase(dir)
+	if err != nil || !ok {
 		return 0, false, err
 	}
-	for _, e := range entries {
-		if b, ok := ParseBaseFileName(e.Name()); ok {
-			return b, true, nil
-		}
-	}
-	return 0, false, nil
+	blk, _ := ParseBaseFileName(name)
+	return blk, true, nil
 }
 
 // ---------- writer ----------
 //
-// THE ONLY CALLERS TODAY ARE TESTS. The real producer is a pruning node
-// folding snapshot(K-1) with the period's own captured writes (DESIGN.md
-// "Our own state sync"), which does not exist yet; this exists so the format
-// is exercised end to end rather than only read. When that producer lands it
-// takes over this function.
-// ponytail: rows is one in-RAM slice, fine for tests and hopeless at full
-// mainnet; the fold producer streams a merge instead.
+// baseWriter is the streaming writer both producers share: the fold
+// (state/fold.go, the real one) and WriteBase (a sort-then-loop wrapper the
+// tests use). Sharing it is what makes "identical rows produce identical
+// bytes" true by construction rather than by review.
+//
+// The bloom is the only thing that ever wanted the whole key set in RAM
+// (buildBloom sizes m from len(keys)), which would have been an OOM at full
+// mainnet, so the row count is passed IN: the fold's pass 1 counts, pass 2
+// writes. Bits are OR-accumulated as rows arrive, which is order-independent,
+// so the section bytes are identical to buildBloom's over the same keys.
 
 // BaseRow is one preimage-keyed row: the 53-byte epoch keyspace.
 type BaseRow struct {
 	Key [baseKeySize]byte
 	Val []byte
+}
+
+type baseWriter struct {
+	m    BaseMeta
+	enc  *zstd.Encoder
+	f    *os.File
+	out  *bufio.Writer
+	dir  string
+	tmp  string
+	path string
+	done bool // Commit succeeded: Abort is a no-op
+
+	written  uint64 // SST bytes emitted so far, which is also the section offset
+	idx      []byte
+	raw      []byte
+	firstKey []byte
+	block    []byte
+
+	bloomM uint64
+	words  []uint64
+
+	rows, want uint64
+	last       [baseKeySize]byte
+	haveLast   bool
+}
+
+// newBaseWriter creates dir/base_<B>.tmp. rowCount must be the exact number
+// of Add calls that follow (Finish refuses otherwise): it sizes the bloom.
+func newBaseWriter(dir string, m BaseMeta, rowCount uint64) (*baseWriter, error) {
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, BaseFileName(m.Block))
+	f, err := os.Create(path + ".tmp")
+	if err != nil {
+		enc.Close()
+		return nil, err
+	}
+	bits := bloomBits(rowCount)
+	return &baseWriter{
+		m: m, enc: enc, f: f, out: bufio.NewWriterSize(f, 4<<20),
+		dir: dir, tmp: path + ".tmp", path: path,
+		bloomM: bits, words: make([]uint64, bits/64),
+		want: rowCount,
+	}, nil
+}
+
+// Add appends one row. Keys must arrive strictly ascending: the sparse index,
+// the lookup binary search and the merge all assume it, and a duplicate key
+// would make the file answer two different values for one key.
+func (w *baseWriter) Add(key, val []byte) error {
+	if len(key) != baseKeySize {
+		return fmt.Errorf("base writer: key is %d bytes, want %d", len(key), baseKeySize)
+	}
+	if w.haveLast && bytes.Compare(key, w.last[:]) <= 0 {
+		return fmt.Errorf("base writer: key %x is not above the previous key %x", key, w.last[:])
+	}
+	copy(w.last[:], key)
+	w.haveLast = true
+	w.rows++
+	if w.firstKey == nil {
+		w.firstKey = append([]byte(nil), key...)
+	}
+	w.raw = append(w.raw, key...)
+	w.raw = binary.AppendUvarint(w.raw, uint64(len(val)))
+	w.raw = append(w.raw, val...)
+	h1, h2 := bloomHash(key)
+	for i := uint64(0); i < bloomHashes; i++ {
+		bit := (h1 + i*h2) % w.bloomM
+		w.words[bit/64] |= 1 << (bit % 64)
+	}
+	if len(w.raw) >= sstBlockTarget {
+		return w.flushBlock()
+	}
+	return nil
+}
+
+func (w *baseWriter) flushBlock() error {
+	if len(w.raw) == 0 {
+		return nil
+	}
+	w.idx = append(w.idx, w.firstKey...)
+	w.idx = binary.LittleEndian.AppendUint64(w.idx, w.written)
+	w.block = w.enc.EncodeAll(w.raw, w.block[:0])
+	if _, err := w.out.Write(w.block); err != nil {
+		return err
+	}
+	w.written += uint64(len(w.block))
+	w.raw, w.firstKey = w.raw[:0], nil
+	return nil
+}
+
+// Finish writes the trailing sections and the footer and fsyncs the temp
+// file, returning its path. The file is NOT visible under its real name
+// until Commit: the fold verifies the temp file first (fold.go crash table).
+func (w *baseWriter) Finish() (string, error) {
+	if w.rows != w.want {
+		return "", fmt.Errorf("base writer: %d rows added, %d announced (the bloom is sized from the announced count)", w.rows, w.want)
+	}
+	if err := w.flushBlock(); err != nil {
+		return "", err
+	}
+
+	var hdrPayload []byte
+	for _, h := range w.m.Headers {
+		hdrPayload = binary.AppendUvarint(hdrPayload, uint64(len(h)))
+		hdrPayload = append(hdrPayload, h...)
+	}
+	var hdrSec []byte
+	if len(hdrPayload) > 0 {
+		hdrSec = w.enc.EncodeAll(hdrPayload, nil)
+	}
+
+	var offsets [baseNumSections][2]uint64
+	offsets[secBaseSST] = [2]uint64{0, w.written}
+	pos := w.written
+	section := func(id int, b []byte) error {
+		offsets[id][0] = pos
+		offsets[id][1] = uint64(len(b))
+		pos += uint64(len(b))
+		_, err := w.out.Write(b)
+		return err
+	}
+	if err := section(secBaseSSTIdx, w.idx); err != nil {
+		return "", err
+	}
+	if err := section(secBaseKeybloom, encodeBloom(w.bloomM, w.words)); err != nil {
+		return "", err
+	}
+	if err := section(secBaseHeaders, hdrSec); err != nil {
+		return "", err
+	}
+
+	var ft [baseFooterSize]byte
+	copy(ft[0:4], baseMagic[:])
+	binary.LittleEndian.PutUint32(ft[4:8], baseVersion)
+	binary.LittleEndian.PutUint64(ft[8:16], w.m.Block)
+	binary.LittleEndian.PutUint64(ft[16:24], w.m.HdrFrom)
+	binary.LittleEndian.PutUint64(ft[24:32], w.m.CumTx)
+	copy(ft[32:64], w.m.Root[:])
+	for i := 0; i < baseNumSections; i++ {
+		binary.LittleEndian.PutUint64(ft[64+i*16:], offsets[i][0])
+		binary.LittleEndian.PutUint64(ft[72+i*16:], offsets[i][1])
+	}
+	copy(ft[baseFooterSize-4:], baseMagic[:])
+	if _, err := w.out.Write(ft[:]); err != nil {
+		return "", err
+	}
+	if err := w.out.Flush(); err != nil {
+		return "", err
+	}
+	if err := w.f.Sync(); err != nil {
+		return "", err
+	}
+	if err := w.f.Close(); err != nil {
+		return "", err
+	}
+	w.f = nil
+	w.enc.Close()
+	w.enc = nil
+	return w.tmp, nil
+}
+
+// Commit makes the file visible. THE COMMIT POINT: the rename is ordered
+// after the file's own fsync, and the directory fsync after the rename, so a
+// crash either leaves the old base untouched or the new one complete.
+func (w *baseWriter) Commit() error {
+	if err := os.Rename(w.tmp, w.path); err != nil {
+		return err
+	}
+	if err := syncDir(w.dir); err != nil {
+		return err
+	}
+	w.done = true
+	return nil
+}
+
+// Abort drops the temp file. Safe to defer: a no-op after Commit.
+func (w *baseWriter) Abort() {
+	if w.done {
+		return
+	}
+	if w.f != nil {
+		w.f.Close()
+		w.f = nil
+	}
+	if w.enc != nil {
+		w.enc.Close()
+		w.enc = nil
+	}
+	os.Remove(w.tmp)
+}
+
+// syncDir fsyncs a directory so a rename inside it is durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // BaseMeta is everything the footer and the header window carry.
@@ -449,122 +712,26 @@ type BaseMeta struct {
 }
 
 // WriteBase writes base_<B> into dir (tmp + rename) and returns its path.
-// Rows are sorted here; duplicates are not checked (the producer owns that).
+// Rows are sorted here; the streaming writer refuses duplicates. The fold
+// producer (state/fold.go) drives the same baseWriter directly, so identical
+// row sets produce identical files whichever path built them.
 func WriteBase(dir string, m BaseMeta, rows []BaseRow) (string, error) {
 	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].Key[:], rows[j].Key[:]) < 0 })
-
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	w, err := newBaseWriter(dir, m, uint64(len(rows)))
 	if err != nil {
 		return "", err
 	}
-	defer enc.Close()
-
-	path := filepath.Join(dir, BaseFileName(m.Block))
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		f.Close()
-		os.Remove(tmp) // no-op once the rename succeeded
-	}()
-	out := bufio.NewWriterSize(f, 4<<20)
-
-	var (
-		written  uint64 // bytes of SST emitted so far, which is also the section offset
-		idx      []byte
-		raw      []byte
-		firstKey []byte
-		block    []byte
-		keys     [][]byte
-	)
-	flush := func() error {
-		if len(raw) == 0 {
-			return nil
-		}
-		idx = append(idx, firstKey...)
-		idx = binary.LittleEndian.AppendUint64(idx, written)
-		block = enc.EncodeAll(raw, block[:0])
-		if _, err := out.Write(block); err != nil {
-			return err
-		}
-		written += uint64(len(block))
-		raw, firstKey = raw[:0], nil
-		return nil
-	}
+	defer w.Abort()
 	for i := range rows {
-		r := &rows[i]
-		keys = append(keys, r.Key[:])
-		if firstKey == nil {
-			firstKey = append([]byte(nil), r.Key[:]...)
-		}
-		raw = append(raw, r.Key[:]...)
-		raw = binary.AppendUvarint(raw, uint64(len(r.Val)))
-		raw = append(raw, r.Val...)
-		if len(raw) >= sstBlockTarget {
-			if err := flush(); err != nil {
-				return "", err
-			}
+		if err := w.Add(rows[i].Key[:], rows[i].Val); err != nil {
+			return "", err
 		}
 	}
-	if err := flush(); err != nil {
+	if _, err := w.Finish(); err != nil {
 		return "", err
 	}
-
-	var hdrPayload []byte
-	for _, h := range m.Headers {
-		hdrPayload = binary.AppendUvarint(hdrPayload, uint64(len(h)))
-		hdrPayload = append(hdrPayload, h...)
-	}
-	var hdrSec []byte
-	if len(hdrPayload) > 0 {
-		hdrSec = enc.EncodeAll(hdrPayload, nil)
-	}
-
-	var offsets [baseNumSections][2]uint64
-	offsets[secBaseSST] = [2]uint64{0, written}
-	pos := written
-	section := func(id int, b []byte) error {
-		offsets[id][0] = pos
-		offsets[id][1] = uint64(len(b))
-		pos += uint64(len(b))
-		_, err := out.Write(b)
-		return err
-	}
-	if err := section(secBaseSSTIdx, idx); err != nil {
+	if err := w.Commit(); err != nil {
 		return "", err
 	}
-	if err := section(secBaseKeybloom, buildBloom(keys)); err != nil {
-		return "", err
-	}
-	if err := section(secBaseHeaders, hdrSec); err != nil {
-		return "", err
-	}
-
-	var ft [baseFooterSize]byte
-	copy(ft[0:4], baseMagic[:])
-	binary.LittleEndian.PutUint32(ft[4:8], baseVersion)
-	binary.LittleEndian.PutUint64(ft[8:16], m.Block)
-	binary.LittleEndian.PutUint64(ft[16:24], m.HdrFrom)
-	binary.LittleEndian.PutUint64(ft[24:32], m.CumTx)
-	copy(ft[32:64], m.Root[:])
-	for i := 0; i < baseNumSections; i++ {
-		binary.LittleEndian.PutUint64(ft[64+i*16:], offsets[i][0])
-		binary.LittleEndian.PutUint64(ft[72+i*16:], offsets[i][1])
-	}
-	copy(ft[baseFooterSize-4:], baseMagic[:])
-	if _, err := out.Write(ft[:]); err != nil {
-		return "", err
-	}
-	if err := out.Flush(); err != nil {
-		return "", err
-	}
-	if err := f.Sync(); err != nil {
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	return path, os.Rename(tmp, path)
+	return w.path, nil
 }

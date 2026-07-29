@@ -138,6 +138,8 @@ func main() {
 		rpcBenchMain(os.Args[2:])
 	case "seal":
 		sealMain(os.Args[2:])
+	case "fold":
+		foldMain(os.Args[2:])
 	case "manifest":
 		manifestMain(os.Args[2:])
 	case "bootstrap":
@@ -164,6 +166,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--epoch-txs <n>]")
+	fmt.Fprintln(os.Stderr, "       epochdb fold [--data <dir>] [--network mainnet] [--epoch-txs <n>]")
 	fmt.Fprintln(os.Stderr, "       epochdb manifest [--data <dir>] [--out <file>]")
 	fmt.Fprintln(os.Stderr, "       epochdb bootstrap --url <base-url> [--data <dir>] [--manifest <file>] [--attempts 3] [--verify] [--network mainnet]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--workers N]")
@@ -219,6 +222,30 @@ func sealMain(args []string) {
 	derive := rpc.NewDeriveStored(hist, rpc.HistoryChainContext(hist), g.Config, exec.ParseEthBlock, *workers)
 	if err := state.SealEpochs(*dataDir, *outDir, *epochTxs, derive); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
+	}
+}
+
+// foldMain is seal's sibling on a PRUNING node: at every canonical boundary
+// it folds the previous snapshot with the period's captured writes into
+// base_<B>, gates the result by loading it into a throwaway Firewood, and
+// retires the raw buckets below B. A node either seals epochs or folds
+// snapshots, never both. Safe beside a live fetch+exec (it reads only durable
+// data at or below the boundary), but never run cook-index by hand beside it:
+// the fold owns cook on a pruning dir.
+func foldMain(args []string) {
+	fs := flag.NewFlagSet("fold", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the genesis alloc is snapshot(0), the bottom of the first fold)")
+	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "canonical boundary tx count: MUST match every other producer's --epoch-txs or the manifest cannot pair a snapshot with the epochs")
+	fs.Parse(args)
+	fetch.RegisterExtras()
+
+	g, err := exec.NetworkGenesis(execNetID(*network))
+	if err != nil {
+		log.Fatalf("epochdb: fold: genesis: %v", err)
+	}
+	if err := state.FoldSnapshots(*dataDir, g.Alloc, *epochTxs, verify.CheckBase); err != nil {
+		log.Fatalf("epochdb: fold: %v", err)
 	}
 }
 
