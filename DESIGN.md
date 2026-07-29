@@ -4,6 +4,8 @@ THE single design file: current implementation plus planned work, kept edited in
 
 Repo: `~/epochdb` (module github.com/containerman17/epochdb, LOCAL ONLY, never pushed).
 
+Agent policy (user ruling 2026-07-29): subagents on this project run OPUS, always, explicitly pinned per dispatch; never fable.
+
 ## Order of work (kept current: anything deferred in conversation lands here immediately)
 1. DONE 2026-07-28: epoch format v3, code into the epoch file (see Torrent distribution). Placement rule measured and decided: every epoch carries the code of every account row it writes.
 2. THERE IS NO RE-SEAL TASK and NO UPGRADE CODE (user ruling 2026-07-28). The existing mainnet corpus is disposable: when the format is final, mainnet gets synced from scratch, not upgraded. So no format change ever owes a migration, and the upgrade machinery was DELETED 2026-07-28: an older file is refused at open, nothing rewrites it. data-fresh stays v2 and frozen meanwhile, which means this build can no longer open it. Iterate on FUJI: small, cheap to rebuild repeatedly, and it is the Helicon target anyway.
