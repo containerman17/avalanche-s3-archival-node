@@ -36,14 +36,17 @@ import (
 //	                store (arrival/index). Its in-RAM store IS the executor's
 //	                block source, so an accepted container is executable the
 //	                moment it is durable.
-//	exec.Executor   the only holder of the Firewood handle; sole writer of the
-//	                state layer (writelog/headers/logs/rcpt/code). Runs one
-//	                goroutine, publishes its committed frontier after every
-//	                block.
-//	rpc.Server      N request goroutines. latest/pending state comes from the
-//	                executor's frontier (no cook wait); historical heights use
-//	                the descent; blocks/txs/receipts/logs come from the same
-//	                live files the executor is appending to.
+//	exec.Executor   the only holder of the Firewood handle, which it uses ONLY
+//	                to verify roots; sole writer of the state layer
+//	                (writelog/headers/logs/rcpt/code) and, through
+//	                AppendWrites, of the tail overlay. Runs one goroutine,
+//	                publishes its executed height after every committed block.
+//	rpc.Server      N request goroutines. latest/pending state is the uncooked
+//	                tail overlay over the descent (no cook wait, and no
+//	                Firewood: it is verify-only and has no readers);
+//	                historical heights use the descent alone;
+//	                blocks/txs/receipts/logs come from the same live files the
+//	                executor is appending to.
 //	exec OnBlock    runs ON the executor goroutine: publishes the serving head
 //	                and the block-hash entry for the block just committed, so
 //	                eth_blockNumber and the frontier can never disagree by more
@@ -129,10 +132,18 @@ func serveMain(args []string) {
 			}
 		},
 		StateCacheBytes: uint64(*stateCacheGiB) << 30,
-		// One Firewood proposal per block: the published frontier must be a
-		// COMMITTED revision, and batching would leave latest reads up to
-		// CommitEvery blocks stale. At chain pace the batching win is nil.
-		CommitEvery: 1,
+		// UNPINNED 2026-07-29: this was 1 only so the served frontier was a
+		// committed Firewood revision. Nothing reads Firewood any more, so
+		// batching costs nothing in freshness: head, block-hash index and the
+		// tail overlay all advance together at the batch boundary, because
+		// publishLive/OnBlock and the state-layer appends all happen in
+		// flushBatch. 64 is invisible at tip pace (Run flushes the open batch
+		// the moment staging runs dry, which at the tip is after every block,
+		// so a following node still commits and root-verifies per block) and
+		// is what makes catch-up fast. Ceiling is 1498 (exec.New's walk-back
+		// guard); 64 keeps the crash walk-back at 8k blocks, well inside one
+		// 100k raw bucket.
+		CommitEvery: 64,
 		NetworkID:   networkID,
 	})
 	if err != nil {
@@ -146,11 +157,24 @@ func serveMain(args []string) {
 	}
 	defer hist.Close()
 
+	// --- the one read path: uncooked tail overlay, then the descent ----------
+	// Cook once before serving so the descent reaches as high as it can, then
+	// hand the residue (executed but not indexed, and therefore answerable
+	// only from the raw writelog) to the overlay. Both must happen before the
+	// executor and the RPC goroutines start.
+	txidx := &txIndexHolder{}
+	cookOnce(*dataDir, hist, txidx)
+	tailBlocks, tailEntries, tailBytes, err := hist.EnableTail(e.LiveHead())
+	if err != nil {
+		log.Fatalf("epochdb: tail overlay: %v", err)
+	}
+	log.Printf("epochdb: tail overlay: cooked=%d executed=%d, backfilled %d uncooked blocks (%d entries, %.1fMB)",
+		hist.StateHead(), e.LiveHead(), tailBlocks, tailEntries, float64(tailBytes)/1e6)
+
 	// --- RPC -----------------------------------------------------------------
 	srv := rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
 	srv.EnableLive(liveNode{Executor: e, accepted: accepted})
 
-	txidx := &txIndexHolder{}
 	txidx.reopen(*dataDir, hist.Epochs())
 	srv.EnableTxAPIs(txidx, sealedBlocks{epochs: hist.Epochs(), blocks: blocks}, exec.ParseEthBlock)
 
@@ -263,21 +287,35 @@ func cookLoop(ctx context.Context, dir string, hist *state.History, txidx *txInd
 			return
 		case <-t.C:
 		}
-		start := time.Now()
-		if err := state.CookIndex(dir); err != nil {
-			log.Printf("epochdb: COOK FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
-			continue
-		}
-		if err := state.CookTxIndex(dir); err != nil {
-			log.Printf("epochdb: COOK-TXINDEX FAILED (tail tx lookups frozen, chain unaffected): %v", err)
-		}
-		if err := hist.Refresh(); err != nil {
-			log.Printf("epochdb: HISTORY REFRESH FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
-			continue
-		}
-		txidx.reopen(dir, hist.Epochs())
-		log.Printf("epochdb: cook: historical window now reaches %d (in %s)", hist.StateHead(), time.Since(start).Round(time.Millisecond))
+		cookOnce(dir, hist, txidx)
 	}
+}
+
+// cookOnce is one pass of that loop, also run once at startup so the node
+// serves with the smallest possible uncooked tail.
+//
+// The overlay prune comes LAST, strictly after Refresh: Refresh publishes the
+// new cooked watermark only once the new sorted buckets are readable, so
+// everything dropped here is already answerable by the descent, and a latest
+// read that misses the overlay picks up its descent target afterwards. See
+// state/tail.go prune for the full race argument.
+func cookOnce(dir string, hist *state.History, txidx *txIndexHolder) {
+	start := time.Now()
+	if err := state.CookIndex(dir); err != nil {
+		log.Printf("epochdb: COOK FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
+		return
+	}
+	if err := state.CookTxIndex(dir); err != nil {
+		log.Printf("epochdb: COOK-TXINDEX FAILED (tail tx lookups frozen, chain unaffected): %v", err)
+	}
+	if err := hist.Refresh(); err != nil {
+		log.Printf("epochdb: HISTORY REFRESH FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
+		return
+	}
+	txidx.reopen(dir, hist.Epochs())
+	entries, size := hist.PruneTail()
+	log.Printf("epochdb: cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
+		hist.StateHead(), time.Since(start).Round(time.Millisecond), entries, float64(size)/1e6)
 }
 
 func statusLoop(ctx context.Context, e *exec.Executor, hist *state.History, accepted func() uint64) {
@@ -290,8 +328,9 @@ func statusLoop(ctx context.Context, e *exec.Executor, hist *state.History, acce
 		case <-t.C:
 		}
 		acc, ex := accepted(), e.LiveHead()
-		log.Printf("epochdb: serve: accepted=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%d",
-			acc, ex, hist.Head(), hist.StateHead(), e.SettledHeight(), int64(acc)-int64(ex))
+		entries, size := hist.TailStats()
+		log.Printf("epochdb: serve: accepted=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%d tail=%d/%.1fMB",
+			acc, ex, hist.Head(), hist.StateHead(), e.SettledHeight(), int64(acc)-int64(ex), entries, float64(size)/1e6)
 	}
 }
 

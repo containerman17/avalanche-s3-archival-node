@@ -145,16 +145,10 @@ type Executor struct {
 	ring *saeRing
 	sae  *saeExec
 
-	// readDB is an UNWRAPPED state.Database over the same Firewood triedb,
-	// used only by LiveState: it must not touch the executor's capture frame
-	// or read cache, and its libevm code/size caches are per-instance, so it
-	// is built once and shared by every RPC goroutine.
-	readDB ethstate.Database
-	// live is the last COMMITTED frontier, published after each block so RPC
-	// goroutines can read latest state without touching executor fields.
-	// Firewood keeps 128 revisions, so a root published here stays readable
-	// far longer than any request.
-	live goatomic.Pointer[liveHead]
+	// live is the last executed height, published after each committed block.
+	// It is a HEIGHT and nothing else: since the 2026-07-29 ruling nothing
+	// reads state from Firewood, so there is no frontier handle to publish.
+	live goatomic.Uint64
 
 	// base is the limited-history floor file (nil on a full node). On a
 	// state-synced node it is where the Firewood frontier, the BLOCKHASH
@@ -179,18 +173,12 @@ type Executor struct {
 	batchBuf       []batchItem
 }
 
-// liveHead is one published frontier: the height and the state root Firewood
-// has a revision for.
-type liveHead struct {
-	num  uint64
-	root common.Hash
-}
-
 // batchItem is one block's buffered state-layer output. Appends are held
 // back until the batch boundary root verifies so a bad batch never leaves
 // unverified frames on disk.
 type batchItem struct {
 	num       uint64
+	hash      common.Hash
 	headerRLP []byte
 	frame     []byte
 	hasFrame  bool
@@ -351,7 +339,6 @@ func New(cfg Config) (*Executor, error) {
 
 	inner := extstate.NewDatabaseWithNodeDB(memdb, tdb)
 	wrapDB := wrapDatabase(inner, cfg.Store, cfg.StateCacheBytes, cfg.VerifyCache)
-	readDB := extstate.NewDatabaseWithNodeDB(memdb, tdb)
 
 	fwBackend, ok := tdb.Backend().(*firewood.TrieDB)
 	if !ok {
@@ -373,7 +360,6 @@ func New(cfg Config) (*Executor, error) {
 		triedb:      tdb,
 		fwBackend:   fwBackend,
 		snowCtx:     snowCtx,
-		readDB:      readDB,
 		chainCtx:    chainContext{},
 		genesisRoot: genesisRoot,
 		genesisHash: g.ToBlock().Hash(),
@@ -850,39 +836,11 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	return nil
 }
 
-// publishLive republishes the committed frontier for LiveState readers.
-func (e *Executor) publishLive() {
-	e.live.Store(&liveHead{num: e.headNum, root: e.headRoot})
-}
+// publishLive republishes the executed head for RPC goroutines.
+func (e *Executor) publishLive() { e.live.Store(e.headNum) }
 
-// LiveState opens a read-only StateDB over the executor's committed frontier
-// and returns the height it belongs to. This is how serve answers
-// latest/pending state without waiting for cook: Firewood IS latest state, and
-// only this process may hold its handle.
-//
-// Race by construction: the executor may commit another block between the
-// publish and this call, so the answer is "the frontier at or just before the
-// reported height", exactly like any node's latest.
-func (e *Executor) LiveState() (*ethstate.StateDB, uint64, error) {
-	lh := e.live.Load()
-	if lh == nil {
-		return nil, 0, fmt.Errorf("executor frontier not published yet")
-	}
-	st, err := ethstate.New(lh.root, e.readDB, nil)
-	if err != nil {
-		return nil, 0, fmt.Errorf("open frontier state at %d (root %x): %w", lh.num, lh.root, err)
-	}
-	return st, lh.num, nil
-}
-
-// LiveHead returns the height of the published frontier (0 before the first
-// publish).
-func (e *Executor) LiveHead() uint64 {
-	if lh := e.live.Load(); lh != nil {
-		return lh.num
-	}
-	return 0
-}
+// LiveHead returns the last executed height (0 before the first publish).
+func (e *Executor) LiveHead() uint64 { return e.live.Load() }
 
 // SettledHeight returns the last SAE-settled height. Below the Helicon
 // boundary settlement does not exist and the executed head IS the settled
@@ -1080,7 +1038,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 
 	if header.Root == e.headRoot {
 		// Empty block: header only, no EVM, no Firewood.
-		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, headerRLP: headerRLP})
+		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, hash: blk.Hash(), headerRLP: headerRLP})
 	} else {
 		frame := &blockFrame{}
 		e.wrapDB.setFrame(frame)
@@ -1104,7 +1062,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 		e.wrapDB.setFrame(nil)
 		e.batchDirty = true
 		e.batchBuf = append(e.batchBuf, batchItem{
-			num: blockNum, headerRLP: headerRLP,
+			num: blockNum, hash: blk.Hash(), headerRLP: headerRLP,
 			frame: frame.buf, hasFrame: true,
 			logsRec: encodeLogsFrame(receiptLogs(receipts)),
 			rcptRec: storedTailRecord(receipts),
@@ -1125,10 +1083,19 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 	return nil
 }
 
-// flushBatch closes the open batch: ONE Firewood proposal for all
-// accumulated writes, boundary root verified against the boundary block's
-// header root (bisecting per block on mismatch), then the buffered
-// state-layer appends land.
+// flushBatch closes the open batch: the boundary root is verified against the
+// boundary block's header root (bisecting per block on mismatch), then the
+// buffered state-layer appends land, then ONE Firewood proposal for all the
+// accumulated writes.
+//
+// THAT ORDER IS LOAD-BEARING, and it mirrors the per-block path: the state
+// layer is written first and Firewood is committed LAST, so a kill -9 can only
+// ever leave Firewood BEHIND the headers, which is exactly what reconcile's
+// backward walk recovers from. The other order (commit, then append) leaves
+// Firewood one batch AHEAD of the highest header after a crash, and the node
+// then refuses to start with "firewood root not found in headers": caught by
+// a kill -9 at 1,621,503 during the 2026-07-29 gate. The root is verified
+// before either half, so no unverified frame reaches disk either way.
 func (e *Executor) flushBatch() error {
 	boundaryNum, boundaryRoot, boundaryHash := e.headNum, e.headRoot, e.batchLastHash
 
@@ -1139,22 +1106,6 @@ func (e *Executor) flushBatch() error {
 	if computed != boundaryRoot {
 		return e.bisect(computed, boundaryNum, boundaryRoot)
 	}
-
-	if e.batchDirty {
-		opt := stateconf.WithTrieDBUpdatePayload(e.lastFwHash, boundaryHash)
-		if err := e.triedb.Update(computed, e.batchStartRoot, e.fwHeight+1, nil, nil, opt); err != nil {
-			return fmt.Errorf("batch update [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
-		}
-		if err := e.triedb.Commit(computed, false); err != nil {
-			return fmt.Errorf("batch commit [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
-		}
-		e.fwHeight++
-	} else {
-		// Whole batch empty: no proposal, just register the boundary hash.
-		e.fwBackend.SetHashAndHeight(boundaryHash, boundaryNum)
-		e.fwHeight = boundaryNum
-	}
-	e.lastFwHash = boundaryHash
 
 	for _, it := range e.batchBuf {
 		if it.hasFrame {
@@ -1178,7 +1129,37 @@ func (e *Executor) flushBatch() error {
 		if err := e.maybeFlush(it.num); err != nil {
 			return err
 		}
+		// Publish PER BLOCK, right after that block's appends: this loop is
+		// where a batch's writes become visible (state layer, and with them
+		// the tail overlay), so the served head has to walk up with them.
+		// Publishing only at the boundary left `latest` naming the previous
+		// boundary while the overlay already answered from the flushed
+		// blocks, which the A/B probe caught as a nonce one write into the
+		// future; it also left 63 of every 64 block hashes out of the hash
+		// index. The remaining exposure is one block wide, exactly as in the
+		// per-block path. executeRaw republishes the boundary right after,
+		// which is idempotent (same height, same hash).
+		e.live.Store(it.num)
+		if e.cfg.OnBlock != nil {
+			e.cfg.OnBlock(it.num, it.hash)
+		}
 	}
+
+	if e.batchDirty {
+		opt := stateconf.WithTrieDBUpdatePayload(e.lastFwHash, boundaryHash)
+		if err := e.triedb.Update(computed, e.batchStartRoot, e.fwHeight+1, nil, nil, opt); err != nil {
+			return fmt.Errorf("batch update [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
+		}
+		if err := e.triedb.Commit(computed, false); err != nil {
+			return fmt.Errorf("batch commit [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
+		}
+		e.fwHeight++
+	} else {
+		// Whole batch empty: no proposal, just register the boundary hash.
+		e.fwBackend.SetHashAndHeight(boundaryHash, boundaryNum)
+		e.fwHeight = boundaryNum
+	}
+	e.lastFwHash = boundaryHash
 
 	e.batchOpen = false
 	e.batchDirty = false

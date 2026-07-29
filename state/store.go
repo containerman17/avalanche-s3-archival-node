@@ -32,6 +32,10 @@ type Store struct {
 	code *codeStore
 	misc *miscStore
 
+	// tail is the uncooked-write overlay, non-nil only when a History
+	// enabled it (serve). Set before the executor goroutine starts.
+	tail *tail
+
 	execHead   uint64
 	execHeadOK bool
 
@@ -151,7 +155,21 @@ func (s *Store) FlushAndSetExecHead(n uint64) error {
 }
 
 // AppendWrites stores block's post-image write frame. Idempotent per block.
+//
+// This is also where the uncooked-tail overlay is fed (serve, via
+// History.EnableTail): every execution path (per-block, batched, SAE, crash
+// re-execution) already funnels its frames through here, so the overlay sees
+// the same stream the writelog does with nothing re-derived. The overlay is
+// updated BEFORE the append so a reader can never see a write that is in the
+// writelog (which the descent ignores until it is cooked) but not yet in the
+// overlay; the block is already root-verified at this point and its head is
+// not published until later, so the other order is the only unsafe one.
 func (s *Store) AppendWrites(block uint64, frame []byte) error {
+	if s.tail != nil {
+		if err := s.tail.apply(block, frame); err != nil {
+			return fmt.Errorf("tail overlay block %d: %w", block, err)
+		}
+	}
 	return s.wl.Append(block, frame)
 }
 

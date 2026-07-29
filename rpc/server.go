@@ -58,14 +58,11 @@ type Server struct {
 	live Live
 }
 
-// Live is the in-process executor view that serve wires in. It is
-// what makes latest reads answer at chain pace: the executor owns the
-// exclusive Firewood handle, so nothing outside this process can serve the
-// frontier.
+// Live is the in-process executor view that serve wires in: the height
+// labels, and nothing else. Latest STATE does not come through here, it comes
+// from History's uncooked-tail overlay (ruling 2026-07-29: Firewood is
+// verify-only and has no readers).
 type Live interface {
-	// LiveState opens a read-only StateDB over the committed frontier and
-	// returns the height it belongs to.
-	LiveState() (*ethstate.StateDB, uint64, error)
 	// LiveHead is the last EXECUTED height: the `latest` label.
 	LiveHead() uint64
 	// AcceptedHead is the last height the follower accepted (>= LiveHead):
@@ -393,9 +390,10 @@ func (s *Server) acceptedHead() uint64 {
 // stateAt opens the state at height n. Three bands when following:
 //
 //	n > executed        not executed here yet (staged, or a backfill hole): error.
-//	n in [head, exec]   the LIVE Firewood frontier: latest/pending answer at
-//	                    chain pace with no cook wait. The band is one advance
-//	                    tick wide, which is the same head race every node has.
+//	n in [head, exec]   the executed head: the uncooked-tail overlay over the
+//	                    descent, so latest/pending answer at chain pace with no
+//	                    cook wait and no Firewood. The band is one advance tick
+//	                    wide, which is the same head race every node has.
 //	n < head            the historical descent, which refuses heights the cook
 //	                    has not reached rather than answering with a pre-gap value.
 func (s *Server) stateAt(n uint64) (*ethstate.StateDB, *rpcError) {
@@ -406,7 +404,7 @@ func (s *Server) stateAt(n uint64) (*ethstate.StateDB, *rpcError) {
 			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
 				"state at block %d is not executed yet (executed head %d)", n, executed)}
 		case n >= s.hist.Head():
-			st, _, err := s.live.LiveState()
+			st, err := ethstate.New(common.Hash{}, s.hist.StateLatest(), nil)
 			if err != nil {
 				return nil, &rpcError{Code: -32000, Message: err.Error()}
 			}

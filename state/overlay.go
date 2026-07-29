@@ -72,6 +72,13 @@ type History struct {
 	// stale value for a key written in the gap.
 	stateHead atomic.Uint64
 
+	// tail is the uncooked-write overlay (state/tail.go), non-nil only after
+	// EnableTail: the executor's writes since the last cook. It is the FIRST
+	// half of the one read path; `latest` state is this then the descent.
+	// nil everywhere else (cook, seal, fold, read-only openers), where every
+	// read is historical by definition.
+	tail *tail
+
 	// mu guards buckets and deletes, which Refresh swaps when cook lands new
 	// sorted files. Everything else here is immutable after open.
 	mu      sync.RWMutex
@@ -690,15 +697,7 @@ func (h *History) AccountAt(addr common.Address, n uint64) (*types.StateAccount,
 		}
 		return acc, nil
 	}
-	if len(val) == 0 {
-		return nil, nil // explicit delete: account gone at n
-	}
-	var acc types.StateAccount
-	if err := rlp.DecodeBytes(val, &acc); err != nil {
-		return nil, fmt.Errorf("decode account %x at %d: %w", addr, n, err)
-	}
-	acc.Root = SentinelStorageRoot
-	return &acc, nil
+	return decodeAccount(val, addr) // empty value = explicit delete, account gone
 }
 
 // StorageAt returns the trie-encoded (RLP of trimmed bytes) value of
@@ -847,12 +846,137 @@ func (h *History) StateAt(n uint64) state.Database {
 	return &Overlay{hist: h, target: n}
 }
 
+// --- the executed head: uncooked-tail overlay, then the descent -------------
+
+// EnableTail turns on the uncooked-write overlay and backfills it from the
+// raw writelog for (cooked watermark, executedHead]: those blocks are
+// executed but not indexed, so nothing else on this node can answer for them.
+// After this, `latest` reads never need Firewood (ruling 2026-07-29).
+//
+// serve calls it after exec.New's reconcile and BEFORE starting the executor
+// and the RPC server; that ordering is what makes the two plain field
+// assignments below safe, since no other goroutine touches either yet.
+func (h *History) EnableTail(executedHead uint64) (blocks int, entries int, size uint64, err error) {
+	from := h.stateHead.Load() + 1
+	if executedHead >= from && executedHead-from+1 > 2*BucketBlocks {
+		return 0, 0, 0, fmt.Errorf("cooked through %d but executed to %d: %d uncooked blocks would not fit in the tail overlay (run epochdb cook-index first)",
+			from-1, executedHead, executedHead-from+1)
+	}
+	t := newTail()
+	for n := from; n <= executedHead; n++ {
+		frame, ok, err := h.store.wl.Get(n)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("tail backfill block %d: %w", n, err)
+		}
+		if !ok {
+			continue // empty block, or a bucket seal already retired (all cooked)
+		}
+		if err := t.apply(n, frame); err != nil {
+			return 0, 0, 0, fmt.Errorf("tail backfill block %d: %w", n, err)
+		}
+		blocks++
+	}
+	h.tail = t
+	h.store.tail = t
+	entries, size = t.stats()
+	return blocks, entries, size, nil
+}
+
+// PruneTail drops overlay entries the cook has taken over. MUST be called
+// after Refresh, never before: see the race argument on tail.prune.
+func (h *History) PruneTail() (entries int, size uint64) {
+	if h.tail == nil {
+		return 0, 0
+	}
+	return h.tail.prune(h.stateHead.Load())
+}
+
+// TailStats reports the overlay's entry count and key+value bytes.
+func (h *History) TailStats() (entries int, size uint64) {
+	if h.tail == nil {
+		return 0, 0
+	}
+	return h.tail.stats()
+}
+
+// AccountLatest returns addr's account at the EXECUTED head: the uncooked
+// overlay, else the descent at the cooked watermark.
+//
+// The watermark is loaded AFTER the overlay miss, deliberately: an entry
+// pruned between the two steps is guaranteed cooked by the watermark we then
+// read (full argument on tail.prune).
+func (h *History) AccountLatest(addr common.Address) (*types.StateAccount, error) {
+	if h.tail != nil {
+		if val, hit := h.tail.account(addr); hit {
+			return decodeAccount(val, addr)
+		}
+	}
+	return h.AccountAt(addr, h.StateHead())
+}
+
+// StorageLatest returns (addr, slot) at the EXECUTED head. Same two layers,
+// same ordering rule as AccountLatest.
+func (h *History) StorageLatest(addr common.Address, slot []byte) ([]byte, error) {
+	if h.tail != nil {
+		val, hit, dead := h.tail.storage(addr, slot)
+		if hit {
+			if len(val) == 0 {
+				return nil, nil
+			}
+			return val, nil
+		}
+		if dead {
+			// Destructed up here and not rewritten since: zero, and the
+			// descent must not be consulted (it holds the pre-destruct value
+			// and its own delete index knows nothing about an uncooked
+			// SELFDESTRUCT).
+			return nil, nil
+		}
+	}
+	return h.StorageAt(addr, slot, h.StateHead())
+}
+
+// StateLatest returns the read surface for the executed head. With no
+// overlay enabled it is exactly the descent at the cooked watermark.
+func (h *History) StateLatest() state.Database {
+	return &Overlay{hist: h, latest: true}
+}
+
+// decodeAccount turns a captured account post-image into a StateAccount.
+// An empty value is an explicit delete: the account does not exist.
+func decodeAccount(val []byte, addr common.Address) (*types.StateAccount, error) {
+	if len(val) == 0 {
+		return nil, nil
+	}
+	var acc types.StateAccount
+	if err := rlp.DecodeBytes(val, &acc); err != nil {
+		return nil, fmt.Errorf("decode account %x: %w", addr, err)
+	}
+	acc.Root = SentinelStorageRoot
+	return &acc, nil
+}
+
 // Overlay is the read-only historical state.Database at a fixed target
 // block. Only value reads work; every trie-structure or write method fails
 // loudly.
+//
+// latest replaces the fixed target with the executed head: reads go through
+// the uncooked-tail overlay and fall back to the descent at whatever the
+// cooked watermark is at miss time.
 type Overlay struct {
 	hist   *History
 	target uint64
+	latest bool
+}
+
+// head is the block this view answers for: the fixed target, or the executed
+// head in latest mode (used only for the BLOCKHASH-ish header lookups, never
+// to bound a state read).
+func (o *Overlay) head() uint64 {
+	if o.latest {
+		return o.hist.Head()
+	}
+	return o.target
 }
 
 func (o *Overlay) OpenTrie(common.Hash) (state.Trie, error) {
@@ -896,22 +1020,29 @@ type overlayTrie struct {
 func (t *overlayTrie) GetKey(k []byte) []byte { return k }
 
 func (t *overlayTrie) GetAccount(addr common.Address) (*types.StateAccount, error) {
+	if t.o.latest {
+		return t.o.hist.AccountLatest(addr)
+	}
 	return t.o.hist.AccountAt(addr, t.o.target)
 }
 
 func (t *overlayTrie) GetStorage(addr common.Address, key []byte) ([]byte, error) {
+	if t.o.latest {
+		return t.o.hist.StorageLatest(addr, key)
+	}
 	return t.o.hist.StorageAt(addr, key, t.o.target)
 }
 
 // Hash returns header(target).Root: the one true root for this height.
 func (t *overlayTrie) Hash() common.Hash {
-	raw, ok, err := t.o.hist.HeaderRLP(t.o.target)
+	n := t.o.head()
+	raw, ok, err := t.o.hist.HeaderRLP(n)
 	if err != nil || !ok {
-		panic(fmt.Sprintf("epochdb overlay: header %d unavailable: ok=%v err=%v", t.o.target, ok, err))
+		panic(fmt.Sprintf("epochdb overlay: header %d unavailable: ok=%v err=%v", n, ok, err))
 	}
 	var h types.Header
 	if err := rlp.DecodeBytes(raw, &h); err != nil {
-		panic(fmt.Sprintf("epochdb overlay: decode header %d: %v", t.o.target, err))
+		panic(fmt.Sprintf("epochdb overlay: decode header %d: %v", n, err))
 	}
 	return h.Root
 }
