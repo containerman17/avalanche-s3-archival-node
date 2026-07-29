@@ -489,7 +489,7 @@ func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64,
 // ---------- epoch set ----------
 
 // EpochSet is every sealed epoch in a directory, ascending. Sealing is
-// strictly sequential, but a torrent-fetched set may have holes: coverage
+// strictly sequential, but a downloaded set may have holes: coverage
 // is the contiguous prefix from the floor (genesis on a full node, the
 // base-file block B in limited-history mode). Epochs above the first gap
 // stay open (their data is epoch-local and valid for body/tx-by-hash
@@ -633,8 +633,9 @@ func (s *EpochSet) GetByHeight(n uint64) ([]byte, bool, error) {
 }
 
 // CombinedTxIndex answers tx-hash candidate queries over sealed epochs
-// plus the raw per-bucket index (the unsealed tail; may overlap epochs
-// until --delete-raw, so candidates are deduped).
+// plus the raw per-bucket index (the unsealed tail; the bucket straddling
+// the sealed end always overlaps the newest epoch, since buckets are 100k
+// blocks and epochs cut on tx count, so candidates are deduped).
 type CombinedTxIndex struct {
 	Raw    *TxIndex
 	Epochs *EpochSet

@@ -134,7 +134,7 @@ func (l *bucketLog) scanRO(bucket uint64) error {
 }
 
 // openCodeStoreRO scans code.log read-only without truncating the tail. A
-// missing code.log is an empty hot tail, not an error: a torrent-bootstrapped
+// missing code.log is an empty hot tail, not an error: a download-bootstrapped
 // node never ran an executor, and format v3 epochs carry the code (as does
 // the base file in limited-history mode).
 func openCodeStoreRO(dir string) (*codeStore, error) {
@@ -171,7 +171,7 @@ func openCodeStoreRO(dir string) (*codeStore, error) {
 }
 
 // openMiscStoreRO replays misc.log read-only without truncating the tail.
-// Absent on a torrent-bootstrapped node (nothing ever executed there), which
+// Absent on a download-bootstrapped node (nothing ever executed there), which
 // is an empty map, not an error.
 func openMiscStoreRO(dir string) (*miscStore, error) {
 	f, err := os.Open(filepath.Join(dir, "misc.log"))

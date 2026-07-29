@@ -16,9 +16,10 @@ import (
 // SealEpochs cuts and writes sealed epochs from the raw staging + capture
 // files, strictly behind the durable exec head. Idempotent and resumable:
 // the next epoch always starts right after the last sealed one, files land
-// via tmp+rename. With deleteRaw, raw bucket files whose whole range is
-// sealed are removed afterwards; NEVER enable that next to a running
-// fetch/exec (they own those files).
+// via tmp+rename. Raw bucket files whose WHOLE range is sealed are removed
+// afterwards, unconditionally (user ruling 2026-07-29: --delete-raw was the
+// only sane setting, so the flag is gone). NEVER run seal next to a running
+// fetch/exec: they own those files.
 // DeriveStored fills EpochInput's stored-logs sections (FullLogs/RcptRecs,
 // plus the posting-list tuples when nil) by re-execution. Implemented in
 // rpc (state cannot import the EVM). Stored logs are unconditional: only
@@ -28,11 +29,11 @@ type DeriveStored func(in *EpochInput) error
 // outDir is where sealed epoch files land (usually dir itself; a separate
 // dir cuts an alternate epoch size from the same raw captures without
 // touching existing epochs).
-func SealEpochs(dir, outDir string, deleteRaw bool, epochTxs uint64, derive DeriveStored) error {
-	return sealEpochs(dir, outDir, deleteRaw, epochTxs, derive)
+func SealEpochs(dir, outDir string, epochTxs uint64, derive DeriveStored) error {
+	return sealEpochs(dir, outDir, epochTxs, derive)
 }
 
-func sealEpochs(dir, outDir string, deleteRaw bool, epochTxs uint64, derive DeriveStored) error {
+func sealEpochs(dir, outDir string, epochTxs uint64, derive DeriveStored) error {
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return err
@@ -109,10 +110,7 @@ func sealEpochs(dir, outDir string, deleteRaw bool, epochTxs uint64, derive Deri
 		next = in.Start + uint64(len(in.Containers))
 	}
 
-	if deleteRaw {
-		return deleteSealedRaw(dir, next-1)
-	}
-	return nil
+	return deleteSealedRaw(dir, next-1)
 }
 
 // rawSizes are the uncompressed raw equivalents consumed by one epoch, for

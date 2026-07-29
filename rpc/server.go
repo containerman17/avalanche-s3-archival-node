@@ -54,7 +54,7 @@ type Server struct {
 }
 
 // HistoryChainContext serves BLOCKHASH headers through the epochs-aware
-// History (raw store first, sealed epochs after --delete-raw).
+// History (raw store first, sealed epochs once the raws are gone).
 func HistoryChainContext(hist *state.History) corethcore.ChainContext {
 	return histChainCtx{hist}
 }

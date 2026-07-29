@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"encoding/binary"
 	"math/big"
 	"strings"
 	"testing"
@@ -35,11 +34,6 @@ func newPrunedServer(t *testing.T, floor uint64) *Server {
 		t.Fatal(err)
 	}
 
-	src := t.TempDir()
-	st, err := state.Open(src)
-	if err != nil {
-		t.Fatal(err)
-	}
 	accRLP, err := rlp.EncodeToBytes(&types.StateAccount{
 		Nonce: 1, Balance: uint256.NewInt(7),
 		Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes(),
@@ -47,41 +41,27 @@ func newPrunedServer(t *testing.T, floor uint64) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One captured account write, in exec/capture.go's post-image frame
-	// layout: kind 'a' | address | uvarint len | account RLP.
-	frame := append([]byte{'a'}, common.HexToAddress("0xabcd").Bytes()...)
-	frame = binary.AppendUvarint(frame, uint64(len(accRLP)))
-	frame = append(frame, accRLP...)
-	if err := st.AppendWrites(floor-2, frame); err != nil {
-		t.Fatal(err)
-	}
-	for n := uint64(0); n <= floor; n++ {
+	// One live account row in the snapshot's 53-byte preimage keyspace:
+	// kind 'a' | address | 32 zero bytes.
+	var row state.BaseRow
+	row.Key[0] = 'a'
+	copy(row.Key[1:21], common.HexToAddress("0xabcd").Bytes())
+	row.Val = accRLP
+
+	m := state.BaseMeta{Block: floor, CumTx: 12345, HdrFrom: floor - 256}
+	for n := m.HdrFrom; n <= floor; n++ {
 		hdr, err := rlp.EncodeToBytes(&types.Header{
 			Number: new(big.Int).SetUint64(n), Difficulty: big.NewInt(1),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.AppendHeader(n, hdr); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := st.FlushAndSetExecHead(floor); err != nil {
-		t.Fatal(err)
-	}
-	if err := state.CookIndex(src); err != nil {
-		t.Fatal(err)
-	}
-	full, err := state.OpenHistory(src, st, nil)
-	if err != nil {
-		t.Fatal(err)
+		m.Headers = append(m.Headers, hdr)
 	}
 	dst := t.TempDir()
-	if _, err := state.BuildBase(full, dst, floor, nil); err != nil {
+	if _, err := state.WriteBase(dst, m, []state.BaseRow{row}); err != nil {
 		t.Fatal(err)
 	}
-	full.Close()
-	st.Close()
 
 	pst, err := state.Open(dst)
 	if err != nil {

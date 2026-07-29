@@ -44,102 +44,60 @@ func codeAccRLP(t *testing.T, nonce uint64, balance int64, codeHash common.Hash)
 	return raw
 }
 
-// baseCorpus stages a small synthetic corpus covering every liveness rule
-// and returns the opened History plus the genesis alloc it was opened with.
-func baseCorpus(t *testing.T) (*History, string) {
-	t.Helper()
-	dir := t.TempDir()
-	st, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	app := func(block uint64, frame []byte) {
-		t.Helper()
-		if err := st.AppendWrites(block, frame); err != nil {
-			t.Fatal(err)
-		}
-	}
-	app(10, frStorage(frAccount(nil, baseA, accRLP(t, 1, 100)), baseA, baseSlot1, baseV1))
-	app(20, frStorage(nil, baseA, baseSlot2, baseV2))
-	app(25, frStorage(nil, baseB, baseSlot1, baseV1))
-	app(30, frAccount(nil, baseB, accRLP(t, 1, 5)))
-	app(40, frAccount(nil, baseB, nil)) // SELFDESTRUCT: orphans slot1 at 25
-	app(50, frAccount(nil, baseC, codeAccRLP(t, 1, 1, baseCodeHash)))
-	app(60, frStorage(nil, baseA, baseSlot2, nil)) // zero write
-	app(62, frAccount(nil, baseA, accRLP(t, 2, 200)))
-	app(70, frAccount(nil, baseD, accRLP(t, 1, 1)))   // above the floor
-	app(80, frStorage(nil, baseA, baseSlot1, baseV3)) // above the floor
-	if err := st.PutCode(baseCodeHash, baseCodeBlob); err != nil {
-		t.Fatal(err)
-	}
-	for n := uint64(0); n <= 90; n++ {
-		if err := st.AppendHeader(n, baseHdr(t, n, baseRoot(n))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := st.FlushAndSetExecHead(90); err != nil {
-		t.Fatal(err)
-	}
-	if err := CookIndex(dir); err != nil {
-		t.Fatal(err)
-	}
-
-	alloc := types.GenesisAlloc{baseGen: types.Account{
-		Balance: big.NewInt(55), Nonce: 9, Code: baseGenCode,
-	}}
-	h, err := OpenHistory(dir, st, alloc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(h.Close)
-	return h, dir
-}
-
 var (
 	baseA   = common.HexToAddress("0x1111111111111111111111111111111111111111")
 	baseB   = common.HexToAddress("0x2222222222222222222222222222222222222222")
 	baseC   = common.HexToAddress("0x3333333333333333333333333333333333333333")
 	baseD   = common.HexToAddress("0x4444444444444444444444444444444444444444")
-	baseGen = common.HexToAddress("0x5555555555555555555555555555555555555555")
 
 	baseSlot1 = common.HexToHash("0x01")
 	baseSlot2 = common.HexToHash("0x02")
 	baseV1    = []byte{0x11}
 	baseV2    = []byte{0x22}
-	baseV3    = []byte{0x33}
 
 	baseCodeBlob = []byte{0x60, 0x60, 0x60, 0x40}
 	baseCodeHash = crypto.Keccak256Hash(baseCodeBlob)
-	baseGenCode  = []byte{0xfe, 0xed}
-	baseGenHash  = crypto.Keccak256Hash(baseGenCode)
 )
 
-func TestBaseBuildAndRead(t *testing.T) {
-	h, _ := baseCorpus(t)
-	out := t.TempDir()
-
-	var sunk int
-	path, err := BuildBase(h, out, 65, func(key [sortedKeySize]byte, val []byte) error {
-		if len(val) == 0 {
-			t.Fatalf("sink got an empty value for %x", key[:21])
-		}
-		sunk++
-		return nil
-	})
+// writeTestBase builds a small base file covering all three row kinds.
+// Rows are handed in unsorted on purpose: WriteBase owns the ordering.
+func writeTestBase(t *testing.T, dir string, block uint64) string {
+	t.Helper()
+	row := func(key []byte, val []byte) BaseRow {
+		var r BaseRow
+		copy(r.Key[:], key)
+		r.Val = val
+		return r
+	}
+	ck := epochCodeKey(baseCodeHash)
+	rows := []BaseRow{
+		row(storageKey(baseA, baseSlot1[:]), baseV1),
+		row(accountKey(baseC), codeAccRLP(t, 1, 1, baseCodeHash)),
+		row(ck[:], baseCodeBlob),
+		row(accountKey(baseA), accRLP(t, 2, 200)),
+		row(storageKey(baseC, baseSlot2[:]), baseV2),
+	}
+	m := BaseMeta{Block: block, CumTx: 7777, Root: baseRoot(block)}
+	if block > baseHeaderWindow {
+		m.HdrFrom = block - baseHeaderWindow
+	}
+	for n := m.HdrFrom; n <= block; n++ {
+		m.Headers = append(m.Headers, baseHdr(t, n, baseRoot(n)))
+	}
+	path, err := WriteBase(dir, m, rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(path) != "base_65" {
-		t.Fatalf("path %s", path)
-	}
-	// A(acct+slot1), C(acct), gen(acct): code rows never reach the sink.
-	if sunk != 4 {
-		t.Fatalf("sink saw %d rows, want 4", sunk)
+	return path
+}
+
+func TestBaseWriteAndRead(t *testing.T) {
+	dir := t.TempDir()
+	if got := filepath.Base(writeTestBase(t, dir, 65)); got != "base_65" {
+		t.Fatalf("path %s", got)
 	}
 
-	b, ok, err := OpenBase(out)
+	b, ok, err := OpenBase(dir)
 	if err != nil || !ok {
 		t.Fatalf("OpenBase: ok=%v err=%v", ok, err)
 	}
@@ -150,6 +108,10 @@ func TestBaseBuildAndRead(t *testing.T) {
 	}
 	if b.StateRoot() != baseRoot(65) {
 		t.Fatalf("root=%x want %x", b.StateRoot(), baseRoot(65))
+	}
+	// The canonical-boundary anchor: nothing else in the file implies it.
+	if b.CumTx() != 7777 {
+		t.Fatalf("cumTx=%d want 7777", b.CumTx())
 	}
 
 	acct := func(a common.Address) []byte {
@@ -163,32 +125,14 @@ func TestBaseBuildAndRead(t *testing.T) {
 		}
 		return v
 	}
-	// Last write at or before B wins.
 	if got := acct(baseA); !bytes.Equal(got, accRLP(t, 2, 200)) {
 		t.Fatalf("account A: %x", got)
-	}
-	// Last write is a delete: absent, not a row with an empty value.
-	if got := acct(baseB); got != nil {
-		t.Fatalf("destructed account B present: %x", got)
 	}
 	if got := acct(baseC); !bytes.Equal(got, codeAccRLP(t, 1, 1, baseCodeHash)) {
 		t.Fatalf("account C: %x", got)
 	}
-	// Written only above the floor: not in the base.
 	if got := acct(baseD); got != nil {
-		t.Fatalf("above-floor account D present: %x", got)
-	}
-	// Never written: the genesis alloc floor is folded in.
-	gen := acct(baseGen)
-	if gen == nil {
-		t.Fatal("genesis alloc account missing from the base")
-	}
-	var ga types.StateAccount
-	if err := rlp.DecodeBytes(gen, &ga); err != nil {
-		t.Fatal(err)
-	}
-	if ga.Nonce != 9 || ga.Balance.Uint64() != 55 || !bytes.Equal(ga.CodeHash, baseGenHash[:]) {
-		t.Fatalf("genesis account: %+v", ga)
+		t.Fatalf("absent account D present: %x", got)
 	}
 
 	slot := func(a common.Address, s common.Hash) []byte {
@@ -203,26 +147,18 @@ func TestBaseBuildAndRead(t *testing.T) {
 		return v
 	}
 	if got := slot(baseA, baseSlot1); !bytes.Equal(got, baseV1) {
-		t.Fatalf("A/slot1: %x want %x (the write at 80 is above the floor)", got, baseV1)
+		t.Fatalf("A/slot1: %x want %x", got, baseV1)
 	}
-	if got := slot(baseA, baseSlot2); got != nil {
-		t.Fatalf("zero-written A/slot2 present: %x", got)
+	if got := slot(baseC, baseSlot2); !bytes.Equal(got, baseV2) {
+		t.Fatalf("C/slot2: %x want %x", got, baseV2)
 	}
 	if got := slot(baseB, baseSlot1); got != nil {
-		t.Fatalf("orphaned B/slot1 present: %x (SELFDESTRUCT drops the storage trie)", got)
-	}
-	if got := slot(baseC, baseSlot1); got != nil {
-		t.Fatalf("never-written slot present: %x", got)
+		t.Fatalf("absent slot present: %x", got)
 	}
 
-	for _, tc := range []struct {
-		hash common.Hash
-		want []byte
-	}{{baseCodeHash, baseCodeBlob}, {baseGenHash, baseGenCode}} {
-		blob, ok, err := b.Code(tc.hash)
-		if err != nil || !ok || !bytes.Equal(blob, tc.want) {
-			t.Fatalf("code %x: %x ok=%v err=%v", tc.hash, blob, ok, err)
-		}
+	blob, ok, err := b.Code(baseCodeHash)
+	if err != nil || !ok || !bytes.Equal(blob, baseCodeBlob) {
+		t.Fatalf("code: %x ok=%v err=%v", blob, ok, err)
 	}
 	if _, ok, _ := b.Code(crypto.Keccak256Hash([]byte("absent"))); ok {
 		t.Fatal("unknown code hash reported found")
@@ -243,95 +179,93 @@ func TestBaseBuildAndRead(t *testing.T) {
 	}
 }
 
-// TestBaseMergesEpochsAndBuckets: sealed epoch rows and raw bucket rows are
-// merged by key, and the newest write at or before B wins across sources.
-func TestBaseMergesEpochsAndBuckets(t *testing.T) {
-	h, dir := baseCorpus(t)
-	h.Close() // reopen below, after sealing an epoch into the same dir
-
-	// Epoch rows for the same keys the buckets carry, plus one key that
-	// exists ONLY in the epoch.
-	onlyKey := storageKey(baseC, baseSlot2[:])
-	in := &EpochInput{Start: 1, TxHashes: map[uint64][][32]byte{}}
-	for i := 0; i < 20; i++ {
-		in.Containers = append(in.Containers, []byte("container"))
-		in.Headers = append(in.Headers, baseHdr(t, uint64(i+1), baseRoot(uint64(i+1))))
-	}
-	var k1, k2 [sortedKeySize]byte
-	copy(k1[:], storageKey(baseA, baseSlot1[:]))
-	copy(k2[:], onlyKey)
-	in.StateRows = []StateRow{
-		{Key: k1, Block: 5, Value: []byte{0xee}}, // shadowed by the bucket write at 10
-		{Key: k2, Block: 6, Value: baseV2},       // only source for this key
-	}
-	if _, err := BuildEpoch(dir, in); err != nil {
-		t.Fatal(err)
-	}
-
-	st, err := OpenReadOnly(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	h2, err := OpenHistory(dir, st, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer h2.Close()
-
-	out := t.TempDir()
-	if _, err := BuildBase(h2, out, 65, nil); err != nil {
-		t.Fatal(err)
-	}
-	b, ok, err := OpenBase(out)
+// TestBaseReadsWithoutKeccak is the point of format v2: an account/storage
+// probe is a direct preimage lookup. Reading through a stub keccak would need
+// libevm surgery, so the check is structural: the key the reader probes with
+// is byte-identical to the 53-byte epoch/bucket key, and the same value comes
+// back through the raw row walk.
+func TestBaseReadsWithoutKeccak(t *testing.T) {
+	dir := t.TempDir()
+	writeTestBase(t, dir, 65)
+	b, ok, err := OpenBase(dir)
 	if err != nil || !ok {
 		t.Fatalf("OpenBase: ok=%v err=%v", ok, err)
 	}
 	defer b.Close()
 
-	if v, ok, _ := b.Storage(baseA, baseSlot1[:]); !ok || !bytes.Equal(v, baseV1) {
-		t.Fatalf("A/slot1 = %x ok=%v, want the bucket write %x", v, ok, baseV1)
+	want := map[string][]byte{
+		string(accountKey(baseA)):               accRLP(t, 2, 200),
+		string(storageKey(baseA, baseSlot1[:])): baseV1,
 	}
-	if v, ok, _ := b.Storage(baseC, baseSlot2[:]); !ok || !bytes.Equal(v, baseV2) {
-		t.Fatalf("epoch-only slot = %x ok=%v, want %x", v, ok, baseV2)
+	got := map[string][]byte{}
+	if err := b.walk(func(key, val []byte) error {
+		if _, ok := want[string(key)]; ok {
+			got[string(key)] = append([]byte(nil), val...)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range want {
+		if !bytes.Equal(got[k], v) {
+			t.Fatalf("row %x on disk is %x, want %x (keys must be preimages)", k, got[k], v)
+		}
+		probe, _, err := b.lookup([]byte(k))
+		if err != nil || !bytes.Equal(probe, v) {
+			t.Fatalf("direct probe of %x: %x err=%v", k, probe, err)
+		}
 	}
 }
 
-// TestBuildBaseRefusesPrunedSource: an existing base file is not a merge
-// source, so re-flooring a dir that already has one would silently drop
-// every key last written at or below the old floor.
-func TestBuildBaseRefusesPrunedSource(t *testing.T) {
-	h, _ := baseCorpus(t)
-	h.Close()
-
-	fb := &fakeBase{block: 65, acc: map[common.Address][]byte{baseA: accRLP(t, 2, 200)}}
-	withBase(t, fb)
+// TestBaseWalkRowsHashes: the Firewood load path (exec.startFromBase) gets
+// 65-byte HASHED keys computed at iteration time, while the disk stays
+// preimage-keyed.
+func TestBaseWalkRowsHashes(t *testing.T) {
 	dir := t.TempDir()
-	st, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
+	writeTestBase(t, dir, 65)
+	b, ok, err := OpenBase(dir)
+	if err != nil || !ok {
+		t.Fatalf("OpenBase: ok=%v err=%v", ok, err)
 	}
-	defer st.Close()
-	pruned, err := OpenHistory(dir, st, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pruned.Close()
+	defer b.Close()
 
-	if _, err := BuildBase(pruned, t.TempDir(), 65, nil); err == nil ||
-		!strings.Contains(err.Error(), "already pruned") {
-		t.Fatalf("BuildBase over a pruned source: err=%v, want a refusal", err)
+	seen := map[string][]byte{}
+	n := 0
+	if err := b.WalkRows(func(key, val []byte) error {
+		if len(key) != baseHashedKeySize {
+			t.Fatalf("walk key is %d bytes, want %d", len(key), baseHashedKeySize)
+		}
+		n++
+		seen[string(append([]byte(nil), key...))] = append([]byte(nil), val...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("walked %d rows, want 5", n)
+	}
+
+	aHash := crypto.Keccak256Hash(baseA[:])
+	wantAcct := append([]byte{'a'}, aHash[:]...)
+	wantAcct = append(wantAcct, make([]byte, 32)...)
+	if !bytes.Equal(seen[string(wantAcct)], accRLP(t, 2, 200)) {
+		t.Fatalf("account row not keyed by keccak(addr)")
+	}
+	wantSlot := append([]byte{'s'}, aHash[:]...)
+	wantSlot = append(wantSlot, crypto.Keccak256(baseSlot1[:])...)
+	if !bytes.Equal(seen[string(wantSlot)], baseV1) {
+		t.Fatalf("storage row not keyed by keccak(addr)||keccak(slot)")
+	}
+	wantCode := append([]byte{'c'}, baseCodeHash[:]...)
+	wantCode = append(wantCode, make([]byte, 32)...)
+	if !bytes.Equal(seen[string(wantCode)], baseCodeBlob) {
+		t.Fatalf("code row not keyed by its content hash")
 	}
 }
 
 func TestOpenBaseFailsLoudly(t *testing.T) {
-	h, _ := baseCorpus(t)
 	src := t.TempDir()
-	path, err := BuildBase(h, src, 65, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	good, err := os.ReadFile(path)
+	good, err := os.ReadFile(writeTestBase(t, src, 65))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +274,7 @@ func TestOpenBaseFailsLoudly(t *testing.T) {
 		t.Fatalf("empty dir: ok=%v err=%v, want false/nil", ok, err)
 	}
 
-	corrupt := func(name string, b []byte) {
+	corrupt := func(name string, b []byte, wantMsg string) {
 		t.Helper()
 		dir := t.TempDir()
 		p := filepath.Join(dir, "base_65")
@@ -354,19 +288,25 @@ func TestOpenBaseFailsLoudly(t *testing.T) {
 			}
 			t.Fatalf("%s: opened without error", name)
 		}
+		if wantMsg != "" && !strings.Contains(err.Error(), wantMsg) {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
-	corrupt("truncated tail", good[:len(good)-8])
-	corrupt("truncated head", good[64:])
-	corrupt("empty", nil)
+	corrupt("truncated tail", good[:len(good)-8], "")
+	corrupt("truncated head", good[64:], "")
+	corrupt("empty", nil, "")
 	bad := append([]byte(nil), good...)
 	bad[len(bad)-baseFooterSize] ^= 0xff // head magic
-	corrupt("footer magic", bad)
+	corrupt("footer magic", bad, "")
 	bad = append([]byte(nil), good...)
-	bad[len(bad)-baseFooterSize+4] = 9 // version
-	corrupt("version", bad)
+	bad[len(bad)-baseFooterSize+68] = 0xff // section offset
+	corrupt("section bounds", bad, "")
+
+	// An older format is refused BY NAME: no migration exists, and a v1 file
+	// is hash-keyed so nothing could re-key it anyway.
 	bad = append([]byte(nil), good...)
-	bad[len(bad)-baseFooterSize+60] = 0xff // section length
-	corrupt("section bounds", bad)
+	bad[len(bad)-baseFooterSize+4] = 1
+	corrupt("v1 base file", bad, "format v1, unsupported")
 
 	// Two base files in one directory: ambiguous floor, refuse to guess.
 	two := t.TempDir()

@@ -158,8 +158,10 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 			}
 		}
 	}
-	// Raw buckets can overlap sealed epochs until --delete-raw runs:
-	// sort + dedupe each key's delete blocks.
+	// Raw buckets STILL overlap sealed epochs even though seal always
+	// deletes fully-sealed raws: buckets are 100k blocks and epochs cut on
+	// tx count, so the one bucket straddling the sealed end keeps rows the
+	// last epoch already carries. Sort + dedupe each key's delete blocks.
 	for k, ds := range h.deletes {
 		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
 		out := ds[:0]
@@ -195,7 +197,8 @@ func (h *History) LogTuples(n uint64) (LogRec, bool, error) {
 // ModifiedAccounts returns the unique addresses whose account record or
 // storage changed in block n, in capture order (code-use records are reads,
 // not modifications). ok=false = no write frame captured for n: an empty
-// block, or the raw writelog is absent (epoch-only node after --delete-raw).
+// block, or the raw writelog is absent (epoch-only node: seal deletes fully
+// sealed raw buckets, so this answers for the tail only).
 // Goroutine-safe (bucketLog is internally locked).
 func (h *History) ModifiedAccounts(n uint64) ([]common.Address, bool, error) {
 	frame, ok, err := h.store.wl.Get(n)
@@ -356,8 +359,9 @@ func (b *sortedBucket) lookup(key []byte, n uint64) (val []byte, blk uint64, fou
 // n of key, then the sealed epochs newest-to-oldest (bloom-gated), then the
 // base file. A key missing from a bucket/epoch falls through to the next
 // lower one; nothing anywhere = (found=false), i.e. genesis/zero territory.
-// Raw buckets may overlap sealed epochs until --delete-raw runs; the data
-// is identical, so whichever side hits first wins.
+// The straddling raw bucket overlaps the newest epoch (bucket and epoch
+// boundaries never align); the data is identical, so whichever side hits
+// first wins.
 func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bool, err error) {
 	// State correctness requires full descent to the floor: refuse below it
 	// (pruned) and above a coverage hole instead of silently skipping
@@ -546,7 +550,7 @@ func (h *History) StorageAt(addr common.Address, slot []byte, n uint64) ([]byte,
 // then the base file's code section, then the genesis alloc. Never any
 // frontier. EmptyCodeHash resolves to nil.
 //
-// The epoch descent is what makes a torrent-bootstrapped node (no code.log
+// The epoch descent is what makes a download-bootstrapped node (no code.log
 // at all) serve eth_getCode: a v3 epoch carries the code of every account it
 // wrote, so whichever epoch answered the account read carries the blob too.
 func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
@@ -593,7 +597,7 @@ func (h *History) CodeAt(addr common.Address, n uint64) ([]byte, error) {
 
 // SampleRecord returns a random state record for bench probing: kind 'a'
 // with a zero slot, or kind 's' with the slot key. Samples raw cooked
-// buckets when present, sealed epochs otherwise (post --delete-raw).
+// buckets when present, sealed epochs otherwise (raw-free node).
 func (h *History) SampleRecord(r *rand.Rand) (kind byte, addr common.Address, slot common.Hash, block uint64, ok bool) {
 	total := 0
 	for _, b := range h.buckets {

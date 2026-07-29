@@ -1,64 +1,66 @@
 package state
 
-// The limited-history floor (DESIGN.md "Limited-history mode"): base_<block>
-// is a flat live-state snapshot at block B that REPLACES the genesis-alloc
-// floor of History.search. Everything at or below B collapses into it, so a
-// node carrying only (base, epochs above B, raw tail) answers every read at
-// N >= B and nothing below B exists.
+// The limited-history floor / snapshot file (DESIGN.md "Our own state sync"
+// and "Limited-history mode"): base_<block> is a flat live-state snapshot at
+// block B that REPLACES the genesis-alloc floor of History.search. Everything
+// at or below B collapses into it, so a node carrying only (base, epochs
+// above B, raw tail) answers every read at N >= B and nothing below B exists.
 //
-// It is NOT an epoch file: keys are HASH-keyed (kind|keccak(addr)|keccak(slot),
-// 65B), which is what a network state sync yields and what makes the file
-// un-foldable with the preimage-keyed epoch rows, forever. Rows carry no
-// block number: the file IS state at B.
+// Keys are PREIMAGE-KEYED, exactly the 53-byte epoch/bucket keyspace
+// ('a' | addr | zeros, 'c' | codehash | zeros, 's' | addr | slot, and
+// 'a' < 'c' < 's' so one sorted keyspace carries state and code). Format v2,
+// user design 2026-07-29: the hash-keyed v1 layout existed only for network
+// leaf-sync, which is deleted; the producer is now a pruning node's own
+// capture, which has the preimages. Reads therefore cost NO keccak, and the
+// Firewood load hashes on the way out (WalkRows). Rows carry no block number:
+// the file IS state at B.
 //
 // Sections in write order, fixed-size footer last (reader seeks from EOF):
 //
-//	sst      rows sorted by key65, values inline, zstd blocks of
+//	sst      rows sorted by key53, values inline, zstd blocks of
 //	         ~sstBlockTarget raw bytes
-//	sstIdx   sparse index: 73B entries key65|off u64
+//	sstIdx   sparse index: 61B entries key53|off u64
 //	keybloom bloom over every key in the file (bloomBitsPerKey)
 //	headers  one zstd frame of the RLP headers in [B-256, B] (uvarint len +
 //	         bytes each), decoded once at open: ~150KB resident, so
 //	         BLOCKHASH inside eth_call costs nothing at read time
 //
-// No zstd dictionary: the bulk of an SST block is 65B random hashes plus
-// short values, a dict buys little there, and training one would need a
-// second pass over the whole corpus. Epoch files train theirs on containers,
-// which is a different (highly self-similar) corpus.
+// The footer carries B, the state root, and CUMULATIVE TX COUNT AT B (the
+// byte-identity requirement: every producer cuts epochs at the same canonical
+// tx-count boundaries, and a snapshot-synced node cannot recompute that count
+// from history it does not have).
+//
+// NO UPGRADE PATH, same policy as epochs: a v1 file is refused by name.
+//
+// No zstd dictionary: short values plus 53B keys are not worth training one,
+// and it would need a second pass over the whole corpus.
 
 import (
 	"bufio"
 	"bytes"
-	"container/heap"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"syscall"
-	"time"
 
 	"github.com/ava-labs/libevm/common"
-	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
-	"github.com/ava-labs/libevm/rlp"
-	"github.com/holiman/uint256"
 	"github.com/klauspost/compress/zstd"
 )
 
 const (
-	baseKeySize      = 1 + 32 + 32 // kind | keccak(addr) | keccak(slot)
+	baseKeySize      = sortedKeySize // kind | addr | slot, the epoch keyspace
 	baseIdxEntrySize = baseKeySize + 8
-	baseVersion      = 1
+	baseVersion      = 2
 	baseNumSections  = 4
-	baseFooterSize   = 4 + 4 + 8 + 8 + 32 + baseNumSections*16 + 4
+	baseFooterSize   = 4 + 4 + 8 + 8 + 8 + 32 + baseNumSections*16 + 4
 	baseHeaderWindow = 256 // headers carried are [B-256, B]: BLOCKHASH reach of eth_call in [B, B+256]
 
-	// baseKindCode keys a code blob by its hash. Code lives in the same
-	// sorted keyspace as state ('a' < 'c' < 's'), which costs one extra
-	// row kind instead of a whole section with its own index and bloom.
-	baseKindCode byte = 'c'
+	// baseHashedKeySize is what WalkRows emits: kind | keccak(addr) |
+	// keccak(slot), the shape Firewood's own keyspace uses.
+	baseHashedKeySize = 1 + 32 + 32
 )
 
 var baseMagic = [4]byte{'B', 'A', 'S', 'E'}
@@ -89,6 +91,7 @@ func ParseBaseFileName(name string) (uint64, bool) {
 // zstd DecodeAll is concurrent-safe).
 type Base struct {
 	block uint64
+	cumTx uint64
 	root  common.Hash
 
 	mm  []byte
@@ -156,24 +159,26 @@ func openBaseFile(path string) (*Base, error) {
 	}
 	if v := binary.LittleEndian.Uint32(ft[4:8]); v != baseVersion {
 		syscall.Munmap(mm)
-		return nil, fmt.Errorf("base %s: format version %d, want %d", path, v, baseVersion)
+		// No migration, ever (user ruling 2026-07-28): v1 was hash-keyed and
+		// nothing can re-key it without the preimages it never stored.
+		return nil, fmt.Errorf("base %s: format v%d, unsupported: delete it and re-fetch the snapshot (only v%d is readable)", path, v, baseVersion)
 	}
 	b := &Base{
 		block:   binary.LittleEndian.Uint64(ft[8:16]),
 		hdrFrom: binary.LittleEndian.Uint64(ft[16:24]),
+		cumTx:   binary.LittleEndian.Uint64(ft[24:32]),
 		mm:      mm,
 	}
-	copy(b.root[:], ft[24:56])
+	copy(b.root[:], ft[32:64])
 	if want, ok := ParseBaseFileName(filepath.Base(path)); ok && want != b.block {
 		syscall.Munmap(mm)
 		return nil, fmt.Errorf("base %s: footer says block %d", path, b.block)
 	}
 	for i := 0; i < baseNumSections; i++ {
-		off := binary.LittleEndian.Uint64(ft[56+i*16:])
-		ln := binary.LittleEndian.Uint64(ft[64+i*16:])
+		off := binary.LittleEndian.Uint64(ft[64+i*16:])
+		ln := binary.LittleEndian.Uint64(ft[72+i*16:])
 		body := uint64(size - baseFooterSize)
 		if off > body || ln > body-off { // overflow-safe bounds check
-
 			syscall.Munmap(mm)
 			return nil, fmt.Errorf("base %s: section %d out of bounds", path, i)
 		}
@@ -222,6 +227,11 @@ func openBaseFile(path string) (*Base, error) {
 // Block returns the floor block B: this file is the state at the end of B.
 func (b *Base) Block() uint64 { return b.block }
 
+// CumTx returns the cumulative tx count of the chain at the end of B. It is
+// the canonical epoch-boundary anchor: a node that starts here has no history
+// to count from, and every producer must agree on where the next epoch cuts.
+func (b *Base) CumTx() uint64 { return b.cumTx }
+
 // StateRoot returns header(B).Root, the root the file's rows rebuild to.
 func (b *Base) StateRoot() common.Hash { return b.root }
 
@@ -237,45 +247,25 @@ func (b *Base) Close() {
 	b.headers = nil
 }
 
-func baseAccountKey(addrHash common.Hash) []byte {
-	k := make([]byte, baseKeySize)
-	k[0] = recKindAccount
-	copy(k[1:33], addrHash[:])
-	return k
-}
-
-func baseStorageKey(addrHash, slotHash common.Hash) []byte {
-	k := baseAccountKey(addrHash)
-	k[0] = recKindStorage
-	copy(k[33:65], slotHash[:])
-	return k
-}
-
-func baseCodeKey(hash common.Hash) []byte {
-	k := baseAccountKey(hash)
-	k[0] = baseKindCode
-	return k
-}
-
 // Account returns the account RLP of addr at B (the stored StorageRoot is
 // the real one captured on chain; substituting the sentinel is the caller's
 // job, exactly as for epoch rows). found=false = the account does not exist.
+// One direct probe, no hashing: the key IS the address.
 func (b *Base) Account(addr common.Address) ([]byte, bool, error) {
-	return b.lookup(baseAccountKey(crypto.Keccak256Hash(addr[:])))
+	return b.lookup(accountKey(addr))
 }
 
 // Storage returns the trie-encoded value of (addr, slot) at B; found=false
 // = zero. slot is the preimage (left-aligned, as capture stores it).
 func (b *Base) Storage(addr common.Address, slot []byte) ([]byte, bool, error) {
-	var s common.Hash
-	copy(s[:], slot)
-	return b.lookup(baseStorageKey(crypto.Keccak256Hash(addr[:]), crypto.Keccak256Hash(s[:])))
+	return b.lookup(storageKey(addr, slot))
 }
 
 // Code returns the code blob for hash. Empty code is never stored, so
 // EmptyCodeHash reports found=false: callers short-circuit it first.
 func (b *Base) Code(hash common.Hash) ([]byte, bool, error) {
-	return b.lookup(baseCodeKey(hash))
+	k := epochCodeKey(hash)
+	return b.lookup(k[:])
 }
 
 // HeaderRLP returns the stored header for block n. Only [B-256, B] is
@@ -289,13 +279,48 @@ func (b *Base) HeaderRLP(n uint64) ([]byte, bool, error) {
 	return raw, raw != nil, nil
 }
 
-// WalkRows streams every row of the file in key order ('a' accounts, then
-// 'c' code blobs, then 's' storage). This is how a state-synced node loads
-// its Firewood frontier at B without any preimages: strip the one-byte kind
-// prefix and an 'a'/'s' row IS a Firewood key/value pair (keccak(addr), or
-// keccak(addr)||keccak(slot), with the same trie-encoded value).
-// key and val alias the mmap and the decode buffer: copy to retain.
+// WalkRows streams every row of the file with HASHED keys: kind | keccak(addr)
+// | keccak(slot), 65 bytes, which is how a node loads its Firewood frontier at
+// B (exec.startFromBase). The disk holds preimages because the producer has
+// them and reads want them; Firewood wants hashed keys, so keccak happens here,
+// once, at load time. Code rows ('c') pass their content-addressed hash
+// through unchanged.
+//
+// ORDER is preimage order, not hash order, so the load is a random-order bulk
+// insert. key and val alias internal buffers: copy to retain.
 func (b *Base) WalkRows(fn func(key, val []byte) error) error {
+	var (
+		hk       [baseHashedKeySize]byte
+		lastAddr common.Address
+		lastHash common.Hash
+		haveAddr bool
+	)
+	addrHash := func(a common.Address) common.Hash {
+		if !haveAddr || a != lastAddr {
+			lastAddr, lastHash, haveAddr = a, crypto.Keccak256Hash(a[:]), true
+		}
+		return lastHash
+	}
+	return b.walk(func(key, val []byte) error {
+		hk = [baseHashedKeySize]byte{}
+		hk[0] = key[0]
+		switch key[0] {
+		case recKindAccount:
+			copy(hk[1:33], addrHash(common.Address(key[1:21])).Bytes())
+		case recKindStorage:
+			copy(hk[1:33], addrHash(common.Address(key[1:21])).Bytes())
+			copy(hk[33:65], crypto.Keccak256(key[21:53]))
+		case recKindCodeUse: // 'c': content-addressed already
+			copy(hk[1:33], key[1:33])
+		default:
+			return fmt.Errorf("base block %d: unknown row kind %q", b.block, key[0])
+		}
+		return fn(hk[:], val)
+	})
+}
+
+// walk streams the raw preimage-keyed rows in key order.
+func (b *Base) walk(fn func(key, val []byte) error) error {
 	idx := b.sec[secBaseSSTIdx]
 	n := len(idx) / baseIdxEntrySize
 	var buf []byte
@@ -384,558 +409,57 @@ func (b *Base) lookup(key []byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-// ---------- builder ----------
-
-// BaseSink observes every live state row (preimage-keyed, in key53 order:
-// accounts before storage) as the base is built. It is the hook for the
-// build-time root check: the file itself is hash-keyed, so nothing can
-// rebuild a trie from it afterwards. nil = no check.
-type BaseSink func(key [sortedKeySize]byte, val []byte) error
-
-// BuildBase folds h's corpus into a base file at block `at` under outDir and
-// returns the path. Memory is bounded: the merge is streaming and the hashed
-// rows go through on-disk prefix buckets (state/verify.go's spill pattern).
-func BuildBase(h *History, outDir string, at uint64, sink BaseSink) (string, error) {
-	if at == 0 || at > h.head {
-		return "", fmt.Errorf("base at %d: corpus covers blocks up to %d", at, h.head)
-	}
-	// An existing base file is NOT a merge source here (openBaseCursors walks
-	// buckets and epochs only), so re-flooring would drop every key whose
-	// last write was at or below the old floor. The fold-down step DESIGN
-	// defers is what would make this work; until it exists, refuse.
-	if h.Floor() > 0 {
-		return "", fmt.Errorf("base at %d: source is already pruned below block %d; re-flooring an already-pruned dir is unsupported (the existing base cannot be a merge source)", at, h.Floor())
-	}
-	if err := h.epochs.RequireCovered(at); err != nil {
-		return "", err
-	}
-	hdrRLP, ok, err := h.HeaderRLP(at)
-	if err != nil || !ok {
-		return "", fmt.Errorf("base at %d: header unavailable: ok=%v err=%v", at, ok, err)
-	}
-	var hdr types.Header
-	if err := rlp.DecodeBytes(hdrRLP, &hdr); err != nil {
-		return "", fmt.Errorf("base at %d: decode header: %w", at, err)
-	}
-
-	spillDir, err := os.MkdirTemp(outDir, fmt.Sprintf(".base-%d-", at))
+// PeekBase reports whether dir carries a base file, without mapping it.
+func PeekBase(dir string) (uint64, bool, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", err
+		return 0, false, err
 	}
-	defer os.RemoveAll(spillDir)
-	sp := &baseSpill{dir: spillDir}
-
-	if err := foldLiveRows(h, at, sink, sp); err != nil {
-		return "", err
-	}
-	if err := sp.finish(); err != nil {
-		return "", err
-	}
-	log.Printf("base: %d live rows spilled, writing base_%d", sp.rows, at)
-
-	headers := make([][]byte, 0, baseHeaderWindow+1)
-	from := uint64(0)
-	if at > baseHeaderWindow {
-		from = at - baseHeaderWindow
-	}
-	for n := from; n <= at; n++ {
-		raw, ok, err := h.HeaderRLP(n)
-		if err != nil {
-			return "", fmt.Errorf("base at %d: header %d: %w", at, n, err)
+	for _, e := range entries {
+		if b, ok := ParseBaseFileName(e.Name()); ok {
+			return b, true, nil
 		}
-		if !ok {
-			raw = nil
-		}
-		headers = append(headers, raw)
 	}
-	return writeBaseFile(outDir, at, hdr.Root, from, headers, sp, nil)
+	return 0, false, nil
 }
 
-// foldLiveRows merges every source ordered by key53, keeps each key's last
-// write at or before `at`, and emits the ones that are still live.
-func foldLiveRows(h *History, at uint64, sink BaseSink, sp *baseSpill) error {
-	cursors, err := openBaseCursors(h, at)
-	if err != nil {
-		return err
-	}
-	hp := &cursorHeap{}
-	for _, c := range cursors {
-		if c.key() != nil {
-			*hp = append(*hp, c)
-		}
-	}
-	heap.Init(hp)
+// ---------- writer ----------
+//
+// THE ONLY CALLERS TODAY ARE TESTS. The real producer is a pruning node
+// folding snapshot(K-1) with the period's own captured writes (DESIGN.md
+// "Our own state sync"), which does not exist yet; this exists so the format
+// is exercised end to end rather than only read. When that producer lands it
+// takes over this function.
+// ponytail: rows is one in-RAM slice, fine for tests and hopeless at full
+// mainnet; the fold producer streams a merge instead.
 
-	var (
-		emitted   = &baseEmitter{h: h, at: at, sink: sink, sp: sp}
-		curKey    []byte
-		bestVal   []byte
-		bestBlk   uint64
-		have      bool
-		rows      uint64
-		lastLog   = time.Now()
-		startTime = time.Now()
-	)
-	for hp.Len() > 0 {
-		curKey = append(curKey[:0], (*hp)[0].key()...)
-		bestVal, bestBlk, have = bestVal[:0], 0, false
-		for hp.Len() > 0 && bytes.Equal((*hp)[0].key(), curKey) {
-			c := (*hp)[0]
-			if blk := c.block(); blk <= at && (!have || blk > bestBlk) {
-				v, err := c.value()
-				if err != nil {
-					return err
-				}
-				bestVal, bestBlk, have = append(bestVal[:0], v...), blk, true
-			}
-			if err := c.next(); err != nil {
-				return err
-			}
-			if c.key() == nil {
-				heap.Pop(hp)
-			} else {
-				heap.Fix(hp, 0)
-			}
-			rows++
-		}
-		if have {
-			if err := emitted.emit(curKey, bestBlk, bestVal); err != nil {
-				return err
-			}
-		}
-		if time.Since(lastLog) >= 30*time.Second {
-			log.Printf("base: folding at key %x: %d rows scanned, %d live rows, %.0f rows/s",
-				curKey[:9], rows, sp.rows, float64(rows)/time.Since(startTime).Seconds())
-			lastLog = time.Now()
-		}
-	}
-	return emitted.emitGenesis()
+// BaseRow is one preimage-keyed row: the 53-byte epoch keyspace.
+type BaseRow struct {
+	Key [baseKeySize]byte
+	Val []byte
 }
 
-// baseEmitter turns surviving (key53, value) pairs into hashed base rows,
-// applying the liveness rules: an empty value is a delete (the key is absent
-// from the base), and a storage slot orphaned by an account delete at or
-// before `at` is dead (SELFDESTRUCT drops the whole storage trie), mirroring
-// History.StorageAt.
-type baseEmitter struct {
-	h    *History
-	at   uint64
-	sink BaseSink
-	sp   *baseSpill
-
-	addr     common.Address // current address run
-	addrHash common.Hash
-	delBlk   uint64 // last account delete <= at for addr
-	delOK    bool
-	haveAddr bool
-
-	seenGenesis map[common.Address]bool // genesis accounts written at or below at
-	codeSeen    map[common.Hash]bool
+// BaseMeta is everything the footer and the header window carry.
+type BaseMeta struct {
+	Block   uint64      // B
+	CumTx   uint64      // cumulative tx count at the end of B
+	Root    common.Hash // header(B).Root
+	HdrFrom uint64      // first block of the header window (max(0, B-256))
+	Headers [][]byte    // RLP for HdrFrom..B, nil entry = absent
 }
 
-// setAddr caches the per-address facts (key hash, last account delete) for
-// the contiguous run of rows sharing an address.
-func (b *baseEmitter) setAddr(key []byte) {
-	var a common.Address
-	copy(a[:], key[1:21])
-	if b.haveAddr && a == b.addr {
-		return
-	}
-	b.addr, b.haveAddr = a, true
-	b.addrHash = crypto.Keccak256Hash(a[:])
-	ak := accountKey(a)
-	b.delBlk, b.delOK = b.h.lastAccountDelete(ak, b.at)
-}
+// WriteBase writes base_<B> into dir (tmp + rename) and returns its path.
+// Rows are sorted here; duplicates are not checked (the producer owns that).
+func WriteBase(dir string, m BaseMeta, rows []BaseRow) (string, error) {
+	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].Key[:], rows[j].Key[:]) < 0 })
 
-func (b *baseEmitter) emit(key []byte, blk uint64, val []byte) error {
-	if key[0] == baseKindCode {
-		// A v3 epoch's own code row: the base rebuilds its code section from
-		// the live accounts it emits (emitCode), so these are not merge input.
-		return nil
-	}
-	b.setAddr(key)
-	switch key[0] {
-	case recKindAccount:
-		if b.seenGenesis == nil {
-			b.seenGenesis = map[common.Address]bool{}
-		}
-		if _, ok := b.h.genesis[b.addr]; ok {
-			b.seenGenesis[b.addr] = true
-		}
-		if len(val) == 0 {
-			return nil // account deleted at or before at
-		}
-		var acc types.StateAccount
-		if err := rlp.DecodeBytes(val, &acc); err != nil {
-			return fmt.Errorf("base: decode account %x: %w", b.addr, err)
-		}
-		if err := b.emitCode(common.BytesToHash(acc.CodeHash)); err != nil {
-			return err
-		}
-		return b.row(baseAccountKey(b.addrHash), key, val)
-	case recKindStorage:
-		if len(val) == 0 {
-			return nil // zero write
-		}
-		if b.delOK && b.delBlk > blk {
-			return nil // orphaned by a later SELFDESTRUCT, exactly History.StorageAt
-		}
-		return b.row(baseStorageKey(b.addrHash, crypto.Keccak256Hash(key[21:53])), key, val)
-	default:
-		return fmt.Errorf("base: unknown row kind %q", key[0])
-	}
-}
-
-func (b *baseEmitter) emitCode(hash common.Hash) error {
-	if hash == types.EmptyCodeHash || hash == (common.Hash{}) {
-		return nil
-	}
-	if b.codeSeen == nil {
-		b.codeSeen = map[common.Hash]bool{}
-	}
-	if b.codeSeen[hash] {
-		return nil
-	}
-	b.codeSeen[hash] = true
-	// Full descent (code.log, v3 epochs, genesis alloc): a folded corpus can
-	// have had its code.log dropped once the epochs carry the blobs.
-	blob, err := b.h.CodeByHash(hash)
-	if err != nil {
-		return fmt.Errorf("base: code %x referenced by a live account: %w", hash, err)
-	}
-	return b.sp.add(baseCodeKey(hash), blob)
-}
-
-// row spills the hashed row and feeds the preimage row to the sink.
-func (b *baseEmitter) row(hashed, key53, val []byte) error {
-	if err := b.sp.add(hashed, val); err != nil {
-		return err
-	}
-	if b.sink == nil {
-		return nil
-	}
-	var k [sortedKeySize]byte
-	copy(k[:], key53)
-	return b.sink(k, val)
-}
-
-// emitGenesis adds the alloc keys that were never written at or below `at`:
-// the base replaces the alloc as the read floor, so they must be in the file.
-func (b *baseEmitter) emitGenesis() error {
-	addrs := make([]common.Address, 0, len(b.h.genesis))
-	for addr := range b.h.genesis {
-		addrs = append(addrs, addr)
-	}
-	sort.Slice(addrs, func(i, j int) bool { return bytes.Compare(addrs[i][:], addrs[j][:]) < 0 })
-	for _, addr := range addrs {
-		if b.seenGenesis[addr] {
-			continue
-		}
-		ga := b.h.genesis[addr]
-		if len(ga.Storage) > 0 {
-			// Neither mainnet nor fuji has alloc storage. Supporting it
-			// needs the alloc storage trie root for the account RLP, which
-			// nothing here computes: fail instead of writing a wrong root.
-			return fmt.Errorf("base: genesis account %x has %d alloc storage slots, unsupported", addr, len(ga.Storage))
-		}
-		acc := types.StateAccount{
-			Nonce:    ga.Nonce,
-			Balance:  new(uint256.Int),
-			Root:     types.EmptyRootHash,
-			CodeHash: types.EmptyCodeHash.Bytes(),
-		}
-		if ga.Balance != nil {
-			acc.Balance = uint256.MustFromBig(ga.Balance)
-		}
-		if len(ga.Code) > 0 {
-			acc.CodeHash = crypto.Keccak256(ga.Code)
-		}
-		val, err := rlp.EncodeToBytes(&acc)
-		if err != nil {
-			return err
-		}
-		b.addr, b.haveAddr = addr, true
-		b.addrHash = crypto.Keccak256Hash(addr[:])
-		if err := b.emitCode(common.BytesToHash(acc.CodeHash)); err != nil {
-			return err
-		}
-		if err := b.row(baseAccountKey(b.addrHash), accountKey(addr), val); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// ---------- merge cursors ----------
-
-// baseCursor is one row source in (key53, block) order. Both the cooked raw
-// buckets and the sealed epoch SSTs are already stored in exactly that
-// order, so folding the corpus is a k-way merge with no re-sort: only the
-// surviving row of each key is ever materialised.
-type baseCursor interface {
-	key() []byte // nil = exhausted
-	block() uint64
-	value() ([]byte, error)
-	next() error
-}
-
-// openBaseCursors returns one positioned cursor per source that can hold a
-// row at or below `at` (History.search's descent set, minus the ordering).
-func openBaseCursors(h *History, at uint64) ([]baseCursor, error) {
-	var out []baseCursor
-	for _, b := range h.buckets {
-		if b.bucket*BucketBlocks > at {
-			continue
-		}
-		out = append(out, &bucketCursor{b: b})
-	}
-	for _, e := range h.epochs.Epochs {
-		if e.Start > at {
-			continue
-		}
-		c := &epochCursor{e: e}
-		if err := c.load(); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, nil
-}
-
-// bucketCursor walks one cooked sorted_NNNNN.idx. Values stay in the
-// writelog and are read only for rows that survive.
-type bucketCursor struct {
-	b *sortedBucket
-	i int
-}
-
-func (c *bucketCursor) key() []byte {
-	if c.i >= c.b.n {
-		return nil
-	}
-	return c.b.rec(c.i)[:sortedKeySize]
-}
-
-func (c *bucketCursor) block() uint64 {
-	return binary.BigEndian.Uint64(c.b.rec(c.i)[53:61])
-}
-
-func (c *bucketCursor) value() ([]byte, error) {
-	r := c.b.rec(c.i)
-	vlen := binary.BigEndian.Uint32(r[69:73])
-	if vlen == 0 {
-		return nil, nil
-	}
-	buf := make([]byte, vlen)
-	off := binary.BigEndian.Uint64(r[61:69])
-	if _, err := c.b.wl.ReadAt(buf, int64(off)); err != nil {
-		return nil, fmt.Errorf("writelog bucket %05d read at %d: %w", c.b.bucket, off, err)
-	}
-	return buf, nil
-}
-
-func (c *bucketCursor) next() error { c.i++; return nil }
-
-// epochCursor walks one epoch's SST, one compressed block at a time.
-type epochCursor struct {
-	e   *Epoch
-	bi  int // next sst block to decode
-	raw []byte
-	pos int
-	k   []byte
-	blk uint64
-	val []byte
-}
-
-func (c *epochCursor) key() []byte            { return c.k }
-func (c *epochCursor) block() uint64          { return c.blk }
-func (c *epochCursor) value() ([]byte, error) { return c.val, nil }
-
-// load positions on the row at pos, decoding further blocks as needed.
-func (c *epochCursor) load() error {
-	idx := c.e.sec[secSSTIdx]
-	n := len(idx) / sstIdxEntrySize
-	for c.pos >= len(c.raw) {
-		if c.bi >= n {
-			c.k, c.val = nil, nil
-			return nil
-		}
-		lo := binary.LittleEndian.Uint64(idx[c.bi*sstIdxEntrySize+sortedKeySize+8:])
-		hi := uint64(len(c.e.sec[secSST]))
-		if c.bi+1 < n {
-			hi = binary.LittleEndian.Uint64(idx[(c.bi+1)*sstIdxEntrySize+sortedKeySize+8:])
-		}
-		raw, err := c.e.decodeAll(c.e.sec[secSST][lo:hi])
-		if err != nil {
-			return fmt.Errorf("epoch %d: decode sst block %d: %w", c.e.Start, c.bi, err)
-		}
-		c.raw, c.pos, c.bi = raw, 0, c.bi+1
-	}
-	if c.pos+sortedKeySize+8 > len(c.raw) {
-		return fmt.Errorf("epoch %d: truncated sst row", c.e.Start)
-	}
-	c.k = c.raw[c.pos : c.pos+sortedKeySize]
-	c.blk = binary.BigEndian.Uint64(c.raw[c.pos+sortedKeySize:])
-	vlen, vn := binary.Uvarint(c.raw[c.pos+sortedKeySize+8:])
-	if vn <= 0 {
-		return fmt.Errorf("epoch %d: bad sst row length", c.e.Start)
-	}
-	vstart := c.pos + sortedKeySize + 8 + vn
-	if vstart+int(vlen) > len(c.raw) {
-		return fmt.Errorf("epoch %d: truncated sst value", c.e.Start)
-	}
-	c.val = c.raw[vstart : vstart+int(vlen)]
-	c.pos = vstart + int(vlen)
-	return nil
-}
-
-func (c *epochCursor) next() error { return c.load() }
-
-// cursorHeap orders the live cursors by current key (container/heap).
-type cursorHeap []baseCursor
-
-func (h cursorHeap) Len() int           { return len(h) }
-func (h cursorHeap) Less(i, j int) bool { return bytes.Compare(h[i].key(), h[j].key()) < 0 }
-func (h cursorHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *cursorHeap) Push(x any)        { *h = append(*h, x.(baseCursor)) }
-func (h *cursorHeap) Pop() any {
-	old := *h
-	n := len(old)
-	c := old[n-1]
-	*h = old[:n-1]
-	return c
-}
-
-// ---------- spill ----------
-
-// baseSpill scatters hashed rows into prefix buckets on disk (one per
-// kind + first hash byte), each small enough to sort in memory during the
-// write pass. Record: key65 | uvarint vlen | value.
-type baseSpill struct {
-	dir  string
-	bufs [3 * 256][]byte
-	rows uint64
-}
-
-func baseBucketIdx(key []byte) int {
-	kind := 0
-	switch key[0] {
-	case baseKindCode:
-		kind = 1
-	case recKindStorage:
-		kind = 2
-	}
-	return kind*256 + int(key[1])
-}
-
-func (s *baseSpill) path(bi int) string { return filepath.Join(s.dir, fmt.Sprintf("p%03d", bi)) }
-
-func (s *baseSpill) add(key, val []byte) error {
-	bi := baseBucketIdx(key)
-	b := s.bufs[bi]
-	b = append(b, key...)
-	b = binary.AppendUvarint(b, uint64(len(val)))
-	b = append(b, val...)
-	s.bufs[bi] = b
-	s.rows++
-	// 1MB per bucket bounds the scatter phase at ~768MB resident; the write
-	// pass then loads one bucket (tens of MB at full mainnet) at a time.
-	if len(b) >= 1<<20 {
-		return s.flush(bi)
-	}
-	return nil
-}
-
-func (s *baseSpill) flush(bi int) error {
-	if len(s.bufs[bi]) == 0 {
-		return nil
-	}
-	f, err := os.OpenFile(s.path(bi), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(s.bufs[bi]); err != nil {
-		f.Close()
-		return err
-	}
-	s.bufs[bi] = s.bufs[bi][:0]
-	return f.Close()
-}
-
-func (s *baseSpill) finish() error {
-	for bi := range s.bufs {
-		if err := s.flush(bi); err != nil {
-			return err
-		}
-		s.bufs[bi] = nil
-	}
-	return nil
-}
-
-type baseRow struct {
-	key [baseKeySize]byte
-	val []byte
-}
-
-// load reads one spill bucket back, sorted by key.
-func (s *baseSpill) load(bi int) ([]baseRow, error) {
-	raw, err := os.ReadFile(s.path(bi))
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var rows []baseRow
-	for pos := 0; pos < len(raw); {
-		if pos+baseKeySize >= len(raw) {
-			return nil, fmt.Errorf("base spill %d: truncated record", bi)
-		}
-		var r baseRow
-		copy(r.key[:], raw[pos:pos+baseKeySize])
-		vlen, n := binary.Uvarint(raw[pos+baseKeySize:])
-		if n <= 0 {
-			return nil, fmt.Errorf("base spill %d: bad length", bi)
-		}
-		pos += baseKeySize + n
-		if pos+int(vlen) > len(raw) {
-			return nil, fmt.Errorf("base spill %d: truncated value", bi)
-		}
-		r.val = raw[pos : pos+int(vlen)]
-		pos += int(vlen)
-		rows = append(rows, r)
-	}
-	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].key[:], rows[j].key[:]) < 0 })
-	return rows, nil
-}
-
-// ---------- file writer ----------
-
-// onRow, when non-nil, sees every row in final sorted key order as it is
-// written. It is the one chance to recompute anything from the whole file
-// without a second pass over the spill.
-func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, headers [][]byte, sp *baseSpill, onRow func(key, val []byte) error) (string, error) {
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
 	if err != nil {
 		return "", err
 	}
 	defer enc.Close()
 
-	// Bloom sized from the exact row count (known after the spill), bits
-	// set inline: the key set is far too large to hold for buildBloom.
-	m := sp.rows * bloomBitsPerKey
-	if m < 64 {
-		m = 64
-	}
-	m = (m + 63) / 64 * 64
-	words := make([]uint64, m/64)
-
-	// The SST is STREAMED to the file, not accumulated: a full-mainnet base is
-	// tens of GB and buffering it (plus the bytes.Buffer copy the footer
-	// assembly used to make) simply OOMs the box. Everything else is small
-	// enough to hold: the sparse index is one 73B entry per ~64KB block and
-	// the bloom is 10 bits per row.
-	path := filepath.Join(outDir, BaseFileName(at))
+	path := filepath.Join(dir, BaseFileName(m.Block))
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -953,6 +477,7 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 		raw      []byte
 		firstKey []byte
 		block    []byte
+		keys     [][]byte
 	)
 	flush := func() error {
 		if len(raw) == 0 {
@@ -968,50 +493,27 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 		raw, firstKey = raw[:0], nil
 		return nil
 	}
-	for bi := range sp.bufs {
-		rows, err := sp.load(bi)
-		if err != nil {
-			return "", err
+	for i := range rows {
+		r := &rows[i]
+		keys = append(keys, r.Key[:])
+		if firstKey == nil {
+			firstKey = append([]byte(nil), r.Key[:]...)
 		}
-		for i := range rows {
-			r := &rows[i]
-			if onRow != nil {
-				if err := onRow(r.key[:], r.val); err != nil {
-					return "", err
-				}
-			}
-			h1, h2 := bloomHash(r.key[:])
-			for j := uint64(0); j < bloomHashes; j++ {
-				bit := (h1 + j*h2) % m
-				words[bit/64] |= 1 << (bit % 64)
-			}
-			if firstKey == nil {
-				firstKey = append([]byte(nil), r.key[:]...)
-			}
-			raw = append(raw, r.key[:]...)
-			raw = binary.AppendUvarint(raw, uint64(len(r.val)))
-			raw = append(raw, r.val...)
-			if len(raw) >= sstBlockTarget {
-				if err := flush(); err != nil {
-					return "", err
-				}
+		raw = append(raw, r.Key[:]...)
+		raw = binary.AppendUvarint(raw, uint64(len(r.Val)))
+		raw = append(raw, r.Val...)
+		if len(raw) >= sstBlockTarget {
+			if err := flush(); err != nil {
+				return "", err
 			}
 		}
-		rows = nil
 	}
 	if err := flush(); err != nil {
 		return "", err
 	}
 
-	bloom := binary.LittleEndian.AppendUint64(nil, m)
-	bloom = binary.LittleEndian.AppendUint32(bloom, bloomHashes)
-	bloom = binary.LittleEndian.AppendUint32(bloom, 0)
-	for _, w := range words {
-		bloom = binary.LittleEndian.AppendUint64(bloom, w)
-	}
-
 	var hdrPayload []byte
-	for _, h := range headers {
+	for _, h := range m.Headers {
 		hdrPayload = binary.AppendUvarint(hdrPayload, uint64(len(h)))
 		hdrPayload = append(hdrPayload, h...)
 	}
@@ -1033,7 +535,7 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 	if err := section(secBaseSSTIdx, idx); err != nil {
 		return "", err
 	}
-	if err := section(secBaseKeybloom, bloom); err != nil {
+	if err := section(secBaseKeybloom, buildBloom(keys)); err != nil {
 		return "", err
 	}
 	if err := section(secBaseHeaders, hdrSec); err != nil {
@@ -1043,12 +545,13 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 	var ft [baseFooterSize]byte
 	copy(ft[0:4], baseMagic[:])
 	binary.LittleEndian.PutUint32(ft[4:8], baseVersion)
-	binary.LittleEndian.PutUint64(ft[8:16], at)
-	binary.LittleEndian.PutUint64(ft[16:24], hdrFrom)
-	copy(ft[24:56], root[:])
+	binary.LittleEndian.PutUint64(ft[8:16], m.Block)
+	binary.LittleEndian.PutUint64(ft[16:24], m.HdrFrom)
+	binary.LittleEndian.PutUint64(ft[24:32], m.CumTx)
+	copy(ft[32:64], m.Root[:])
 	for i := 0; i < baseNumSections; i++ {
-		binary.LittleEndian.PutUint64(ft[56+i*16:], offsets[i][0])
-		binary.LittleEndian.PutUint64(ft[64+i*16:], offsets[i][1])
+		binary.LittleEndian.PutUint64(ft[64+i*16:], offsets[i][0])
+		binary.LittleEndian.PutUint64(ft[72+i*16:], offsets[i][1])
 	}
 	copy(ft[baseFooterSize-4:], baseMagic[:])
 	if _, err := out.Write(ft[:]); err != nil {
@@ -1064,18 +567,4 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 		return "", err
 	}
 	return path, os.Rename(tmp, path)
-}
-
-// PeekBase reports whether dir carries a base file, without mapping it.
-func PeekBase(dir string) (uint64, bool, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, false, err
-	}
-	for _, e := range entries {
-		if b, ok := ParseBaseFileName(e.Name()); ok {
-			return b, true, nil
-		}
-	}
-	return 0, false, nil
 }

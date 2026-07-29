@@ -190,7 +190,7 @@ func TestSealCodeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 3 txs/block, boundary 10 => epochs 1-4 and 5-8.
-	if err := sealEpochs(dir, dir, false, 10, nil); err != nil {
+	if err := sealEpochs(dir, dir, 10, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,7 +236,7 @@ func TestSealCodeEndToEnd(t *testing.T) {
 }
 
 // TestCodeFromEpochsWithoutCodeLog: a node holding nothing but epoch files
-// (the torrent-bootstrap case, no code.log, no writelogs, no misc.log) still
+// (the download-bootstrap case, no code.log, no writelogs, no misc.log) still
 // answers eth_getCode. Models base_test's equivalent property for the base
 // file.
 func TestCodeFromEpochsWithoutCodeLog(t *testing.T) {

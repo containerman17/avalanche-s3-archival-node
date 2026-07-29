@@ -90,7 +90,7 @@ const (
 
 	// Format v3 is the ONLY supported format: stored-logs sections (v2,
 	// 2026-07-20) plus contract code as 'c' rows in the SST (v3,
-	// 2026-07-28), so an epoch is self-contained and a torrent-bootstrapped
+	// 2026-07-28), so an epoch is self-contained and a download-bootstrapped
 	// node serves eth_getCode. There is no upgrade path: OpenEpoch refuses
 	// an older file and the corpus is rebuilt by a fresh sync (user ruling
 	// 2026-07-28).

@@ -13,7 +13,6 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,7 +26,6 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
@@ -142,14 +140,10 @@ func main() {
 		sealMain(os.Args[2:])
 	case "manifest":
 		manifestMain(os.Args[2:])
-	case "seed":
-		seedMain(os.Args[2:])
 	case "bootstrap":
 		bootstrapMain(os.Args[2:])
 	case "verify":
 		verifyMain(os.Args[2:])
-	case "snapshot":
-		snapshotMain(os.Args[2:])
 	case "backfill-logs":
 		backfillLogsMain(os.Args[2:])
 	case "verify-logs":
@@ -169,10 +163,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120] [--floor N]")
-	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--epoch-txs <n>] [--delete-raw]")
+	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--epoch-txs <n>]")
 	fmt.Fprintln(os.Stderr, "       epochdb manifest [--data <dir>] [--out <file>]")
-	fmt.Fprintln(os.Stderr, "       epochdb seed [--data <dir>] [--manifest <file>] [--listen-port 42069]")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--manifest <file>] [--rounds 20] [--verify] [--network mainnet]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap --url <base-url> [--data <dir>] [--manifest <file>] [--attempts 3] [--verify] [--network mainnet]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
@@ -190,11 +183,11 @@ func cookMain(args []string) {
 }
 
 // sealMain cuts sealed epoch files from the raw staging + capture files,
-// strictly behind the exec head.
+// strictly behind the exec head, then deletes every fully sealed raw bucket
+// (unconditional since 2026-07-29). NEVER run it beside a live fetch/exec.
 func sealMain(args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	deleteRaw := fs.Bool("delete-raw", false, "remove fully sealed raw buckets afterwards (NEVER next to a running fetch/exec)")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	workers := fs.Int("workers", 12, "re-execution workers for the stored-logs derivation")
 	outDir := fs.String("out", "", "directory for the sealed epoch files (default --data; a separate dir cuts an alternate epoch size from the same raws)")
@@ -224,7 +217,7 @@ func sealMain(args []string) {
 	}
 	defer hist.Close()
 	derive := rpc.NewDeriveStored(hist, rpc.HistoryChainContext(hist), g.Config, exec.ParseEthBlock, *workers)
-	if err := state.SealEpochs(*dataDir, *outDir, *deleteRaw, *epochTxs, derive); err != nil {
+	if err := state.SealEpochs(*dataDir, *outDir, *epochTxs, derive); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
 }
@@ -240,93 +233,75 @@ func cookTxMain(args []string) {
 	}
 }
 
-// manifestMain hashes every sealed epoch into the shipped manifest:
-// name, size, sha256, v1 torrent infohash. Epochs are bit-identical
-// across builders, so these are stable facts.
+// manifestMain hashes every sealed epoch plus the local snapshot into the
+// shipped manifest JSON: name, size, sha256. Epochs are bit-identical across
+// builders, so these are stable facts.
 func manifestMain(args []string) {
 	fs := flag.NewFlagSet("manifest", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	out := fs.String("out", "", "output path (default <data>/epochs.manifest)")
 	fs.Parse(args)
-	if *out == "" {
-		*out = filepath.Join(*dataDir, "epochs.manifest")
-	}
-	entries, err := dist.BuildManifest(*dataDir)
+	*out = defaultManifestPath(*dataDir, *out)
+	m, err := buildManifest(*dataDir)
 	if err != nil {
 		log.Fatalf("epochdb: manifest: %v", err)
 	}
-	if err := dist.WriteManifest(*out, entries); err != nil {
+	if err := writeManifest(*out, m); err != nil {
 		log.Fatalf("epochdb: manifest: %v", err)
 	}
 	var total int64
-	for _, e := range entries {
+	snap := "none"
+	for _, e := range m.Epochs {
 		total += e.Size
 	}
-	log.Printf("manifest: %d epochs, %.1f GB, wrote %s", len(entries), float64(total)/1e9, *out)
+	if m.Snapshot != nil {
+		total += m.Snapshot.Size
+		snap = m.Snapshot.Name
+	}
+	log.Printf("manifest: %d epochs + snapshot %s, %.1f GB, wrote %s", len(m.Epochs), snap, float64(total)/1e9, *out)
 }
 
-// seedMain seeds every local epoch matching the manifest until killed.
-func seedMain(args []string) {
-	fs := flag.NewFlagSet("seed", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "shared data directory")
-	manifestPath := fs.String("manifest", "", "epoch manifest path (default <data>/epochs.manifest)")
-	listenPort := fs.Int("listen-port", 42069, "BitTorrent listen port")
-	noDHT := fs.Bool("no-dht", false, "disable DHT+trackers (tests)")
-	fs.Parse(args)
-	if *manifestPath == "" {
-		*manifestPath = filepath.Join(*dataDir, "epochs.manifest")
-	}
-	if err := dist.Seed(*dataDir, *manifestPath, dist.ClientOpts{
-		ListenPort: *listenPort, NoDHT: *noDHT, NoTrackers: *noDHT, NoUpnp: *noDHT, DisableIPv6: *noDHT,
-	}); err != nil {
-		log.Fatalf("epochdb: seed: %v", err)
-	}
-}
-
-// bootstrapMain leeches until the local epoch set exactly matches the
-// manifest (retrying in rounds, seeding completed epochs meanwhile), then
-// exits 0. Operator flow on a new machine: bootstrap, then serve.
+// bootstrapMain downloads every manifest file missing from --data over plain
+// HTTP (sha256-verified, tmp+rename), then exits 0. Operator flow on a new
+// machine: bootstrap, then serve.
 func bootstrapMain(args []string) {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	manifestPath := fs.String("manifest", "", "epoch manifest path (default <data>/epochs.manifest)")
-	epochTimeout := fs.Duration("epoch-timeout", 5*time.Minute, "per-epoch attempt timeout within a round")
-	rounds := fs.Int("rounds", 20, "give up after this many retry rounds")
-	peer := fs.String("peer", "", "explicit seeder host:port (tests, boost)")
-	noDHT := fs.Bool("no-dht", false, "disable DHT+trackers (tests)")
-	listenPort := fs.Int("listen-port", 0, "BitTorrent listen port (0 = random)")
+	manifestPath := fs.String("manifest", "", "manifest JSON path (default <data>/epochs.manifest)")
+	baseURL := fs.String("url", "", "base URL the manifest files hang off, e.g. https://pub.example.com/mainnet (required)")
+	attempts := fs.Int("attempts", 3, "GET attempts per file before giving up")
 	doVerify := fs.Bool("verify", false, "pipelined no-execution verification: verify the contiguous epoch prefix as downloads complete; exit 0 only when all manifest epochs are downloaded AND verified")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (--verify genesis anchor)")
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
-	if *manifestPath == "" {
-		*manifestPath = filepath.Join(*dataDir, "epochs.manifest")
+	if *baseURL == "" {
+		log.Fatalf("epochdb: bootstrap: --url is required")
 	}
-	opts := dist.FetchOpts{
-		Timeout: *epochTimeout,
-		Peer:    *peer,
-		Client:  dist.ClientOpts{ListenPort: *listenPort, NoDHT: *noDHT, NoTrackers: *noDHT, NoUpnp: *noDHT, DisableIPv6: *noDHT},
-	}
-	if !*doVerify {
-		if err := dist.Bootstrap(*dataDir, *manifestPath, *rounds, opts); err != nil {
-			log.Fatalf("epochdb: bootstrap: %v", err)
-		}
-		return
-	}
-
-	entries, err := dist.LoadManifest(*manifestPath)
+	*manifestPath = defaultManifestPath(*dataDir, *manifestPath)
+	m, err := loadManifest(*manifestPath)
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
+	url := trimURL(*baseURL)
+
+	if !*doVerify {
+		if err := fetchMissing(*dataDir, url, m, *attempts, nil); err != nil {
+			log.Fatalf("epochdb: bootstrap: %v", err)
+		}
+		log.Printf("bootstrap: complete, local set matches the manifest (%d files)", len(m.Files()))
+		return
+	}
+
+	// Verification is transport-independent: the cursor chases the contiguous
+	// epoch prefix as files land, whatever moved the bytes.
 	tmp, err := os.MkdirTemp(*dataDir, ".verify-")
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
 	defer os.RemoveAll(tmp)
-	cur := verify.StartCursor(*dataDir, tmp, execNetID(*network), *workers, len(entries))
-	opts.OnEpoch = cur.Notify
+	cur := verify.StartCursor(*dataDir, tmp, execNetID(*network), *workers, len(m.Epochs))
 	bootErr := make(chan error, 1)
-	go func() { bootErr <- dist.Bootstrap(*dataDir, *manifestPath, *rounds, opts) }()
+	go func() { bootErr <- fetchMissing(*dataDir, url, m, *attempts, cur.Notify) }()
 	bootDone, verDone := false, false
 	for !bootDone || !verDone {
 		select {
@@ -344,7 +319,7 @@ func bootstrapMain(args []string) {
 			verDone = true
 		}
 	}
-	log.Printf("bootstrap: all %d epochs downloaded and verified", len(entries))
+	log.Printf("bootstrap: all %d epochs downloaded and verified", len(m.Epochs))
 }
 
 // verifyMain runs the no-execution verification over an already-downloaded
@@ -378,33 +353,7 @@ func serveMain(args []string) {
 	dataDir := fs.String("data", "./data", "shared data directory")
 	port := fs.Int("port", 9650, "HTTP listen port")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
-	fetchEpochs := fs.Bool("fetch-epochs", false, "at startup, torrent-leech manifest epochs missing from --data")
-	manifestPath := fs.String("manifest", "", "epoch manifest path (default <data>/epochs.manifest)")
-	epochTimeout := fs.Duration("epoch-timeout", 5*time.Minute, "per-epoch give-up when leeching")
-	fetchPeer := fs.String("fetch-peer", "", "explicit seeder host:port (tests, boost)")
-	fetchMax := fs.Int("fetch-max", 0, "leech at most N missing epochs (0 = all; tests)")
-	fetchNoDHT := fs.Bool("fetch-no-dht", false, "disable DHT+trackers when leeching (tests: --fetch-peer only)")
 	fs.Parse(args)
-
-	if *fetchEpochs {
-		mp := *manifestPath
-		if mp == "" {
-			mp = filepath.Join(*dataDir, "epochs.manifest")
-		}
-		still, err := dist.FetchMissing(*dataDir, mp, dist.FetchOpts{
-			Timeout: *epochTimeout,
-			Peer:    *fetchPeer,
-			Max:     *fetchMax,
-			Client:  dist.ClientOpts{NoDHT: *fetchNoDHT, NoTrackers: *fetchNoDHT, NoUpnp: *fetchNoDHT, DisableIPv6: *fetchNoDHT},
-		})
-		if err != nil {
-			log.Fatalf("epochdb: fetch-epochs: %v", err)
-		}
-		if len(still) > 0 {
-			log.Printf("epochdb: fetch-epochs: still missing after pass: %v", still)
-			log.Printf("epochdb: serving the contiguous prefix; state/receipt/log queries above the first gap return a missing-epoch error (bodies/tx-by-hash above the gap remain epoch-local and may serve)")
-		}
-	}
 
 	store, err := state.OpenReadOnly(*dataDir)
 	if err != nil {
@@ -447,9 +396,9 @@ func serveMain(args []string) {
 	}
 
 	// eth block hash -> height for the *ByHash methods, from the staging
-	// sidecars (~40B/block resident). After --delete-raw the sidecars only
-	// cover the raw tail, so fill the sealed range from epoch-served
-	// headers (one decode+hash pass at startup).
+	// sidecars (~40B/block resident). Seal deletes fully sealed raw buckets,
+	// so the sidecars only cover the tail: fill the sealed range from
+	// epoch-served headers (one decode+hash pass at startup).
 	if hashes, err := fetch.BlockHashes(*dataDir); err != nil {
 		log.Printf("epochdb: block hash index unavailable: %v", err)
 	} else {
