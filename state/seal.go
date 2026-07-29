@@ -55,6 +55,12 @@ func sealEpochs(dir, outDir string, deleteRaw bool, epochTxs uint64, derive Deri
 	next := uint64(1) // block 0 is genesis: no container, state in the alloc
 	if end, ok := set.SealedEnd(); ok {
 		next = end + 1
+	} else if b, ok, err := PeekBase(dir); err != nil {
+		return err
+	} else if ok {
+		// Limited-history node: nothing below the floor exists, so the
+		// first epoch starts at B+1 and the tx count is counted from there.
+		next = b + 1
 	}
 	set.Close()
 

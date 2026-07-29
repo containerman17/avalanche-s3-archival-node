@@ -1,9 +1,12 @@
 package exec
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
+	"github.com/ava-labs/avalanchego/upgrade"
+	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
@@ -162,5 +165,74 @@ func TestEmptyBlockFastPathAcrossRestart(t *testing.T) {
 	}
 	if e.headNum != 3 {
 		t.Fatalf("head=%d, want 3", e.headNum)
+	}
+}
+
+// TestHeliconBoundaryHalts: the first block at or past Fuji's HeliconTime
+// must stop replay with errHelicon instead of being executed by coreth
+// (which would fail root verification with a misleading message), and
+// mainnet, which has no scheduled HeliconTime, must never trip the guard.
+func TestHeliconBoundaryHalts(t *testing.T) {
+	fetch.RegisterExtras()
+	dir := t.TempDir()
+
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	e, err := New(Config{DataDir: dir, Blocks: fakeSource{}, Store: store}) // NetworkID 0 = Fuji
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	g, err := loadCChainGenesis(e.snowCtx.NetworkID, e.snowCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helicon := uint64(upgrade.GetConfig(avaconstants.FujiID).HeliconTime.Unix())
+	for _, tc := range []struct {
+		time uint64
+		want bool
+	}{
+		{helicon - heliconTransitionLead - 1, false}, // last block coreth surely owns
+		{helicon - heliconTransitionLead, true},      // transitionvm switch point
+		{helicon, true},
+	} {
+		if got := postHeliconTransition(e.chainCfg, tc.time); got != tc.want {
+			t.Fatalf("postHeliconTransition(fuji, %d) = %v, want %v", tc.time, got, tc.want)
+		}
+	}
+
+	blk := types.NewBlockWithHeader(&types.Header{
+		ParentHash: g.ToBlock().Hash(),
+		Number:     big.NewInt(1),
+		Root:       e.genesisRoot,
+		GasLimit:   8_000_000,
+		Time:       helicon,
+		Difficulty: big.NewInt(1),
+	})
+	raw, err := rlp.EncodeToBytes(blk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.executeRaw(1, raw); !errors.Is(err, errHelicon) {
+		t.Fatalf("executeRaw at HeliconTime: got %v, want errHelicon", err)
+	}
+	if e.headNum != 0 {
+		t.Fatalf("head advanced to %d across the boundary", e.headNum)
+	}
+
+	mainCtx, err := snowContextFor(avaconstants.MainnetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mg, err := loadCChainGenesis(avaconstants.MainnetID, mainCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if postHeliconTransition(mg.Config, helicon) {
+		t.Fatal("mainnet must have no scheduled Helicon activation")
 	}
 }

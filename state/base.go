@@ -27,6 +27,7 @@ package state
 // which is a different (highly self-similar) corpus.
 
 import (
+	"bufio"
 	"bytes"
 	"container/heap"
 	"encoding/binary"
@@ -288,6 +289,45 @@ func (b *Base) HeaderRLP(n uint64) ([]byte, bool, error) {
 	return raw, raw != nil, nil
 }
 
+// WalkRows streams every row of the file in key order ('a' accounts, then
+// 'c' code blobs, then 's' storage). This is how a state-synced node loads
+// its Firewood frontier at B without any preimages: strip the one-byte kind
+// prefix and an 'a'/'s' row IS a Firewood key/value pair (keccak(addr), or
+// keccak(addr)||keccak(slot), with the same trie-encoded value).
+// key and val alias the mmap and the decode buffer: copy to retain.
+func (b *Base) WalkRows(fn func(key, val []byte) error) error {
+	idx := b.sec[secBaseSSTIdx]
+	n := len(idx) / baseIdxEntrySize
+	var buf []byte
+	for bi := 0; bi < n; bi++ {
+		lo := binary.LittleEndian.Uint64(idx[bi*baseIdxEntrySize+baseKeySize:])
+		hi := uint64(len(b.sec[secBaseSST]))
+		if bi+1 < n {
+			hi = binary.LittleEndian.Uint64(idx[(bi+1)*baseIdxEntrySize+baseKeySize:])
+		}
+		raw, err := b.dec.DecodeAll(b.sec[secBaseSST][lo:hi], buf[:0])
+		if err != nil {
+			return fmt.Errorf("base block %d: decode sst block %d: %w", b.block, bi, err)
+		}
+		buf = raw
+		for pos := 0; pos+baseKeySize < len(raw); {
+			vlen, vn := binary.Uvarint(raw[pos+baseKeySize:])
+			if vn <= 0 {
+				return fmt.Errorf("base block %d: bad row at %d", b.block, pos)
+			}
+			vstart := pos + baseKeySize + vn
+			if vstart+int(vlen) > len(raw) {
+				return fmt.Errorf("base block %d: truncated row at %d", b.block, pos)
+			}
+			if err := fn(raw[pos:pos+baseKeySize], raw[vstart:vstart+int(vlen)]); err != nil {
+				return err
+			}
+			pos = vstart + int(vlen)
+		}
+	}
+	return nil
+}
+
 func (b *Base) mayContain(key []byte) bool {
 	h1, h2 := bloomHash(key)
 	for i := uint64(0); i < uint64(b.bloomK); i++ {
@@ -408,7 +448,7 @@ func BuildBase(h *History, outDir string, at uint64, sink BaseSink) (string, err
 		}
 		headers = append(headers, raw)
 	}
-	return writeBaseFile(outDir, at, hdr.Root, from, headers, sp)
+	return writeBaseFile(outDir, at, hdr.Root, from, headers, sp, nil)
 }
 
 // foldLiveRows merges every source ordered by key53, keeps each key's last
@@ -871,7 +911,10 @@ func (s *baseSpill) load(bi int) ([]baseRow, error) {
 
 // ---------- file writer ----------
 
-func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, headers [][]byte, sp *baseSpill) (string, error) {
+// onRow, when non-nil, sees every row in final sorted key order as it is
+// written. It is the one chance to recompute anything from the whole file
+// without a second pass over the spill.
+func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, headers [][]byte, sp *baseSpill, onRow func(key, val []byte) error) (string, error) {
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
 	if err != nil {
 		return "", err
@@ -887,20 +930,43 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 	m = (m + 63) / 64 * 64
 	words := make([]uint64, m/64)
 
+	// The SST is STREAMED to the file, not accumulated: a full-mainnet base is
+	// tens of GB and buffering it (plus the bytes.Buffer copy the footer
+	// assembly used to make) simply OOMs the box. Everything else is small
+	// enough to hold: the sparse index is one 73B entry per ~64KB block and
+	// the bloom is 10 bits per row.
+	path := filepath.Join(outDir, BaseFileName(at))
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		f.Close()
+		os.Remove(tmp) // no-op once the rename succeeded
+	}()
+	out := bufio.NewWriterSize(f, 4<<20)
+
 	var (
-		sst      []byte
+		written  uint64 // bytes of SST emitted so far, which is also the section offset
 		idx      []byte
 		raw      []byte
 		firstKey []byte
+		block    []byte
 	)
-	flush := func() {
+	flush := func() error {
 		if len(raw) == 0 {
-			return
+			return nil
 		}
 		idx = append(idx, firstKey...)
-		idx = binary.LittleEndian.AppendUint64(idx, uint64(len(sst)))
-		sst = enc.EncodeAll(raw, sst)
+		idx = binary.LittleEndian.AppendUint64(idx, written)
+		block = enc.EncodeAll(raw, block[:0])
+		if _, err := out.Write(block); err != nil {
+			return err
+		}
+		written += uint64(len(block))
 		raw, firstKey = raw[:0], nil
+		return nil
 	}
 	for bi := range sp.bufs {
 		rows, err := sp.load(bi)
@@ -909,6 +975,11 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 		}
 		for i := range rows {
 			r := &rows[i]
+			if onRow != nil {
+				if err := onRow(r.key[:], r.val); err != nil {
+					return "", err
+				}
+			}
 			h1, h2 := bloomHash(r.key[:])
 			for j := uint64(0); j < bloomHashes; j++ {
 				bit := (h1 + j*h2) % m
@@ -921,11 +992,16 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 			raw = binary.AppendUvarint(raw, uint64(len(r.val)))
 			raw = append(raw, r.val...)
 			if len(raw) >= sstBlockTarget {
-				flush()
+				if err := flush(); err != nil {
+					return "", err
+				}
 			}
 		}
+		rows = nil
 	}
-	flush()
+	if err := flush(); err != nil {
+		return "", err
+	}
 
 	bloom := binary.LittleEndian.AppendUint64(nil, m)
 	bloom = binary.LittleEndian.AppendUint32(bloom, bloomHashes)
@@ -944,19 +1020,25 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 		hdrSec = enc.EncodeAll(hdrPayload, nil)
 	}
 
-	var (
-		buf     bytes.Buffer
-		offsets [baseNumSections][2]uint64
-	)
-	section := func(id int, b []byte) {
-		offsets[id][0] = uint64(buf.Len())
+	var offsets [baseNumSections][2]uint64
+	offsets[secBaseSST] = [2]uint64{0, written}
+	pos := written
+	section := func(id int, b []byte) error {
+		offsets[id][0] = pos
 		offsets[id][1] = uint64(len(b))
-		buf.Write(b)
+		pos += uint64(len(b))
+		_, err := out.Write(b)
+		return err
 	}
-	section(secBaseSST, sst)
-	section(secBaseSSTIdx, idx)
-	section(secBaseKeybloom, bloom)
-	section(secBaseHeaders, hdrSec)
+	if err := section(secBaseSSTIdx, idx); err != nil {
+		return "", err
+	}
+	if err := section(secBaseKeybloom, bloom); err != nil {
+		return "", err
+	}
+	if err := section(secBaseHeaders, hdrSec); err != nil {
+		return "", err
+	}
 
 	var ft [baseFooterSize]byte
 	copy(ft[0:4], baseMagic[:])
@@ -969,12 +1051,31 @@ func writeBaseFile(outDir string, at uint64, root common.Hash, hdrFrom uint64, h
 		binary.LittleEndian.PutUint64(ft[64+i*16:], offsets[i][1])
 	}
 	copy(ft[baseFooterSize-4:], baseMagic[:])
-	buf.Write(ft[:])
-
-	path := filepath.Join(outDir, BaseFileName(at))
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+	if _, err := out.Write(ft[:]); err != nil {
+		return "", err
+	}
+	if err := out.Flush(); err != nil {
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
 		return "", err
 	}
 	return path, os.Rename(tmp, path)
+}
+
+// PeekBase reports whether dir carries a base file, without mapping it.
+func PeekBase(dir string) (uint64, bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, e := range entries {
+		if b, ok := ParseBaseFileName(e.Name()); ok {
+			return b, true, nil
+		}
+	}
+	return 0, false, nil
 }
