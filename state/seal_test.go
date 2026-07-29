@@ -8,6 +8,19 @@ import (
 	"testing"
 )
 
+// synthRcpt is a stand-in for the executor's live capture: nTxs receipt
+// entries (uvarint gasUsed + status byte) and no logs, wrapped in the tail
+// framing. Seal REFUSES a tx-bearing block without one, so every synthetic
+// corpus has to write them exactly as exec does.
+func synthRcpt(nTxs int, n uint64) []byte {
+	var rr []byte
+	for i := 0; i < nTxs; i++ {
+		rr = binary.AppendUvarint(rr, 21000+n)
+		rr = append(rr, 1)
+	}
+	return EncodeTailRcpt(nil, rr)
+}
+
 // TestSealCutAndResume drives the sealer end-to-end on synthetic staging +
 // capture: fixed 3 txs/block, boundary at 10 txs => epochs of 4 blocks;
 // blocks beyond the exec head stay raw; re-running seals nothing new.
@@ -43,6 +56,9 @@ func TestSealCutAndResume(t *testing.T) {
 		if err := st.AppendWrites(n, frame); err != nil {
 			t.Fatal(err)
 		}
+		if err := st.AppendRcpt(n, synthRcpt(3, n)); err != nil {
+			t.Fatal(err)
+		}
 		// logs record on even blocks: 1 addr, 1 topic
 		if n%2 == 0 {
 			var rec []byte
@@ -67,7 +83,7 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// 3 txs/block, boundary 10 => blocks 1-4 (12 txs), 5-8 (12 txs); 9,10
 	// beyond the exec head.
-	if err := sealEpochs(dir, dir, 10, nil); err != nil {
+	if err := sealEpochs(dir, dir, 10); err != nil {
 		t.Fatal(err)
 	}
 	set, err := OpenEpochSet(dir)
@@ -110,7 +126,7 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// resume: nothing new to seal
 	before, _ := os.ReadDir(dir)
-	if err := sealEpochs(dir, dir, 10, nil); err != nil {
+	if err := sealEpochs(dir, dir, 10); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadDir(dir)
@@ -119,5 +135,37 @@ func TestSealCutAndResume(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, EpochFileName(9, 2))); err == nil {
 		t.Fatal("blocks beyond exec head must not seal")
+	}
+}
+
+// TestTailRcptFraming: the tail record must split back into the exact epoch
+// section bytes, including the two asymmetric cases (a tx-bearing block that
+// emitted no logs, and a block with neither). The whole no-re-execution seal
+// rests on these halves being the epoch encodings verbatim.
+func TestTailRcptFraming(t *testing.T) {
+	logs := []byte{1, 2, 3, 4, 5}
+	rcpt := []byte{0xaa, 0, 0xbb, 1}
+	for _, c := range []struct{ l, r []byte }{
+		{logs, rcpt},
+		{nil, rcpt}, // txs but no logs: the common case
+		{logs, nil}, // logs without txs is impossible, but must not corrupt
+	} {
+		rec := EncodeTailRcpt(c.l, c.r)
+		if rec == nil {
+			t.Fatalf("no record for %x/%x", c.l, c.r)
+		}
+		gotL, gotR, err := DecodeTailRcpt(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotL, c.l) || !bytes.Equal(gotR, c.r) {
+			t.Fatalf("round trip: %x/%x -> %x/%x", c.l, c.r, gotL, gotR)
+		}
+	}
+	if EncodeTailRcpt(nil, nil) != nil {
+		t.Fatal("a block with no txs and no logs must produce no record")
+	}
+	if _, _, err := DecodeTailRcpt([]byte{9}); err == nil {
+		t.Fatal("a record claiming 9 log bytes it does not have was accepted")
 	}
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
 )
 
@@ -273,10 +272,10 @@ func sealEpochs(t *testing.T, dir string, blocks []tblock, mutate func(in *state
 				in.TxHashes[b.n] = append(in.TxHashes[b.n], [32]byte(tx.Hash()))
 				in.TxCount++
 			}
-			if rec := rpc.EncodeStoredReceipts(b.receipts); rec != nil {
+			if rec := state.EncodeStoredReceipts(b.receipts); rec != nil {
 				in.RcptRecs[b.n] = rec
 			}
-			if rec := rpc.EncodeStoredLogs(b.receipts); rec != nil {
+			if rec := state.EncodeStoredLogs(b.receipts); rec != nil {
 				in.FullLogs[b.n] = rec
 			}
 		}

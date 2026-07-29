@@ -173,6 +173,9 @@ func TestSealCodeEndToEnd(t *testing.T) {
 		if err := st.AppendWrites(n, frame); err != nil {
 			t.Fatal(err)
 		}
+		if err := st.AppendRcpt(n, synthRcpt(3, n)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.PutCode(hashA, blobA); err != nil {
 		t.Fatal(err)
@@ -190,7 +193,7 @@ func TestSealCodeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 3 txs/block, boundary 10 => epochs 1-4 and 5-8.
-	if err := sealEpochs(dir, dir, 10, nil); err != nil {
+	if err := sealEpochs(dir, dir, 10); err != nil {
 		t.Fatal(err)
 	}
 

@@ -148,23 +148,47 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 	return marshalReceipt(receipts[i], blk.Hash(), n, signer, blk.Transactions()[i], i), nil
 }
 
-// storedBlockReceipts reconstructs every receipt of blk from its epoch's
-// stored sections (the ONLY receipt source, no re-execution): gasUsed /
-// status / cumulative from the receipt-fields record, logs from the
-// stored-logs record, everything else derived from the txs themselves.
-// Blocks outside a sealed epoch (the raw tail) are a clean error.
+// storedSections returns block n's receipt-fields and full-logs records: from
+// the sealed epoch when n is in one, otherwise from the live tail capture the
+// executor writes per block (same encoding, so this is one branch and no
+// re-execution anywhere). A node that never executed AND never sealed n has
+// neither, which is a clean error.
+func (s *Server) storedSections(n uint64) (rcptRec, logsRec []byte, _ *rpcError) {
+	if e, ok := s.hist.Epochs().At(n); ok {
+		rcptRec, ok, err := e.StoredRcptRecord(n)
+		if err != nil || !ok {
+			return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts for block %d: ok=%v err=%v", n, ok, err)}
+		}
+		logsRec, _, err := e.StoredLogsRecord(n)
+		if err != nil {
+			return nil, nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return rcptRec, logsRec, nil
+	}
+	logsRec, rcptRec, ok, err := s.hist.StoredTail(n)
+	if err != nil {
+		return nil, nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	if !ok {
+		return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
+			"no stored receipts for block %d: it is not in a sealed epoch and this node captured none (it never executed that block)", n)}
+	}
+	return rcptRec, logsRec, nil
+}
+
+// storedBlockReceipts reconstructs every receipt of blk from the stored
+// sections (the ONLY receipt source, no re-execution): gasUsed / status /
+// cumulative from the receipt-fields record, logs from the stored-logs
+// record, everything else derived from the txs themselves. Serves the sealed
+// range and the unsealed tail alike.
 func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcError) {
 	n := blk.NumberU64()
-	e, ok := s.hist.Epochs().At(n)
-	if !ok {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("block %d is not sealed into an epoch yet; stored receipts are the only source", n)}
+	rcptRec, logsRec, rerr := s.storedSections(n)
+	if rerr != nil {
+		return nil, rerr
 	}
 	txs := blk.Transactions()
-	rcptRec, ok, err := e.StoredRcptRecord(n)
-	if err != nil || !ok {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts for block %d: ok=%v err=%v", n, ok, err)}
-	}
-	entries, err := DecodeStoredReceipts(rcptRec)
+	entries, err := state.DecodeStoredReceipts(rcptRec)
 	if err != nil || len(entries) != len(txs) {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts decode for block %d: %d entries for %d txs: %v", n, len(entries), len(txs), err)}
 	}
@@ -188,10 +212,8 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 		}
 		receipts[i] = r
 	}
-	if logsRec, hasLogs, err := e.StoredLogsRecord(n); err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
-	} else if hasLogs {
-		stored, err := DecodeStoredLogs(logsRec)
+	if len(logsRec) > 0 {
+		stored, err := state.DecodeStoredLogs(logsRec)
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}

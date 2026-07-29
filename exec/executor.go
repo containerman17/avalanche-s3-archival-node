@@ -171,6 +171,7 @@ type batchItem struct {
 	frame     []byte
 	hasFrame  bool
 	logsRec   []byte // nil = no logs in this block
+	rcptRec   []byte // nil = no transactions in this block
 }
 
 // chainContext is the minimal coreth ChainContext for
@@ -866,7 +867,7 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("open statedb: %w", err)
 	}
-	evmLogs, err := e.runEVM(blk, statedb)
+	receipts, err := e.runEVM(blk, statedb)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -895,8 +896,13 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err := e.cfg.Store.AppendHeader(blockNum, headerRLP); err != nil {
 		return common.Hash{}, err
 	}
-	if rec := encodeLogsFrame(evmLogs); rec != nil {
+	if rec := encodeLogsFrame(receiptLogs(receipts)); rec != nil {
 		if err := e.cfg.Store.AppendLogs(blockNum, rec); err != nil {
+			return common.Hash{}, err
+		}
+	}
+	if rec := storedTailRecord(receipts); rec != nil {
+		if err := e.cfg.Store.AppendRcpt(blockNum, rec); err != nil {
 			return common.Hash{}, err
 		}
 	}
@@ -915,10 +921,10 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 }
 
 // runEVM applies upgrades, all transactions, and the atomic ExtData
-// transfers of blk onto statedb, returning every event log emitted (the
-// receipts already exist in memory: capture is free). Shared by the
-// per-block and batched paths.
-func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) ([]*types.Log, error) {
+// transfers of blk onto statedb, returning every receipt produced (they
+// already exist in memory: capture is free). Shared by the per-block and
+// batched paths.
+func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) (types.Receipts, error) {
 	header := blk.Header()
 
 	upgradeBlockCtx := corethcore.NewBlockContext(header.Number, header.Time)
@@ -929,8 +935,8 @@ func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) ([]*types
 	blockCtx := corethcore.NewEVMBlockContext(header, e.chainCtx, nil)
 	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
 	var (
-		usedGas uint64
-		logs    []*types.Log
+		usedGas  uint64
+		receipts types.Receipts
 	)
 
 	for txIndex, tx := range blk.Transactions() {
@@ -942,7 +948,7 @@ func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) ([]*types
 		if err != nil {
 			return nil, fmt.Errorf("tx %d: %w", txIndex, err)
 		}
-		logs = append(logs, receipt.Logs...)
+		receipts = append(receipts, receipt)
 	}
 
 	// Atomic txs ride in the block's ExtData; Fuji has real imports and
@@ -964,7 +970,7 @@ func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) ([]*types
 			}
 		}
 	}
-	return logs, nil
+	return receipts, nil
 }
 
 // executeBatched accumulates blk into the open batch (opening one if
@@ -1002,7 +1008,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 			e.wrapDB.setFrame(nil)
 			return fmt.Errorf("open statedb: %w", err)
 		}
-		evmLogs, err := e.runEVM(blk, statedb)
+		receipts, err := e.runEVM(blk, statedb)
 		if err != nil {
 			e.wrapDB.setFrame(nil)
 			return err
@@ -1019,7 +1025,8 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 		e.batchBuf = append(e.batchBuf, batchItem{
 			num: blockNum, headerRLP: headerRLP,
 			frame: frame.buf, hasFrame: true,
-			logsRec: encodeLogsFrame(evmLogs),
+			logsRec: encodeLogsFrame(receiptLogs(receipts)),
+			rcptRec: storedTailRecord(receipts),
 		})
 	}
 
@@ -1079,6 +1086,11 @@ func (e *Executor) flushBatch() error {
 		}
 		if it.logsRec != nil {
 			if err := e.cfg.Store.AppendLogs(it.num, it.logsRec); err != nil {
+				return err
+			}
+		}
+		if it.rcptRec != nil {
+			if err := e.cfg.Store.AppendRcpt(it.num, it.rcptRec); err != nil {
 				return err
 			}
 		}

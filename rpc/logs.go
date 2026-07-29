@@ -106,18 +106,30 @@ func (s *Server) runGetLogs(from, to uint64, addrs []common.Address, topics [][]
 
 	out := []*types.Log{}
 	for _, n := range candidates {
-		e, inEpoch := s.hist.Epochs().At(n)
-		if !inEpoch {
-			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("block %d is not sealed into an epoch yet; stored logs are the only source", n)}
+		// Sealed epoch below, live capture above: one encoding, so the tail
+		// answers with the same full log payloads as a sealed epoch does.
+		var rec []byte
+		if e, inEpoch := s.hist.Epochs().At(n); inEpoch {
+			var err error
+			rec, _, err = e.StoredLogsRecord(n)
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: err.Error()}
+			}
+		} else {
+			logsRec, _, ok, err := s.hist.StoredTail(n)
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: err.Error()}
+			}
+			if !ok {
+				return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
+					"no stored logs for block %d: it is not in a sealed epoch and this node captured none (it never executed that block)", n)}
+			}
+			rec = logsRec
 		}
-		rec, hasLogs, err := e.StoredLogsRecord(n)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		if !hasLogs {
+		if len(rec) == 0 {
 			continue
 		}
-		stored, err := DecodeStoredLogs(rec)
+		stored, err := state.DecodeStoredLogs(rec)
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}

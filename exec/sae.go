@@ -23,6 +23,7 @@ import (
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
+	"github.com/containerman17/epochdb/state"
 
 	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
 	saetypes "github.com/ava-labs/avalanchego/vms/saevm/types"
@@ -307,6 +308,11 @@ func (e *Executor) executeSAEBlock(blk *types.Block) error {
 			return err
 		}
 	}
+	if rec := storedTailRecord(res.Receipts); rec != nil {
+		if err := e.cfg.Store.AppendRcpt(blockNum, rec); err != nil {
+			return err
+		}
+	}
 	if err := e.maybeFlush(blockNum); err != nil {
 		return err
 	}
@@ -423,14 +429,24 @@ func (e *Executor) checkSettled(n uint64, header *types.Header) error {
 	return nil
 }
 
-// receiptLogs flattens receipt logs in block order, the same slice the
-// coreth path hands to encodeLogsFrame.
+// receiptLogs flattens receipt logs in block order, the slice both execution
+// paths hand to encodeLogsFrame.
 func receiptLogs(receipts types.Receipts) []*types.Log {
 	var logs []*types.Log
 	for _, r := range receipts {
 		logs = append(logs, r.Logs...)
 	}
 	return logs
+}
+
+// storedTailRecord builds the tail receipts+full-logs record from receipts the
+// executor already holds, in the EPOCH stored-section encoding. Both execution
+// paths call it; sealing copies the result into the epoch's sections byte for
+// byte, so no block is ever re-executed to derive them. SAE-proof by
+// construction: receipts are per-block deterministic at execution regardless
+// of when a header settles them.
+func storedTailRecord(receipts types.Receipts) []byte {
+	return state.EncodeTailRcpt(state.EncodeStoredLogs(receipts), state.EncodeStoredReceipts(receipts))
 }
 
 // --- discard sinks -----------------------------------------------------------

@@ -33,11 +33,22 @@ func OpenReadOnly(dir string) (*Store, error) {
 		hd.Close()
 		return nil, fmt.Errorf("open logs ro: %w", err)
 	}
+	// A missing rcpt family is an EMPTY store, not an error: openBucketLogRO
+	// finds no sidecars and stops there, which is exactly the download-
+	// bootstrapped node that never executed a block.
+	rc, err := openBucketLogRO(dir, rcptPrefix)
+	if err != nil {
+		wl.Close()
+		hd.Close()
+		lg.Close()
+		return nil, fmt.Errorf("open receipts ro: %w", err)
+	}
 	code, err := openCodeStoreRO(dir)
 	if err != nil {
 		wl.Close()
 		hd.Close()
 		lg.Close()
+		rc.Close()
 		return nil, fmt.Errorf("open code store ro: %w", err)
 	}
 	misc, err := openMiscStoreRO(dir)
@@ -45,10 +56,11 @@ func OpenReadOnly(dir string) (*Store, error) {
 		wl.Close()
 		hd.Close()
 		lg.Close()
+		rc.Close()
 		code.Close()
 		return nil, fmt.Errorf("open misc store ro: %w", err)
 	}
-	s := &Store{dir: dir, wl: wl, hd: hd, lg: lg, code: code, misc: misc}
+	s := &Store{dir: dir, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
 	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
 	if err == nil && len(raw) == 8 {
 		s.execHead = binary.BigEndian.Uint64(raw)

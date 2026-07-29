@@ -194,6 +194,23 @@ func (h *History) LogTuples(n uint64) (LogRec, bool, error) {
 	return lr, true, nil
 }
 
+// StoredTail returns block n's captured receipts and full-logs records from
+// the live tail family, in the SAME encoding the sealed epoch sections hold.
+// ok=false = no record: the block had no transactions, or it predates capture
+// (an old corpus, or a node that only ever downloaded epochs).
+// Goroutine-safe (bucketLog is internally locked).
+func (h *History) StoredTail(n uint64) (logsRec, rcptRec []byte, ok bool, err error) {
+	rec, ok, err := h.store.RcptRecord(n)
+	if err != nil || !ok {
+		return nil, nil, false, err
+	}
+	logsRec, rcptRec, err = DecodeTailRcpt(rec)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("tail receipts record %d: %w", n, err)
+	}
+	return logsRec, rcptRec, true, nil
+}
+
 // ModifiedAccounts returns the unique addresses whose account record or
 // storage changed in block n, in capture order (code-use records are reads,
 // not modifications). ok=false = no write frame captured for n: an empty

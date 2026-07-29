@@ -191,8 +191,6 @@ func cookMain(args []string) {
 func sealMain(args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	network := fs.String("network", "fuji", "network: fuji|mainnet")
-	workers := fs.Int("workers", 12, "re-execution workers for the stored-logs derivation")
 	outDir := fs.String("out", "", "directory for the sealed epoch files (default --data; a separate dir cuts an alternate epoch size from the same raws)")
 	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "epoch boundary tx count override")
 	fs.Parse(args)
@@ -203,32 +201,18 @@ func sealMain(args []string) {
 	}
 	fetch.RegisterExtras()
 
-	// Stored logs are unconditional (user ruling 2026-07-20): every seal
-	// derives the sections.
-	g, err := exec.NetworkGenesis(execNetID(*network))
-	if err != nil {
-		log.Fatalf("epochdb: seal: genesis: %v", err)
-	}
-	store, err := state.OpenReadOnly(*dataDir)
-	if err != nil {
-		log.Fatalf("epochdb: seal: %v", err)
-	}
-	defer store.Close()
-	hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
-	if err != nil {
-		log.Fatalf("epochdb: seal: %v", err)
-	}
-	defer hist.Close()
-	derive := rpc.NewDeriveStored(hist, rpc.HistoryChainContext(hist), g.Config, exec.ParseEthBlock, *workers)
-	if err := state.SealEpochs(*dataDir, *outDir, *epochTxs, derive); err != nil {
+	// No genesis, no overlay, no EVM: the stored-logs/receipt sections are a
+	// byte copy of the executor's live capture, so seal never re-executes and
+	// needs no chain config (the --network and --workers flags went with the
+	// DeriveStored stage, 2026-07-29).
+	if err := state.SealEpochs(*dataDir, *outDir, *epochTxs); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
 }
 
 // foldMain is seal's sibling on a PRUNING node: at every canonical boundary
 // it folds the previous snapshot with the period's captured writes into
-// base_<B>, gates the result by loading it into a throwaway Firewood, and
-// retires the raw buckets below B. A node either seals epochs or folds
+// base_<B> and retires the raw buckets below B. A node either seals epochs or folds
 // snapshots, never both. Safe beside a live fetch+exec (it reads only durable
 // data at or below the boundary), but never run cook-index by hand beside it:
 // the fold owns cook on a pruning dir.
@@ -244,7 +228,7 @@ func foldMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: fold: genesis: %v", err)
 	}
-	if err := state.FoldSnapshots(*dataDir, g.Alloc, *epochTxs, verify.CheckBase); err != nil {
+	if err := state.FoldSnapshots(*dataDir, g.Alloc, *epochTxs); err != nil {
 		log.Fatalf("epochdb: fold: %v", err)
 	}
 }

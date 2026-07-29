@@ -14,6 +14,7 @@ import (
 //	writelog_NNNNN.log (+_idx_) post-image write capture, one frame per block
 //	headers_NNNNN.log  (+_idx_) RLP headers, one per executed block
 //	logs_NNNNN.log     (+_idx_) per-block unique event-log addrs+topics
+//	rcpt_NNNNN.log     (+_idx_) per-block receipts + full logs, epoch encoding
 //	code.log                    every contract code blob, by hash
 //	misc.log                    the few non-code rawdb keys
 //	exechead                    executorHead: last group-fsynced height
@@ -27,6 +28,7 @@ type Store struct {
 	wl   *bucketLog
 	hd   *bucketLog
 	lg   *bucketLog
+	rc   *bucketLog
 	code *codeStore
 	misc *miscStore
 
@@ -40,6 +42,11 @@ type Store struct {
 const (
 	execHeadFile  = "exechead"
 	logsStartFile = "logs.start"
+
+	// rcptPrefix names the live receipts+full-logs tail family. Its records
+	// are the epoch stored sections verbatim (see state/storedlogs.go), so
+	// serving the unsealed tail and sealing an epoch read the same bytes.
+	rcptPrefix = "rcpt"
 )
 
 // Open opens (or creates) the state layer inside dir.
@@ -62,11 +69,19 @@ func Open(dir string) (*Store, error) {
 		hd.Close()
 		return nil, fmt.Errorf("open logs: %w", err)
 	}
+	rc, err := openBucketLog(dir, rcptPrefix)
+	if err != nil {
+		wl.Close()
+		hd.Close()
+		lg.Close()
+		return nil, fmt.Errorf("open receipts: %w", err)
+	}
 	code, err := openCodeStore(dir)
 	if err != nil {
 		wl.Close()
 		hd.Close()
 		lg.Close()
+		rc.Close()
 		return nil, fmt.Errorf("open code store: %w", err)
 	}
 	misc, err := openMiscStore(dir)
@@ -74,10 +89,11 @@ func Open(dir string) (*Store, error) {
 		wl.Close()
 		hd.Close()
 		lg.Close()
+		rc.Close()
 		code.Close()
 		return nil, fmt.Errorf("open misc store: %w", err)
 	}
-	s := &Store{dir: dir, wl: wl, hd: hd, lg: lg, code: code, misc: misc}
+	s := &Store{dir: dir, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
 	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
 	if err == nil && len(raw) == 8 {
 		s.execHead = binary.BigEndian.Uint64(raw)
@@ -101,7 +117,7 @@ func Open(dir string) (*Store, error) {
 // exechead: only FlushAndSetExecHead does that.
 func (s *Store) Close() error {
 	var firstErr error
-	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.code.Close, s.misc.Close} {
+	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.rc.Close, s.code.Close, s.misc.Close} {
 		if err := c(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -115,7 +131,7 @@ func (s *Store) ExecHead() (uint64, bool) { return s.execHead, s.execHeadOK }
 // FlushAndSetExecHead fsyncs every dirty file (writelog, headers, code,
 // misc) and only then persists executorHead = n via tmp+rename.
 func (s *Store) FlushAndSetExecHead(n uint64) error {
-	for _, f := range []func() error{s.wl.Sync, s.hd.Sync, s.lg.Sync, s.code.Sync, s.misc.Sync} {
+	for _, f := range []func() error{s.wl.Sync, s.hd.Sync, s.lg.Sync, s.rc.Sync, s.code.Sync, s.misc.Sync} {
 		if err := f(); err != nil {
 			return err
 		}
@@ -162,6 +178,19 @@ func (s *Store) AppendLogs(block uint64, rec []byte) error {
 // LogsRecord returns the stored event-log record for block. ok=false means
 // no logs in that block (or the block predates capture, see LogsStart).
 func (s *Store) LogsRecord(block uint64) ([]byte, bool, error) { return s.lg.Get(block) }
+
+// AppendRcpt stores block's receipts+full-logs record (EncodeTailRcpt).
+// Blocks with no transactions get no record. Idempotent per block.
+func (s *Store) AppendRcpt(block uint64, rec []byte) error { return s.rc.Append(block, rec) }
+
+// RcptRecord returns block's captured receipts+full-logs record. ok=false
+// means the block had no transactions, or predates capture entirely (an old
+// corpus, or a node that never executed): the two are indistinguishable here
+// on purpose, callers that need the difference check the tx count.
+func (s *Store) RcptRecord(block uint64) ([]byte, bool, error) { return s.rc.Get(block) }
+
+// RcptBytes returns total captured receipt+logs payload bytes on disk.
+func (s *Store) RcptBytes() uint64 { return s.rc.Bytes() }
 
 // LogsBytes returns total logs payload bytes on disk.
 func (s *Store) LogsBytes() uint64 { return s.lg.Bytes() }

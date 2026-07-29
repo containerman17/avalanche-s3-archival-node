@@ -82,6 +82,9 @@ func writeFoldCorpus(t *testing.T, dir string, blks []foldBlk) {
 				t.Fatal(err)
 			}
 		}
+		if err := st.AppendRcpt(b.n, synthRcpt(foldTxsPerBlock, b.n)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.PutCode(fdCodeHash, fdCode); err != nil {
 		t.Fatal(err)
@@ -135,7 +138,7 @@ func foldCorpusRound2(t *testing.T) []foldBlk {
 
 func mustFold(t *testing.T, dir string) {
 	t.Helper()
-	if err := FoldSnapshots(dir, foldAlloc(), foldEpochTxs, nil); err != nil {
+	if err := FoldSnapshots(dir, foldAlloc(), foldEpochTxs); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -581,47 +584,6 @@ func TestFoldRetirementGuard(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 6. Gate teeth: a failing pre-rename gate must leave the directory exactly
-// as it was, temp file included.
-// ---------------------------------------------------------------------------
-
-func TestFoldGateBlocksRename(t *testing.T) {
-	dir := t.TempDir()
-	writeFoldCorpus(t, dir, foldCorpusRound1(t))
-
-	gated := 0
-	err := FoldSnapshots(dir, foldAlloc(), foldEpochTxs, func(tmp string) error {
-		gated++
-		if filepath.Base(tmp) != "base_4.tmp" {
-			t.Fatalf("gate got %s, want base_4.tmp", tmp)
-		}
-		// The gate must be able to OPEN the temp file: that is the whole
-		// point, and openBaseFile's name check has to tolerate the suffix.
-		b, err := OpenBaseFile(tmp)
-		if err != nil {
-			t.Fatalf("gate cannot open the temp snapshot: %v", err)
-		}
-		if b.Block() != 4 {
-			t.Fatalf("temp snapshot claims block %d", b.Block())
-		}
-		b.Close()
-		return fmt.Errorf("synthetic gate failure")
-	})
-	if err == nil || !strings.Contains(err.Error(), "gate") {
-		t.Fatalf("fold ignored the gate: %v", err)
-	}
-	if gated != 1 {
-		t.Fatalf("gate called %d times", gated)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "base_4")); !os.IsNotExist(err) {
-		t.Fatal("a gate-rejected snapshot was renamed into place")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "base_4.tmp")); !os.IsNotExist(err) {
-		t.Fatal("a gate-rejected snapshot left its temp file behind")
-	}
-}
-
 // TestFoldRefusesSealedDir: a node either seals epochs or folds snapshots.
 func TestFoldRefusesSealedDir(t *testing.T) {
 	dir := t.TempDir()
@@ -629,7 +591,7 @@ func TestFoldRefusesSealedDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, EpochFileName(1, 4)), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := FoldSnapshots(dir, foldAlloc(), foldEpochTxs, nil)
+	err := FoldSnapshots(dir, foldAlloc(), foldEpochTxs)
 	if err == nil || !strings.Contains(err.Error(), "sealed epochs") {
 		t.Fatalf("fold accepted a sealed dir: %v", err)
 	}

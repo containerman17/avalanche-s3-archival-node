@@ -20,20 +20,21 @@ import (
 // afterwards, unconditionally (user ruling 2026-07-29: --delete-raw was the
 // only sane setting, so the flag is gone). NEVER run seal next to a running
 // fetch/exec: they own those files.
-// DeriveStored fills EpochInput's stored-logs sections (FullLogs/RcptRecs,
-// plus the posting-list tuples when nil) by re-execution. Implemented in
-// rpc (state cannot import the EVM). Stored logs are unconditional: only
-// unit tests pass nil (seal without the sections).
-type DeriveStored func(in *EpochInput) error
-
+//
+// The stored-logs/receipt sections come from the executor's LIVE CAPTURE (the
+// rcpt tail family, same encoding), never from re-execution: the DeriveStored
+// seal stage is gone, proven byte-identical before deletion. A range whose
+// tx-bearing blocks have no captured records is REFUSED, not backfilled
+// (corpora are disposable by ruling; see gatherEpoch).
+//
 // outDir is where sealed epoch files land (usually dir itself; a separate
 // dir cuts an alternate epoch size from the same raw captures without
 // touching existing epochs).
-func SealEpochs(dir, outDir string, epochTxs uint64, derive DeriveStored) error {
-	return sealEpochs(dir, outDir, epochTxs, derive)
+func SealEpochs(dir, outDir string, epochTxs uint64) error {
+	return sealEpochs(dir, outDir, epochTxs)
 }
 
-func sealEpochs(dir, outDir string, epochTxs uint64, derive DeriveStored) error {
+func sealEpochs(dir, outDir string, epochTxs uint64) error {
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return err
@@ -79,11 +80,6 @@ func sealEpochs(dir, outDir string, epochTxs uint64, derive DeriveStored) error 
 			break
 		}
 		t0 := time.Now()
-		if derive != nil {
-			if err := derive(in); err != nil {
-				return fmt.Errorf("seal epoch at %d: derive stored logs: %w", in.Start, err)
-			}
-		}
 		path, err := BuildEpoch(outDir, in)
 		if err != nil {
 			return fmt.Errorf("seal epoch at %d: %w", in.Start, err)
@@ -95,9 +91,10 @@ func sealEpochs(dir, outDir string, epochTxs uint64, derive DeriveStored) error 
 			float64(rawBytes.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
 		if e, err := OpenEpoch(path); err == nil {
 			s := e.SectionSizes()
-			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB",
+			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB rcpt=%.2fMB",
 				float64(rawBytes.containers)/1e6, float64(rawBytes.headers)/1e6,
-				float64(rawBytes.writelog)/1e6, float64(rawBytes.logs)/1e6)
+				float64(rawBytes.writelog)/1e6, float64(rawBytes.logs)/1e6,
+				float64(rawBytes.rcpt)/1e6)
 			log.Printf("seal:   sealed: dict=%.2fMB bodies=%.2fMB(+idx %.2f) headers=%.2fMB(+idx %.2f) sst=%.2fMB(+idx %.2f) deletes=%.2fMB txidx=%.2fMB logidx=%.2fMB bloom=%.2fMB",
 				float64(s["dict"])/1e6,
 				float64(s["bodies"])/1e6, float64(s["bodiesIdx"])/1e6,
@@ -115,15 +112,22 @@ func sealEpochs(dir, outDir string, epochTxs uint64, derive DeriveStored) error 
 
 // rawSizes are the uncompressed raw equivalents consumed by one epoch, for
 // the compression scoreboard.
-type rawSizes struct{ containers, headers, writelog, logs uint64 }
+type rawSizes struct{ containers, headers, writelog, logs, rcpt uint64 }
 
-func (r rawSizes) total() uint64 { return r.containers + r.headers + r.writelog + r.logs }
+func (r rawSizes) total() uint64 {
+	return r.containers + r.headers + r.writelog + r.logs + r.rcpt
+}
 
 // gatherEpoch collects blocks from start until the cumulative tx count
 // reaches EpochTxs (that block included). nil input = not enough txs
 // materialized yet (tail stays raw).
 func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uint64) (*EpochInput, rawSizes, error) {
-	in := &EpochInput{Start: start, TxHashes: map[uint64][][32]byte{}}
+	in := &EpochInput{
+		Start:    start,
+		TxHashes: map[uint64][][32]byte{},
+		FullLogs: map[uint64][]byte{},
+		RcptRecs: map[uint64][]byte{},
+	}
 	var rawBytes rawSizes
 	for n := start; n <= execHead; n++ {
 		container, ok, err := reader.GetByHeight(n)
@@ -153,6 +157,34 @@ func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs u
 			}
 			in.TxHashes[n] = hs
 			in.TxCount += uint64(len(hashes))
+		}
+
+		// THE NO-RECORDS RULE: the stored sections are a byte copy of the
+		// executor's live capture. A tx-bearing block without one cannot be
+		// sealed, and there is deliberately no backfill-by-re-execution
+		// crutch: corpora are disposable (DESIGN.md work order item 2), so
+		// the answer to a pre-capture corpus is a fresh sync, not a patch.
+		rcptRaw, hasRcpt, err := store.RcptRecord(n)
+		if err != nil {
+			return nil, rawSizes{}, err
+		}
+		if len(hashes) > 0 && !hasRcpt {
+			return nil, rawSizes{}, fmt.Errorf(
+				"seal: block %d has %d txs but no captured receipts record: this corpus was executed before live receipt capture, resync it (there is no backfill)",
+				n, len(hashes))
+		}
+		if hasRcpt {
+			logsRec, rcptRec, err := DecodeTailRcpt(rcptRaw)
+			if err != nil {
+				return nil, rawSizes{}, fmt.Errorf("seal: block %d: %w", n, err)
+			}
+			rawBytes.rcpt += uint64(len(rcptRaw))
+			if len(logsRec) > 0 {
+				in.FullLogs[n] = logsRec
+			}
+			if len(rcptRec) > 0 {
+				in.RcptRecs[n] = rcptRec
+			}
 		}
 
 		if frame, ok, err := store.wl.Get(n); err != nil {
@@ -265,6 +297,7 @@ func deleteSealedRaw(dir string, sealedEnd uint64) error {
 		"writelog_%05d.log", "writelog_idx_%05d.log",
 		"headers_%05d.log", "headers_idx_%05d.log",
 		"logs_%05d.log", "logs_idx_%05d.log",
+		"rcpt_%05d.log", "rcpt_idx_%05d.log",
 		"logsbf_%05d.log", "logsbf_idx_%05d.log", "logsbf_done_%05d",
 		"sorted_%05d.idx", "txidx_%05d.idx",
 	}

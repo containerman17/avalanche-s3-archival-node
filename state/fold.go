@@ -40,10 +40,11 @@ package state
 // a zero storage root, the RPC read path substitutes SentinelStorageRoot, and
 // graft/evm/firewood's UpdateAccount is literally ffi.Put(keccak(addr),
 // rlp(account)). So the rows this file emits are byte-for-byte what a
-// consumer's Firewood wants. Two nets pin that premise instead of assuming
-// it: verify's zero-root unit test, and the pre-rename gate below, which
-// loads the finished file through the consumer's exact path and compares the
-// resulting root to header(B).Root before the name ever becomes visible.
+// consumer's Firewood wants. verify's zero-root unit test pins that premise
+// instead of assuming it. There is NO pre-rename gate (deleted 2026-07-29,
+// user: "extra validation of already-validated data no one asked for"):
+// the producer executed every block root-verified, and every consumer
+// recomputes the root as a side effect of loading the file.
 
 import (
 	"bytes"
@@ -66,14 +67,10 @@ import (
 
 // FoldSnapshots emits every snapshot the local data supports, in order.
 //
-// gate is called with the finished base_<B>.tmp before it is renamed into
-// place; cmd wires it to verify.CheckBase (state cannot import verify), unit
-// tests may pass nil. A gate error deletes the temp file and fails the fold.
-//
 // Loop invariant: nothing is persisted about the fold itself, so every
 // restart re-derives (floor, boundary, rows) from the newest base footer, the
 // containers and exechead. Idempotence IS determinism here.
-func FoldSnapshots(dir string, alloc types.GenesisAlloc, epochTxs uint64, gate func(tmpPath string) error) error {
+func FoldSnapshots(dir string, alloc types.GenesisAlloc, epochTxs uint64) error {
 	if err := sweepBases(dir); err != nil {
 		return err
 	}
@@ -95,7 +92,7 @@ func FoldSnapshots(dir string, alloc types.GenesisAlloc, epochTxs uint64, gate f
 		if err := CookIndex(dir); err != nil {
 			return err
 		}
-		more, err := foldOnce(dir, alloc, epochTxs, gate)
+		more, err := foldOnce(dir, alloc, epochTxs)
 		if err != nil || !more {
 			return err
 		}
@@ -142,7 +139,7 @@ func sweepBases(dir string) error {
 
 // foldOnce produces at most one snapshot. more=true means a boundary was
 // crossed and the caller should look for the next one.
-func foldOnce(dir string, alloc types.GenesisAlloc, epochTxs uint64, gate func(string) error) (more bool, err error) {
+func foldOnce(dir string, alloc types.GenesisAlloc, epochTxs uint64) (more bool, err error) {
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return false, err
@@ -213,19 +210,8 @@ func foldOnce(dir string, alloc types.GenesisAlloc, epochTxs uint64, gate func(s
 	if err := f.merge(w.Add); err != nil {
 		return false, err
 	}
-	tmp, err := w.Finish()
-	if err != nil {
+	if _, err := w.Finish(); err != nil {
 		return false, err
-	}
-
-	// The producer's only defense against publishing a poisoned manifest:
-	// load the finished file through the CONSUMER's exact path and compare the
-	// root to header(B).Root. "Verification is the load" stays true for
-	// clients; this proves the artifact loads, not merely that it hashes.
-	if gate != nil {
-		if err := gate(tmp); err != nil {
-			return false, fmt.Errorf("fold: base_%d failed the pre-rename gate: %w", B, err)
-		}
 	}
 	if err := w.Commit(); err != nil {
 		return false, err

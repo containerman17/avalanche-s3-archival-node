@@ -29,7 +29,6 @@ import (
 
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
 )
 
@@ -365,7 +364,7 @@ func reconstructReceipts(e *state.Epoch, n uint64, txs types.Transactions) (type
 		}
 		return nil, nil
 	}
-	srs, err := rpc.DecodeStoredReceipts(rec)
+	srs, err := state.DecodeStoredReceipts(rec)
 	if err != nil {
 		return nil, fmt.Errorf("block %d: %w", n, err)
 	}
@@ -385,7 +384,7 @@ func reconstructReceipts(e *state.Epoch, n uint64, txs types.Transactions) (type
 		return nil, fmt.Errorf("block %d: stored logs: %w", n, err)
 	}
 	if ok {
-		logs, err := rpc.DecodeStoredLogs(logsRec)
+		logs, err := state.DecodeStoredLogs(logsRec)
 		if err != nil {
 			return nil, fmt.Errorf("block %d: %w", n, err)
 		}

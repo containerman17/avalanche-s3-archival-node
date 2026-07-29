@@ -5,22 +5,22 @@ package verify
 // The snapshot fold emits captured post-images VERBATIM: no StackTrie pass,
 // no storage-root reconstruction, no RLP patching. That is only sound because
 // firewood-ethhash manages storage roots internally, so the StorageRoot field
-// of a captured account RLP is the ZERO hash and Firewood substitutes the
-// real one when it hashes. If that ever stopped being true, every snapshot
-// would load to a wrong root and the fold's whole design would be wrong.
+// of a captured account RLP is the ZERO hash and Firewood substitutes the real
+// one when it hashes. If that ever stopped being true, every snapshot would
+// load to a wrong root.
 //
-// TestZeroStorageRootPremise is the cheap permanent check: the same rows,
+// This is a LIBRARY-BEHAVIOUR pin, not a producer gate (the pre-rename fold
+// gate was deleted 2026-07-29: verification is the load). It stays because
+// exec.startFromBase depends on exactly this equality: it bulk-loads a
+// snapshot's zero-rooted rows through raw ffi.Put and then expects the
+// resulting frontier to answer as the canonical state at B. The same rows,
 // once through the preimage-keyed UpdateAccount/UpdateStorage path the
-// executor writes with, once through the raw ffi.Put path the snapshot load
-// reads with, must produce the same root. The other net is CheckBase itself,
-// which runs on the real artifact before it is ever named.
+// executor writes with, once through the raw ffi.Put path startFromBase reads
+// with, must produce the same root.
 
 import (
 	"bytes"
 	"math/big"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	ffi "github.com/ava-labs/firewood-go-ethhash/ffi"
@@ -90,7 +90,7 @@ func vbRows(t *testing.T) []state.StateRow {
 }
 
 // vbFirewoodRoot builds the state through the raw hashed-key ffi.Put path,
-// which is what exec.startFromBase and CheckBase both do.
+// which is what exec.startFromBase does when it loads a snapshot.
 func vbFirewoodRoot(t *testing.T, rows []state.StateRow) common.Hash {
 	t.Helper()
 	tdb, fw, _, err := newThrowawayFirewood(t.TempDir())
@@ -150,65 +150,6 @@ func TestZeroStorageRootPremise(t *testing.T) {
 	}
 	if viaAPI != viaPut {
 		t.Fatalf("ZERO-ROOT PREMISE BROKEN: UpdateAccount path gives %x, raw ffi.Put of the same zero-rooted rows gives %x. "+
-			"The snapshot fold emits post-images verbatim on the strength of these being equal", viaAPI, viaPut)
-	}
-}
-
-// writeVerifyBase turns the same rows into a real base file whose footer
-// claims root.
-func writeVerifyBase(t *testing.T, dir string, block uint64, rows []state.StateRow, root common.Hash) string {
-	t.Helper()
-	var brs []state.BaseRow
-	for i := range rows {
-		brs = append(brs, state.BaseRow{Key: rows[i].Key, Val: rows[i].Value})
-	}
-	hdr, err := rlp.EncodeToBytes(&types.Header{
-		Number: new(big.Int).SetUint64(block), Difficulty: big.NewInt(1), Root: root,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	path, err := state.WriteBase(dir, state.BaseMeta{
-		Block: block, CumTx: 42, Root: root, HdrFrom: block, Headers: [][]byte{hdr},
-	}, brs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-// TestCheckBaseTeeth: the producer's pre-rename gate must accept a snapshot
-// whose rows rebuild the footer's root and reject one whose rows do not. This
-// is the check that stands between a bad merge and a published manifest.
-func TestCheckBaseTeeth(t *testing.T) {
-	fetch.RegisterExtras()
-	rows := vbRows(t)
-	root := vbFirewoodRoot(t, rows)
-
-	good := writeVerifyBase(t, t.TempDir(), 900, rows, root)
-	if err := CheckBase(good); err != nil {
-		t.Fatalf("a correct snapshot was rejected: %v", err)
-	}
-
-	// One corrupted row: the balance of an account nobody would look at.
-	bad := make([]state.StateRow, len(rows))
-	copy(bad, rows)
-	bad[0].Value = vbAccount(t, 3, 12, types.EmptyCodeHash)
-	badPath := writeVerifyBase(t, t.TempDir(), 900, bad, root)
-	err := CheckBase(badPath)
-	if err == nil || !strings.Contains(err.Error(), "rows rebuild root") {
-		t.Fatalf("a snapshot with a corrupted row passed the gate: %v", err)
-	}
-
-	// And the gate has to work on the .tmp name, which is the only name the
-	// file has when the fold calls it.
-	dir := t.TempDir()
-	src := writeVerifyBase(t, dir, 900, rows, root)
-	tmp := filepath.Join(dir, "base_900.tmp")
-	if err := os.Rename(src, tmp); err != nil {
-		t.Fatal(err)
-	}
-	if err := CheckBase(tmp); err != nil {
-		t.Fatalf("gate cannot verify a pre-rename temp file: %v", err)
+			"The snapshot fold emits post-images verbatim, and startFromBase loads them, on the strength of these being equal", viaAPI, viaPut)
 	}
 }
