@@ -3,7 +3,6 @@ package exec
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -119,7 +118,15 @@ type Executor struct {
 	genesisHash common.Hash
 	headRoot    common.Hash
 	headNum     uint64
+	headTime    uint64 // timestamp of headNum: the transitionvm boundary test
 	totalGas    uint64 // session gas, for mgas/s
+
+	// SAE (ACP-194) side, live only above the Helicon boundary. ring
+	// records our own post-execution roots and gas clocks, which
+	// post-Helicon headers no longer carry per block; sae holds the
+	// engine state and is built on the first post-boundary block.
+	ring *saeRing
+	sae  *saeExec
 
 	// base is the limited-history floor file (nil on a full node). On a
 	// state-synced node it is where the Firewood frontier, the BLOCKHASH
@@ -305,9 +312,16 @@ func New(cfg Config) (*Executor, error) {
 		return nil, fmt.Errorf("triedb backend is %T, want *firewood.TrieDB", tdb.Backend())
 	}
 
+	ring, err := openSAERing(cfg.DataDir)
+	if err != nil {
+		tdb.Close()
+		return nil, err
+	}
+
 	e := &Executor{
 		cfg:         cfg,
 		chainCfg:    g.Config,
+		ring:        ring,
 		wrapDB:      wrapDB,
 		triedb:      tdb,
 		fwBackend:   fwBackend,
@@ -317,6 +331,7 @@ func New(cfg Config) (*Executor, error) {
 		genesisHash: g.ToBlock().Hash(),
 		headRoot:    genesisRoot,
 		headNum:     0,
+		headTime:    g.Timestamp,
 		lastFwHash:  g.ToBlock().Hash(),
 	}
 
@@ -441,7 +456,7 @@ func (e *Executor) startFromBase() error {
 
 	e.fwBackend.SetHashAndHeight(hdr.Hash(), B)
 	e.fwHeight, e.lastFwHash = B, hdr.Hash()
-	e.headNum, e.headRoot = B, hdr.Root
+	e.headNum, e.headRoot, e.headTime = B, hdr.Root, hdr.Time
 	if err := e.cfg.Store.FlushAndSetExecHead(B); err != nil {
 		return fmt.Errorf("base start: seed exechead: %w", err)
 	}
@@ -493,7 +508,10 @@ func (e *Executor) reconcile() error {
 		return nil
 	}
 
-	// Walk-back: highest block i <= top whose header.Root == firewood root.
+	// Walk-back: highest block i <= top whose POST-EXECUTION root is the
+	// firewood root. Below the Helicon boundary that is header.Root; above
+	// it, header.Root belongs to the settled block, so the executor's own
+	// ring is the only place its roots live (see saering.go).
 	var (
 		fwN    uint64
 		fwHash common.Hash
@@ -515,7 +533,7 @@ func (e *Executor) reconcile() error {
 		if err != nil {
 			return fmt.Errorf("reconcile: %w", err)
 		}
-		if h.Root == rootFW {
+		if root, ok := e.ownRootAt(h, i); ok && root == rootFW {
 			fwN = i
 			fwHash = h.Hash()
 			found = true
@@ -550,7 +568,11 @@ func (e *Executor) reconcile() error {
 		if err != nil {
 			return fmt.Errorf("reconcile: %w", err)
 		}
-		e.headRoot = h.Root
+		// The walk-back matched here, so this is the same root; taking it
+		// from firewood keeps the SAE case (header.Root is the settled
+		// block's) from sneaking in.
+		e.headRoot = rootFW
+		e.headTime = h.Time
 	}
 
 	if fwN == top {
@@ -622,6 +644,10 @@ func (e *Executor) Close() error {
 			return fmt.Errorf("close: flush batch: %w", err)
 		}
 	}
+	if err := e.ring.close(); err != nil {
+		e.triedb.Close()
+		return err
+	}
 	if err := e.cfg.Store.FlushAndSetExecHead(e.headNum); err != nil {
 		e.triedb.Close()
 		return err
@@ -680,16 +706,6 @@ func (e *Executor) Run(ctx context.Context) error {
 			continue
 		}
 		if err := e.executeRaw(next, raw); err != nil {
-			if errors.Is(err, errHelicon) {
-				if e.batchOpen && e.batchCount > 0 {
-					if ferr := e.flushBatch(); ferr != nil {
-						return ferr
-					}
-				}
-				log.Printf("exec: HALTED at %v", err)
-				log.Printf("exec: executed head is %d; everything at or below it stays queryable, replay resumes when the SAE engine lands", e.headNum)
-				return nil
-			}
 			return err
 		}
 		blocksDone++
@@ -712,37 +728,31 @@ func (e *Executor) Run(ctx context.Context) error {
 				hitPct,
 				float64(e.wrapDB.cacheSize)/1e6,
 			)
+			if e.sae != nil && e.sae.settledSeen {
+				log.Printf("sae: settled=%d (lag %d..%d over %d settlements)",
+					e.sae.settledHeight, e.sae.lagMin, e.sae.lagMax, e.sae.settlements)
+			}
 			lastLog = time.Now()
 			lastGas, lastBlocks = e.totalGas, blocksDone
 		}
 	}
 }
 
-// errHelicon marks the ACP-194 (Helicon/SAE) boundary. Past it, header.Root
-// is the post-execution root of the last SETTLED block rather than this
-// block's own, and the body is executed by vms/saevm, not coreth. Nothing
-// in this package can produce a matching root, so replay halts instead of
-// failing root verification with a misleading message. Mainnet has no
-// scheduled HeliconTime, so this never fires there.
-var errHelicon = errors.New("Helicon/ACP-194 boundary: post-Helicon blocks need the SAE execution engine (saexec + vms/saevm/cchain), which is not implemented yet")
-
-// heliconTransitionLead is transitionvm's switch offset: the C-Chain
-// registers TransitionTime = HeliconTime - 10s, and the SAE VM executes
-// every block AFTER the first one at or past it (the transition block
-// itself is still coreth's). See vms/transitionvm/README.md.
-const heliconTransitionLead = 10
-
-// postHeliconTransition reports whether coreth may no longer be trusted to
-// execute a block with this timestamp. It deliberately fires one block
-// early, on the transition block, which coreth could still execute:
-// stopping short costs one block, guessing wrong writes garbage. Networks
-// without a scheduled Helicon (mainnet today) never trip it.
-func postHeliconTransition(cfg *params.ChainConfig, blockTime uint64) bool {
-	ts := cparams.GetExtra(cfg).HeliconTimestamp
-	return ts != nil && blockTime+heliconTransitionLead >= *ts
+// ownRootAt returns the post-execution state root THIS executor computed
+// for block n. Below the Helicon boundary that is the block's own
+// header.Root; above it, header.Root is the root of the block this one
+// SETTLES, so the value comes from the root ring. ok=false means an SAE
+// height that has aged out of the ring.
+func (e *Executor) ownRootAt(hdr *types.Header, n uint64) (common.Hash, bool) {
+	if !hasSettledMarkers(hdr) {
+		return hdr.Root, true
+	}
+	root, _, ok := e.ring.get(n)
+	return root, ok
 }
 
-// executeRaw parses and executes one container at the expected height.
+// executeRaw parses and executes one container at the expected height,
+// picking the engine by the transitionvm boundary rule (see saeExecuted).
 func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	blk, err := parseEthBlock(raw)
 	if err != nil {
@@ -751,14 +761,27 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	if got := blk.NumberU64(); got != blockNum {
 		return fmt.Errorf("block %d has internal number %d", blockNum, got)
 	}
-	if postHeliconTransition(e.chainCfg, blk.Time()) {
-		return fmt.Errorf("block %d (timestamp %d): %w", blockNum, blk.Time(), errHelicon)
+	sae, err := e.saeExecuted(blk, e.headTime)
+	if err != nil {
+		return err
 	}
-	if e.cfg.CommitEvery > 1 {
+	switch {
+	case sae:
+		// The coreth-side batch must close at the boundary: SAE commits
+		// one Firewood proposal per block.
+		if e.batchOpen && e.batchCount > 0 {
+			if err := e.flushBatch(); err != nil {
+				return err
+			}
+		}
+		if err := e.executeSAEBlock(blk); err != nil {
+			return fmt.Errorf("block %d: %w", blockNum, err)
+		}
+	case e.cfg.CommitEvery > 1:
 		if err := e.executeBatched(blk); err != nil {
 			return fmt.Errorf("block %d: %w", blockNum, err)
 		}
-	} else {
+	default:
 		newRoot, err := e.executeBlock(blk)
 		if err != nil {
 			return fmt.Errorf("block %d: %w", blockNum, err)
@@ -766,14 +789,21 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 		e.headRoot = newRoot
 		e.headNum = blockNum
 	}
+	e.headTime = blk.Time()
 	e.totalGas += blk.GasUsed()
 	return nil
 }
 
-// maybeFlush advances the durable watermark every flushEvery blocks.
+// maybeFlush advances the durable watermark every flushEvery blocks. The
+// SAE root ring is fsynced with the group: exechead must never claim a
+// height whose recorded root did not reach disk, or the next restart could
+// not identify the frontier.
 func (e *Executor) maybeFlush(blockNum uint64) error {
 	if blockNum%flushEvery != 0 {
 		return nil
+	}
+	if err := e.ring.sync(); err != nil {
+		return err
 	}
 	return e.cfg.Store.FlushAndSetExecHead(blockNum)
 }

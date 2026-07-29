@@ -1,7 +1,6 @@
 package exec
 
 import (
-	"errors"
 	"math/big"
 	"testing"
 
@@ -168,11 +167,13 @@ func TestEmptyBlockFastPathAcrossRestart(t *testing.T) {
 	}
 }
 
-// TestHeliconBoundaryHalts: the first block at or past Fuji's HeliconTime
-// must stop replay with errHelicon instead of being executed by coreth
-// (which would fail root verification with a misleading message), and
-// mainnet, which has no scheduled HeliconTime, must never trip the guard.
-func TestHeliconBoundaryHalts(t *testing.T) {
+// TestHeliconBoundaryRule pins the exact transitionvm split: coreth
+// executes up to AND INCLUDING the transition block (the first block at or
+// past HeliconTime-10s), so a block is SAE i.f.f. its PARENT's timestamp is
+// at or past that point. The settlement markers must agree with the
+// timestamp rule, and mainnet, with no scheduled Helicon, must never take
+// the SAE path.
+func TestHeliconBoundaryRule(t *testing.T) {
 	fetch.RegisterExtras()
 	dir := t.TempDir()
 
@@ -187,41 +188,57 @@ func TestHeliconBoundaryHalts(t *testing.T) {
 	}
 	defer e.Close()
 
-	g, err := loadCChainGenesis(e.snowCtx.NetworkID, e.snowCtx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	helicon := uint64(upgrade.GetConfig(avaconstants.FujiID).HeliconTime.Unix())
+	transition := helicon - heliconTransitionLead
+	if got, ok := transitionTimestamp(e.chainCfg); !ok || got != transition {
+		t.Fatalf("transitionTimestamp(fuji) = %d, %v; want %d, true", got, ok, transition)
+	}
+
 	for _, tc := range []struct {
-		time uint64
-		want bool
+		name       string
+		parentTime uint64
+		markers    bool
+		wantSAE    bool
+		wantErr    bool
 	}{
-		{helicon - heliconTransitionLead - 1, false}, // last block coreth surely owns
-		{helicon - heliconTransitionLead, true},      // transitionvm switch point
-		{helicon, true},
+		{"parent below the switch", transition - 1, false, false, false},
+		{"transition block itself is coreth's", transition - 1, true, false, true},
+		{"first block after the transition block", transition, true, true, false},
+		{"post-Helicon", helicon, true, true, false},
+		{"SAE height without markers", helicon, false, false, true},
 	} {
-		if got := postHeliconTransition(e.chainCfg, tc.time); got != tc.want {
-			t.Fatalf("postHeliconTransition(fuji, %d) = %v, want %v", tc.time, got, tc.want)
+		blk := saeTestBlock(t, e, 2, common.Hash{}, helicon, tc.markers)
+		got, err := e.saeExecuted(blk, tc.parentTime)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: saeExecuted err = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+		if err == nil && got != tc.wantSAE {
+			t.Fatalf("%s: saeExecuted = %v, want %v", tc.name, got, tc.wantSAE)
 		}
 	}
 
-	blk := types.NewBlockWithHeader(&types.Header{
-		ParentHash: g.ToBlock().Hash(),
-		Number:     big.NewInt(1),
-		Root:       e.genesisRoot,
-		GasLimit:   8_000_000,
-		Time:       helicon,
-		Difficulty: big.NewInt(1),
-	})
-	raw, err := rlp.EncodeToBytes(blk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := e.executeRaw(1, raw); !errors.Is(err, errHelicon) {
-		t.Fatalf("executeRaw at HeliconTime: got %v, want errHelicon", err)
-	}
-	if e.headNum != 0 {
-		t.Fatalf("head advanced to %d across the boundary", e.headNum)
+	// The real Fuji boundary, read off the network 2026-07-29 (block
+	// timestamps and settledHeight presence via the public RPC):
+	//
+	//	57,403,045  t=1785250767  no markers
+	//	57,403,046  t=1785250790  no markers   <- transition block, t == HeliconTime-10 exactly
+	//	57,403,047  t=1785250806  markers      <- first SAE block, settles 57,403,046
+	//
+	// so the split lands where the parent-timestamp rule puts it.
+	for _, tc := range []struct {
+		num        uint64
+		parentTime uint64
+		markers    bool
+		wantSAE    bool
+	}{
+		{57_403_046, 1_785_250_767, false, false},
+		{57_403_047, 1_785_250_790, true, true},
+	} {
+		blk := saeTestBlock(t, e, tc.num, common.Hash{}, tc.parentTime+16, tc.markers)
+		got, err := e.saeExecuted(blk, tc.parentTime)
+		if err != nil || got != tc.wantSAE {
+			t.Fatalf("fuji block %d: saeExecuted = %v, %v; want %v, nil", tc.num, got, err, tc.wantSAE)
+		}
 	}
 
 	mainCtx, err := snowContextFor(avaconstants.MainnetID)
@@ -232,7 +249,11 @@ func TestHeliconBoundaryHalts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if postHeliconTransition(mg.Config, helicon) {
-		t.Fatal("mainnet must have no scheduled Helicon activation")
+	// Mainnet is "unscheduled" as a year-9999 activation time rather than a
+	// nil one, so the guard is inert instead of absent.
+	me := &Executor{chainCfg: mg.Config, ring: e.ring}
+	blk := saeTestBlock(t, e, 2, common.Hash{}, helicon, false)
+	if sae, err := me.saeExecuted(blk, helicon); err != nil || sae {
+		t.Fatalf("mainnet at Fuji's Helicon time: sae=%v err=%v, want false/nil", sae, err)
 	}
 }

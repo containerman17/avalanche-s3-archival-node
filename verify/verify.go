@@ -193,6 +193,14 @@ func (v *Verifier) verifyState(e *state.Epoch) error {
 		if hdr.ParentHash != v.parentHash {
 			return fmt.Errorf("header chain broken at block %d: parent hash %x, want %x", n, hdr.ParentHash, v.parentHash)
 		}
+		if exec.HasSettledMarkers(&hdr) {
+			// Post-Helicon (ACP-194): header.Root is the post-execution
+			// root of the block this one SETTLES, and receiptsRoot covers
+			// the concatenated receipts of the whole settled range, so
+			// neither of this engine's per-block identities holds. Fail
+			// with the reason rather than reporting a root mismatch.
+			return fmt.Errorf("block %d is post-Helicon (SAE): the no-execution verifier still checks per-block roots and receipts, which ACP-194 moved to settlement; it needs the settled-root ring and the merged receipt range", n)
+		}
 		hdrHash := hdr.Hash()
 
 		if dOK && dBlk == n {

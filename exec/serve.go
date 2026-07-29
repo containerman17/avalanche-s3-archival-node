@@ -33,6 +33,13 @@ var ParseEthBlock = parseEthBlock
 // the log backfill produces byte-identical records.
 var EncodeLogsFrame = encodeLogsFrame
 
+// HasSettledMarkers reports whether a header carries the ACP-194
+// settlement markers, i.e. whether it was built by the SAE VM. Read-side
+// consumers need it because every per-block header invariant changes above
+// the boundary (header.Root belongs to the settled block, receiptsRoot
+// covers the whole settled range).
+var HasSettledMarkers = hasSettledMarkers
+
 // NewChainContext exposes the executor's headers-log-backed ChainContext so
 // BLOCKHASH inside historical eth_call resolves real hashes. Not
 // goroutine-safe (bucketLog LRU state): callers serialize.
