@@ -14,7 +14,23 @@ import (
 // the staging sidecars) enabling the *ByHash methods. The block-body
 // methods themselves ride on the EnableTxAPIs container source.
 func (s *Server) EnableBlockAPIs(hashToHeight map[common.Hash]uint64) {
-	s.hashIdx = hashToHeight
+	s.hashIdx = &hashIndex{m: hashToHeight}
+}
+
+// AddBlockHash extends the block-hash index as the follower accepts blocks
+// (serve --follow). No-op before EnableBlockAPIs.
+func (s *Server) AddBlockHash(h common.Hash, n uint64) {
+	if s.hashIdx != nil {
+		s.hashIdx.add(h, n)
+	}
+}
+
+// BlockHashCount reports the index size (startup/status logging).
+func (s *Server) BlockHashCount() int {
+	if s.hashIdx == nil {
+		return 0
+	}
+	return s.hashIdx.len()
 }
 
 // blockAt fetches and parses the container at height n (must be <= head).
@@ -22,7 +38,7 @@ func (s *Server) blockAt(n uint64) (*types.Block, *rpcError) {
 	if s.blocks == nil || s.parse == nil {
 		return nil, &rpcError{Code: -32000, Message: "block source not available"}
 	}
-	if n > s.hist.Head() {
+	if n > s.acceptedHead() {
 		return nil, errInvalid("block %d beyond head %d", n, s.hist.Head())
 	}
 	// Below the floor the container is gone, not missing: name the floor like
@@ -62,7 +78,7 @@ func (s *Server) heightByHash(raw json.RawMessage) (uint64, bool, *rpcError) {
 	if s.hashIdx == nil {
 		return 0, false, &rpcError{Code: -32000, Message: "block hash index not available"}
 	}
-	n, ok := s.hashIdx[h]
+	n, ok := s.hashIdx.get(h)
 	if !ok {
 		// Same failure mode as tx-by-hash: the index starts at the floor, so
 		// an unknown hash on a pruned node may well be a real block below it.
@@ -144,11 +160,23 @@ func (s *Server) getBlockByNumber(params []json.RawMessage) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
+	// SAE label: `pending` is the last ACCEPTED container, which the tail
+	// serves even though the executor has not reached it yet. Every other
+	// caller of blockNumber wants pending == latest (state semantics).
+	if s.live != nil && isTag(params[0], "pending") {
+		n = s.acceptedHead()
+	}
 	blk, rerr := s.blockAt(n)
 	if rerr != nil {
 		return nil, rerr
 	}
 	return s.marshalBlock(blk, fullTxFlag(params, 1)), nil
+}
+
+// isTag reports whether a raw block-tag param is exactly the given tag.
+func isTag(raw json.RawMessage, tag string) bool {
+	var s string
+	return json.Unmarshal(raw, &s) == nil && s == tag
 }
 
 func (s *Server) getBlockByHash(params []json.RawMessage) (any, *rpcError) {

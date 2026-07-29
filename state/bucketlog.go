@@ -37,8 +37,12 @@ type bucketLog struct {
 	useCounter  uint64
 	bytes       uint64 // total payload bytes on disk (for progress logging)
 
-	// mu guards the pair map, its LRU state, and reads through pair file
-	// handles (eviction closes them, so ReadAt must stay under the lock).
+	// mu guards the pair map, its LRU state, reads through pair file
+	// handles (eviction closes them, so ReadAt must stay under the lock),
+	// AND the idx/maxBlock/bytes bookkeeping. The bookkeeping half matters
+	// only in serve --follow, where the RPC reads this log while the
+	// executor appends to it: an unlocked map read beside Append is a
+	// fatal concurrent map access, not a stale answer.
 	// Concurrent RPC readers contend only for the microsecond-scale pread;
 	// ponytail: per-pair refcounts if header reads ever top a profile.
 	mu sync.Mutex
@@ -148,11 +152,21 @@ func (l *bucketLog) rebuild(bucket uint64) error {
 }
 
 // pair returns the open file pair for bucket, LRU-closing over the cap.
-func (l *bucketLog) pair(bucket uint64) (*blPair, error) {
+// create=false is the READ path: a bucket whose files are gone (seal and fold
+// retire whole buckets behind the sealed/folded end) returns nil, nil so the
+// caller falls through to the epochs or the base file. It must never be
+// O_CREATE there, or a read would resurrect an empty data file where a
+// retirement just removed one, turning every later read of that range into an
+// EOF error and leaving a zero-length file for the next cook to trip over.
+func (l *bucketLog) pair(bucket uint64, create bool) (*blPair, error) {
 	l.useCounter++
 	if p, ok := l.pairs[bucket]; ok {
 		p.lastUse = l.useCounter
 		return p, nil
+	}
+	flags := os.O_RDWR
+	if create {
+		flags |= os.O_CREATE
 	}
 	for len(l.pairs) >= maxOpenPairs {
 		var (
@@ -168,11 +182,22 @@ func (l *bucketLog) pair(bucket uint64) (*blPair, error) {
 			return nil, err
 		}
 	}
-	data, err := os.OpenFile(filepath.Join(l.dir, l.dataName(bucket)), os.O_RDWR|os.O_CREATE, 0o644)
+	data, err := os.OpenFile(filepath.Join(l.dir, l.dataName(bucket)), flags, 0o644)
+	if os.IsNotExist(err) {
+		return nil, nil // retired bucket: not an error, just not here
+	}
 	if err != nil {
 		return nil, err
 	}
-	index, err := os.OpenFile(filepath.Join(l.dir, l.idxName(bucket)), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	idxFlags := os.O_WRONLY | os.O_APPEND
+	if create {
+		idxFlags |= os.O_CREATE
+	}
+	index, err := os.OpenFile(filepath.Join(l.dir, l.idxName(bucket)), idxFlags, 0o644)
+	if os.IsNotExist(err) {
+		data.Close()
+		return nil, nil
+	}
 	if err != nil {
 		data.Close()
 		return nil, err
@@ -218,6 +243,8 @@ func (p *blPair) flush() error {
 
 // Has reports whether block already has an indexed payload.
 func (l *bucketLog) Has(block uint64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	_, ok := l.idx[block]
 	return ok
 }
@@ -227,12 +254,12 @@ func (l *bucketLog) Has(block uint64) bool {
 // after a batch. Single writer by design; the lock exists for concurrent
 // readers.
 func (l *bucketLog) Append(block uint64, payload []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if _, ok := l.idx[block]; ok {
 		return nil
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	p, err := l.pair(block / BucketBlocks)
+	p, err := l.pair(block/BucketBlocks, true)
 	if err != nil {
 		return err
 	}
@@ -260,15 +287,21 @@ func (l *bucketLog) Append(block uint64, payload []byte) error {
 // Get returns a copy of block's payload. ok=false if not stored.
 // Goroutine-safe: the pair lock covers handle lookup and the pread.
 func (l *bucketLog) Get(block uint64) ([]byte, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	loc, ok := l.idx[block]
 	if !ok {
 		return nil, false, nil
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	p, err := l.pair(block / BucketBlocks)
+	p, err := l.pair(block/BucketBlocks, false)
 	if err != nil {
 		return nil, false, err
+	}
+	if p == nil {
+		// Bucket retired under us (a sibling seal or fold). The read is not
+		// answered from here; the epoch or base fallback takes it.
+		delete(l.idx, block)
+		return nil, false, nil
 	}
 	buf := make([]byte, loc.ln)
 	if _, err := p.data.ReadAt(buf, int64(loc.off)); err != nil {
@@ -278,10 +311,18 @@ func (l *bucketLog) Get(block uint64) ([]byte, bool, error) {
 }
 
 // Max returns the highest indexed block, ok=false if empty.
-func (l *bucketLog) Max() (uint64, bool) { return l.maxBlock, l.any }
+func (l *bucketLog) Max() (uint64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.maxBlock, l.any
+}
 
 // Bytes returns total payload bytes on disk.
-func (l *bucketLog) Bytes() uint64 { return l.bytes }
+func (l *bucketLog) Bytes() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.bytes
+}
 
 // Sync fsyncs every dirty open pair.
 func (l *bucketLog) Sync() error {

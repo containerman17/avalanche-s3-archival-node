@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	goatomic "sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
@@ -111,6 +112,11 @@ type Config struct {
 	// StopAt makes Run return cleanly after executing this height
 	// (fixed-corpus builds; staging above it is disposable). 0 = never.
 	StopAt uint64
+	// OnBlock, if set, is called on the executor goroutine right after each
+	// block's frontier is published: serve --follow uses it to advance the
+	// serving head and the block-hash index in lockstep with execution, so
+	// `latest` never names a height the frontier is not at. Must not block.
+	OnBlock func(num uint64, hash common.Hash)
 }
 
 // Executor replays Fuji C-Chain blocks against Firewood-backed frontier
@@ -139,6 +145,17 @@ type Executor struct {
 	ring *saeRing
 	sae  *saeExec
 
+	// readDB is an UNWRAPPED state.Database over the same Firewood triedb,
+	// used only by LiveState: it must not touch the executor's capture frame
+	// or read cache, and its libevm code/size caches are per-instance, so it
+	// is built once and shared by every RPC goroutine.
+	readDB ethstate.Database
+	// live is the last COMMITTED frontier, published after each block so RPC
+	// goroutines can read latest state without touching executor fields.
+	// Firewood keeps 128 revisions, so a root published here stays readable
+	// far longer than any request.
+	live goatomic.Pointer[liveHead]
+
 	// base is the limited-history floor file (nil on a full node). On a
 	// state-synced node it is where the Firewood frontier, the BLOCKHASH
 	// header window and the contract code below B all come from.
@@ -160,6 +177,13 @@ type Executor struct {
 	batchDirty     bool        // any non-empty block drained this batch
 	batchCount     int
 	batchBuf       []batchItem
+}
+
+// liveHead is one published frontier: the height and the state root Firewood
+// has a revision for.
+type liveHead struct {
+	num  uint64
+	root common.Hash
 }
 
 // batchItem is one block's buffered state-layer output. Appends are held
@@ -327,6 +351,7 @@ func New(cfg Config) (*Executor, error) {
 
 	inner := extstate.NewDatabaseWithNodeDB(memdb, tdb)
 	wrapDB := wrapDatabase(inner, cfg.Store, cfg.StateCacheBytes, cfg.VerifyCache)
+	readDB := extstate.NewDatabaseWithNodeDB(memdb, tdb)
 
 	fwBackend, ok := tdb.Backend().(*firewood.TrieDB)
 	if !ok {
@@ -348,6 +373,7 @@ func New(cfg Config) (*Executor, error) {
 		triedb:      tdb,
 		fwBackend:   fwBackend,
 		snowCtx:     snowCtx,
+		readDB:      readDB,
 		chainCtx:    chainContext{},
 		genesisRoot: genesisRoot,
 		genesisHash: g.ToBlock().Hash(),
@@ -373,6 +399,8 @@ func New(cfg Config) (*Executor, error) {
 		tdb.Close()
 		return nil, err
 	}
+
+	e.publishLive()
 
 	// Event-log capture starts wherever this build first executes; blocks
 	// below the marker are the backfill job's range. Write-once.
@@ -810,7 +838,60 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	}
 	e.headTime = blk.Time()
 	e.totalGas += blk.GasUsed()
+	// Mid-batch (--commit-every > 1) the head root has no Firewood revision
+	// yet, so the frontier only advances at batch boundaries. serve --follow
+	// pins CommitEvery=1, which makes that every block.
+	if !e.batchOpen {
+		e.publishLive()
+		if e.cfg.OnBlock != nil {
+			e.cfg.OnBlock(e.headNum, blk.Hash())
+		}
+	}
 	return nil
+}
+
+// publishLive republishes the committed frontier for LiveState readers.
+func (e *Executor) publishLive() {
+	e.live.Store(&liveHead{num: e.headNum, root: e.headRoot})
+}
+
+// LiveState opens a read-only StateDB over the executor's committed frontier
+// and returns the height it belongs to. This is how serve --follow answers
+// latest/pending state without waiting for cook: Firewood IS latest state, and
+// only this process may hold its handle.
+//
+// Race by construction: the executor may commit another block between the
+// publish and this call, so the answer is "the frontier at or just before the
+// reported height", exactly like any node's latest.
+func (e *Executor) LiveState() (*ethstate.StateDB, uint64, error) {
+	lh := e.live.Load()
+	if lh == nil {
+		return nil, 0, fmt.Errorf("executor frontier not published yet")
+	}
+	st, err := ethstate.New(lh.root, e.readDB, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("open frontier state at %d (root %x): %w", lh.num, lh.root, err)
+	}
+	return st, lh.num, nil
+}
+
+// LiveHead returns the height of the published frontier (0 before the first
+// publish).
+func (e *Executor) LiveHead() uint64 {
+	if lh := e.live.Load(); lh != nil {
+		return lh.num
+	}
+	return 0
+}
+
+// SettledHeight returns the last SAE-settled height. Below the Helicon
+// boundary settlement does not exist and the executed head IS the settled
+// head, which is what the safe/finalized labels report.
+func (e *Executor) SettledHeight() uint64 {
+	if e.sae != nil && e.sae.settledSeen {
+		return e.sae.settledHeight
+	}
+	return e.LiveHead()
 }
 
 // maybeFlush advances the durable watermark every flushEvery blocks. The

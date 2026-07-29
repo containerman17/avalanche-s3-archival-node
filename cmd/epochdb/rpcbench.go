@@ -61,7 +61,7 @@ func rpcBenchMain(args []string) {
 		log.Fatalf("rpc-bench: %v", err)
 	}
 	defer fr.Close()
-	blocks := sealedBlocks{epochs: hist.Epochs(), reader: fr}
+	blocks := sealedBlocks{epochs: hist.Epochs(), blocks: fr}
 	head := hist.Head()
 	// Logs/receipts are stored-only: bench within the sealed range (the
 	// raw tail above it errors by design).

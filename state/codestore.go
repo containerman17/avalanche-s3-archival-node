@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/ava-labs/libevm/common"
 )
@@ -20,6 +21,11 @@ import (
 // at startup; a torn tail (partial record) is truncated away. Put dedups
 // by hash, which also makes replayed blocks free.
 type codeStore struct {
+	// mu guards idx/off/dirty. serve --follow reads code.log (eth_getCode,
+	// eth_call) from RPC goroutines while the executor deploys new blobs
+	// into the same store: without this the map access is fatal, not stale.
+	// Held for map work only; the pread/pwrite are safe on their own.
+	mu    sync.Mutex
 	f     *os.File
 	off   uint64 // append offset
 	idx   map[common.Hash]recLoc
@@ -71,6 +77,8 @@ func uvarintLen(v uint64) int {
 
 // Put appends a blob unless its hash is already stored.
 func (c *codeStore) Put(hash common.Hash, blob []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, ok := c.idx[hash]; ok {
 		return nil
 	}
@@ -91,7 +99,9 @@ func (c *codeStore) Put(hash common.Hash, blob []byte) error {
 
 // Get returns a copy of the blob for hash, ok=false if unknown.
 func (c *codeStore) Get(hash common.Hash) ([]byte, bool, error) {
+	c.mu.Lock()
 	loc, ok := c.idx[hash]
+	c.mu.Unlock()
 	if !ok {
 		return nil, false, nil
 	}
@@ -103,13 +113,21 @@ func (c *codeStore) Get(hash common.Hash) ([]byte, bool, error) {
 }
 
 func (c *codeStore) Has(hash common.Hash) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	_, ok := c.idx[hash]
 	return ok
 }
 
-func (c *codeStore) Count() int { return len(c.idx) }
+func (c *codeStore) Count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.idx)
+}
 
 func (c *codeStore) Sync() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if !c.dirty || c.f == nil { // nil file = absent code.log (read-only, empty)
 		return nil
 	}

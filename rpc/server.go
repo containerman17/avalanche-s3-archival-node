@@ -49,8 +49,60 @@ type Server struct {
 	filtersOnce sync.Once
 	filters     *filterReg
 
-	// block APIs: eth block hash -> height, wired by EnableBlockAPIs.
-	hashIdx map[common.Hash]uint64
+	// block APIs: eth block hash -> height, wired by EnableBlockAPIs and
+	// grown per accepted block by serve --follow.
+	hashIdx *hashIndex
+
+	// live is the in-process executor (serve --follow); nil on a static
+	// serve, where every read is historical.
+	live Live
+}
+
+// Live is the in-process executor view that serve --follow wires in. It is
+// what makes latest reads answer at chain pace: the executor owns the
+// exclusive Firewood handle, so nothing outside this process can serve the
+// frontier.
+type Live interface {
+	// LiveState opens a read-only StateDB over the committed frontier and
+	// returns the height it belongs to.
+	LiveState() (*ethstate.StateDB, uint64, error)
+	// LiveHead is the last EXECUTED height: the `latest` label.
+	LiveHead() uint64
+	// AcceptedHead is the last height the follower accepted (>= LiveHead):
+	// the `pending` label.
+	AcceptedHead() uint64
+	// SettledHeight is the last SAE-settled height: the `safe`/`finalized`
+	// labels. Below the Helicon boundary it equals LiveHead.
+	SettledHeight() uint64
+}
+
+// EnableLive wires the executor frontier into the server (serve --follow).
+func (s *Server) EnableLive(l Live) { s.live = l }
+
+// hashIndex is the eth block hash -> height map. serve --follow appends to it
+// as the executor advances, so it is locked; a static serve builds it once.
+type hashIndex struct {
+	mu sync.RWMutex
+	m  map[common.Hash]uint64
+}
+
+func (h *hashIndex) get(k common.Hash) (uint64, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	n, ok := h.m[k]
+	return n, ok
+}
+
+func (h *hashIndex) add(k common.Hash, n uint64) {
+	h.mu.Lock()
+	h.m[k] = n
+	h.mu.Unlock()
+}
+
+func (h *hashIndex) len() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.m)
 }
 
 // HistoryChainContext serves BLOCKHASH headers through the epochs-aware
@@ -189,7 +241,20 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 	case "web3_clientVersion":
 		return ClientVersion, nil
 	case "eth_syncing":
-		return false, nil // fixed complete corpus
+		// Following: report the geth-shaped object whenever execution trails
+		// what the follower already accepted. A node 60M blocks behind the tip
+		// answering `false` is the lie that hides a broken pipeline.
+		if s.live != nil {
+			cur, acc := s.live.LiveHead(), s.live.AcceptedHead()
+			if acc > cur+1 {
+				return map[string]string{
+					"startingBlock": hexutil.EncodeUint64(0),
+					"currentBlock":  hexutil.EncodeUint64(cur),
+					"highestBlock":  hexutil.EncodeUint64(acc),
+				}, nil
+			}
+		}
+		return false, nil // caught up (or a fixed complete corpus)
 	case "net_listening":
 		return false, nil // no p2p listener on the read server
 	case "eth_accounts":
@@ -274,6 +339,17 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 }
 
 // blockNumber resolves a block tag parameter to a height within coverage.
+//
+// SAE label mapping (ACP-194), which collapses to one height below the Helicon
+// boundary because settlement does not exist there:
+//
+//	pending         = last accepted (staged, not executed here)
+//	latest          = last executed
+//	safe, finalized = last settled
+//
+// `pending` deliberately resolves to the LAST EXECUTED height for state reads
+// (there is no mempool, so pending state is latest state); the pending BLOCK
+// itself is served by getBlockByNumber, which handles the tag before this.
 func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 	head := s.hist.Head()
 	if raw == nil {
@@ -284,7 +360,12 @@ func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 		return 0, errInvalid("bad block tag: %v", err)
 	}
 	switch tag {
-	case "latest", "pending", "safe", "finalized", "":
+	case "latest", "pending", "":
+		return head, nil
+	case "safe", "finalized":
+		if s.live != nil {
+			return min(s.live.SettledHeight(), head), nil
+		}
 		return head, nil
 	case "earliest":
 		return 0, nil
@@ -293,13 +374,45 @@ func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 	if err != nil {
 		return 0, errInvalid("bad block number %q: %v", tag, err)
 	}
-	if n > head {
+	if n > s.acceptedHead() {
 		return 0, errInvalid("block %d beyond head %d", n, head)
 	}
 	return n, nil
 }
 
+// acceptedHead is the highest height any tail source can answer for: the
+// follower's accepted height when following, the serving head otherwise.
+func (s *Server) acceptedHead() uint64 {
+	head := s.hist.Head()
+	if s.live == nil {
+		return head
+	}
+	return max(head, s.live.AcceptedHead())
+}
+
+// stateAt opens the state at height n. Three bands when following:
+//
+//	n > executed        not executed here yet (staged, or a backfill hole): error.
+//	n in [head, exec]   the LIVE Firewood frontier: latest/pending answer at
+//	                    chain pace with no cook wait. The band is one advance
+//	                    tick wide, which is the same head race every node has.
+//	n < head            the historical descent, which refuses heights the cook
+//	                    has not reached rather than answering with a pre-gap value.
 func (s *Server) stateAt(n uint64) (*ethstate.StateDB, *rpcError) {
+	if s.live != nil {
+		executed := s.live.LiveHead()
+		switch {
+		case n > executed:
+			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
+				"state at block %d is not executed yet (executed head %d)", n, executed)}
+		case n >= s.hist.Head():
+			st, _, err := s.live.LiveState()
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: err.Error()}
+			}
+			return st, nil
+		}
+	}
 	st, err := ethstate.New(common.Hash{}, s.hist.StateAt(n), nil)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}

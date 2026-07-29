@@ -318,7 +318,7 @@ func benchTxMain(args []string) {
 		log.Fatalf("ab-bench-tx: open epochs: %v", err)
 	}
 	defer epochs.Close()
-	reader := sealedBlocks{epochs: epochs, reader: fr} // sample sealed + raw
+	reader := sealedBlocks{epochs: epochs, blocks: fr} // sample sealed + raw
 
 	// Replayed head from the local server, staging ceiling from the bucket files.
 	res, rerr := rpcCall(*local, "eth_blockNumber", nil, 2)

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/ava-labs/libevm/common"
@@ -52,13 +54,28 @@ type baseState interface {
 // goroutine-safe: everything here is immutable after open and the store's
 // bucketLogs are internally locked.
 type History struct {
+	dir     string
 	store   *Store
 	genesis types.GenesisAlloc
-	base    baseState       // nil on a full node
-	floor   uint64          // base.Block(); 0 on a full node
+	base    baseState // nil on a full node
+	floor   uint64    // base.Block(); 0 on a full node
+	epochs  *EpochSet // sealed epochs (may be empty)
+
+	// head is the highest block the SERVER answers for. On a static node it
+	// equals stateHead; serve --follow advances it to the executor's head
+	// (blocks, headers, receipts and logs all come from live sources) and
+	// leaves stateHead trailing by at most one cook cadence.
+	head atomic.Uint64
+	// stateHead is the highest block the historical DESCENT can answer:
+	// the cooked buckets plus sealed epochs. search refuses above it rather
+	// than silently descending past uncooked writes, which would return a
+	// stale value for a key written in the gap.
+	stateHead atomic.Uint64
+
+	// mu guards buckets and deletes, which Refresh swaps when cook lands new
+	// sorted files. Everything else here is immutable after open.
+	mu      sync.RWMutex
 	buckets []*sortedBucket // ascending bucket number
-	epochs  *EpochSet       // sealed epochs (may be empty)
-	head    uint64          // highest readable block
 
 	// deletes: account key -> ascending blocks of explicit account-delete
 	// records (SELFDESTRUCT) ABOVE the floor. Built by one sequential scan
@@ -77,6 +94,7 @@ type sortedBucket struct {
 	mm     []byte
 	n      int
 	wl     *os.File // writelog_NNNNN.log, values live here
+	cooked uint64   // cookedThrough from the file header (Refresh's change test)
 }
 
 // openBase is the base-file opener, indirected so the floor plumbing can be
@@ -94,40 +112,25 @@ var openBase = func(dir string) (baseState, bool, error) {
 // used as the below-first-capture floor on a full node; when dir carries a
 // base file, that file is the floor instead and the alloc is unused.
 func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, error) {
-	h := &History{store: store, genesis: alloc}
+	h := &History{dir: dir, store: store, genesis: alloc}
+	stateHead := uint64(0)
 	if base, ok, err := openBase(dir); err != nil {
 		return nil, fmt.Errorf("open base file: %w", err)
 	} else if ok {
-		h.base, h.floor, h.head = base, base.Block(), base.Block()
+		h.base, h.floor, stateHead = base, base.Block(), base.Block()
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	var err error
+	if h.buckets, stateHead, err = openSortedBuckets(dir, stateHead); err != nil {
 		h.Close()
 		return nil, err
 	}
-	for _, e := range entries {
-		var bucket uint64
-		if _, err := fmt.Sscanf(e.Name(), "sorted_%d.idx", &bucket); err != nil {
-			continue
-		}
-		sb, cookedThrough, err := openSortedBucket(dir, bucket)
-		if err != nil {
-			h.Close()
-			return nil, fmt.Errorf("open sorted bucket %05d: %w", bucket, err)
-		}
-		h.buckets = append(h.buckets, sb)
-		if cookedThrough > h.head {
-			h.head = cookedThrough
-		}
-	}
-	sort.Slice(h.buckets, func(i, j int) bool { return h.buckets[i].bucket < h.buckets[j].bucket })
 	if h.epochs, err = OpenEpochSet(dir); err != nil {
 		h.Close()
 		return nil, err
 	}
 	h.epochs.SetFloor(h.floor)
-	if end, ok := h.epochs.SealedEnd(); ok && end > h.head {
-		h.head = end
+	if end, ok := h.epochs.SealedEnd(); ok && end > stateHead {
+		stateHead = end
 	}
 	if len(h.buckets) == 0 && len(h.epochs.Epochs) == 0 && h.base == nil {
 		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets, epochs or base file in %s (run epochdb cook-index or seal)", dir)
@@ -145,7 +148,50 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 			h.deletes[string(key)] = append(h.deletes[string(key)], blk)
 		})
 	}
-	for _, b := range h.buckets {
+	h.addBucketDeletes(h.deletes, h.buckets)
+	h.stateHead.Store(stateHead)
+	h.head.Store(stateHead)
+	return h, nil
+}
+
+// openSortedBuckets mmaps every sorted_NNNNN.idx in dir, ascending, and
+// returns the highest cooked height seen (never below floorHead).
+func openSortedBuckets(dir string, floorHead uint64) ([]*sortedBucket, uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, err
+	}
+	var out []*sortedBucket
+	for _, e := range entries {
+		var bucket uint64
+		if _, err := fmt.Sscanf(e.Name(), "sorted_%d.idx", &bucket); err != nil {
+			continue
+		}
+		sb, cookedThrough, err := openSortedBucket(dir, bucket)
+		if err != nil {
+			for _, b := range out {
+				b.close()
+			}
+			return nil, 0, fmt.Errorf("open sorted bucket %05d: %w", bucket, err)
+		}
+		out = append(out, sb)
+		if cookedThrough > floorHead {
+			floorHead = cookedThrough
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].bucket < out[j].bucket })
+	return out, floorHead, nil
+}
+
+// addBucketDeletes folds every account-delete row of the given buckets into
+// dst, keeping each key's block list sorted and deduped. Raw buckets STILL
+// overlap sealed epochs even though seal always deletes fully-sealed raws
+// (buckets are 100k blocks, epochs cut on tx count), and a re-cooked tip
+// bucket is a superset of its previous cook, so dedupe is load-bearing both
+// at open and on Refresh.
+func (h *History) addBucketDeletes(dst map[string][]uint64, buckets []*sortedBucket) {
+	touched := make(map[string]bool)
+	for _, b := range buckets {
 		if (b.bucket+1)*BucketBlocks <= h.floor {
 			continue
 		}
@@ -154,15 +200,21 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 			blk := binary.BigEndian.Uint64(r[53:61])
 			if r[0] == recKindAccount && binary.BigEndian.Uint32(r[69:73]) == 0 && blk > h.floor {
 				k := string(r[:sortedKeySize])
-				h.deletes[k] = append(h.deletes[k], blk)
+				if !touched[k] {
+					// Refresh works on a shallow copy of the map, so the first
+					// touch must clone: append + the dedupe below rewrite the
+					// backing array, which a reader may still be holding from
+					// the previous map.
+					dst[k] = append(append([]uint64(nil), dst[k]...), blk)
+					touched[k] = true
+					continue
+				}
+				dst[k] = append(dst[k], blk)
 			}
 		}
 	}
-	// Raw buckets STILL overlap sealed epochs even though seal always
-	// deletes fully-sealed raws: buckets are 100k blocks and epochs cut on
-	// tx count, so the one bucket straddling the sealed end keeps rows the
-	// last epoch already carries. Sort + dedupe each key's delete blocks.
-	for k, ds := range h.deletes {
+	for k := range touched {
+		ds := dst[k]
 		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
 		out := ds[:0]
 		for i, d := range ds {
@@ -170,9 +222,103 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 				out = append(out, d)
 			}
 		}
-		h.deletes[k] = out
+		dst[k] = out
 	}
-	return h, nil
+}
+
+// Refresh re-opens the sorted buckets whose cook advanced (and any new one),
+// then republishes stateHead. serve --follow calls it after each in-process
+// cook so the historical descent chases the executor; a static serve never
+// calls it. Safe beside live readers: the swap happens under the write lock
+// and a replaced mmap is unmapped only after no reader can hold it.
+//
+// ponytail: re-scans a changed bucket's rows whole to merge its deletes. A
+// bucket is 100k blocks, so the cost is bounded by the tip bucket, not by the
+// corpus; make it incremental only if a profile ever blames it.
+func (h *History) Refresh() error {
+	h.mu.RLock()
+	cur := make(map[uint64]uint64, len(h.buckets))
+	for _, b := range h.buckets {
+		cur[b.bucket] = b.cooked
+	}
+	h.mu.RUnlock()
+
+	entries, err := os.ReadDir(h.dir)
+	if err != nil {
+		return err
+	}
+	var changed []uint64
+	for _, e := range entries {
+		var bucket uint64
+		if _, err := fmt.Sscanf(e.Name(), "sorted_%d.idx", &bucket); err != nil {
+			continue
+		}
+		cooked, _, ok := readSortedHeader(filepath.Join(h.dir, sortedName(bucket)))
+		if !ok {
+			continue
+		}
+		if old, have := cur[bucket]; !have || cooked > old {
+			changed = append(changed, bucket)
+		}
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+
+	fresh := make([]*sortedBucket, 0, len(changed))
+	for _, bucket := range changed {
+		sb, _, err := openSortedBucket(h.dir, bucket)
+		if err != nil {
+			for _, b := range fresh {
+				b.close()
+			}
+			return fmt.Errorf("refresh sorted bucket %05d: %w", bucket, err)
+		}
+		fresh = append(fresh, sb)
+	}
+
+	h.mu.Lock()
+	replaced := make([]*sortedBucket, 0, len(fresh))
+	byBucket := make(map[uint64]*sortedBucket, len(h.buckets)+len(fresh))
+	for _, b := range h.buckets {
+		byBucket[b.bucket] = b
+	}
+	for _, b := range fresh {
+		if old, ok := byBucket[b.bucket]; ok {
+			replaced = append(replaced, old)
+		}
+		byBucket[b.bucket] = b
+	}
+	list := make([]*sortedBucket, 0, len(byBucket))
+	stateHead := h.floor
+	for _, b := range byBucket {
+		list = append(list, b)
+		if b.cooked > stateHead {
+			stateHead = b.cooked
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].bucket < list[j].bucket })
+	deletes := make(map[string][]uint64, len(h.deletes))
+	for k, v := range h.deletes {
+		deletes[k] = v
+	}
+	h.addBucketDeletes(deletes, fresh)
+	h.buckets, h.deletes = list, deletes
+	h.mu.Unlock()
+
+	// Readers hold the read lock for the whole descent, so the write lock
+	// above already drained them: nothing can still be inside a replaced mmap.
+	for _, b := range replaced {
+		b.close()
+	}
+	if end, ok := h.epochs.SealedEnd(); ok && end > stateHead {
+		stateHead = end
+	}
+	h.stateHead.Store(stateHead)
+	if h.head.Load() < stateHead {
+		h.head.Store(stateHead)
+	}
+	return nil
 }
 
 // Epochs exposes the sealed epoch set (shared with the serve wiring for
@@ -283,6 +429,7 @@ func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) 
 		mm:     mm,
 		n:      (size - sortedHdrSize) / sortedRecSize,
 		wl:     wl,
+		cooked: cookedThrough,
 	}, cookedThrough, nil
 }
 
@@ -307,8 +454,24 @@ func (h *History) Close() {
 	}
 }
 
-// Head returns the highest block the cooked index covers.
-func (h *History) Head() uint64 { return h.head }
+// Head returns the highest block this node serves. Static serve: the cooked
+// index. serve --follow: the executor's head, which the tail sources (headers,
+// receipts, logs, containers) already answer for.
+func (h *History) Head() uint64 { return h.head.Load() }
+
+// SetHead publishes a new serving head (serve --follow, after the executor
+// advanced and the block-hash index caught up). Never moves below stateHead.
+func (h *History) SetHead(n uint64) {
+	if n < h.stateHead.Load() {
+		return
+	}
+	h.head.Store(n)
+}
+
+// StateHead returns the highest block the historical descent can answer:
+// heads above it need the executor's live frontier (serve --follow) and are
+// refused by the descent.
+func (h *History) StateHead() uint64 { return h.stateHead.Load() }
 
 // Floor returns the limited-history floor B: nothing below it is served.
 // 0 on a full node.
@@ -390,7 +553,16 @@ func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bo
 	if err := h.epochs.RequireCovered(n); err != nil {
 		return nil, 0, false, err
 	}
+	// Above the cooked watermark the descent would skip straight past the
+	// uncooked writes and answer with an older value. serve --follow answers
+	// the frontier heights from the executor instead; everything in between is
+	// cook lag and says so.
+	if sh := h.stateHead.Load(); n > sh {
+		return nil, 0, false, fmt.Errorf("state at block %d is not indexed yet (cooked through %d, cook lag): retry, or read at latest", n, sh)
+	}
+	h.mu.RLock()
 	val, blk, found, err = h.searchAboveFloor(key, n)
+	h.mu.RUnlock()
 	if err != nil || found {
 		return val, blk, found, err
 	}
@@ -462,7 +634,9 @@ func (h *History) searchAboveFloor(key []byte, n uint64) (val []byte, blk uint64
 // lastAccountDelete finds the largest block <= n where addr's account was
 // deleted (map lookup over the open-time delete index).
 func (h *History) lastAccountDelete(key []byte, n uint64) (uint64, bool) {
+	h.mu.RLock()
 	ds := h.deletes[string(key)]
+	h.mu.RUnlock()
 	i := sort.Search(len(ds), func(i int) bool { return ds[i] > n }) - 1
 	if i < 0 {
 		return 0, false
@@ -620,6 +794,8 @@ func (h *History) CodeAt(addr common.Address, n uint64) ([]byte, error) {
 // with a zero slot, or kind 's' with the slot key. Samples raw cooked
 // buckets when present, sealed epochs otherwise (raw-free node).
 func (h *History) SampleRecord(r *rand.Rand) (kind byte, addr common.Address, slot common.Hash, block uint64, ok bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	total := 0
 	for _, b := range h.buckets {
 		total += b.n

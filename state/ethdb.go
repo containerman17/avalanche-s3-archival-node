@@ -175,6 +175,12 @@ func (b *ethKVBatch) Replay(w ethdb.KeyValueWriter) error {
 func (a *ethKV) NewIterator(prefix, start []byte) ethdb.Iterator {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// The two store locks, not a.mu, are what makes this safe beside a live
+	// executor (a.mu is per-EthDB()-instance, and serve --follow holds two).
+	a.s.misc.mu.Lock()
+	defer a.s.misc.mu.Unlock()
+	a.s.code.mu.Lock()
+	defer a.s.code.mu.Unlock()
 	lower := string(prefix) + string(start)
 	var keys []string
 	for k := range a.s.misc.m {

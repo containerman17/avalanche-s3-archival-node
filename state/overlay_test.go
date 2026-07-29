@@ -475,3 +475,76 @@ func TestCookIdempotentAndTipRecook(t *testing.T) {
 		t.Fatalf("after recook at 5: %x", got)
 	}
 }
+
+// TestHistoryRefreshChasesCook is the serve --follow contract in miniature:
+// the descent refuses heights the cook has not reached (instead of answering
+// with a pre-gap value), and Refresh picks up the re-cooked bucket, its new
+// account-delete records, and the new stateHead.
+func TestHistoryRefreshChasesCook(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	addr := common.HexToAddress("0x4444444444444444444444444444444444444444")
+	slot := common.HexToHash("0x01")
+	old, fresh := []byte{0x11}, []byte{0x22}
+
+	if err := st.AppendWrites(10, frStorage(nil, addr, slot, old)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FlushAndSetExecHead(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := CookIndex(dir); err != nil {
+		t.Fatal(err)
+	}
+	h, err := OpenHistory(dir, st, types.GenesisAlloc{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if h.StateHead() != 100 {
+		t.Fatalf("stateHead=%d want 100", h.StateHead())
+	}
+
+	// The executor moves on; nothing is cooked yet.
+	if err := st.AppendWrites(200, frStorage(nil, addr, slot, fresh)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendWrites(210, frAccount(nil, addr, nil)); err != nil { // SELFDESTRUCT
+		t.Fatal(err)
+	}
+	if err := st.FlushAndSetExecHead(300); err != nil {
+		t.Fatal(err)
+	}
+	h.SetHead(300) // serving head follows the executor, stateHead does not
+
+	// Reading in the gap must fail loudly, never answer with the block-10 value.
+	if _, err := h.StorageAt(addr, slot[:], 250); err == nil {
+		t.Fatal("read above the cooked watermark answered instead of erroring")
+	}
+	if got, err := h.StorageAt(addr, slot[:], 50); err != nil || !bytes.Equal(got, old) {
+		t.Fatalf("read below the watermark: got %x err %v", got, err)
+	}
+
+	// Cook catches up.
+	if err := CookIndex(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if h.StateHead() != 300 {
+		t.Fatalf("stateHead after refresh=%d want 300", h.StateHead())
+	}
+	if got, err := h.StorageAt(addr, slot[:], 205); err != nil || !bytes.Equal(got, fresh) {
+		t.Fatalf("post-refresh read at 205: got %x err %v", got, err)
+	}
+	// The delete at 210 must have landed in the refreshed delete index.
+	if got, err := h.StorageAt(addr, slot[:], 250); err != nil || got != nil {
+		t.Fatalf("post-destruct storage: got %x err %v, want nil", got, err)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // miscStore holds the handful of non-code rawdb keys (genesis block rows,
@@ -20,6 +21,9 @@ import (
 // Puts of an identical value are skipped, so replayed blocks and repeated
 // genesis writes don't grow the file. Torn tails are truncated at startup.
 type miscStore struct {
+	// mu guards m/dirty: serve --follow reads rawdb keys through this map
+	// from RPC goroutines while the executor writes them.
+	mu    sync.Mutex
 	f     *os.File
 	m     map[string][]byte
 	dirty bool
@@ -86,6 +90,8 @@ func readMiscRecord(r *bufio.Reader, pos uint64) (end uint64, op byte, k, v []by
 }
 
 func (s *miscStore) Get(key []byte) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	v, ok := s.m[string(key)]
 	if !ok {
 		return nil, false
@@ -96,6 +102,8 @@ func (s *miscStore) Get(key []byte) ([]byte, bool) {
 }
 
 func (s *miscStore) Put(key, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if cur, ok := s.m[string(key)]; ok && bytes.Equal(cur, value) {
 		return nil
 	}
@@ -116,6 +124,8 @@ func (s *miscStore) Put(key, value []byte) error {
 }
 
 func (s *miscStore) Delete(key []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.m[string(key)]; !ok {
 		return nil
 	}
@@ -132,6 +142,8 @@ func (s *miscStore) Delete(key []byte) error {
 }
 
 func (s *miscStore) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.dirty || s.f == nil { // nil file = absent misc.log (read-only, empty)
 		return nil
 	}

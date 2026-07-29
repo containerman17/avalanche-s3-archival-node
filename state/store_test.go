@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -178,5 +179,59 @@ func TestMiscStoreReplayAndEthDBRouting(t *testing.T) {
 	}
 	if h, ok := s.ExecHead(); !ok || h != 42 {
 		t.Fatalf("exechead: got %d ok=%v", h, ok)
+	}
+}
+
+// TestLiveStoreConcurrentReadWrite pins the serve --follow sharing model: the
+// executor appends to the SAME Store the RPC reads from. Before the bucketLog
+// and code/misc locks this was a fatal concurrent map access, not a stale read.
+// Run with -race.
+func TestLiveStoreConcurrentReadWrite(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	const n = 2000
+	kv := st.EthDB()
+	done := make(chan struct{})
+	go func() { // the executor
+		defer close(done)
+		for i := uint64(1); i <= n; i++ {
+			if err := st.AppendHeader(i, []byte{byte(i), byte(i >> 8)}); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := st.AppendRcpt(i, []byte{byte(i)}); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := st.PutCode(common.BigToHash(new(big.Int).SetUint64(i)), []byte{byte(i)}); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	for { // the RPC
+		select {
+		case <-done:
+			if max, ok := st.HeadersMax(); !ok || max != n {
+				t.Fatalf("headers max=%d ok=%v", max, ok)
+			}
+			return
+		default:
+		}
+		for i := uint64(1); i <= n; i += 97 {
+			if _, _, err := st.HeaderRLP(i); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := st.RcptRecord(i); err != nil {
+				t.Fatal(err)
+			}
+			kv.Get(append([]byte{'c'}, common.BigToHash(new(big.Int).SetUint64(i)).Bytes()...))
+		}
+		st.CodeCount()
 	}
 }

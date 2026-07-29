@@ -160,7 +160,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
-	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650]")
+	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650] [--follow [--vdr-sources <p-chain rpcs>]]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300] [--floor N]")
@@ -364,6 +364,13 @@ func serveMain(args []string) {
 	dataDir := fs.String("data", "./data", "shared data directory")
 	port := fs.Int("port", 9650, "HTTP listen port")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	fs.Bool("follow", false, "ONE process at the tip: follow the chain, execute, and serve continuously (no restarts)")
+	// --follow takes fetch and executor flags too, so it registers the rest of
+	// them on this flag set and does the parsing itself.
+	if hasFlag(args, "follow") {
+		serveFollowMain(args, fs, dataDir, port, network)
+		return
+	}
 	fs.Parse(args)
 
 	store, err := state.OpenReadOnly(*dataDir)
@@ -397,7 +404,7 @@ func serveMain(args []string) {
 			log.Fatalf("epochdb: open staging reader: %v", err)
 		}
 		defer reader.Close()
-		blocks := sealedBlocks{epochs: epochs, reader: reader}
+		blocks := sealedBlocks{epochs: epochs, blocks: reader}
 		srv.EnableTxAPIs(state.CombinedTxIndex{Raw: rawIdx, Epochs: epochs}, blocks, exec.ParseEthBlock)
 		var rawTx uint64
 		if rawIdx != nil {
@@ -452,14 +459,29 @@ func serveMain(args []string) {
 // the fallback for the unsealed tail.
 type sealedBlocks struct {
 	epochs *state.EpochSet
-	reader *fetch.Reader
+	blocks rpc.BlockSource // fetch.Reader (static) or the live fetch.Store (follow)
 }
 
 func (s sealedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
 	if raw, ok, err := s.epochs.GetByHeight(n); ok || err != nil {
 		return raw, ok, err
 	}
-	return s.reader.GetByHeight(n)
+	return s.blocks.GetByHeight(n)
+}
+
+// hasFlag reports whether name appears as a flag in args, in any of Go's
+// accepted spellings (-name, --name, -name=v), before the "--" terminator.
+func hasFlag(args []string, name string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		f := strings.TrimLeft(a, "-")
+		if f == name || strings.HasPrefix(f, name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 // execMain replays blocks ascending from genesis out of the (possibly
