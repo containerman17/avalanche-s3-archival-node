@@ -113,7 +113,7 @@ type Config struct {
 	// (fixed-corpus builds; staging above it is disposable). 0 = never.
 	StopAt uint64
 	// OnBlock, if set, is called on the executor goroutine right after each
-	// block's frontier is published: serve --follow uses it to advance the
+	// block's frontier is published: serve uses it to advance the
 	// serving head and the block-hash index in lockstep with execution, so
 	// `latest` never names a height the frontier is not at. Must not block.
 	OnBlock func(num uint64, hash common.Hash)
@@ -839,7 +839,7 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	e.headTime = blk.Time()
 	e.totalGas += blk.GasUsed()
 	// Mid-batch (--commit-every > 1) the head root has no Firewood revision
-	// yet, so the frontier only advances at batch boundaries. serve --follow
+	// yet, so the frontier only advances at batch boundaries. serve
 	// pins CommitEvery=1, which makes that every block.
 	if !e.batchOpen {
 		e.publishLive()
@@ -856,7 +856,7 @@ func (e *Executor) publishLive() {
 }
 
 // LiveState opens a read-only StateDB over the executor's committed frontier
-// and returns the height it belongs to. This is how serve --follow answers
+// and returns the height it belongs to. This is how serve answers
 // latest/pending state without waiting for cook: Firewood IS latest state, and
 // only this process may hold its handle.
 //

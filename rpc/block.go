@@ -18,7 +18,7 @@ func (s *Server) EnableBlockAPIs(hashToHeight map[common.Hash]uint64) {
 }
 
 // AddBlockHash extends the block-hash index as the follower accepts blocks
-// (serve --follow). No-op before EnableBlockAPIs.
+// (serve). No-op before EnableBlockAPIs.
 func (s *Server) AddBlockHash(h common.Hash, n uint64) {
 	if s.hashIdx != nil {
 		s.hashIdx.add(h, n)

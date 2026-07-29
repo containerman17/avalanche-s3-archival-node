@@ -25,8 +25,10 @@ import (
 	"github.com/containerman17/epochdb/state"
 )
 
-// serveFollowMain is `epochdb serve --follow`: ONE process that follows the
-// chain, executes, and serves RPC continuously. No restarts, ever.
+// serveMain is `epochdb serve`: ONE process that follows the chain, executes,
+// and serves RPC continuously. No restarts, ever, and no static mode: following
+// is what a node does (ruling 2026-07-29). The serve process is the sole
+// writer and sole server of its data dir; side consumers use its RPC port.
 //
 // Who owns what:
 //
@@ -52,8 +54,12 @@ import (
 //
 // Seal (archival) and fold (pruning) deliberately stay OUT of this process;
 // see the comment on cookLoop.
-func serveFollowMain(args []string, fs *flag.FlagSet, dataDir *string, port *int, network *string) {
-	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set. EMPTY = do not follow the network in-process: consume staging written by a sibling `epochdb fetch` (files-as-API cohabitation)")
+func serveMain(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "shared data directory")
+	port := fs.Int("port", 9650, "HTTP listen port")
+	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: --node URI only, with a warning")
 	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network)")
 	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
 	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook (index + txindex) that drags the historical window up to the head")
@@ -76,40 +82,26 @@ func serveFollowMain(args []string, fs *flag.FlagSet, dataDir *string, port *int
 	fatal := make(chan error, 4)
 
 	// --- staging: the follower writes it, the executor reads it ---------------
-	var (
-		fetcher  *fetch.Fetcher
-		blocks   rpc.BlockSource
-		accepted = func() uint64 { return 0 }
-	)
-	if *vdrSources != "" || *tipOverride != "" {
-		cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer}
-		if *vdrSources != "" {
-			cfg.VdrSources = strings.Split(*vdrSources, ",")
-		}
-		f, err := fetch.New(cfg)
-		if err != nil {
-			log.Fatalf("epochdb: serve --follow: fetch: %v", err)
-		}
-		fetcher = f
-		blocks = f.Store()
-		accepted = func() uint64 { n, _ := f.Store().Head(); return n }
-		if *vdrSources != "" {
-			go func() { report(fatal, "follower", f.Follow(ctx)) }()
-		} else {
-			// Same process, same staging store, different source of blocks:
-			// a bounded backfill instead of the consensus tip. Everything
-			// above (executor, RPC, advance, cook) is identical.
-			anchors := resolveTipOverride(ctx, f, rpcURL, *tipOverride, networkID)
-			go func() { report(fatal, "backfill", f.SyncTo(ctx, anchors, *walks)) }()
-		}
+	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer}
+	if *vdrSources != "" {
+		cfg.VdrSources = strings.Split(*vdrSources, ",")
+	} else if *tipOverride == "" {
+		log.Printf("epochdb: serve: no --vdr-sources, validator set cross-checked against the --node URI only")
+	}
+	fetcher, err := fetch.New(cfg)
+	if err != nil {
+		log.Fatalf("epochdb: serve: fetch: %v", err)
+	}
+	var blocks rpc.BlockSource = fetcher.Store()
+	accepted := func() uint64 { n, _ := fetcher.Store().Head(); return n }
+	if *tipOverride != "" {
+		// Same process, same staging store, different source of blocks: a
+		// bounded backfill instead of the consensus tip (fixed-corpus builds
+		// and integration runs). Everything below is identical.
+		anchors := resolveTipOverride(ctx, fetcher, rpcURL, *tipOverride, networkID)
+		go func() { report(fatal, "backfill", fetcher.SyncTo(ctx, anchors, *walks)) }()
 	} else {
-		log.Printf("epochdb: serve --follow: no --vdr-sources, NOT following the network: executing and serving staging written by a sibling fetch process")
-		r, err := fetch.OpenReader(*dataDir)
-		if err != nil {
-			log.Fatalf("epochdb: serve --follow: open staging reader: %v", err)
-		}
-		defer r.Close()
-		blocks = r
+		go func() { report(fatal, "follower", fetcher.Follow(ctx)) }()
 	}
 
 	// --- state layer: the executor owns the writer, the RPC shares it ---------
@@ -201,7 +193,7 @@ func serveFollowMain(args []string, fs *flag.FlagSet, dataDir *string, port *int
 	if floor := hist.Floor(); floor > 0 {
 		log.Printf("epochdb: LIMITED HISTORY: floor=%d (base file), nothing below block %d is served", floor, floor)
 	}
-	log.Printf("epochdb: serve --follow on :%d, executed=%d cooked=%d floor=%d chainId=%s (cook every %s)",
+	log.Printf("epochdb: serve on :%d, executed=%d cooked=%d floor=%d chainId=%s (cook every %s)",
 		*port, e.LiveHead(), hist.StateHead(), hist.Floor(), g.Config.ChainID, *cookEvery)
 
 	select {
@@ -211,17 +203,13 @@ func serveFollowMain(args []string, fs *flag.FlagSet, dataDir *string, port *int
 		// Close the writers before dying so the restart is a clean resume
 		// rather than a crash walk-back (the deferred Closes run on return).
 		log.Printf("epochdb: FATAL: %v", err)
-		if fetcher != nil {
-			fetcher.Close()
-		}
+		fetcher.Close()
 		e.Close()
 		store.Close()
 		os.Exit(1)
 	}
-	if fetcher != nil {
-		if err := fetcher.Close(); err != nil {
-			log.Printf("epochdb: fetch close: %v", err)
-		}
+	if err := fetcher.Close(); err != nil {
+		log.Printf("epochdb: fetch close: %v", err)
 	}
 	log.Printf("epochdb: stopped at executed=%d", e.LiveHead())
 }
@@ -302,7 +290,7 @@ func statusLoop(ctx context.Context, e *exec.Executor, hist *state.History, acce
 		case <-t.C:
 		}
 		acc, ex := accepted(), e.LiveHead()
-		log.Printf("epochdb: follow: accepted=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%d",
+		log.Printf("epochdb: serve: accepted=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%d",
 			acc, ex, hist.Head(), hist.StateHead(), e.SettledHeight(), int64(acc)-int64(ex))
 	}
 }

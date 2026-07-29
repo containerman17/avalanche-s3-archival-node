@@ -50,15 +50,15 @@ type Server struct {
 	filters     *filterReg
 
 	// block APIs: eth block hash -> height, wired by EnableBlockAPIs and
-	// grown per accepted block by serve --follow.
+	// grown per accepted block by serve.
 	hashIdx *hashIndex
 
-	// live is the in-process executor (serve --follow); nil on a static
+	// live is the in-process executor (serve); nil before EnableLive
 	// serve, where every read is historical.
 	live Live
 }
 
-// Live is the in-process executor view that serve --follow wires in. It is
+// Live is the in-process executor view that serve wires in. It is
 // what makes latest reads answer at chain pace: the executor owns the
 // exclusive Firewood handle, so nothing outside this process can serve the
 // frontier.
@@ -76,10 +76,10 @@ type Live interface {
 	SettledHeight() uint64
 }
 
-// EnableLive wires the executor frontier into the server (serve --follow).
+// EnableLive wires the executor frontier into the server (serve).
 func (s *Server) EnableLive(l Live) { s.live = l }
 
-// hashIndex is the eth block hash -> height map. serve --follow appends to it
+// hashIndex is the eth block hash -> height map. serve appends to it
 // as the executor advances, so it is locked; a static serve builds it once.
 type hashIndex struct {
 	mu sync.RWMutex

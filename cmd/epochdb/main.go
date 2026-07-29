@@ -23,8 +23,6 @@ import (
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
-	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/rlp"
 
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -160,7 +158,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
-	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650] [--follow [--vdr-sources <p-chain rpcs>]]")
+	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300] [--floor N]")
@@ -356,105 +354,6 @@ func verifyMain(args []string) {
 	log.Printf("verify: PASS %d blocks in %s (%.0f blk/s)", blocks, wall.Round(time.Second), float64(blocks)/wall.Seconds())
 }
 
-// serveMain serves historical JSON-RPC reads over the cooked indexes. The
-// state layer is opened read-only, so it is safe next to a running
-// fetch/exec; the view is pinned to what was durable at startup.
-func serveMain(args []string) {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "shared data directory")
-	port := fs.Int("port", 9650, "HTTP listen port")
-	network := fs.String("network", "fuji", "network: fuji|mainnet")
-	fs.Bool("follow", false, "ONE process at the tip: follow the chain, execute, and serve continuously (no restarts)")
-	// --follow takes fetch and executor flags too, so it registers the rest of
-	// them on this flag set and does the parsing itself.
-	if hasFlag(args, "follow") {
-		serveFollowMain(args, fs, dataDir, port, network)
-		return
-	}
-	fs.Parse(args)
-
-	store, err := state.OpenReadOnly(*dataDir)
-	if err != nil {
-		log.Fatalf("epochdb: open state layer: %v", err)
-	}
-	defer store.Close()
-
-	g, err := exec.NetworkGenesis(execNetID(*network))
-	if err != nil {
-		log.Fatalf("epochdb: genesis: %v", err)
-	}
-	hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
-	if err != nil {
-		log.Fatalf("epochdb: open history: %v", err)
-	}
-	defer hist.Close()
-
-	// Format v3 is the only served format; OpenHistory above already
-	// refused anything older (state.OpenEpoch), so there is no check here.
-	srv := rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
-
-	epochs := hist.Epochs()
-	rawIdx, err := state.OpenTxIndex(*dataDir)
-	if err != nil {
-		log.Printf("epochdb: raw tx index unavailable: %v", err)
-	}
-	if (rawIdx != nil && rawIdx.NumTx() > 0) || len(epochs.Epochs) > 0 {
-		reader, err := fetch.OpenReader(*dataDir)
-		if err != nil {
-			log.Fatalf("epochdb: open staging reader: %v", err)
-		}
-		defer reader.Close()
-		blocks := sealedBlocks{epochs: epochs, blocks: reader}
-		srv.EnableTxAPIs(state.CombinedTxIndex{Raw: rawIdx, Epochs: epochs}, blocks, exec.ParseEthBlock)
-		var rawTx uint64
-		if rawIdx != nil {
-			rawTx = rawIdx.NumTx()
-		}
-		log.Printf("epochdb: tx lookup: %d raw-indexed txs, %d sealed epochs", rawTx, len(epochs.Epochs))
-	}
-
-	// eth block hash -> height for the *ByHash methods, from the staging
-	// sidecars (~40B/block resident). Seal deletes fully sealed raw buckets,
-	// so the sidecars only cover the tail: fill the sealed range from
-	// epoch-served headers (one decode+hash pass at startup).
-	if hashes, err := fetch.BlockHashes(*dataDir); err != nil {
-		log.Printf("epochdb: block hash index unavailable: %v", err)
-	} else {
-		// Nothing below the floor exists, so the scan starts there.
-		floor := hist.Floor()
-		byHash := make(map[common.Hash]uint64, hist.Head()+1-floor)
-		for h, n := range hashes {
-			byHash[common.Hash(h)] = n
-		}
-		if uint64(len(byHash)) < hist.Head()+1-floor {
-			filled := 0
-			for n := floor; n <= hist.Head(); n++ {
-				raw, ok, err := hist.HeaderRLP(n)
-				if err != nil || !ok {
-					continue
-				}
-				var h types.Header
-				if rlp.DecodeBytes(raw, &h) == nil {
-					if _, dup := byHash[h.Hash()]; !dup {
-						byHash[h.Hash()] = n
-						filled++
-					}
-				}
-			}
-			log.Printf("epochdb: block hash index: filled %d heights from sealed headers", filled)
-		}
-		srv.EnableBlockAPIs(byHash)
-		log.Printf("epochdb: block hash index: %d blocks", len(byHash))
-	}
-
-	addr := fmt.Sprintf(":%d", *port)
-	if floor := hist.Floor(); floor > 0 {
-		log.Printf("epochdb: LIMITED HISTORY: floor=%d (base file), nothing below block %d is served", floor, floor)
-	}
-	log.Printf("epochdb: serving historical RPC on %s, head=%d floor=%d chainId=%s", addr, hist.Head(), hist.Floor(), g.Config.ChainID)
-	log.Fatal(srv.ListenAndServe(addr))
-}
-
 // sealedBlocks serves containers from sealed epochs first, raw staging as
 // the fallback for the unsealed tail.
 type sealedBlocks struct {
@@ -467,21 +366,6 @@ func (s sealedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
 		return raw, ok, err
 	}
 	return s.blocks.GetByHeight(n)
-}
-
-// hasFlag reports whether name appears as a flag in args, in any of Go's
-// accepted spellings (-name, --name, -name=v), before the "--" terminator.
-func hasFlag(args []string, name string) bool {
-	for _, a := range args {
-		if a == "--" {
-			return false
-		}
-		f := strings.TrimLeft(a, "-")
-		if f == name || strings.HasPrefix(f, name+"=") {
-			return true
-		}
-	}
-	return false
 }
 
 // execMain replays blocks ascending from genesis out of the (possibly
