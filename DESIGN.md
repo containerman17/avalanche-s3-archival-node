@@ -2,7 +2,7 @@
 
 THE single design file: current implementation plus planned work, kept edited in place, never forked into per-topic docs. Sections are tagged [BUILT] or [PLANNED]. Chronology, incidents, and measurements-in-flight live in `~/dotfiles/devlogs/epochdb/`, durable gotchas in `~/dotfiles/wiki/epochdb/`.
 
-Repo: `~/epochdb` (module github.com/containerman17/epochdb, LOCAL ONLY, never pushed).
+Repo: `~/epochdb`, private remote https://github.com/containerman17/epochdb (user 2026-07-29: push committed work regularly, do not lose it; was local-only before).
 
 Agent policy (user ruling 2026-07-29): subagents on this project run OPUS, always, explicitly pinned per dispatch; never fable.
 
