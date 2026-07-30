@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/ava-labs/avalanchego/genesis"
@@ -63,7 +64,58 @@ const (
 type Store struct {
 	dir   string
 	spool string
-	cas   *casfs.Store
+	cas   *sharedCas
+}
+
+// ONE CASFS PER CACHE DIRECTORY, and it is not a nicety: casfs.New removes the
+// clean marker and wipes anything it cannot vouch for, so a second store over
+// a live cache directory would delete the first one's chunks out from under it
+// and leave two LRUs fighting over one byte cap. Nothing enforces that across
+// PROCESSES (running a sibling tool against a serving node's data dir costs
+// that node its warm cache, never its correctness: the spool and the bucket are
+// untouched), so inside a process the stores are shared and refcounted. Both
+// bootstrap paths need it: `bootstrap --frontier` opens the artifact store and
+// then a whole state layer over the same directory.
+var (
+	casMu     sync.Mutex
+	casShared = map[string]*sharedCas{}
+)
+
+type sharedCas struct {
+	*casfs.Store
+	dir  string
+	refs int
+}
+
+func openCas(cacheDir string, cfg casfs.Config) (*sharedCas, error) {
+	key, err := filepath.Abs(cacheDir)
+	if err != nil {
+		return nil, err
+	}
+	casMu.Lock()
+	defer casMu.Unlock()
+	if s := casShared[key]; s != nil {
+		s.refs++
+		return s, nil
+	}
+	st, err := casfs.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	s := &sharedCas{Store: st, dir: key, refs: 1}
+	casShared[key] = s
+	return s, nil
+}
+
+// close drops one reference and marks the cache clean at the last one.
+func (s *sharedCas) close() error {
+	casMu.Lock()
+	defer casMu.Unlock()
+	if s.refs--; s.refs > 0 {
+		return nil
+	}
+	delete(casShared, s.dir)
+	return s.Store.Close()
 }
 
 // Open builds the store for a data directory from the environment.
@@ -84,7 +136,8 @@ func Open(dataDir string) (*Store, error) {
 		}
 		cacheBytes = n
 	}
-	cas, err := casfs.New(casfs.Config{
+	cacheDir := filepath.Join(dataDir, cacheName)
+	cas, err := openCas(cacheDir, casfs.Config{
 		Endpoint:   endpoint,
 		Region:     os.Getenv("EPOCHDB_S3_REGION"),
 		Bucket:     os.Getenv("EPOCHDB_S3_BUCKET"),
@@ -92,7 +145,7 @@ func Open(dataDir string) (*Store, error) {
 		AccessKey:  os.Getenv("EPOCHDB_S3_ACCESS_KEY"),
 		SecretKey:  os.Getenv("EPOCHDB_S3_SECRET_KEY"),
 		SpoolDir:   s.spool,
-		CacheDir:   filepath.Join(dataDir, cacheName),
+		CacheDir:   cacheDir,
 		CacheBytes: cacheBytes,
 	})
 	if err != nil {
@@ -221,6 +274,17 @@ func (s *Store) Sync() error {
 }
 
 // ---------- reading ----------
+
+// Close releases the chunk cache cleanly. Without it casfs wipes the cache on
+// the next start (a missing clean marker means a chunk may be half written),
+// so every long-lived consumer calls this on the way out and keeps its cache
+// warm across restarts. Costs the cache and nothing durable if it is skipped.
+func (s *Store) Close() error {
+	if s.cas == nil {
+		return nil
+	}
+	return s.cas.close()
+}
 
 // Open returns the bytes of one artifact. Without credentials that is an mmap
 // of the spool file; with them it is casfs, which reads through its chunk

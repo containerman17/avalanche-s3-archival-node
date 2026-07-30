@@ -125,9 +125,14 @@ func Open(dir string) (*Store, error) {
 
 // Close flushes everything and releases file handles. It does NOT advance
 // exechead: only FlushAndSetExecHead does that.
+//
+// It also closes the artifact store, which is what marks the casfs chunk cache
+// CLEAN: a process that dies without this starts with a cold cache (casfs
+// cannot tell a torn chunk from a whole one, so it wipes rather than journals).
+// Costs the cache and nothing durable.
 func (s *Store) Close() error {
 	var firstErr error
-	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.rc.Close, s.code.Close, s.misc.Close} {
+	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.rc.Close, s.code.Close, s.misc.Close, s.cas.Close} {
 		if err := c(); err != nil && firstErr == nil {
 			firstErr = err
 		}

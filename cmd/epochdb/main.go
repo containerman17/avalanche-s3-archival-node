@@ -206,6 +206,8 @@ func sealMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
+	// Close marks the chunk cache clean, so the next process starts warm.
+	defer out.Close()
 	if err := state.SealEpochs(*dataDir, out, *epochTxs, chainRoot); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
@@ -245,6 +247,7 @@ func bootstrapMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
+	defer st.Close()
 	epochs, err := bootstrapChain(st, chainRoot)
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
@@ -288,6 +291,7 @@ func verifyMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: verify: %v", err)
 	}
+	defer st.Close()
 	blocks, wall, err := verify.VerifySet(st, tmp, execNetID(*network), *workers)
 	if err != nil {
 		os.RemoveAll(tmp)

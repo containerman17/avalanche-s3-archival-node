@@ -98,6 +98,8 @@ github.com/consensys/gnark-crypto v0.18.1 h1:RyLV6UhPRoYYzaFnPQA4qK3DyuDgkTgskDd
 github.com/consensys/gnark-crypto v0.18.1/go.mod h1:L3mXGFTe1ZN+RSJ+CLjUt9x7PNdx8ubaYfDROyp2Z8c=
 github.com/containerman17/casfs v0.0.0-20260730042211-0a99cf780978 h1:JgQOpKIBHpwLTnlNZwXxA3PHtmuMQaJoA04jn1Wq3ZA=
 github.com/containerman17/casfs v0.0.0-20260730042211-0a99cf780978/go.mod h1:gzzV+FgD/XI8dzMwj/x+CV2b45OzIG/zaNVxkeIxYD8=
+github.com/containerman17/casfs v0.0.0-20260730162613-777915bcf3f2 h1:ndR+Umii208esFa6S037McT5d5iRjCoSKnMKwWRCkm8=
+github.com/containerman17/casfs v0.0.0-20260730162613-777915bcf3f2/go.mod h1:gzzV+FgD/XI8dzMwj/x+CV2b45OzIG/zaNVxkeIxYD8=
 github.com/coreos/etcd v3.3.10+incompatible/go.mod h1:uF7uidLiAD3TWHmW31ZFd/JWoc32PjwdhPthX9715RE=
 github.com/coreos/go-etcd v2.0.0+incompatible/go.mod h1:Jez6KQU2B/sWsbdaef3ED8NzMklzPG4d5KIOhIy30Tk=
 github.com/coreos/go-semver v0.2.0/go.mod h1:nnelYz7RCh+5ahJtPPxZlU+153eP4D4r3EedlOD2RNk=

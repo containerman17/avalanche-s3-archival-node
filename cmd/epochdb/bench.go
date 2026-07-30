@@ -256,6 +256,7 @@ func benchTxMain(args []string) {
 	if err != nil {
 		log.Fatalf("ab-bench-tx: open store: %v", err)
 	}
+	defer cas.Close()
 	epochs, err := state.OpenEpochSet(cas)
 	if err != nil {
 		log.Fatalf("ab-bench-tx: open epochs: %v", err)

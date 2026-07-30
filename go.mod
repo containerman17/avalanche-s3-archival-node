@@ -9,7 +9,7 @@ require (
 	github.com/ava-labs/firewood-go-ethhash/ffi v0.8.0
 	github.com/ava-labs/libevm v1.13.15-0.20260721184559-5557c68d296b
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/containerman17/casfs v0.0.0-20260730042211-0a99cf780978
+	github.com/containerman17/casfs v0.0.0-20260730162613-777915bcf3f2
 	github.com/gorilla/websocket v1.5.0
 	github.com/holiman/uint256 v1.2.4
 	github.com/klauspost/compress v1.18.0
