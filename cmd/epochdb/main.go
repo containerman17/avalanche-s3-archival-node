@@ -27,7 +27,6 @@ import (
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
 	"github.com/containerman17/epochdb/verify"
 )
@@ -321,20 +320,6 @@ func verifyMain(args []string) {
 		log.Fatalf("epochdb: verify: FAIL after %d blocks in %s: %v", blocks, wall.Round(time.Second), err)
 	}
 	log.Printf("verify: PASS %d blocks in %s (%.0f blk/s)", blocks, wall.Round(time.Second), float64(blocks)/wall.Seconds())
-}
-
-// sealedBlocks serves containers from sealed epochs first, raw staging as
-// the fallback for the unsealed tail.
-type sealedBlocks struct {
-	epochs *state.EpochSet
-	blocks rpc.BlockSource // fetch.Reader (static) or the live fetch.Store (follow)
-}
-
-func (s sealedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
-	if raw, ok, err := s.epochs.GetByHeight(n); ok || err != nil {
-		return raw, ok, err
-	}
-	return s.blocks.GetByHeight(n)
 }
 
 // execMain replays blocks ascending from genesis out of the (possibly

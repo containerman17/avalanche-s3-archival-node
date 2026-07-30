@@ -22,6 +22,7 @@ import (
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
 )
 
@@ -323,7 +324,7 @@ func benchTxMain(args []string) {
 		log.Fatalf("ab-bench-tx: open epochs: %v", err)
 	}
 	defer epochs.Close()
-	reader := sealedBlocks{epochs: epochs, blocks: fr} // sample sealed + raw
+	reader := rpc.SealedBlocks{Epochs: epochs, Blocks: fr} // sample sealed + raw
 
 	// Replayed head from the local server, staging ceiling from the bucket files.
 	res, rerr := rpcCall(*local, "eth_blockNumber", nil, 2)

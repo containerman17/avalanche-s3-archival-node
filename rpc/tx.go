@@ -23,6 +23,20 @@ type BlockSource interface {
 	GetByHeight(n uint64) ([]byte, bool, error)
 }
 
+// SealedBlocks serves containers from sealed epochs first, raw staging as
+// the fallback for the unsealed tail.
+type SealedBlocks struct {
+	Epochs *state.EpochSet
+	Blocks BlockSource // fetch.Reader (read-only opener) or the live fetch.Store
+}
+
+func (s SealedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
+	if raw, ok, err := s.Epochs.GetByHeight(n); ok || err != nil {
+		return raw, ok, err
+	}
+	return s.Blocks.GetByHeight(n)
+}
+
 // TxCandidateSource maps a tx hash to candidate block heights
 // (state.TxIndex or state.CombinedTxIndex).
 type TxCandidateSource interface {

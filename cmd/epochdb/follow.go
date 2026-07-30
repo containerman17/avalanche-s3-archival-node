@@ -178,7 +178,7 @@ func serveMain(args []string) {
 	srv.EnableLive(liveNode{Executor: e, accepted: accepted})
 
 	txidx.reopen(*dataDir, hist.Epochs())
-	srv.EnableTxAPIs(txidx, sealedBlocks{epochs: hist.Epochs(), blocks: blocks}, exec.ParseEthBlock)
+	srv.EnableTxAPIs(txidx, rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: blocks}, exec.ParseEthBlock)
 
 	byHash, err := fetch.BlockHashes(*dataDir)
 	if err != nil {

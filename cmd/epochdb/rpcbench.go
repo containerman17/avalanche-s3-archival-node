@@ -18,6 +18,7 @@ import (
 
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
 )
 
@@ -61,7 +62,7 @@ func rpcBenchMain(args []string) {
 		log.Fatalf("rpc-bench: %v", err)
 	}
 	defer fr.Close()
-	blocks := sealedBlocks{epochs: hist.Epochs(), blocks: fr}
+	blocks := rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: fr}
 	head := hist.Head()
 	// Logs/receipts are stored-only: bench within the sealed range (the
 	// raw tail above it errors by design).
