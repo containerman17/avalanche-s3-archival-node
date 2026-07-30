@@ -250,8 +250,13 @@ func ReExecuteBlock(hist *state.History, chainCtx corethcore.ChainContext, chain
 		return nil, err
 	}
 	// Precompile activations at this block boundary write state before txs
-	// run (same call the verified executor makes).
-	if err := corethcore.ApplyUpgrades(chainCfg, nil, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
+	// run (same call the verified executor makes, parent timestamp included:
+	// nil would re-activate every active precompile, see exec runEVM).
+	parent := chainCtx.GetHeader(header.ParentHash, n-1)
+	if parent == nil {
+		return nil, fmt.Errorf("parent header %d missing", n-1)
+	}
+	if err := corethcore.ApplyUpgrades(chainCfg, &parent.Time, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
 		return nil, fmt.Errorf("apply upgrades: %w", err)
 	}
 	blockCtx := corethcore.NewEVMBlockContext(header, chainCtx, nil)

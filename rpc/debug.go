@@ -64,7 +64,14 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
-	if err := corethcore.ApplyUpgrades(s.chainCfg, nil, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
+	// Parent timestamp, not nil: nil re-activates every already-active
+	// precompile here, so every post-Durango trace carried a phantom
+	// SetNonce/SetCode the executor never performed (see exec runEVM).
+	parent := s.chainCtx.GetHeader(header.ParentHash, n-1)
+	if parent == nil {
+		return nil, errInvalid("parent header %d missing", n-1)
+	}
+	if err := corethcore.ApplyUpgrades(s.chainCfg, &parent.Time, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("apply upgrades: %v", err)}
 	}
 	blockCtx := corethcore.NewEVMBlockContext(header, s.chainCtx, nil)

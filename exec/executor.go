@@ -145,6 +145,7 @@ type Executor struct {
 	batchOpen      bool
 	batchStartNum  uint64
 	batchStartRoot common.Hash
+	batchStartTime uint64      // headTime when the batch opened, so bisect can rewind it
 	batchLastHash  common.Hash // hash of the last executed batch block
 	batchDirty     bool        // any non-empty block drained this batch
 	batchCount     int
@@ -945,8 +946,20 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) (types.Receipts, error) {
 	header := blk.Header()
 
+	// The PARENT timestamp is what makes a precompile activate exactly once:
+	// IsForkTransition treats a nil parent as "never forked", so nil
+	// re-activates every already-active precompile on EVERY block
+	// (SetNonce 1 + SetCode {0x01} + Configure). Idempotent for Warp, but it
+	// writes two junk rows per post-Durango block into the write frame,
+	// which breaks epoch byte-determinism against a correct builder, and it
+	// is a live correctness bug for any precompile whose Configure is not
+	// idempotent. Mirrors coreth core/state_processor.go Process.
+	//
+	// e.headTime IS the parent's timestamp here: executeRaw advances it only
+	// after the block returns, and bisect rewinds it with batchStartTime.
+	parentTime := e.headTime
 	upgradeBlockCtx := corethcore.NewBlockContext(header.Number, header.Time)
-	if err := corethcore.ApplyUpgrades(e.chainCfg, nil, upgradeBlockCtx, statedb); err != nil {
+	if err := corethcore.ApplyUpgrades(e.chainCfg, &parentTime, upgradeBlockCtx, statedb); err != nil {
 		return nil, fmt.Errorf("apply upgrades: %w", err)
 	}
 
@@ -1005,6 +1018,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 		e.batchOpen = true
 		e.batchStartNum = e.headNum
 		e.batchStartRoot = e.headRoot
+		e.batchStartTime = e.headTime
 		e.batchDirty = false
 		e.batchCount = 0
 		e.wrapDB.beginBatch(e.headRoot)
@@ -1163,6 +1177,11 @@ func (e *Executor) bisect(computed common.Hash, boundaryNum uint64, boundaryRoot
 	e.wrapDB.resetCache()
 	e.headNum = e.batchStartNum
 	e.headRoot = e.batchStartRoot
+	// executeRaw advanced headTime for every buffered block, so it now names
+	// the batch TAIL. Re-executing from the batch start with a parent
+	// timestamp in the future would hide a precompile activation inside the
+	// batch and diverge the re-execution from the batch it is diagnosing.
+	e.headTime = e.batchStartTime
 
 	for i := from; i <= to; i++ {
 		raw, ok, err := e.cfg.Blocks.GetByHeight(i)
@@ -1179,6 +1198,7 @@ func (e *Executor) bisect(computed common.Hash, boundaryNum uint64, boundaryRoot
 		}
 		e.headRoot = newRoot
 		e.headNum = i
+		e.headTime = blk.Time()
 	}
 	return fmt.Errorf("batch [%d..%d] root mismatch (computed %x want %x) but per-block re-execution verified clean: batching bug", from, to, computed, boundaryRoot)
 }
