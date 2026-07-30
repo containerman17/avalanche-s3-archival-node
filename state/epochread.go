@@ -135,6 +135,10 @@ func openEpochBlob(blob *dist.Blob, hash string) (*Epoch, error) {
 	if size < epochFooterSize {
 		return nil, fmt.Errorf("epoch %s: too small", hash)
 	}
+	if err := blob.Pin(size-epochFooterSize, epochFooterSize); err != nil {
+		return nil, err
+	}
+	defer blob.Unpin(size-epochFooterSize, epochFooterSize)
 	ft, err := blob.Slice(size-epochFooterSize, epochFooterSize)
 	if err != nil {
 		return nil, err
