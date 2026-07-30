@@ -78,7 +78,8 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 //
 // The footer carries the HASH CHAIN: epoch K's footer embeds sha256 of epoch
 // K-1's whole file, and the first epoch of a chain embeds the chain root,
-// sha256 of that chain's genesis config (dist.ChainRoot). Prev-hash is chain
+// sha256(genesisData || upgradeBytes) over the chain's on-chain CreateChainTx
+// genesis and its upgrade.json if it has one (dist.ChainRoot). Prev-hash is chain
 // content like everything else here, so two honest builders still emit
 // identical bytes, and one head hash authenticates every epoch below it.
 //
@@ -243,7 +244,7 @@ type EpochInput struct {
 	TxCount    uint64
 
 	// Prev is the hash-chain link: sha256 of epoch K-1's file, or the chain
-	// root (sha256 of the genesis config) for a chain's first epoch.
+	// root (dist.ChainRoot) for a chain's first epoch.
 	Prev [32]byte
 
 	// Stored-logs sections (v2, unconditional): per-block encoded records

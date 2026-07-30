@@ -29,9 +29,8 @@ type Epoch struct {
 
 	// Hash is the artifact's hex sha256, i.e. its name everywhere.
 	Hash string
-	// Prev is sha256 of epoch K-1, or the chain root (sha256 of the genesis
-	// config) for the first epoch of a chain: the hash chain of DESIGN.md
-	// "Distribution".
+	// Prev is sha256 of epoch K-1, or the chain root (dist.ChainRoot) for the
+	// first epoch of a chain: the hash chain of DESIGN.md "Distribution".
 	Prev [32]byte
 
 	blob *dist.Blob

@@ -38,7 +38,6 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/ava-labs/avalanchego/genesis"
 	"github.com/containerman17/casfs"
 )
 
@@ -52,7 +51,7 @@ const (
 	cacheName = "chunks" // <data>/chunks: disposable
 	// LatestPointer names the one mutable object in the bucket. It is a HINT,
 	// never an authority: every artifact self-verifies by hash and the epoch
-	// footers chain back to the genesis config.
+	// footers chain back to the chain root.
 	LatestPointer = "latest"
 
 	defaultCacheBytes = 8 << 30
@@ -558,16 +557,4 @@ func ValidHash(s string) bool {
 		}
 	}
 	return true
-}
-
-// ChainRoot is the epoch chain's anchor: sha256 of the chain's own genesis
-// config, which every client already ships. Epoch 1's footer carries it as its
-// previous-file hash, so one head hash authenticates all of that chain's
-// history and there is no global registry anywhere (DESIGN.md "Multi-chain").
-func ChainRoot(networkID uint32) ([32]byte, error) {
-	cfg := genesis.GetConfig(networkID)
-	if cfg == nil {
-		return [32]byte{}, fmt.Errorf("dist: no embedded genesis config for network %d", networkID)
-	}
-	return sha256.Sum256([]byte(cfg.CChainGenesis)), nil
 }

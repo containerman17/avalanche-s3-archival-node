@@ -184,7 +184,7 @@ func sealMain(args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	outDir := fs.String("out", "", "directory the sealed epochs are published into (default --data; a separate dir cuts an alternate epoch size from the same raws)")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (the hash chain roots at sha256 of this network's genesis config)")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the hash chain roots at this network's chain root, sha256 of its CreateChainTx genesisData)")
 	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "epoch boundary tx count override")
 	fs.Parse(args)
 	if *outDir == "" {

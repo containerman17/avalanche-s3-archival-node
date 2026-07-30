@@ -4,8 +4,8 @@ package main
 //
 // There is no manifest. The bucket carries exactly one mutable object, the
 // `latest` pointer, and it is a HINT: boot reads it, then walks the epoch
-// footers BACKWARD by their embedded prev-hash, which roots at sha256 of this
-// chain's genesis config. Everything the walk learns is written to the local
+// footers BACKWARD by their embedded prev-hash, which roots at this chain's
+// CHAIN ROOT (dist.ChainRoot). Everything the walk learns is written to the local
 // index (one marker per epoch), and nothing is downloaded eagerly: with S3
 // credentials the reads that follow pull only the chunks they touch, and
 // without credentials the artifacts are already in the spool.
@@ -49,7 +49,7 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 		below = start
 		if start <= 1 {
 			if prev != chainRoot {
-				return epochs, fmt.Errorf("epoch %s claims prev %x, but this network's genesis config hashes to %x: wrong chain", hash, prev, chainRoot)
+				return epochs, fmt.Errorf("epoch %s claims prev %x, but this network's chain root is %x: wrong chain", hash, prev, chainRoot)
 			}
 			break
 		}
