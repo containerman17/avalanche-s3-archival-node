@@ -1,7 +1,6 @@
 package exec
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -18,7 +17,6 @@ import (
 	"github.com/ava-labs/avalanchego/graft/evm/firewood"
 	"github.com/ava-labs/avalanchego/snow"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
-	ffi "github.com/ava-labs/firewood-go-ethhash/ffi"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
 	ethstate "github.com/ava-labs/libevm/core/state"
@@ -53,11 +51,6 @@ func walkBackBudgetFor(commitEvery int) uint64 {
 	}
 	return budget
 }
-
-// baseLoadBatch is how many base rows go into one Firewood Update when a
-// state-synced node loads its frontier. Bounded so a full-mainnet base
-// (tens of millions of rows) does not build one giant cgo batch.
-const baseLoadBatch = 200_000
 
 // BlockSource yields raw containers by height. ok=false means the height
 // is not available yet (the fetch walk has not landed it).
@@ -128,11 +121,6 @@ type Executor struct {
 	// reads state from Firewood, so there is no frontier handle to publish.
 	live goatomic.Uint64
 
-	// base is the limited-history floor file (nil on a full node). On a
-	// state-synced node it is where the Firewood frontier, the BLOCKHASH
-	// header window and the contract code below B all come from.
-	base *state.Base
-
 	// Firewood bookkeeping. fwHeight mirrors Firewood's internal
 	// proposal-height chain (parent.height+1 per committed proposal);
 	// with batching it deliberately diverges from block heights.
@@ -197,14 +185,6 @@ func (c chainContext) GetHeader(_ common.Hash, num uint64) *types.Header {
 		raw, ok, err = c.store.HeaderRLP(num)
 		if err != nil {
 			return nil
-		}
-		if !ok && c.e != nil && c.e.base != nil {
-			// BLOCKHASH in [B+1, B+256) reaches below the floor: the base
-			// carries [B-256, B] exactly for this.
-			raw, ok, err = c.e.base.HeaderRLP(num)
-			if err != nil {
-				return nil
-			}
 		}
 		if !ok {
 			return nil
@@ -297,23 +277,13 @@ func New(cfg Config) (*Executor, error) {
 		DBOverride: fwCfg.BackendConstructor,
 	})
 
-	// A state-synced node must NOT materialise the genesis alloc: its
-	// Firewood holds the state at B, and genesis rows written under it
-	// would be state that block B does not have.
-	hasBase := false
-	if _, ok, err := state.PeekBase(cfg.DataDir); err != nil {
+	// Every node materialises the genesis alloc: it is the bottom of the
+	// state both for a replaying node and for one whose frontier is merged
+	// out of the epochs (BuildFrontier applies the winning rows on top of it).
+	genesisRoot, err := commitGenesisIfNeeded(tdb, g, ethdbKV)
+	if err != nil {
 		tdb.Close()
-		return nil, fmt.Errorf("open base file: %w", err)
-	} else if ok {
-		hasBase = true
-	}
-	genesisRoot := g.ToBlock().Root()
-	if !hasBase {
-		var err error
-		if genesisRoot, err = commitGenesisIfNeeded(tdb, g, ethdbKV); err != nil {
-			tdb.Close()
-			return nil, err
-		}
+		return nil, err
 	}
 
 	inner := extstate.NewDatabaseWithNodeDB(memdb, tdb)
@@ -350,16 +320,6 @@ func New(cfg Config) (*Executor, error) {
 
 	e.chainCtx = chainContext{e: e, store: cfg.Store}
 
-	// A base file makes this a limited-history node: state below B lives in
-	// the file, not in the replay, and reconcile starts at B+1 instead of
-	// walking back to genesis.
-	if base, ok, err := state.OpenBase(cfg.Store.Cas()); err != nil {
-		tdb.Close()
-		return nil, fmt.Errorf("open base file: %w", err)
-	} else if ok {
-		e.base = base
-	}
-
 	if err := e.reconcile(); err != nil {
 		tdb.Close()
 		return nil, err
@@ -391,104 +351,9 @@ func New(cfg Config) (*Executor, error) {
 // SetHashAndHeight there, then re-execute the gap through the normal
 // executeBlock path. All state-layer appends are idempotent (block-frame
 // skip, code dedup, misc same-value skip) so replays are free.
-// startFromBase brings a state-synced node's Firewood up to the state at B
-// straight from base_<B>, then parks the head there so Run executes B+1
-// onward. No genesis, no replay from 0.
-//
-// The base is HASH-KEYED and libevm's trie API is preimage-keyed, but that
-// is not the wall it looks like: Firewood's own keyspace IS hashed
-// (graft/evm/firewood's baseTrie writes keccak(addr) and
-// keccak(addr)||keccak(slot) with rlp values, see base_trie.go), and the
-// ffi takes raw keys. So a base row minus its one-byte kind prefix is
-// already a Firewood Put, and the resulting root is checked against
-// header(B).Root before anything executes on top of it.
-func (e *Executor) startFromBase() error {
-	b := e.base
-	B := b.Block()
-	hdrRLP, ok, err := b.HeaderRLP(B)
-	if err != nil {
-		return fmt.Errorf("base start: header %d: %w", B, err)
-	}
-	if !ok {
-		return fmt.Errorf("base start: base_%d carries no header for its own floor", B)
-	}
-	var hdr types.Header
-	if err := rlp.DecodeBytes(hdrRLP, &hdr); err != nil {
-		return fmt.Errorf("base start: decode header %d: %w", B, err)
-	}
-
-	t0 := time.Now()
-	var (
-		batch            []ffi.BatchOp
-		nAcct, nSlot, nC uint64
-		root             ffi.Hash
-	)
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		r, err := e.fwBackend.Firewood.Update(batch)
-		if err != nil {
-			return fmt.Errorf("base start: firewood update: %w", err)
-		}
-		root, batch = r, batch[:0]
-		return nil
-	}
-	err = b.WalkRows(func(key, val []byte) error {
-		switch key[0] {
-		case 'a': // account: keccak(addr) | 32 pad bytes
-			nAcct++
-			batch = append(batch, ffi.Put(bytes.Clone(key[1:33]), bytes.Clone(val)))
-		case 's': // storage: keccak(addr) | keccak(slot)
-			nSlot++
-			// Rows hold the raw trimmed slot value; a Firewood leaf is the
-			// RLP of it (graft/evm/firewood baseTrie.UpdateStorage).
-			enc, err := rlp.EncodeToBytes(val)
-			if err != nil {
-				return err
-			}
-			batch = append(batch, ffi.Put(bytes.Clone(key[1:65]), enc))
-		case 'c': // code blob: not trie content, it belongs in the code store
-			nC++
-			return e.cfg.Store.PutCode(common.BytesToHash(key[1:33]), val)
-		default:
-			return fmt.Errorf("base start: unknown row kind %q", key[0])
-		}
-		if len(batch) >= baseLoadBatch {
-			return flush()
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if err := flush(); err != nil {
-		return err
-	}
-	if got := common.Hash(root); got != hdr.Root {
-		return fmt.Errorf("base start: frontier root %x != header(%d).Root %x (loaded %d accounts, %d slots, %d code blobs)", got, B, hdr.Root, nAcct, nSlot, nC)
-	}
-
-	e.fwBackend.SetHashAndHeight(hdr.Hash(), B)
-	e.fwHeight, e.lastFwHash = B, hdr.Hash()
-	e.headNum, e.headRoot, e.headTime = B, hdr.Root, hdr.Time
-	if err := e.cfg.Store.FlushAndSetExecHead(B); err != nil {
-		return fmt.Errorf("base start: seed exechead: %w", err)
-	}
-	log.Printf("exec: base start at floor=%d root=%x (%d accounts, %d slots, %d code blobs loaded in %s)",
-		B, hdr.Root, nAcct, nSlot, nC, time.Since(t0).Round(time.Millisecond))
-	return nil
-}
-
 func (e *Executor) reconcile() error {
 	execN, execOK := e.cfg.Store.ExecHead()
 	hdN, hdOK := e.cfg.Store.HeadersMax()
-
-	if !execOK && e.base != nil {
-		// State-synced node: nothing was ever replayed here, and the state
-		// below B is the base file, not a fold of local history.
-		return e.startFromBase()
-	}
 
 	if !execOK && !hdOK {
 		// Fresh store: seed exechead=0 so a crash before the first flush
@@ -626,14 +491,6 @@ func (e *Executor) loadHeader(blockNum uint64) (*types.Header, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !ok && e.base != nil {
-		// Below the floor nothing was replayed here: the base carries
-		// [B-256, B] so BLOCKHASH works across the window above B.
-		raw, ok, err = e.base.HeaderRLP(blockNum)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if !ok {
 		return nil, fmt.Errorf("header %d missing from state layer", blockNum)
 	}
@@ -647,9 +504,6 @@ func (e *Executor) loadHeader(blockNum uint64) (*types.Header, error) {
 // Close flushes any open batch and the state layer watermark, then
 // releases Firewood.
 func (e *Executor) Close() error {
-	if e.base != nil {
-		defer func() { e.base.Close(); e.base = nil }()
-	}
 	if e.batchOpen && e.batchCount > 0 {
 		if err := e.flushBatch(); err != nil {
 			e.triedb.Close()

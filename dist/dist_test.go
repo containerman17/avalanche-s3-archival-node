@@ -141,11 +141,11 @@ func TestLatestPointer(t *testing.T) {
 	if err != nil || got != want {
 		t.Fatalf("latest: %+v %v", got, err)
 	}
-	want.Snapshot = hex.EncodeToString(bytes.Repeat([]byte{2}, 32))
+	want.Epoch = hex.EncodeToString(bytes.Repeat([]byte{2}, 32))
 	if err := s.SetLatest(want); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := s.Latest(); err != nil || got != want {
-		t.Fatalf("latest with snapshot: %+v %v", got, err)
+		t.Fatalf("latest after advance: %+v %v", got, err)
 	}
 }

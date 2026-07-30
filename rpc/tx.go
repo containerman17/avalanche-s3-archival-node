@@ -57,37 +57,16 @@ func (s *Server) EnableTxAPIs(idx TxCandidateSource, blocks BlockSource, parse C
 	s.txidx, s.blocks, s.parse = idx, blocks, parse
 }
 
-// errCodePruned is the JSON-RPC code for a read below the limited-history
-// floor: the generic -32000 every geth-family node uses for "this node no
-// longer has that block". The message carries the floor.
-const errCodePruned = -32000
-
-// coverageError maps a state coverage failure (pruned or a mid-set hole) to
-// a JSON-RPC error.
+// coverageError maps a state coverage failure (a mid-set hole) to a
+// JSON-RPC error.
 func coverageError(err error) *rpcError {
 	return &rpcError{Code: -32000, Message: err.Error()}
-}
-
-// prunedTxError is the answer for a tx that was not found on a node with a
-// history floor: the hash may well belong to a real tx below the floor, and
-// answering null would let a bot conclude it never existed.
-func (s *Server) prunedTxError() *rpcError {
-	floor := s.hist.Floor()
-	if floor == 0 {
-		return nil
-	}
-	return &rpcError{Code: errCodePruned, Message: fmt.Sprintf(
-		"transaction not found at or above block %d; this node is pruned below %d and cannot tell an unknown hash from a pruned one (limited-history mode)",
-		floor, floor)}
 }
 
 // findTx resolves a tx hash through the fingerprint index and verifies the
 // candidates against the actual blocks. found=false is a clean "unknown tx".
 func (s *Server) findTx(hash common.Hash) (blk *types.Block, txIndex int, found bool, err error) {
 	err = s.txidx.WalkCandidates(hash, func(h uint64) (bool, error) {
-		if h < s.hist.Floor() {
-			return false, nil // below the floor nothing is served, even if the container is still on disk
-		}
 		raw, ok, err := s.blocks.GetByHeight(h)
 		if err != nil {
 			return false, err
@@ -134,9 +113,6 @@ func (s *Server) getTransactionByHash(params []json.RawMessage) (any, *rpcError)
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if !found {
-		if rerr := s.prunedTxError(); rerr != nil {
-			return nil, rerr
-		}
 		return nil, nil // unknown tx: result null, like coreth
 	}
 	return newRPCTransaction(blk.Transactions()[i], blk.Hash(), blk.NumberU64(), blk.Time(),
@@ -153,9 +129,6 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if !found {
-		if rerr := s.prunedTxError(); rerr != nil {
-			return nil, rerr
-		}
 		return nil, nil
 	}
 	n := blk.NumberU64()

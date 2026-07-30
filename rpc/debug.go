@@ -211,9 +211,6 @@ func (s *Server) debugGetRawTransaction(params []json.RawMessage) (any, *rpcErro
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if !found {
-		if rerr := s.prunedTxError(); rerr != nil {
-			return nil, rerr
-		}
 		return hexutil.Bytes{}, nil // geth returns empty for unknown
 	}
 	raw, err := blk.Transactions()[i].MarshalBinary()
@@ -479,8 +476,8 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
-		// A state read that failed (below the floor: *state.PrunedError) makes
-		// the whole traced list and gasUsed fiction, exactly as in ethCall.
+		// A state read that failed (a coverage hole) makes the whole traced
+		// list and gasUsed fiction, exactly as in ethCall.
 		if err := st.Error(); err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}

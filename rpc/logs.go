@@ -204,7 +204,6 @@ func logMatches(l *types.Log, addrs []common.Address, topics [][]common.Hash) bo
 func (s *Server) logCandidates(from, to uint64, addrs []common.Address, topics [][]common.Hash) ([]uint64, *rpcError) {
 	inSet := map[uint64]bool{}
 	epochs := s.hist.Epochs()
-	// from first: a range starting below the floor is pruned, not empty.
 	if err := epochs.RequireCovered(from); err != nil {
 		return nil, coverageError(err)
 	}

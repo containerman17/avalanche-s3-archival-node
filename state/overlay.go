@@ -22,7 +22,6 @@ import (
 	"github.com/ava-labs/libevm/trie"
 	"github.com/ava-labs/libevm/trie/trienode"
 	"github.com/ava-labs/libevm/triedb"
-	"github.com/containerman17/epochdb/dist"
 	"github.com/holiman/uint256"
 )
 
@@ -35,31 +34,19 @@ var SentinelStorageRoot = crypto.Keccak256Hash([]byte("epochdb: sentinel storage
 
 var errOverlayReadOnly = errors.New("epochdb overlay: read-only historical view")
 
-// baseState is the read surface of the limited-history base file
-// (state/base.go): flat live state at block B plus its code blobs and the
-// headers of the BLOCKHASH window below B. Interface, not *Base, so the
-// descent can be tested without building a real base file.
-type baseState interface {
-	Block() uint64
-	Account(addr common.Address) ([]byte, bool, error)
-	Storage(addr common.Address, slot []byte) ([]byte, bool, error)
-	Code(hash common.Hash) ([]byte, bool, error)
-	HeaderRLP(n uint64) ([]byte, bool, error)
-	Close()
-}
-
 // History serves historical account/storage reads from the cooked
 // sorted_NNNNN.idx buckets (mmap binary search) and sealed epochs, falling
-// through to the floor for keys never written above it: the base file in
-// limited-history mode, the genesis alloc on a full node. Fully
-// goroutine-safe: everything here is immutable after open and the store's
-// bucketLogs are internally locked.
+// through to the genesis alloc for keys never written. Fully goroutine-safe:
+// everything here is immutable after open and the store's bucketLogs are
+// internally locked.
+//
+// There is no floor and no pruned mode (DESIGN.md ruling 1 of 2026-07-31):
+// every node's descent ends at the genesis alloc, and a bootstrapped node
+// gets its Firewood frontier from the epochs themselves (exec.BuildFrontier).
 type History struct {
 	dir     string
 	store   *Store
 	genesis types.GenesisAlloc
-	base    baseState // nil on a full node
-	floor   uint64    // base.Block(); 0 on a full node
 	epochs  *EpochSet // sealed epochs (may be empty)
 
 	// head is the highest block the SERVER answers for. On a static node it
@@ -76,7 +63,7 @@ type History struct {
 	// tail is the uncooked-write overlay (state/tail.go), non-nil only after
 	// EnableTail: the executor's writes since the last cook. It is the FIRST
 	// half of the one read path; `latest` state is this then the descent.
-	// nil everywhere else (cook, seal, fold, read-only openers), where every
+	// nil everywhere else (cook, seal, read-only openers), where every
 	// read is historical by definition.
 	tail *tail
 	// tailApplied is the highest block folded into the overlay, owned by the
@@ -90,14 +77,9 @@ type History struct {
 	buckets []*sortedBucket // ascending bucket number
 
 	// deletes: account key -> ascending blocks of explicit account-delete
-	// records (SELFDESTRUCT) ABOVE the floor. Built by one sequential scan
-	// at open; rare enough to keep resident, and it turns the per-read
-	// delete check into a map lookup (a linear run scan here was 96% of
-	// backfill CPU). Nothing below the floor is needed, and that is only
-	// true because searchAboveFloor treats a row at or below the floor as a
-	// miss: the base file is a post-image of live state at B, so every pre-B
-	// deletion is already folded into it (the destructed account and its
-	// slots are simply absent) and no read can be answered from down there.
+	// records (SELFDESTRUCT). Built by one sequential scan at open; rare
+	// enough to keep resident, and it turns the per-read delete check into a
+	// map lookup (a linear run scan here was 96% of backfill CPU).
 	deletes map[string][]uint64
 }
 
@@ -109,29 +91,14 @@ type sortedBucket struct {
 	cooked uint64   // cookedThrough from the file header (Refresh's change test)
 }
 
-// openBase is the base-file opener, indirected so the floor plumbing can be
-// tested with a synthetic base (building a real base file is the snapshot
-// tool's job).
-var openBase = func(st *dist.Store) (baseState, bool, error) {
-	b, ok, err := OpenBase(st)
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	return b, true, nil
-}
-
-// OpenHistory mmaps every sorted bucket in dir. alloc is the genesis alloc
-// used as the below-first-capture floor on a full node; when dir carries a
-// base file, that file is the floor instead and the alloc is unused.
+// OpenHistory mmaps every sorted bucket in dir. alloc is the genesis alloc,
+// the floor every descent ends at.
 func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, error) {
 	h := &History{dir: dir, store: store, genesis: alloc}
-	stateHead := uint64(0)
-	if base, ok, err := openBase(store.Cas()); err != nil {
-		return nil, fmt.Errorf("open base file: %w", err)
-	} else if ok {
-		h.base, h.floor, stateHead = base, base.Block(), base.Block()
-	}
-	var err error
+	var (
+		stateHead uint64
+		err       error
+	)
 	if h.buckets, stateHead, err = openSortedBuckets(dir, stateHead); err != nil {
 		h.Close()
 		return nil, err
@@ -140,23 +107,15 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 		h.Close()
 		return nil, err
 	}
-	h.epochs.SetFloor(h.floor)
 	if end, ok := h.epochs.SealedEnd(); ok && end > stateHead {
 		stateHead = end
 	}
-	if len(h.buckets) == 0 && len(h.epochs.Epochs) == 0 && h.base == nil {
-		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets, epochs or base file in %s (run epochdb cook-index or seal)", dir)
+	if len(h.buckets) == 0 && len(h.epochs.Epochs) == 0 {
+		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets or epochs in %s (run epochdb cook-index or seal)", dir)
 	}
-	// Deletes above the floor only (see the field comment).
 	h.deletes = make(map[string][]uint64)
 	for _, e := range h.epochs.Epochs {
-		if e.End() <= h.floor {
-			continue
-		}
 		e.AccountDeletes(func(key []byte, blk uint64) {
-			if blk <= h.floor {
-				return
-			}
 			h.deletes[string(key)] = append(h.deletes[string(key)], blk)
 		})
 	}
@@ -204,13 +163,10 @@ func openSortedBuckets(dir string, floorHead uint64) ([]*sortedBucket, uint64, e
 func (h *History) addBucketDeletes(dst map[string][]uint64, buckets []*sortedBucket) {
 	touched := make(map[string]bool)
 	for _, b := range buckets {
-		if (b.bucket+1)*BucketBlocks <= h.floor {
-			continue
-		}
 		for i := 0; i < b.n; i++ {
 			r := b.rec(i)
 			blk := binary.BigEndian.Uint64(r[53:61])
-			if r[0] == recKindAccount && binary.BigEndian.Uint32(r[69:73]) == 0 && blk > h.floor {
+			if r[0] == recKindAccount && binary.BigEndian.Uint32(r[69:73]) == 0 {
 				k := string(r[:sortedKeySize])
 				if !touched[k] {
 					// Refresh works on a shallow copy of the map, so the first
@@ -302,7 +258,7 @@ func (h *History) Refresh() error {
 		byBucket[b.bucket] = b
 	}
 	list := make([]*sortedBucket, 0, len(byBucket))
-	stateHead := h.floor
+	var stateHead uint64
 	for _, b := range byBucket {
 		list = append(list, b)
 		if b.cooked > stateHead {
@@ -460,10 +416,6 @@ func (h *History) Close() {
 		h.epochs.Close()
 		h.epochs = nil
 	}
-	if h.base != nil {
-		h.base.Close()
-		h.base = nil
-	}
 }
 
 // Head returns the highest block this node serves. Static serve: the cooked
@@ -485,14 +437,9 @@ func (h *History) SetHead(n uint64) {
 // refused by the descent.
 func (h *History) StateHead() uint64 { return h.stateHead.Load() }
 
-// Floor returns the limited-history floor B: nothing below it is served.
-// 0 on a full node.
-func (h *History) Floor() uint64 { return h.floor }
-
 // HeaderRLP returns the stored header RLP for block n: raw store first
 // (bucketLog is internally locked), sealed epochs as the fallback once raw
-// buckets are deleted, then the base file's BLOCKHASH window below the
-// floor (so eth_call works at heights just above B). Goroutine-safe.
+// buckets are deleted. Goroutine-safe.
 func (h *History) HeaderRLP(n uint64) ([]byte, bool, error) {
 	raw, ok, err := h.store.HeaderRLP(n)
 	if err != nil || ok {
@@ -504,9 +451,6 @@ func (h *History) HeaderRLP(n uint64) ([]byte, bool, error) {
 			return nil, false, err
 		}
 		return hdr, true, nil
-	}
-	if h.base != nil {
-		return h.base.HeaderRLP(n)
 	}
 	return nil, false, nil
 }
@@ -552,16 +496,15 @@ func (b *sortedBucket) lookup(key []byte, n uint64) (val []byte, blk uint64, fou
 }
 
 // search descends buckets from bucket(n) downward for the largest write <=
-// n of key, then the sealed epochs newest-to-oldest (bloom-gated), then the
-// base file. A key missing from a bucket/epoch falls through to the next
-// lower one; nothing anywhere = (found=false), i.e. genesis/zero territory.
-// The straddling raw bucket overlaps the newest epoch (bucket and epoch
-// boundaries never align); the data is identical, so whichever side hits
-// first wins.
+// n of key, then the sealed epochs newest-to-oldest (bloom-gated). A key
+// missing from a bucket/epoch falls through to the next lower one; nothing
+// anywhere = (found=false), i.e. genesis/zero territory. The straddling raw
+// bucket overlaps the newest epoch (bucket and epoch boundaries never align);
+// the data is identical, so whichever side hits first wins.
 func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bool, err error) {
-	// State correctness requires full descent to the floor: refuse below it
-	// (pruned) and above a coverage hole instead of silently skipping
-	// history. This is the choke point, hence the only floor check.
+	// State correctness requires full descent to genesis: refuse above a
+	// coverage hole instead of silently skipping history. This is the choke
+	// point, hence the only coverage check.
 	if err := h.epochs.RequireCovered(n); err != nil {
 		return nil, 0, false, err
 	}
@@ -573,71 +516,23 @@ func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bo
 		return nil, 0, false, fmt.Errorf("state at block %d is not indexed yet (cooked through %d, cook lag): retry, or read at latest", n, sh)
 	}
 	h.mu.RLock()
-	val, blk, found, err = h.searchAboveFloor(key, n)
-	h.mu.RUnlock()
-	if err != nil || found {
-		return val, blk, found, err
-	}
-	if h.base != nil {
-		// The base is live state at the floor, so a hit dates from <= floor:
-		// report the floor as the write block (any recorded delete is above
-		// it, which is exactly what makes StorageAt's delete check work).
-		var addr common.Address
-		copy(addr[:], key[1:21])
-		switch key[0] {
-		case recKindAccount:
-			val, found, err = h.base.Account(addr)
-		case recKindStorage:
-			val, found, err = h.base.Storage(addr, key[21:53])
-		}
-		return val, h.floor, found, err
-	}
-	return nil, 0, false, nil
-}
-
-// searchAboveFloor is the descent proper: buckets newest-to-oldest, then the
-// sealed epochs. A row at or BELOW the floor is not an answer, it is a miss,
-// so search falls through to the base: the base file is live state at B, it
-// already folded that write in (a below-B SELFDESTRUCT included) and the
-// deletes map deliberately carries nothing from down there. Buckets and
-// epochs can STRADDLE the floor, so the rule is per row, not per source; and
-// since the first hit wins the descent, every remaining source below it is
-// older still and can be skipped.
-func (h *History) searchAboveFloor(key []byte, n uint64) (val []byte, blk uint64, found bool, err error) {
-	belowFloor := func(blk uint64) bool { return h.floor > 0 && blk <= h.floor }
+	defer h.mu.RUnlock()
 	for i := len(h.buckets) - 1; i >= 0; i-- {
 		b := h.buckets[i]
 		if b.bucket*BucketBlocks > n {
 			continue
 		}
-		val, blk, found, err = b.lookup(key, n)
-		if err != nil {
-			return nil, 0, false, err
-		}
-		if found {
-			if belowFloor(blk) {
-				return nil, 0, false, nil
-			}
-			return val, blk, true, nil
+		if val, blk, found, err = b.lookup(key, n); err != nil || found {
+			return val, blk, found, err
 		}
 	}
 	for i := len(h.epochs.Epochs) - 1; i >= 0; i-- {
 		e := h.epochs.Epochs[i]
-		if e.Start > n {
+		if e.Start > n || !e.MayContainKey(key) {
 			continue
 		}
-		if !e.MayContainKey(key) {
-			continue
-		}
-		val, blk, found, err = e.StateSearch(key, n)
-		if err != nil {
-			return nil, 0, false, err
-		}
-		if found {
-			if belowFloor(blk) {
-				return nil, 0, false, nil
-			}
-			return val, blk, true, nil
+		if val, blk, found, err = e.StateSearch(key, n); err != nil || found {
+			return val, blk, found, err
 		}
 	}
 	return nil, 0, false, nil
@@ -680,9 +575,6 @@ func (h *History) AccountAt(addr common.Address, n uint64) (*types.StateAccount,
 		return nil, err
 	}
 	if !found {
-		if h.floor > 0 {
-			return nil, nil // base file is the floor, genesis included
-		}
 		// Below the first capture / never written: genesis alloc floor.
 		ga, ok := h.genesis[addr]
 		if !ok {
@@ -724,9 +616,6 @@ func (h *History) StorageAt(addr common.Address, slot []byte, n uint64) ([]byte,
 	if _, ok := h.lastAccountDelete(aKey, n); ok {
 		return nil, nil // account deleted at some point <= n, genesis storage is dead
 	}
-	if h.floor > 0 {
-		return nil, nil // base file is the floor, genesis included
-	}
 	ga, ok := h.genesis[addr]
 	if !ok || ga.Storage == nil {
 		return nil, nil
@@ -746,8 +635,7 @@ func (h *History) StorageAt(addr common.Address, slot []byte, n uint64) ([]byte,
 
 // CodeByHash serves contract code from code.log (the hot tail: everything
 // deployed above the sealed end), then the sealed epochs newest-to-oldest,
-// then the base file's code section, then the genesis alloc. Never any
-// frontier. EmptyCodeHash resolves to nil.
+// then the genesis alloc. Never any frontier. EmptyCodeHash resolves to nil.
 //
 // The epoch descent is what makes a download-bootstrapped node (no code.log
 // at all) serve eth_getCode: a v3 epoch carries the code of every account it
@@ -765,12 +653,6 @@ func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if !ok && h.base != nil {
-		blob, ok, err = h.base.Code(codeHash)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if !ok {
 		// Genesis alloc code was never deployed by a block, so no epoch
 		// carries it; the alloc ships with the binary.
@@ -779,7 +661,7 @@ func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 				return ga.Code, nil
 			}
 		}
-		return nil, fmt.Errorf("code %x not in code.log, the sealed epochs or the base file", codeHash)
+		return nil, fmt.Errorf("code %x not in code.log or the sealed epochs", codeHash)
 	}
 	return blob, nil
 }

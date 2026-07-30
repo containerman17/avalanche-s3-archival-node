@@ -3,14 +3,17 @@ package state
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/rlp"
 	"github.com/containerman17/epochdb/dist"
+	"github.com/holiman/uint256"
 )
 
 // synthEpoch builds a deterministic synthetic epoch: 100 blocks from start,
@@ -287,44 +290,6 @@ func TestEpochSetContiguity(t *testing.T) {
 	}
 }
 
-// TestEpochSetFloorCoverage: in limited-history mode coverage anchors at
-// the base file's block, not genesis.
-func TestEpochSetFloorCoverage(t *testing.T) {
-	st := testStore(t, t.TempDir())
-	synthEpoch(t, st, 500) // [500,599]
-	synthEpoch(t, st, 600) // [600,699]
-	synthEpoch(t, st, 900) // hole at 700
-	s, err := OpenEpochSet(st)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	// Without a floor a set that skips genesis is entirely gapped.
-	if got := s.CoveredEnd(); got != 0 {
-		t.Fatalf("covered end without floor: %d, want 0", got)
-	}
-
-	s.SetFloor(499)
-	if got := s.CoveredEnd(); got != 699 {
-		t.Fatalf("covered end with floor 499: %d, want 699", got)
-	}
-	if err := s.RequireCovered(500); err != nil {
-		t.Fatalf("RequireCovered(500): %v", err)
-	}
-	// Below the floor is pruned, and typed.
-	var pe *PrunedError
-	err = s.RequireCovered(498)
-	if !errors.As(err, &pe) || pe.Floor != 499 || pe.Block != 498 {
-		t.Fatalf("RequireCovered(498): %v, want *PrunedError{498,499}", err)
-	}
-	// A hole above the floor is still a hole, not a pruned read.
-	err = s.RequireCovered(750)
-	if err == nil || errors.As(err, &pe) || !strings.Contains(err.Error(), "missing epoch epoch_700") {
-		t.Fatalf("RequireCovered(750): %v, want missing epoch epoch_700", err)
-	}
-}
-
 func TestEpochDeterminism(t *testing.T) {
 	s1, s2 := testStore(t, t.TempDir()), testStore(t, t.TempDir())
 	_, h1 := synthEpoch(t, s1, 500)
@@ -507,4 +472,19 @@ func TestEpochThroughRangedReads(t *testing.T) {
 	if rows != localRows || rows == 0 {
 		t.Fatalf("walked %d rows, local walked %d", rows, localRows)
 	}
+}
+
+// codeAccRLP is a captured account post-image referencing a code blob.
+func codeAccRLP(t *testing.T, nonce uint64, balance int64, codeHash common.Hash) []byte {
+	t.Helper()
+	raw, err := rlp.EncodeToBytes(&types.StateAccount{
+		Nonce:    nonce,
+		Balance:  uint256.NewInt(uint64(balance)),
+		Root:     types.EmptyRootHash,
+		CodeHash: codeHash.Bytes(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

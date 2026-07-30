@@ -253,6 +253,6 @@ func (s *Store) CodeCount() int { return s.code.Count() }
 func (s *Store) WritelogBytes() uint64 { return s.wl.Bytes() }
 
 // Cas is the process's artifact store for this data directory: sealed epochs,
-// snapshots and the `latest` pointer (dist). One per state layer, so one chunk
+// artifacts and the `latest` pointer (dist). One per state layer, so one chunk
 // cache per process.
 func (s *Store) Cas() *dist.Store { return s.cas }

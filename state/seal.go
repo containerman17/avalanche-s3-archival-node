@@ -49,24 +49,14 @@ func hashBytes(hash string) ([32]byte, error) {
 	return out, nil
 }
 
-// setLatestEpoch advances the `latest` pointer's epoch half, leaving the
-// snapshot half (the pruning node's artifact) untouched.
+// setLatestEpoch advances the `latest` pointer: it names the newest epoch
+// and nothing else.
 func setLatestEpoch(st *dist.Store, hash string) error {
 	l, err := st.Latest()
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	l.Epoch = hash
-	return st.SetLatest(l)
-}
-
-// setLatestSnapshot advances the `latest` pointer's snapshot half.
-func setLatestSnapshot(st *dist.Store, hash string) error {
-	l, err := st.Latest()
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	l.Snapshot = hash
 	return st.SetLatest(l)
 }
 
@@ -99,14 +89,6 @@ func sealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte
 		if prev, err = hashBytes(head.Hash); err != nil {
 			return err
 		}
-	} else if b, ok, err := PeekBase(out.Dir()); err != nil {
-		return err
-	} else if ok {
-		// Limited-history node: nothing below the floor exists, so the
-		// first epoch starts at B+1 and the tx count is counted from there.
-		// Its predecessor is the epoch ending at B, whose hash only the local
-		// index can supply; refuse rather than fork the chain at the root.
-		return fmt.Errorf("seal: this node starts at snapshot floor %d with no epoch in its local index, so the hash chain has no link at %d: bootstrap the epoch index first", b, b+1)
 	}
 	set.Close()
 

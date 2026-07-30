@@ -57,9 +57,6 @@ func (s *Server) HeightByHash(hash common.Hash) (uint64, bool, error) {
 		found  bool
 	)
 	err := s.txidx.WalkCandidates(hash, func(n uint64) (bool, error) {
-		if n < s.hist.Floor() {
-			return false, nil // below the floor nothing is served
-		}
 		raw, ok, err := s.hist.HeaderRLP(n)
 		if err != nil {
 			return false, err
@@ -77,7 +74,7 @@ func (s *Server) HeightByHash(hash common.Hash) (uint64, bool, error) {
 }
 
 // FindTx resolves a tx hash to its block and index. found=false is a clean
-// "unknown tx" (see prunedTxError for why a pruned node must not say that).
+// "unknown tx".
 func (s *Server) FindTx(hash common.Hash) (blk *types.Block, txIndex int, found bool, err error) {
 	if s.txidx == nil {
 		return nil, 0, false, errors.New("tx index not available (run epochdb cook-txindex)")

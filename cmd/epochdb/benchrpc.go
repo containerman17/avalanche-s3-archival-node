@@ -31,7 +31,6 @@ func benchRPCMain(args []string) {
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	n := fs.Int("n", 300, "total probes")
 	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
-	floor := fs.Uint64("floor", 0, "limited-history floor of --local: probe only at or above it, and assert --local refuses below it (point --remote at a full epochdb node)")
 	fs.Parse(args)
 	if *remote == "" {
 		_, _, *remote = netParams(*network)
@@ -46,7 +45,7 @@ func benchRPCMain(args []string) {
 	json.Unmarshal(headRaw, &headHex)
 	var head uint64
 	fmt.Sscanf(headHex, "0x%x", &head)
-	log.Printf("ab-bench-rpc: local head=%d floor=%d remote=%s seed=%d", head, *floor, *remote, *seed)
+	log.Printf("ab-bench-rpc: local head=%d remote=%s seed=%d", head, *remote, *seed)
 
 	stats := map[string][2]int{} // method -> {probes, mismatches}
 	mismatches := 0
@@ -76,7 +75,7 @@ func benchRPCMain(args []string) {
 
 	done := 4
 	for done < *n {
-		h := atOrAboveFloor(rng, *floor, head)
+		h := randHeight(rng, head)
 		hHex := fmt.Sprintf("0x%x", h)
 
 		// Block body both ways + counts + uncles.
@@ -158,29 +157,10 @@ func benchRPCMain(args []string) {
 	for m, s := range stats {
 		fmt.Printf("  %-46s %4d probes, %d mismatches\n", m, s[0], s[1])
 	}
-	if *floor > 0 {
-		mismatches += belowFloorBlockRefusals(rng, *local, *floor)
-	}
 	if mismatches > 0 {
 		log.Fatalf("RESULT: %d MISMATCHES", mismatches)
 	}
 	fmt.Println("RESULT: ZERO mismatches")
-}
-
-// belowFloorBlockRefusals asserts the limited-history node refuses block
-// reads below its floor: nothing down there exists, so an answer (a body,
-// a null) instead of an error is a mismatch.
-func belowFloorBlockRefusals(rng *rand.Rand, local string, floor uint64) int {
-	bad, probes := 0, 0
-	for i := 0; i < 10; i++ {
-		h := fmt.Sprintf("0x%x", uint64(rng.Int63n(int64(floor))))
-		probes += 3
-		bad += refuse(local, "eth_getBlockByNumber", []any{h, false}, floor)
-		bad += refuse(local, "eth_getBlockTransactionCountByNumber", []any{h}, floor)
-		bad += refuse(local, "eth_getBlockReceipts", []any{h}, floor)
-	}
-	fmt.Printf("  below-floor block refusals: %d probes, %d answered (want 0)\n", probes, bad)
-	return bad
 }
 
 // diffJSON structurally compares two JSON-RPC answers (errors must agree
@@ -209,7 +189,7 @@ func diffBlockReceipts(local, remote, hHex string, txHashes []string) string {
 	lRes, lErr := rpcCall(local, "eth_getBlockReceipts", []any{hHex}, 2)
 	if lErr != nil {
 		// Paired errors are a match, same rule as diffJSON: above the sealed
-		// end (and below a floor) receipts legitimately fail on both sides.
+		// end receipts legitimately fail on both sides.
 		if _, rErr := rpcCall(remote, "eth_getTransactionReceipt", []any{txHashes[0]}, 4); rErr != nil {
 			return ""
 		}

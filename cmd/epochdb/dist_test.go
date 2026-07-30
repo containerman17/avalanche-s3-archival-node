@@ -57,9 +57,9 @@ func TestBootstrapChainWalk(t *testing.T) {
 		}
 	}
 
-	epochs, floor, err := bootstrapChain(st, root)
-	if err != nil || epochs != 2 || floor != 0 {
-		t.Fatalf("walk: %d epochs, floor %d, err %v", epochs, floor, err)
+	epochs, err := bootstrapChain(st, root)
+	if err != nil || epochs != 2 {
+		t.Fatalf("walk: %d epochs, err %v", epochs, err)
 	}
 	if got, err := state.ReadMarker(dir, state.EpochMarkerName(1, 4)); err != nil || got != h1 {
 		t.Fatalf("epoch 1 marker: %s %v, want %s", got, err, h1)
@@ -74,7 +74,7 @@ func TestBootstrapChainWalk(t *testing.T) {
 	}
 
 	// The chain root is the trust anchor: another network's root is refused.
-	if _, _, err := bootstrapChain(st, [32]byte{9}); err == nil || !strings.Contains(err.Error(), "wrong chain") {
+	if _, err := bootstrapChain(st, [32]byte{9}); err == nil || !strings.Contains(err.Error(), "wrong chain") {
 		t.Fatalf("walk with the wrong chain root: %v", err)
 	}
 }

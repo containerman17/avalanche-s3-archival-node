@@ -54,8 +54,7 @@ import (
 //	                so the historical window chases the head. Async and
 //	                fail-loud: a cook failure is logged, never stalls the chain.
 //
-// Seal (archival) and fold (pruning) deliberately stay OUT of this process;
-// see the comment on cookLoop.
+// Seal deliberately stays OUT of this process; see the comment on cookLoop.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
@@ -196,11 +195,8 @@ func serveMain(args []string) {
 	go syncLoop(ctx, store.Cas(), *syncEvery)
 	go statusLoop(ctx, e, hist, accepted)
 
-	if floor := hist.Floor(); floor > 0 {
-		log.Printf("epochdb: LIMITED HISTORY: floor=%d (base file), nothing below block %d is served", floor, floor)
-	}
-	log.Printf("epochdb: serve on :%d, executed=%d cooked=%d floor=%d chainId=%s (cook every %s)",
-		*port, e.LiveHead(), hist.StateHead(), hist.Floor(), g.Config.ChainID, *cookEvery)
+	log.Printf("epochdb: serve on :%d, executed=%d cooked=%d chainId=%s (cook every %s)",
+		*port, e.LiveHead(), hist.StateHead(), g.Config.ChainID, *cookEvery)
 
 	select {
 	case <-ctx.Done():
@@ -249,17 +245,15 @@ func (l liveNode) AcceptedHead() uint64 { return max(l.accepted(), l.Executor.Li
 // state at newly executed heights answerable by the descent, cook-txindex
 // makes their txs findable by hash, and History.Refresh publishes both.
 //
-// Deliberately NOT in this loop: seal and fold. Both DELETE raw buckets, and
-// this process is the live writer of exactly those files. seal drops a bucket
-// only once every block in it is sealed (so it can only ever target buckets
-// far below the writer's tip bucket), and fold's retirement guard additionally
-// requires exechead >= B + BucketBlocks, so both are SAFE in principle beside
-// this writer; what is NOT safe is the state.Open handle: our bucketLog holds
-// open fds and an in-RAM index of files a sibling would unlink, and cook's
-// tmp+rename races another cook. The documented shape stays: run seal or fold
-// as the external sibling on its own cadence, one at a time. With EPOCH_TXS at
-// 10M an epoch boundary is ~10 days away, so nothing is lost by leaving it out
-// of the tip loop.
+// Deliberately NOT in this loop: seal. It DELETES raw buckets, and this
+// process is the live writer of exactly those files. Seal drops a bucket only
+// once every block in it is sealed (so it can only ever target buckets far
+// below the writer's tip bucket) and is SAFE in principle beside this writer;
+// what is NOT safe is the state.Open handle: our bucketLog holds open fds and
+// an in-RAM index of files a sibling would unlink, and cook's tmp+rename races
+// another cook. The documented shape stays: run seal as the external sibling
+// on its own cadence. With EPOCH_TXS at 10M an epoch boundary is ~10 days
+// away, so nothing is lost by leaving it out of the tip loop.
 func cookLoop(ctx context.Context, dir string, hist *state.History, txidx *txIndexHolder, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()

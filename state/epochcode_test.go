@@ -243,8 +243,7 @@ func TestSealCodeEndToEnd(t *testing.T) {
 
 // TestCodeFromEpochsWithoutCodeLog: a node holding nothing but epoch files
 // (the download-bootstrap case, no code.log, no writelogs, no misc.log) still
-// answers eth_getCode. Models base_test's equivalent property for the base
-// file.
+// answers eth_getCode: the epoch is the only code source such a node has.
 func TestCodeFromEpochsWithoutCodeLog(t *testing.T) {
 	dir := t.TempDir()
 	in, code := codeEpochInput(t, 1)

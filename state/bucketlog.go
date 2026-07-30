@@ -158,9 +158,9 @@ func (l *bucketLog) rebuild(bucket uint64) error {
 }
 
 // pair returns the open file pair for bucket, LRU-closing over the cap.
-// create=false is the READ path: a bucket whose files are gone (seal and fold
-// retire whole buckets behind the sealed/folded end) returns nil, nil so the
-// caller falls through to the epochs or the base file. It must never be
+// create=false is the READ path: a bucket whose files are gone (seal retires
+// whole buckets behind the sealed end) returns nil, nil so the caller falls
+// through to the epochs. It must never be
 // O_CREATE there, or a read would resurrect an empty data file where a
 // retirement just removed one, turning every later read of that range into an
 // EOF error and leaving a zero-length file for the next cook to trip over.
@@ -304,7 +304,7 @@ func (l *bucketLog) Get(block uint64) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	if p == nil {
-		// Bucket retired under us (a sibling seal or fold). The read is not
+		// Bucket retired under us (a sibling seal). The read is not
 		// answered from here; the epoch or base fallback takes it.
 		delete(l.idx, block)
 		return nil, false, nil

@@ -1,6 +1,6 @@
 // Package dist is epochdb's artifact layer (DESIGN.md "Distribution").
 //
-// Sealed epochs and snapshots are WHOLE FILES NAMED BY THEIR HEX SHA256. A
+// Sealed epochs are WHOLE FILES NAMED BY THEIR HEX SHA256. A
 // producer renames a finished file onto the casfs spool path for its own hash
 // and that rename is the entire registration; a ticker uploads whatever the
 // spool holds and unlinks the local copy once the bucket confirms it. Reads go
@@ -315,20 +315,17 @@ func (b *Blob) Close() error {
 
 // ---------- pointers ----------
 
-// Latest is the bucket's one mutable object: the newest epoch and the newest
-// snapshot. A HINT, never an authority (DESIGN.md "Distribution").
+// Latest is the bucket's one mutable object: the newest epoch, and nothing
+// else since snapshots died (DESIGN.md ruling 1 of 2026-07-31). A HINT, never
+// an authority.
 type Latest struct {
-	Epoch    string
-	Snapshot string
+	Epoch string
 }
 
 func (l Latest) encode() string {
 	var b strings.Builder
 	if l.Epoch != "" {
 		fmt.Fprintf(&b, "epoch %s\n", l.Epoch)
-	}
-	if l.Snapshot != "" {
-		fmt.Fprintf(&b, "snapshot %s\n", l.Snapshot)
 	}
 	return b.String()
 }
@@ -346,8 +343,6 @@ func decodeLatest(s string) (Latest, error) {
 		switch f[0] {
 		case "epoch":
 			l.Epoch = f[1]
-		case "snapshot":
-			l.Snapshot = f[1]
 		default:
 			return l, fmt.Errorf("dist: unknown latest pointer field %q", f[0])
 		}

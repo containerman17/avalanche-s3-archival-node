@@ -224,9 +224,6 @@ func (s *Server) rawTxByHash(params []json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if !found {
-		if rerr := s.prunedTxError(); rerr != nil {
-			return nil, rerr
-		}
 		return "0x", nil // coreth returns empty bytes for unknown txs
 	}
 	raw, err := blk.Transactions()[i].MarshalBinary()

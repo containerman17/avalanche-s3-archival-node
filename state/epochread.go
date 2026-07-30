@@ -739,17 +739,14 @@ func ReadMarker(dir, name string) (string, error) {
 // ---------- epoch set ----------
 
 // EpochSet is every sealed epoch the local index knows, ascending. Sealing is
-// strictly sequential, but a downloaded set may have holes: coverage
-// is the contiguous epoch range from the floor (genesis on a full node, the
-// base-file block B in limited-history mode). Epochs above the first gap
-// stay open (their data is epoch-local and valid for body/tx-by-hash
-// reads), but full-descent reads (state, receipts, logs) must call
-// RequireCovered.
+// strictly sequential, but a downloaded set may have holes: coverage is the
+// contiguous epoch range from genesis. Epochs above the first gap stay open
+// (their data is epoch-local and valid for body/tx-by-hash reads), but
+// full-descent reads (state, receipts, logs) must call RequireCovered.
 type EpochSet struct {
 	Epochs []*Epoch // ascending by Start
 
-	floor    uint64 // limited-history floor B (0 = full node, genesis anchored)
-	covered  uint64 // last block of the contiguous prefix from the floor
+	covered  uint64 // last block of the contiguous prefix from genesis
 	gapStart uint64 // expected Start of the first missing epoch (covered+1)
 	gapped   bool   // true when at least one epoch above the prefix exists
 
@@ -783,18 +780,6 @@ func (s *EpochSet) touchTxIndex(e *Epoch) {
 		s.txHot[len(s.txHot)-1].dropTxIndex()
 		s.txHot = s.txHot[:len(s.txHot)-1]
 	}
-}
-
-// PrunedError is the typed refusal for a read below the limited-history
-// floor. The base file replaced every block under Floor, so the data is
-// GONE, not absent: this must never be answered with "not found" / null.
-type PrunedError struct {
-	Block uint64
-	Floor uint64
-}
-
-func (e *PrunedError) Error() string {
-	return fmt.Sprintf("block %d is pruned below block %d: this node serves history from block %d up (limited-history mode)", e.Block, e.Floor, e.Floor)
 }
 
 // OpenEpochSet opens every epoch the store's data directory indexes. An empty
@@ -839,23 +824,10 @@ func OpenEpochSet(st *dist.Store) (*EpochSet, error) {
 	return s, nil
 }
 
-// SetFloor anchors coverage at a limited-history floor B (the base file's
-// block): coverage may then start at B+1 instead of genesis, and reads
-// below B are pruned rather than missing.
-func (s *EpochSet) SetFloor(b uint64) {
-	s.floor = b
-	s.computeCoverage()
-}
-
-// Floor returns the limited-history floor (0 on a full node).
-func (s *EpochSet) Floor() uint64 { return s.floor }
-
-// computeCoverage walks the epochs upward from the floor. Anything after
-// the first gap (including a first epoch that starts above floor+1) stays
-// open for epoch-local reads but is outside coverage. Epochs wholly below
-// the floor are irrelevant: the base file answers there.
+// computeCoverage walks the epochs upward from genesis. Anything after the
+// first gap stays open for epoch-local reads but is outside coverage.
 func (s *EpochSet) computeCoverage() {
-	s.covered, s.gapped, s.gapStart = s.floor, false, 0
+	s.covered, s.gapped, s.gapStart = 0, false, 0
 	for _, e := range s.Epochs {
 		if e.End() <= s.covered {
 			continue
@@ -876,18 +848,14 @@ func (s *EpochSet) computeCoverage() {
 }
 
 // CoveredEnd returns the last block of the contiguous sealed prefix from
-// the floor (0 when nothing is covered on a full node).
+// genesis (0 when nothing is covered).
 func (s *EpochSet) CoveredEnd() uint64 { return s.covered }
 
-// RequireCovered errors when block n is below the limited-history floor
-// (pruned, typed as *PrunedError), or beyond the contiguous prefix while
+// RequireCovered errors when block n is beyond the contiguous prefix while
 // later epochs exist (a hole): state, receipt, and log reads at n would
 // silently skip missing history. Bodies/tx-by-hash are epoch-local and may
 // still be served above the gap without this check.
 func (s *EpochSet) RequireCovered(n uint64) error {
-	if n < s.floor {
-		return &PrunedError{Block: n, Floor: s.floor}
-	}
 	if s.gapped && n > s.covered {
 		return fmt.Errorf("missing epoch epoch_%d: sealed coverage is contiguous only through block %d", s.gapStart, s.covered)
 	}

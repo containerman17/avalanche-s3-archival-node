@@ -136,8 +136,6 @@ func main() {
 		rpcBenchMain(os.Args[2:])
 	case "seal":
 		sealMain(os.Args[2:])
-	case "fold":
-		foldMain(os.Args[2:])
 	case "bootstrap":
 		bootstrapMain(os.Args[2:])
 	case "verify":
@@ -157,13 +155,12 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override N]")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000] [--floor N]")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600] [--floor N]")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300] [--floor N]")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120] [--floor N]")
+	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
+	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
+	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
+	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120]")
 	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet] [--epoch-txs <n>]")
-	fmt.Fprintln(os.Stderr, "       epochdb fold [--data <dir>] [--network mainnet] [--epoch-txs <n>]")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--verify]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--frontier] [--verify]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
@@ -214,33 +211,6 @@ func sealMain(args []string) {
 	}
 }
 
-// foldMain is seal's sibling on a PRUNING node: at every canonical boundary
-// it folds the previous snapshot with the period's captured writes into
-// base_<B> and retires the raw buckets below B. A node either seals epochs or folds
-// snapshots, never both. Safe beside a live fetch+exec (it reads only durable
-// data at or below the boundary), but never run cook-index by hand beside it:
-// the fold owns cook on a pruning dir.
-func foldMain(args []string) {
-	fs := flag.NewFlagSet("fold", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "shared data directory")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (the genesis alloc is snapshot(0), the bottom of the first fold)")
-	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "canonical boundary tx count: MUST match every other producer's --epoch-txs or snapshots and epochs cut at different heights")
-	fs.Parse(args)
-	fetch.RegisterExtras()
-
-	g, err := exec.NetworkGenesis(execNetID(*network))
-	if err != nil {
-		log.Fatalf("epochdb: fold: genesis: %v", err)
-	}
-	st, err := dist.Open(*dataDir)
-	if err != nil {
-		log.Fatalf("epochdb: fold: %v", err)
-	}
-	if err := state.FoldSnapshots(st, g.Alloc, *epochTxs); err != nil {
-		log.Fatalf("epochdb: fold: %v", err)
-	}
-}
-
 // cookTxMain builds the per-bucket tx-hash indexes over the staging
 // segments. Read-only on the staging files, safe next to running processes.
 func cookTxMain(args []string) {
@@ -274,11 +244,11 @@ func bootstrapMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
-	epochs, floor, err := bootstrapChain(st, chainRoot)
+	epochs, err := bootstrapChain(st, chainRoot)
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
-	log.Printf("bootstrap: %d epochs indexed, floor %d, chain rooted at %x", epochs, floor, chainRoot[:8])
+	log.Printf("bootstrap: %d epochs indexed, chain rooted at %x", epochs, chainRoot[:8])
 	if !*doVerify {
 		return
 	}

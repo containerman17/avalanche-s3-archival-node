@@ -24,24 +24,11 @@ func (s *Server) blockAt(n uint64) (*types.Block, *rpcError) {
 	if n > s.acceptedHead() {
 		return nil, errInvalid("block %d beyond head %d", n, s.hist.Head())
 	}
-	// Below the floor the container is gone, not missing: name the floor like
-	// block-by-hash, tx-by-hash and getLogs do.
-	if floor := s.hist.Floor(); n < floor {
-		return nil, &rpcError{Code: errCodePruned, Message: fmt.Sprintf(
-			"block %d is pruned below block %d: this node serves history from block %d up (limited-history mode)", n, floor, floor)}
-	}
 	raw, ok, err := s.blocks.GetByHeight(n)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if !ok {
-		// Block F itself is the asymmetric case: the base file is state AT F,
-		// but F's body lived in the epoch that pruning dropped, so state reads
-		// at F answer while the block does not exist here.
-		if floor := s.hist.Floor(); floor > 0 && n <= floor {
-			return nil, &rpcError{Code: errCodePruned, Message: fmt.Sprintf(
-				"block %d is pruned: this node holds state from block %d but block bodies only above it (limited-history mode)", n, floor)}
-		}
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("container %d missing", n)}
 	}
 	blk, err := s.parse(raw)
@@ -61,15 +48,6 @@ func (s *Server) heightByHash(raw json.RawMessage) (uint64, bool, *rpcError) {
 	n, ok, err := s.HeightByHash(h)
 	if err != nil {
 		return 0, false, &rpcError{Code: -32000, Message: err.Error()}
-	}
-	if !ok {
-		// Same failure mode as tx-by-hash: the index starts at the floor, so
-		// an unknown hash on a pruned node may well be a real block below it.
-		if floor := s.hist.Floor(); floor > 0 {
-			return 0, false, &rpcError{Code: errCodePruned, Message: fmt.Sprintf(
-				"block hash not found at or above block %d; this node is pruned below %d and cannot tell an unknown hash from a pruned one (limited-history mode)",
-				floor, floor)}
-		}
 	}
 	return n, ok, nil
 }
