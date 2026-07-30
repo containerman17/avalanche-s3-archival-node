@@ -19,23 +19,32 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Tx-hash -> block index over the fetch staging segments, one file per
+// Hash -> block index over the fetch staging segments, one file per
 // staging bucket: txidx_NNNNN.idx.
 //
 //	header (32B): magic "EDBX" | version u32 | nTx u64 | nRecords u64 |
 //	              efL u32 | blkBits u32
-//	then five length-prefixed little-endian u64 word sections:
+//	then six length-prefixed little-endian u64 word sections:
 //	  EF lows, EF high bitvector, EF select0 samples, EF select1 samples,
-//	  bit-packed block-number offsets (height - bucket*SegmentBlocks).
+//	  bit-packed block-number offsets (height - bucket*SegmentBlocks),
+//	  the has-tx bitmap (bit i = block bucket*SegmentBlocks+i has >=1 tx).
 //
-// Keys are 48-bit tx-hash fingerprints (top 6 bytes) in an Elias-Fano
-// sequence; duplicate fingerprints map to multiple candidate blocks and the
-// caller verifies candidates against the full block. nRecords is the count
-// of complete staging sidecar records consumed at cook time: a bucket whose
-// visible record count is unchanged is skipped, growing buckets re-cook.
-// Atomic txs live in extdata and are not indexed.
+// Keys are 48-bit fingerprints (top 6 bytes) of TX HASHES AND BLOCK HASHES
+// alike, in one Elias-Fano sequence: a block hash maps to that block's own
+// height, which is what lets eth_getBlockByHash resolve without a
+// floor-to-head map (DESIGN.md ruling 2 of 2026-07-31). Duplicate
+// fingerprints map to multiple candidate blocks and the caller verifies
+// candidates against the full block, so a collision between the two kinds
+// costs one wasted read and nothing else. nRecords is the count of complete
+// staging sidecar records consumed at cook time: a bucket whose visible
+// record count is unchanged is skipped, growing buckets re-cook. Atomic txs
+// live in extdata and are not indexed.
 const (
-	txidxMagic   = "EDBX"
+	txidxMagic = "EDBX"
+	// Version 2 folds block hashes in and adds the has-tx bitmap. An older
+	// file is not read (openTxBucket refuses it) and cookTxBucket rebuilds
+	// it: these are local derived files, never distributed.
+	txidxVersion = 2
 	txidxHdrSize = 32
 	fpBits       = 48
 	txBlkBits    = 17 // SegmentBlocks-1 fits; constant keeps the format dumb
@@ -47,8 +56,15 @@ const (
 
 func txidxName(bucket uint64) string { return fmt.Sprintf("txidx_%05d.idx", bucket) }
 
-// txFingerprint is the top 48 bits of the tx hash.
+// txFingerprint is the top 48 bits of a tx or block hash.
 func txFingerprint(h common.Hash) uint64 { return binary.BigEndian.Uint64(h[:8]) >> 16 }
+
+// BlockHashFromHeaderRLP is the eth block hash of a stored RLP header. That
+// IS the definition of types.Header.Hash() (keccak256 of the header's RLP),
+// so the sealed index and the read path agree without decoding a header.
+func BlockHashFromHeaderRLP(headerRLP []byte) common.Hash {
+	return common.BytesToHash(crypto.Keccak256(headerRLP))
+}
 
 // ---------- bit-packed array ----------
 
@@ -326,7 +342,7 @@ func CookTxIndex(dir string) error {
 	if firstErr != nil {
 		return firstErr
 	}
-	fmt.Printf("cook-txindex: %d buckets (%d rebuilt), %d txs, %.1fMB total, %.2f bits/tx, in %s\n",
+	fmt.Printf("cook-txindex: %d buckets (%d rebuilt), %d entries, %.1fMB total, %.2f bits/entry, in %s\n",
 		len(sidecars), cooked, totTx, float64(totBytes)/1e6,
 		float64(totBytes*8)/float64(max(totTx, 1)), time.Since(start).Round(time.Millisecond))
 	return nil
@@ -383,12 +399,19 @@ func cookTxBucket(dir, sidecarPath string, bucket uint64) (nTx uint64, fileSize 
 		raw     []byte
 		hashBuf []common.Hash
 		base    = bucket * BucketBlocks
+		hasTx   = make([]uint64, (BucketBlocks+63)/64)
 	)
 	for i := 0; i < nRecords; i++ {
 		rec := idx[i*stagingRecSize : (i+1)*stagingRecSize]
 		height := binary.BigEndian.Uint64(rec[0:8])
 		off := binary.BigEndian.Uint64(rec[72:80])
 		ln := binary.BigEndian.Uint32(rec[80:84])
+		// The sidecar already carries the eth block hash, so folding block
+		// hashes into the same fingerprint space is free here.
+		pairs = append(pairs, pair{
+			fp:  txFingerprint(common.BytesToHash(rec[40:72])),
+			blk: height - base,
+		})
 		if cap(frame) < int(ln) {
 			frame = make([]byte, ln)
 		}
@@ -403,6 +426,10 @@ func cookTxBucket(dir, sidecarPath string, bucket uint64) (nTx uint64, fileSize 
 		hashBuf, err = extractTxHashes(innerEthBlock(raw), hashBuf[:0])
 		if err != nil {
 			return 0, 0, false, fmt.Errorf("height %d: %w", height, err)
+		}
+		if len(hashBuf) > 0 {
+			rel := height - base
+			hasTx[rel/64] |= 1 << (rel % 64)
 		}
 		for _, h := range hashBuf {
 			pairs = append(pairs, pair{fp: txFingerprint(h), blk: height - base})
@@ -425,7 +452,7 @@ func cookTxBucket(dir, sidecarPath string, bucket uint64) (nTx uint64, fileSize 
 		blk.set(i, p.blk)
 	}
 
-	size, err := writeTxIdx(outPath, uint64(len(pairs)), uint64(nRecords), e, blk)
+	size, err := writeTxIdx(outPath, uint64(len(pairs)), uint64(nRecords), e, blk, hasTx)
 	return uint64(len(pairs)), size, true, err
 }
 
@@ -437,10 +464,10 @@ func writeWords(buf []byte, ws []uint64) []byte {
 	return buf
 }
 
-func writeTxIdx(path string, nTx, nRecords uint64, e *ef, blk *packed) (int64, error) {
-	buf := make([]byte, 0, txidxHdrSize+8*(len(e.lows.w)+len(e.high)+len(e.sel0)+len(e.sel1)+len(blk.w)+5))
+func writeTxIdx(path string, nTx, nRecords uint64, e *ef, blk *packed, hasTx []uint64) (int64, error) {
+	buf := make([]byte, 0, txidxHdrSize+8*(len(e.lows.w)+len(e.high)+len(e.sel0)+len(e.sel1)+len(blk.w)+len(hasTx)+6))
 	buf = append(buf, txidxMagic...)
-	buf = binary.LittleEndian.AppendUint32(buf, 1)
+	buf = binary.LittleEndian.AppendUint32(buf, txidxVersion)
 	buf = binary.LittleEndian.AppendUint64(buf, nTx)
 	buf = binary.LittleEndian.AppendUint64(buf, nRecords)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(e.l))
@@ -450,6 +477,7 @@ func writeTxIdx(path string, nTx, nRecords uint64, e *ef, blk *packed) (int64, e
 	buf = writeWords(buf, e.sel0)
 	buf = writeWords(buf, e.sel1)
 	buf = writeWords(buf, blk.w)
+	buf = writeWords(buf, hasTx)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
 		return 0, err
@@ -465,11 +493,13 @@ type txBucket struct {
 	fileSize int64
 	e        *ef
 	blk      *packed
+	hasTx    []uint64 // bit i = block bucket*BucketBlocks+i has >=1 regular tx
 }
 
-// TxIndex answers tx-hash -> candidate-block queries over every cooked
-// bucket. Fully resident (the whole index is ~a few bits per tx);
-// goroutine-safe, everything is immutable after open.
+// TxIndex answers hash -> candidate-block queries (tx hashes and block
+// hashes share the fingerprint space) over every cooked bucket. Fully
+// resident (the whole index is ~a few bits per entry); goroutine-safe,
+// everything is immutable after open.
 type TxIndex struct {
 	buckets []*txBucket
 	nTx     uint64
@@ -497,8 +527,9 @@ func OpenTxIndex(dir string) (*TxIndex, error) {
 	return t, nil
 }
 
-// NumTx returns the total indexed transaction count.
-func (t *TxIndex) NumTx() uint64 { return t.nTx }
+// NumEntries returns the total indexed fingerprint count (txs plus one per
+// block for its own block hash).
+func (t *TxIndex) NumEntries() uint64 { return t.nTx }
 
 func readWords(b []byte, pos int) ([]uint64, int, error) {
 	if pos+8 > len(b) {
@@ -521,7 +552,7 @@ func openTxBucket(path string, bucket uint64) (*txBucket, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(b) < txidxHdrSize || string(b[0:4]) != txidxMagic || binary.LittleEndian.Uint32(b[4:8]) != 1 {
+	if len(b) < txidxHdrSize || string(b[0:4]) != txidxMagic || binary.LittleEndian.Uint32(b[4:8]) != txidxVersion {
 		return nil, fmt.Errorf("bad header")
 	}
 	nTx := binary.LittleEndian.Uint64(b[8:16])
@@ -530,7 +561,7 @@ func openTxBucket(path string, bucket uint64) (*txBucket, error) {
 	blkBits := uint(binary.LittleEndian.Uint32(b[28:32]))
 
 	pos := txidxHdrSize
-	var sections [5][]uint64
+	var sections [6][]uint64
 	for i := range sections {
 		if sections[i], pos, err = readWords(b, pos); err != nil {
 			return nil, err
@@ -551,29 +582,35 @@ func openTxBucket(path string, bucket uint64) (*txBucket, error) {
 		fileSize: int64(len(b)),
 		e:        e,
 		blk:      &packed{w: sections[4], bits: blkBits},
+		hasTx:    sections[5],
 	}, nil
 }
 
 // BlocksWithTxs returns a bitmap (indexed by height - bucket*BucketBlocks)
 // of blocks in the bucket that contain at least one regular tx. Blocks
 // without regular txs cannot emit logs, so the log backfill skips them
-// without touching the container.
+// without touching the container. It reads the cooked has-tx bitmap rather
+// than the fingerprint index, because since v2 every block contributes its
+// own block hash to that index and so appears in it whether it has txs or
+// not.
 func (t *TxIndex) BlocksWithTxs(bucket uint64) []bool {
 	out := make([]bool, BucketBlocks)
 	for _, tb := range t.buckets {
 		if tb.bucket != bucket {
 			continue
 		}
-		for i := 0; i < tb.e.n; i++ {
-			out[tb.blk.get(i)] = true
+		for i := range out {
+			if w := i / 64; w < len(tb.hasTx) && tb.hasTx[w]&(1<<(i%64)) != 0 {
+				out[i] = true
+			}
 		}
 	}
 	return out
 }
 
-// Candidates returns every block height that may contain a tx with this
-// hash (48-bit fingerprint match; the caller must verify against the full
-// block). Duplicate fingerprints yield multiple candidates.
+// Candidates returns every block height that may hold this hash (48-bit
+// fingerprint match; the caller must verify against the full block).
+// Duplicate fingerprints yield multiple candidates.
 func (t *TxIndex) Candidates(hash common.Hash) []uint64 {
 	return t.candidatesFP(txFingerprint(hash))
 }
@@ -589,9 +626,9 @@ func (t *TxIndex) candidatesFP(fp uint64) []uint64 {
 	return out
 }
 
-// WalkCandidates calls fn for every candidate block, newest first, stopping
-// when fn returns true (rpc.TxCandidateSource: the raw index alone is the
-// whole source on a node with no sealed epochs).
+// WalkCandidates calls fn for every candidate block of a tx OR block hash,
+// newest first, stopping when fn returns true (rpc.TxCandidateSource: the raw
+// index alone is the whole source on a node with no sealed epochs).
 func (t *TxIndex) WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error {
 	_, err := t.walkCandidatesFP(txFingerprint(hash), fn)
 	return err

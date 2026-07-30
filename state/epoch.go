@@ -69,7 +69,8 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 //	deletes    raw sorted 61B rows key53|block u64 of account-delete
 //	           records (rare; feeds the open-time delete map without
 //	           decompressing the SST)
-//	txidx      EF fp48 + bit-packed epoch-relative block numbers
+//	txidx      EF fp48 + bit-packed epoch-relative block numbers, over TX
+//	           HASHES AND BLOCK HASHES alike (v6)
 //	txbloom    bloom over exactly the fp48s in txidx (txBloomBitsPerTx), the
 //	           reject filter that keeps txidx off the resident set
 //	logidx     posting lists addr->EF blocklist, topic->EF blocklist
@@ -132,14 +133,16 @@ const (
 	txBloomBitsPerTx = 16
 	txBloomHashes    = 11
 
-	// Format v5 is the ONLY supported format: stored-logs sections (v2,
+	// Format v6 is the ONLY supported format: stored-logs sections (v2,
 	// 2026-07-20), contract code as 'c' rows in the SST (v3, 2026-07-28),
 	// the HASH-CHAIN footer field (v4, 2026-07-30) that makes one head hash
-	// authenticate all of a chain's history, and the tx-fingerprint bloom
-	// (v5, 2026-07-30). There is no upgrade path: OpenEpoch refuses an older
-	// file and the corpus is rebuilt by a fresh sync (user ruling
-	// 2026-07-28).
-	epochVersion     = 5
+	// authenticate all of a chain's history, the tx-fingerprint bloom (v5,
+	// 2026-07-30), and BLOCK HASHES FOLDED INTO THAT SAME INDEX AND BLOOM
+	// (v6, 2026-07-31), which deletes the floor-to-head block-hash map. Same
+	// 17 sections: v6 changes only what goes into txidx/txbloom. There is no
+	// upgrade path: OpenEpoch refuses an older file and the corpus is rebuilt
+	// by a fresh sync (user ruling 2026-07-28).
+	epochVersion     = 6
 	epochNumSections = 17
 	epochTableOff    = 4 + 4 + 8 + 8 + 8 + 32                  // magic, version, start, count, txs, prev hash
 	epochFooterSize  = epochTableOff + epochNumSections*16 + 4 // + table + trailing magic
@@ -611,14 +614,30 @@ func buildSST(enc *zstd.Encoder, rows []StateRow, cc *codeCursor) (sst, sstIdx, 
 	return w.sst, w.sstIdx, w.deletes, w.keys
 }
 
-// buildEpochTxidx encodes the epoch's tx fingerprints exactly like the raw
+// buildEpochTxidx encodes the epoch's fingerprints exactly like the raw
 // txidx buckets (ef + packed blocks), with epoch-relative block numbers.
-// Layout: nTx u64 | efL u32 | blkBits u32 | 5 length-prefixed word sections.
-// It also returns the tx bloom over the SAME fingerprint slice, so the filter
-// and the index it guards cannot disagree.
+// Layout: nEntries u64 | efL u32 | blkBits u32 | 5 length-prefixed word
+// sections. It also returns the tx bloom over the SAME fingerprint slice, so
+// the filter and the index it guards cannot disagree.
+//
+// v6: EVERY BLOCK HASH IS AN ENTRY TOO, mapping to that block's own height.
+// A block hash and a tx hash are both just hashes that resolve to a block
+// number, so one structure serves both and the floor-to-head
+// map[common.Hash]uint64 serve used to hold (measured 100.7 B/entry, 9.07GB
+// at mainnet) is deleted. +1 entry per block on ~10 txs per block is a few
+// percent of the index; a fingerprint collision BETWEEN the two kinds is
+// harmless because the caller knows which kind it wants and verifies against
+// the header or the body, costing one wasted read exactly as a same-kind
+// collision already did.
 func buildEpochTxidx(in *EpochInput, count uint64) (idx, bloom []byte) {
 	type pair struct{ fp, blk uint64 }
-	var pairs []pair
+	pairs := make([]pair, 0, len(in.Headers)+int(in.TxCount))
+	for i, hdr := range in.Headers {
+		pairs = append(pairs, pair{
+			fp:  txFingerprint(BlockHashFromHeaderRLP(hdr)),
+			blk: uint64(i),
+		})
+	}
 	for blk, hashes := range in.TxHashes {
 		for _, h := range hashes {
 			pairs = append(pairs, pair{

@@ -74,8 +74,9 @@ func TestEFRoundtripAndDuplicates(t *testing.T) {
 }
 
 // writeStagingBlock appends one synthetic eth block to a fake staging
-// bucket (zstd frame + 84B sidecar record), returning its txs' hashes.
-func writeStagingBlock(t *testing.T, dir string, bucket, height uint64, nTxs int) []common.Hash {
+// bucket (zstd frame + 84B sidecar record), returning its txs' hashes and
+// its own block hash.
+func writeStagingBlock(t *testing.T, dir string, bucket, height uint64, nTxs int) ([]common.Hash, common.Hash) {
 	t.Helper()
 	to := common.HexToAddress("0xbeef")
 	var txs []*types.Transaction
@@ -88,11 +89,8 @@ func writeStagingBlock(t *testing.T, dir string, bucket, height uint64, nTxs int
 			Value:    big.NewInt(int64(i)),
 		}))
 	}
-	blockRLP, err := rlp.EncodeToBytes([]any{
-		&types.Header{Number: new(big.Int).SetUint64(height)},
-		txs,
-		[]*types.Header{},
-	})
+	header := &types.Header{Number: new(big.Int).SetUint64(height)}
+	blockRLP, err := rlp.EncodeToBytes([]any{header, txs, []*types.Header{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +111,7 @@ func writeStagingBlock(t *testing.T, dir string, bucket, height uint64, nTxs int
 
 	var rec [stagingRecSize]byte
 	binary.BigEndian.PutUint64(rec[0:8], height)
+	copy(rec[40:72], header.Hash().Bytes()) // the eth block hash the cook folds in
 	binary.BigEndian.PutUint64(rec[72:80], off)
 	binary.BigEndian.PutUint32(rec[80:84], uint32(len(frame)))
 	idxPath := filepath.Join(dir, fmt.Sprintf("index_%05d.log", bucket))
@@ -129,13 +128,13 @@ func writeStagingBlock(t *testing.T, dir string, bucket, height uint64, nTxs int
 	for _, tx := range txs {
 		out = append(out, tx.Hash())
 	}
-	return out
+	return out, header.Hash()
 }
 
 func TestCookTxIndexAndSkip(t *testing.T) {
 	dir := t.TempDir()
-	h1 := writeStagingBlock(t, dir, 0, 5, 3)
-	h2 := writeStagingBlock(t, dir, 1, 150_000, 2)
+	h1, b1 := writeStagingBlock(t, dir, 0, 5, 3)
+	h2, b2 := writeStagingBlock(t, dir, 1, 150_000, 2)
 
 	if err := CookTxIndex(dir); err != nil {
 		t.Fatal(err)
@@ -144,8 +143,9 @@ func TestCookTxIndexAndSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if idx.NumTx() != 5 {
-		t.Fatalf("NumTx=%d want 5", idx.NumTx())
+	// 5 txs + one entry per block for its own block hash.
+	if idx.NumEntries() != 7 {
+		t.Fatalf("NumEntries=%d want 7", idx.NumEntries())
 	}
 	wantHit := func(h common.Hash, height uint64) {
 		t.Helper()
@@ -163,6 +163,20 @@ func TestCookTxIndexAndSkip(t *testing.T) {
 	for _, h := range h2 {
 		wantHit(h, 150_000)
 	}
+	// The v6 fold: a BLOCK hash resolves to its own height out of the same index.
+	wantHit(b1, 5)
+	wantHit(b2, 150_000)
+	// ...and the has-tx bitmap still names only tx-bearing blocks, which is
+	// what keeps the log backfill from re-executing every empty block.
+	with := idx.BlocksWithTxs(0)
+	if !with[5] {
+		t.Fatal("block 5 has txs but the has-tx bitmap says no")
+	}
+	for i, v := range with {
+		if v && i != 5 {
+			t.Fatalf("has-tx bitmap claims block %d in bucket 0", i)
+		}
+	}
 
 	// Skip logic: unchanged bucket must not be rewritten.
 	before, _ := os.Stat(filepath.Join(dir, txidxName(0)))
@@ -175,7 +189,7 @@ func TestCookTxIndexAndSkip(t *testing.T) {
 	}
 
 	// A grown bucket must re-cook and index the new txs.
-	h3 := writeStagingBlock(t, dir, 0, 9, 4)
+	h3, _ := writeStagingBlock(t, dir, 0, 9, 4)
 	if err := CookTxIndex(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -183,8 +197,8 @@ func TestCookTxIndexAndSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if idx2.NumTx() != 9 {
-		t.Fatalf("after grow NumTx=%d want 9", idx2.NumTx())
+	if idx2.NumEntries() != 12 { // 9 txs + 3 block hashes
+		t.Fatalf("after grow NumEntries=%d want 12", idx2.NumEntries())
 	}
 	for _, h := range h3 {
 		cands := idx2.Candidates(h)

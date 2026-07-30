@@ -201,6 +201,27 @@ func TestEpochRoundtrip(t *testing.T) {
 		t.Fatalf("duplicate fp: %v", dupC)
 	}
 
+	// v6: every BLOCK hash is in the same index and bloom, mapping to its own
+	// height. This is what replaced the floor-to-head block-hash map.
+	for i, hdr := range in.Headers {
+		blk := in.Start + uint64(i)
+		fp := txFingerprint(BlockHashFromHeaderRLP(hdr))
+		if !e.MayContainTx(fp) {
+			t.Fatalf("block %d: tx bloom rejects its own block hash", blk)
+		}
+		cands, err := e.TxCandidates(fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hit := false
+		for _, c := range cands {
+			hit = hit || c == blk
+		}
+		if !hit {
+			t.Fatalf("block %d: candidates %v missing its own height", blk, cands)
+		}
+	}
+
 	// logidx
 	b1, err := e.LogAddrBlocks(addr20(1))
 	if err != nil || len(b1) != 2 || b1[0] != 1007 || b1[1] != 1077 {

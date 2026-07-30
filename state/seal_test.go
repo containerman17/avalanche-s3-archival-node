@@ -31,7 +31,8 @@ func TestSealCutAndResume(t *testing.T) {
 	// the txindex test helper).
 	txHashes := map[uint64][]struct{ h [32]byte }{}
 	for n := uint64(1); n <= 10; n++ {
-		for _, h := range writeStagingBlock(t, dir, 0, n, 3) {
+		hs, _ := writeStagingBlock(t, dir, 0, n, 3)
+		for _, h := range hs {
 			txHashes[n] = append(txHashes[n], struct{ h [32]byte }{[32]byte(h)})
 		}
 	}

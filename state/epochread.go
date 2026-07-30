@@ -285,8 +285,8 @@ func (e *Epoch) HeaderRLP(n uint64) ([]byte, error) {
 func (e *Epoch) MayContainKey(key []byte) bool { return e.keyBloom.mayContain(key) }
 
 // MayContainTx is the bloom prefilter in front of the tx index: false means
-// this epoch definitely holds no tx with that fingerprint, which is the whole
-// answer for an unknown hash and costs no index load.
+// this epoch definitely holds neither a tx nor a block with that fingerprint,
+// which is the whole answer for an unknown hash and costs no index load.
 func (e *Epoch) MayContainTx(fp uint64) bool {
 	k := txBloomKey(fp)
 	return e.txBloom.mayContain(k[:])
@@ -460,8 +460,9 @@ func (e *Epoch) dropTxIndex() {
 	e.txMu.Unlock()
 }
 
-// TxCandidates returns absolute candidate blocks for a tx-hash fingerprint,
-// descending. Bloom first: an unknown fingerprint never loads the index.
+// TxCandidates returns absolute candidate blocks for a fingerprint (a tx
+// hash, or since v6 a block hash mapping to its own height), descending.
+// Bloom first: an unknown fingerprint never loads the index.
 func (e *Epoch) TxCandidates(fp uint64) ([]uint64, error) {
 	if !e.MayContainTx(fp) {
 		return nil, nil
