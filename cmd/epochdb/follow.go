@@ -367,13 +367,13 @@ type txIndexHolder struct {
 	cur state.CombinedTxIndex
 }
 
-func (t *txIndexHolder) Candidates(hash common.Hash) []uint64 {
+func (t *txIndexHolder) WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if t.cur.Epochs == nil {
 		return nil
 	}
-	return t.cur.Candidates(hash)
+	return t.cur.WalkCandidates(hash, fn)
 }
 
 func (t *txIndexHolder) reopen(dir string, epochs *state.EpochSet) {

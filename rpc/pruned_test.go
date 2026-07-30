@@ -23,7 +23,7 @@ func (noBlocks) GetByHeight(uint64) ([]byte, bool, error) { return nil, false, n
 
 type noTxIndex struct{}
 
-func (noTxIndex) Candidates(common.Hash) []uint64 { return nil }
+func (noTxIndex) WalkCandidates(common.Hash, func(uint64) (bool, error)) error { return nil }
 
 // newPrunedServer builds a real limited-history node: a tiny captured corpus
 // is folded into a base file at `floor`, and the server runs over a dir that

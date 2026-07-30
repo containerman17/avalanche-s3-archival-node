@@ -178,7 +178,13 @@ func TestEpochRoundtrip(t *testing.T) {
 	for blk, hashes := range in.TxHashes {
 		for _, h := range hashes {
 			fp := binary.BigEndian.Uint64(h[:8]) >> 16
-			cands := e.TxCandidates(fp)
+			cands, err := e.TxCandidates(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !e.MayContainTx(fp) {
+				t.Fatalf("tx %x: bloom rejects an indexed fingerprint", h[:6])
+			}
 			ok := false
 			for _, c := range cands {
 				ok = ok || c == blk
@@ -190,7 +196,7 @@ func TestEpochRoundtrip(t *testing.T) {
 	}
 	var dup [32]byte
 	copy(dup[:], []byte("duplicated-fingerprint-hash!!"))
-	dupC := e.TxCandidates(binary.BigEndian.Uint64(dup[:8]) >> 16)
+	dupC, _ := e.TxCandidates(binary.BigEndian.Uint64(dup[:8]) >> 16)
 	if len(dupC) != 2 {
 		t.Fatalf("duplicate fp: %v", dupC)
 	}
@@ -454,6 +460,16 @@ func TestEpochThroughRangedReads(t *testing.T) {
 	tb, _ := ranged.LogTopicBlocks(topic32(9))
 	if len(ta) != len(tb) {
 		t.Fatalf("log topic blocks: %v vs %v", ta, tb)
+	}
+	// The tx index is loaded lazily out of the blob, so it must decode from a
+	// ReadAt copy exactly as it does from the mapping.
+	var dup [32]byte
+	copy(dup[:], []byte("duplicated-fingerprint-hash!!"))
+	dupFP := binary.BigEndian.Uint64(dup[:8]) >> 16
+	ca, err1 := local.TxCandidates(dupFP)
+	cb, err2 := ranged.TxCandidates(dupFP)
+	if err1 != nil || err2 != nil || len(ca) != 2 || len(cb) != 2 || ca[0] != cb[0] || ca[1] != cb[1] {
+		t.Fatalf("tx candidates: %v %v vs %v %v", ca, err1, cb, err2)
 	}
 	ra, oka, _ := ranged.StoredLogsRecord(1007)
 	if !oka || !bytes.Equal(ra, []byte{7, 7, 7}) {

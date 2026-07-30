@@ -70,6 +70,8 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 //	           records (rare; feeds the open-time delete map without
 //	           decompressing the SST)
 //	txidx      EF fp48 + bit-packed epoch-relative block numbers
+//	txbloom    bloom over exactly the fp48s in txidx (txBloomBitsPerTx), the
+//	           reject filter that keeps txidx off the resident set
 //	logidx     posting lists addr->EF blocklist, topic->EF blocklist
 //	keybloom   bloom over keys written in this epoch (bloomBitsPerKey)
 //
@@ -118,14 +120,27 @@ const (
 	bloomBitsPerKey = 20
 	bloomHashes     = 14
 
-	// Format v4 is the ONLY supported format: stored-logs sections (v2,
+	// The TX bloom (v5) is the reject filter in front of the per-epoch tx
+	// index. Without it every eth_getTransactionByHash for a hash this node
+	// does not know (a tx still in the mempool, i.e. every wallet polling
+	// its own pending tx) walks every epoch's Elias-Fano index, which is why
+	// that index used to be resident: 6.35 B/tx, ~7.1GB at mainnet scale.
+	// 16 bits/tx with the matching optimal k = round(16*ln2) = 11 gives
+	// 0.045% per epoch, i.e. ~0.05 wasted index loads per pending-tx poll on
+	// a 120-epoch mainnet, for 2 B/tx of mmap'd page cache. The fingerprints
+	// are exactly the fp48s buildEpochTxidx encodes, from the same slice.
+	txBloomBitsPerTx = 16
+	txBloomHashes    = 11
+
+	// Format v5 is the ONLY supported format: stored-logs sections (v2,
 	// 2026-07-20), contract code as 'c' rows in the SST (v3, 2026-07-28),
-	// and the HASH-CHAIN footer field (v4, 2026-07-30) that makes one head
-	// hash authenticate all of a chain's history. There is no upgrade path:
-	// OpenEpoch refuses an older file and the corpus is rebuilt by a fresh
-	// sync (user ruling 2026-07-28).
-	epochVersion     = 4
-	epochNumSections = 16
+	// the HASH-CHAIN footer field (v4, 2026-07-30) that makes one head hash
+	// authenticate all of a chain's history, and the tx-fingerprint bloom
+	// (v5, 2026-07-30). There is no upgrade path: OpenEpoch refuses an older
+	// file and the corpus is rebuilt by a fresh sync (user ruling
+	// 2026-07-28).
+	epochVersion     = 5
+	epochNumSections = 17
 	epochTableOff    = 4 + 4 + 8 + 8 + 8 + 32                  // magic, version, start, count, txs, prev hash
 	epochFooterSize  = epochTableOff + epochNumSections*16 + 4 // + table + trailing magic
 
@@ -151,6 +166,8 @@ const (
 	secFullLogsIdx
 	secRcpt
 	secRcptIdx
+	// v5 addition: the tx-fingerprint bloom.
+	secTxBloom
 )
 
 var epochMagic = [4]byte{'E', 'P', 'O', 'C'}
@@ -351,7 +368,9 @@ func BuildEpoch(st *dist.Store, in *EpochInput) (string, error) {
 	section(secSSTIdx, sstIdx)
 	section(secDeletes, deletes)
 
-	section(secTxidx, buildEpochTxidx(in, count))
+	txidx, txbloom := buildEpochTxidx(in, count)
+	section(secTxidx, txidx)
+	section(secTxBloom, txbloom)
 	section(secLogidx, buildLogidx(in.Logs, in.Start, count))
 	section(secKeybloom, buildBloom(keys))
 
@@ -595,7 +614,9 @@ func buildSST(enc *zstd.Encoder, rows []StateRow, cc *codeCursor) (sst, sstIdx, 
 // buildEpochTxidx encodes the epoch's tx fingerprints exactly like the raw
 // txidx buckets (ef + packed blocks), with epoch-relative block numbers.
 // Layout: nTx u64 | efL u32 | blkBits u32 | 5 length-prefixed word sections.
-func buildEpochTxidx(in *EpochInput, count uint64) []byte {
+// It also returns the tx bloom over the SAME fingerprint slice, so the filter
+// and the index it guards cannot disagree.
+func buildEpochTxidx(in *EpochInput, count uint64) (idx, bloom []byte) {
 	type pair struct{ fp, blk uint64 }
 	var pairs []pair
 	for blk, hashes := range in.TxHashes {
@@ -633,7 +654,7 @@ func buildEpochTxidx(in *EpochInput, count uint64) []byte {
 	out = writeWords(out, e.sel0)
 	out = writeWords(out, e.sel1)
 	out = writeWords(out, blk.w)
-	return out
+	return out, buildTxBloom(fps)
 }
 
 // buildLogidx encodes position-agnostic posting lists. Layout:
@@ -739,11 +760,11 @@ func (e *ef) values() []uint64 {
 
 // ---------- bloom ----------
 
-// bloomBits: m = 10 bits/key rounded up to whole words. Split out of
-// buildBloom so a streaming writer that knows only the row count up front
+// bloomBits: m = bitsPerKey bits per key rounded up to whole words. Split out
+// of buildBloom so a streaming writer that knows only the row count up front
 // (state/base.go's baseWriter) sizes the filter identically.
-func bloomBits(nKeys uint64) uint64 {
-	m := nKeys * bloomBitsPerKey
+func bloomBits(nKeys, bitsPerKey uint64) uint64 {
+	m := nKeys * bitsPerKey
 	if m < 64 {
 		m = 64
 	}
@@ -751,9 +772,11 @@ func bloomBits(nKeys uint64) uint64 {
 }
 
 // encodeBloom serializes the filter: m u64 | k u32 | pad u32 | words.
-func encodeBloom(m uint64, words []uint64) []byte {
+// Readers take m and k from these bytes, so the two filters (keys, tx
+// fingerprints) share one reader.
+func encodeBloom(m uint64, k uint32, words []uint64) []byte {
 	out := binary.LittleEndian.AppendUint64(nil, m)
-	out = binary.LittleEndian.AppendUint32(out, bloomHashes)
+	out = binary.LittleEndian.AppendUint32(out, k)
 	out = binary.LittleEndian.AppendUint32(out, 0)
 	for _, w := range words {
 		out = binary.LittleEndian.AppendUint64(out, w)
@@ -761,19 +784,42 @@ func encodeBloom(m uint64, words []uint64) []byte {
 	return out
 }
 
-// buildBloom: k = bloomHashes, double hashing over xxhash. Bits are
-// OR-accumulated, so insertion order cannot reach the bytes.
+// bloomSet ORs one key's k bits in. OR-accumulated, so insertion order cannot
+// reach the bytes.
+func bloomSet(words []uint64, m, k uint64, key []byte) {
+	h1, h2 := bloomHash(key)
+	for i := uint64(0); i < k; i++ {
+		bit := (h1 + i*h2) % m
+		words[bit/64] |= 1 << (bit % 64)
+	}
+}
+
+// buildBloom is the key bloom: k = bloomHashes, double hashing over xxhash.
 func buildBloom(keys [][]byte) []byte {
-	m := bloomBits(uint64(len(keys)))
+	m := bloomBits(uint64(len(keys)), bloomBitsPerKey)
 	words := make([]uint64, m/64)
 	for _, k := range keys {
-		h1, h2 := bloomHash(k)
-		for i := uint64(0); i < bloomHashes; i++ {
-			bit := (h1 + i*h2) % m
-			words[bit/64] |= 1 << (bit % 64)
-		}
+		bloomSet(words, m, bloomHashes, k)
 	}
-	return encodeBloom(m, words)
+	return encodeBloom(m, bloomHashes, words)
+}
+
+// buildTxBloom is the tx-fingerprint bloom over the fp48s of one epoch, keyed
+// by the fingerprint's 8 little-endian bytes (txBloomKey).
+func buildTxBloom(fps []uint64) []byte {
+	m := bloomBits(uint64(len(fps)), txBloomBitsPerTx)
+	words := make([]uint64, m/64)
+	for _, fp := range fps {
+		k := txBloomKey(fp)
+		bloomSet(words, m, txBloomHashes, k[:])
+	}
+	return encodeBloom(m, txBloomHashes, words)
+}
+
+// txBloomKey is the bloom key for a 48-bit tx fingerprint.
+func txBloomKey(fp uint64) (k [8]byte) {
+	binary.LittleEndian.PutUint64(k[:], fp)
+	return
 }
 
 func bloomHash(key []byte) (h1, h2 uint64) {

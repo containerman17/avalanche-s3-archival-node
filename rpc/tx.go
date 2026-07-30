@@ -37,10 +37,14 @@ func (s SealedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
 	return s.Blocks.GetByHeight(n)
 }
 
-// TxCandidateSource maps a tx hash to candidate block heights
-// (state.TxIndex or state.CombinedTxIndex).
+// TxCandidateSource walks the candidate block heights for a tx hash, newest
+// first, stopping when the callback says it found the tx (state.TxIndex or
+// state.CombinedTxIndex). It is a walk rather than a list so an unknown hash
+// (every wallet polling its own still-pending tx) is rejected by the per-epoch
+// tx blooms without loading any epoch's tx index, and a known one stops at the
+// first epoch that answers instead of probing all of history.
 type TxCandidateSource interface {
-	Candidates(hash common.Hash) []uint64
+	WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error
 }
 
 // ContainerParser decodes a raw container into an eth block (exec.ParseEthBlock).
@@ -80,28 +84,33 @@ func (s *Server) prunedTxError() *rpcError {
 // findTx resolves a tx hash through the fingerprint index and verifies the
 // candidates against the actual blocks. found=false is a clean "unknown tx".
 func (s *Server) findTx(hash common.Hash) (blk *types.Block, txIndex int, found bool, err error) {
-	for _, h := range s.txidx.Candidates(hash) {
+	err = s.txidx.WalkCandidates(hash, func(h uint64) (bool, error) {
 		if h < s.hist.Floor() {
-			continue // below the floor nothing is served, even if the container is still on disk
+			return false, nil // below the floor nothing is served, even if the container is still on disk
 		}
 		raw, ok, err := s.blocks.GetByHeight(h)
 		if err != nil {
-			return nil, 0, false, err
+			return false, err
 		}
 		if !ok {
-			continue // candidate block not (visibly) staged
+			return false, nil // candidate block not (visibly) staged
 		}
 		b, err := s.parse(raw)
 		if err != nil {
-			return nil, 0, false, fmt.Errorf("parse container %d: %w", h, err)
+			return false, fmt.Errorf("parse container %d: %w", h, err)
 		}
 		for i, tx := range b.Transactions() {
 			if tx.Hash() == hash {
-				return b, i, true, nil
+				blk, txIndex, found = b, i, true
+				return true, nil
 			}
 		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, 0, false, err
 	}
-	return nil, 0, false, nil
+	return blk, txIndex, found, nil
 }
 
 func txHashParam(params []json.RawMessage) (common.Hash, *rpcError) {

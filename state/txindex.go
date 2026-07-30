@@ -588,3 +588,25 @@ func (t *TxIndex) candidatesFP(fp uint64) []uint64 {
 	}
 	return out
 }
+
+// WalkCandidates calls fn for every candidate block, newest first, stopping
+// when fn returns true (rpc.TxCandidateSource: the raw index alone is the
+// whole source on a node with no sealed epochs).
+func (t *TxIndex) WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error {
+	_, err := t.walkCandidatesFP(txFingerprint(hash), fn)
+	return err
+}
+
+func (t *TxIndex) walkCandidatesFP(fp uint64, fn func(blk uint64) (bool, error)) (bool, error) {
+	for i := len(t.buckets) - 1; i >= 0; i-- {
+		tb := t.buckets[i]
+		lo, hi := tb.e.lookup(fp)
+		for j := hi - 1; j >= lo; j-- {
+			stop, err := fn(tb.bucket*BucketBlocks + tb.blk.get(j))
+			if stop || err != nil {
+				return stop, err
+			}
+		}
+	}
+	return false, nil
+}

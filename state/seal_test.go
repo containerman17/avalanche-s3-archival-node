@@ -111,7 +111,11 @@ func TestSealCutAndResume(t *testing.T) {
 	for _, th := range txHashes[6] {
 		fp := binary.BigEndian.Uint64(th.h[:8]) >> 16
 		found := false
-		for _, c := range e2.TxCandidates(fp) {
+		cands, err := e2.TxCandidates(fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range cands {
 			found = found || c == 6
 		}
 		if !found {

@@ -572,7 +572,7 @@ func newBaseWriter(st *dist.Store, m BaseMeta, rowCount uint64) (*baseWriter, er
 		enc.Close()
 		return nil, err
 	}
-	bits := bloomBits(rowCount)
+	bits := bloomBits(rowCount, bloomBitsPerKey)
 	dg := dist.NewDigest()
 	return &baseWriter{
 		m: m, enc: enc, f: f, out: bufio.NewWriterSize(io.MultiWriter(f, dg), 4<<20),
@@ -601,11 +601,7 @@ func (w *baseWriter) Add(key, val []byte) error {
 	w.raw = append(w.raw, key...)
 	w.raw = binary.AppendUvarint(w.raw, uint64(len(val)))
 	w.raw = append(w.raw, val...)
-	h1, h2 := bloomHash(key)
-	for i := uint64(0); i < bloomHashes; i++ {
-		bit := (h1 + i*h2) % w.bloomM
-		w.words[bit/64] |= 1 << (bit % 64)
-	}
+	bloomSet(w.words, w.bloomM, bloomHashes, key)
 	if len(w.raw) >= sstBlockTarget {
 		return w.flushBlock()
 	}
@@ -661,7 +657,7 @@ func (w *baseWriter) Finish() (string, error) {
 	if err := section(secBaseSSTIdx, w.idx); err != nil {
 		return "", err
 	}
-	if err := section(secBaseKeybloom, encodeBloom(w.bloomM, w.words)); err != nil {
+	if err := section(secBaseKeybloom, encodeBloom(w.bloomM, bloomHashes, w.words)); err != nil {
 		return "", err
 	}
 	if err := section(secBaseHeaders, hdrSec); err != nil {

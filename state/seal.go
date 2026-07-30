@@ -146,12 +146,13 @@ func sealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte
 				float64(rawBytes.containers)/1e6, float64(rawBytes.headers)/1e6,
 				float64(rawBytes.writelog)/1e6, float64(rawBytes.logs)/1e6,
 				float64(rawBytes.rcpt)/1e6)
-			log.Printf("seal:   sealed: dict=%.2fMB bodies=%.2fMB(+idx %.2f) headers=%.2fMB(+idx %.2f) sst=%.2fMB(+idx %.2f) deletes=%.2fMB txidx=%.2fMB logidx=%.2fMB bloom=%.2fMB",
+			log.Printf("seal:   sealed: dict=%.2fMB bodies=%.2fMB(+idx %.2f) headers=%.2fMB(+idx %.2f) sst=%.2fMB(+idx %.2f) deletes=%.2fMB txidx=%.2fMB(+bloom %.2f) logidx=%.2fMB bloom=%.2fMB",
 				float64(s["dict"])/1e6,
 				float64(s["bodies"])/1e6, float64(s["bodiesIdx"])/1e6,
 				float64(s["headers"])/1e6, float64(s["headersIdx"])/1e6,
 				float64(s["sst"])/1e6, float64(s["sstIdx"])/1e6,
 				float64(s["deletes"])/1e6, float64(s["txidx"])/1e6,
+				float64(s["txbloom"])/1e6,
 				float64(s["logidx"])/1e6, float64(s["keybloom"])/1e6)
 			e.Close()
 		}
