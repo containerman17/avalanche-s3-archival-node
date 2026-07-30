@@ -25,11 +25,13 @@
 // historical descent. There is no second implementation of anything here; the
 // package is wiring plus that loop.
 //
-// The handle is goroutine-safe and read-only: it never writes, truncates or
-// fsyncs anything in dir. It does need FILESYSTEM write permission on the
-// dir, because the shared bucket-log read path opens data files O_RDWR (the
-// same handle cache the writer appends through); nothing is ever written
-// through those handles here.
+// The handle is goroutine-safe and reads only: it never appends, truncates or
+// fsyncs any of the writer's files. It does need FILESYSTEM write permission
+// on the dir, for two reasons that both predate it: the shared bucket-log read
+// path opens data files O_RDWR (the same handle cache the writer appends
+// through, nothing is written through it here), and state.OpenReadOnly opens
+// the artifact store, which mkdirs the spool. Nothing here ever uploads or
+// releases an artifact: that is serve's syncLoop, and only with credentials.
 package sdk
 
 import (
