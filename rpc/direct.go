@@ -6,6 +6,8 @@ import (
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
+
+	"github.com/containerman17/epochdb/state"
 )
 
 // Direct Go reads for in-process consumers (the read-only SDK). Every one of
@@ -34,12 +36,44 @@ func (s *Server) BlockAt(n uint64) (*types.Block, error) {
 	return blk, rerr.error()
 }
 
-// HeightByHash resolves an eth block hash through the block-hash index.
-func (s *Server) HeightByHash(h common.Hash) (uint64, bool) {
-	if s.hashIdx == nil {
-		return 0, false
+// HeightByHash resolves an eth block hash to its height: the bounded
+// live-tail map first, then the fingerprint index, which since epoch format
+// v6 carries every block hash mapped to that block's own height. There is no
+// whole-history hash map anywhere.
+//
+// A candidate is VERIFIED against the real header, so a fingerprint that
+// belongs to a tx rather than to a block (or to a different block entirely)
+// is rejected at the cost of one header read, exactly like the tx path's
+// container read.
+func (s *Server) HeightByHash(hash common.Hash) (uint64, bool, error) {
+	if n, ok := s.recent.get(hash); ok {
+		return n, true, nil
 	}
-	return s.hashIdx.get(h)
+	if s.txidx == nil {
+		return 0, false, errors.New("block hash index not available (run epochdb cook-txindex)")
+	}
+	var (
+		height uint64
+		found  bool
+	)
+	err := s.txidx.WalkCandidates(hash, func(n uint64) (bool, error) {
+		if n < s.hist.Floor() {
+			return false, nil // below the floor nothing is served
+		}
+		raw, ok, err := s.hist.HeaderRLP(n)
+		if err != nil {
+			return false, err
+		}
+		if !ok || state.BlockHashFromHeaderRLP(raw) != hash {
+			return false, nil
+		}
+		height, found = n, true
+		return true, nil
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return height, found, nil
 }
 
 // FindTx resolves a tx hash to its block and index. found=false is a clean

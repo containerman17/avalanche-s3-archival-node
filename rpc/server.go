@@ -49,9 +49,9 @@ type Server struct {
 	filtersOnce sync.Once
 	filters     *filterReg
 
-	// block APIs: eth block hash -> height, wired by EnableBlockAPIs and
-	// grown per accepted block by serve.
-	hashIdx *hashIndex
+	// recent is the BOUNDED live-tail block-hash map (see recentHashes):
+	// everything older resolves through the tx index.
+	recent *recentHashes
 
 	// live is the in-process executor (serve); nil before EnableLive
 	// serve, where every read is historical.
@@ -76,30 +76,56 @@ type Live interface {
 // EnableLive wires the executor frontier into the server (serve).
 func (s *Server) EnableLive(l Live) { s.live = l }
 
-// hashIndex is the eth block hash -> height map. serve appends to it
-// as the executor advances, so it is locked; a static serve builds it once.
-type hashIndex struct {
-	mu sync.RWMutex
-	m  map[common.Hash]uint64
+// recentBlockHashes bounds the live-tail block-hash map. Every block hash is
+// in the tx index (epoch format v6 for sealed epochs, the cooked staging
+// index for the raw tail), so the only heights this has to answer for are the
+// ones ACCEPTED SINCE THE LAST COOK, which at chain pace is a couple of
+// hundred: 128Ki entries is over a day of cook outage at Fuji/mainnet block
+// rates, for ~4MB of ring plus a map of the same order.
+//
+// ponytail: fixed-size FIFO, not a cook-watermark prune. During a multi-
+// thousand-block/s catch-up the ring can wrap before the next cook, and a
+// block-by-hash for a height in the wrapped window answers null until that
+// cook lands (a node in that state already reports eth_syncing). Swap the
+// FIFO for an explicit "drop below the cooked height" prune if that window
+// ever has to be zero.
+const recentBlockHashes = 1 << 17
+
+// recentHashes is the eth block hash -> height map for the LIVE TAIL only:
+// serve/sdk push each accepted block in, the oldest entry falls out, and the
+// whole of history is answered by the fingerprint index instead. The
+// floor-to-head version of this map was the largest resident item in the
+// process (measured 100.7 B/entry, 5.78GB at Fuji's 57.4M blocks).
+type recentHashes struct {
+	mu   sync.RWMutex
+	m    map[common.Hash]uint64
+	ring []common.Hash
+	next int
 }
 
-func (h *hashIndex) get(k common.Hash) (uint64, bool) {
+func newRecentHashes(n int) *recentHashes {
+	return &recentHashes{m: make(map[common.Hash]uint64), ring: make([]common.Hash, n)}
+}
+
+func (h *recentHashes) get(k common.Hash) (uint64, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	n, ok := h.m[k]
 	return n, ok
 }
 
-func (h *hashIndex) add(k common.Hash, n uint64) {
+func (h *recentHashes) add(k common.Hash, n uint64) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, dup := h.m[k]; dup {
+		return
+	}
+	if old := h.ring[h.next]; old != (common.Hash{}) {
+		delete(h.m, old)
+	}
+	h.ring[h.next] = k
+	h.next = (h.next + 1) % len(h.ring)
 	h.m[k] = n
-	h.mu.Unlock()
-}
-
-func (h *hashIndex) len() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.m)
 }
 
 // HistoryChainContext serves BLOCKHASH headers through the epochs-aware
@@ -125,7 +151,7 @@ func (c histChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
 }
 
 func NewServer(hist *state.History, chainCtx corethcore.ChainContext, chainCfg *params.ChainConfig) *Server {
-	return &Server{hist: hist, chainCtx: chainCtx, chainCfg: chainCfg}
+	return &Server{hist: hist, chainCtx: chainCtx, chainCfg: chainCfg, recent: newRecentHashes(recentBlockHashes)}
 }
 
 type rpcRequest struct {

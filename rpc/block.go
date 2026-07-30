@@ -10,28 +10,11 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 )
 
-// EnableBlockAPIs wires the eth block hash -> height map (built once from
-// the staging sidecars) enabling the *ByHash methods. The block-body
-// methods themselves ride on the EnableTxAPIs container source.
-func (s *Server) EnableBlockAPIs(hashToHeight map[common.Hash]uint64) {
-	s.hashIdx = &hashIndex{m: hashToHeight}
-}
-
-// AddBlockHash extends the block-hash index as the follower accepts blocks
-// (serve). No-op before EnableBlockAPIs.
-func (s *Server) AddBlockHash(h common.Hash, n uint64) {
-	if s.hashIdx != nil {
-		s.hashIdx.add(h, n)
-	}
-}
-
-// BlockHashCount reports the index size (startup/status logging).
-func (s *Server) BlockHashCount() int {
-	if s.hashIdx == nil {
-		return 0
-	}
-	return s.hashIdx.len()
-}
+// AddBlockHash records an accepted block in the bounded live-tail map
+// (serve, sdk). Blocks below it resolve through the tx index, whose
+// fingerprint space carries every block hash, so this is the ONLY block-hash
+// state the process keeps and it never grows past recentBlockHashes.
+func (s *Server) AddBlockHash(h common.Hash, n uint64) { s.recent.add(h, n) }
 
 // blockAt fetches and parses the container at height n (must be <= head).
 func (s *Server) blockAt(n uint64) (*types.Block, *rpcError) {
@@ -75,10 +58,10 @@ func (s *Server) heightByHash(raw json.RawMessage) (uint64, bool, *rpcError) {
 	if err := json.Unmarshal(raw, &h); err != nil {
 		return 0, false, errInvalid("bad block hash: %v", err)
 	}
-	if s.hashIdx == nil {
-		return 0, false, &rpcError{Code: -32000, Message: "block hash index not available"}
+	n, ok, err := s.HeightByHash(h)
+	if err != nil {
+		return 0, false, &rpcError{Code: -32000, Message: err.Error()}
 	}
-	n, ok := s.hashIdx.get(h)
 	if !ok {
 		// Same failure mode as tx-by-hash: the index starts at the floor, so
 		// an unknown hash on a pruned node may well be a real block below it.

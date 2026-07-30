@@ -16,8 +16,6 @@ import (
 	"time"
 
 	"github.com/ava-labs/libevm/common"
-	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/rlp"
 
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
@@ -180,30 +178,11 @@ func serveMain(args []string) {
 	txidx.reopen(*dataDir, hist.Epochs())
 	srv.EnableTxAPIs(txidx, rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: blocks}, exec.ParseEthBlock)
 
-	byHash, err := fetch.BlockHashes(*dataDir)
-	if err != nil {
-		log.Fatalf("epochdb: block hash index: %v", err)
-	}
-	idx := make(map[common.Hash]uint64, len(byHash))
-	for h, n := range byHash {
-		idx[common.Hash(h)] = n
-	}
-	srv.EnableBlockAPIs(idx)
-	// Sealed heights whose raw sidecars seal deleted still need hashes: fill
-	// those from the epoch-served headers, exactly like static serve.
-	// Everything from the head up arrives through OnBlock.
-	if uint64(len(idx)) < hist.Head()+1-hist.Floor() {
-		for n := hist.Floor(); n <= hist.Head(); n++ {
-			if raw, ok, err := hist.HeaderRLP(n); err == nil && ok {
-				var h types.Header
-				if rlp.DecodeBytes(raw, &h) == nil {
-					srv.AddBlockHash(h.Hash(), n)
-				}
-			}
-		}
-	}
-	log.Printf("epochdb: block hash index: %d blocks", srv.BlockHashCount())
-
+	// NO floor-to-head block-hash map (deleted 2026-07-31, DESIGN.md ruling
+	// 2): block hashes live in the same fp48 index as tx hashes, sealed and
+	// raw alike, so eth_getBlockByHash resolves through WalkCandidates. Only
+	// the blocks accepted since the last cook need in-process tracking, and
+	// those arrive through OnBlock into a bounded ring.
 	advance := func(n uint64, h common.Hash) {
 		srv.AddBlockHash(h, n)
 		hist.SetHead(n)

@@ -45,7 +45,6 @@ import (
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/rlp"
 
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -127,24 +126,10 @@ func Open(dir string, networkID uint32) (*DB, error) {
 	d.txidx.reopen(dir, hist.Epochs())
 	d.reads.EnableTxAPIs(d.txidx, rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: fr}, exec.ParseEthBlock)
 
-	byHash, err := fetch.BlockHashes(dir)
-	if err != nil {
-		d.closeFiles()
-		return nil, err
-	}
-	idx := make(map[common.Hash]uint64, len(byHash))
-	for h, n := range byHash {
-		idx[common.Hash(h)] = n
-	}
-	d.reads.EnableBlockAPIs(idx)
-	// Staging sidecars are deleted once their blocks are cooked, so sealed
-	// heights need their hashes from the stored headers instead (serve fills
-	// the same gap the same way).
-	if uint64(len(idx)) < head+1-hist.Floor() {
-		for n := hist.Floor(); n <= head; n++ {
-			d.addHash(n)
-		}
-	}
+	// No block-hash map is built here: block hashes are in the fp48 index
+	// (epoch format v6 sealed, cooked staging raw), and only the heights the
+	// writer has appended since its last cook need the bounded live-tail map
+	// that advance() feeds.
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d.stop = cancel
@@ -254,18 +239,16 @@ func (d *DB) refresh(dir string) error {
 	return nil
 }
 
-// addHash indexes block n's eth hash from its stored header, which is the
-// only hash source for heights whose staging sidecar is already gone.
+// addHash records block n in the bounded live-tail map. It covers exactly the
+// window between the writer appending a block and its next cook folding that
+// block's hash into the raw tx index; everything below resolves through the
+// index itself.
 func (d *DB) addHash(n uint64) {
 	raw, ok, err := d.hist.HeaderRLP(n)
 	if err != nil || !ok {
 		return
 	}
-	var h types.Header
-	if rlp.DecodeBytes(raw, &h) != nil {
-		return
-	}
-	d.reads.AddBlockHash(h.Hash(), n)
+	d.reads.AddBlockHash(state.BlockHashFromHeaderRLP(raw), n)
 }
 
 // liveHead reports the height labels to the read paths. This handle only ever
@@ -391,9 +374,9 @@ func (d *DB) BlockByHash(hash common.Hash) (*types.Block, bool, error) {
 	if err := d.Err(); err != nil {
 		return nil, false, err
 	}
-	n, ok := d.reads.HeightByHash(hash)
-	if !ok {
-		return nil, false, nil
+	n, ok, err := d.reads.HeightByHash(hash)
+	if err != nil || !ok {
+		return nil, false, err
 	}
 	blk, err := d.reads.BlockAt(n)
 	return blk, err == nil, err

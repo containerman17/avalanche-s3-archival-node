@@ -127,9 +127,6 @@ func TestModifiedAccountsOnCorpus(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
 	head := env.srv.hist.Head()
 
-	// Live hash index for the ByHash variant, filled as blocks are sampled.
-	hashIdx := map[common.Hash]uint64{}
-	env.srv.EnableBlockAPIs(hashIdx)
 
 	checked, emptyChecked := 0, 0
 	for tries := 0; tries < 6000 && (checked < 100 || emptyChecked < 5); tries++ {
@@ -174,8 +171,10 @@ func TestModifiedAccountsOnCorpus(t *testing.T) {
 			}
 		}
 
-		// ByHash parity.
-		hashIdx[blk.Hash()] = n
+		// ByHash parity. The corpus's cooked tx index carries block hashes
+		// only if it was cooked by this build, so feed the live-tail map,
+		// which is the same path serve uses for an accepted block.
+		env.srv.AddBlockHash(blk.Hash(), n)
 		var byHash []common.Address
 		if rerr := callJSON(t, env, "debug_getModifiedAccountsByHash", &byHash, blk.Hash()); rerr != nil {
 			t.Fatalf("byHash %d: %v", n, rerr)
