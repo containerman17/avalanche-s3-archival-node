@@ -142,6 +142,23 @@ type Executor struct {
 	batchDirty     bool        // any non-empty block drained this batch
 	batchCount     int
 	batchBuf       []batchItem
+
+	// spl accumulates exec-goroutine wall time per status interval:
+	// where the serial thread's time goes (throughput experiment).
+	spl struct{ read, evm, hash, fw, fsync time.Duration }
+
+	// Async group flush (throughput experiment): maybeFlush enqueues the
+	// watermark, a flusher goroutine started by Run does ring.sync +
+	// FlushAndSetExecHead. Coalescing: if the flusher is busy the enqueue
+	// is skipped and the next flushEvery multiple carries the watermark
+	// forward. Correctness is unchanged because everything at or below an
+	// enqueued watermark was appended before the enqueue, so the flusher's
+	// fsync covers it; exechead just lags a little more, well inside the
+	// walk-back budget.
+	flushReq    chan uint64
+	flushErr    chan error
+	flushDone   chan struct{}
+	flushBusyNs goatomic.Int64 // flusher-goroutine fsync time, for the status line
 }
 
 // batchItem is one block's buffered state-layer output. Appends are held
@@ -540,6 +557,73 @@ func (e *Executor) Run(ctx context.Context) error {
 	lastWait := time.Time{}
 
 	next := e.headNum + 1
+
+	// Async group flusher (throughput experiment): see maybeFlush.
+	e.flushReq = make(chan uint64, 1)
+	e.flushErr = make(chan error, 1)
+	e.flushDone = make(chan struct{})
+	go func() {
+		defer close(e.flushDone)
+		for n := range e.flushReq {
+			t0 := time.Now()
+			if err := e.ring.sync(); err != nil {
+				e.flushErr <- err
+				return
+			}
+			if err := e.cfg.Store.FlushAndSetExecHead(n); err != nil {
+				e.flushErr <- err
+				return
+			}
+			e.flushBusyNs.Add(int64(time.Since(t0)))
+		}
+	}()
+	defer func() {
+		close(e.flushReq)
+		<-e.flushDone
+		e.flushReq = nil
+	}()
+
+	// Prefetcher (throughput experiment): container reads and their
+	// decompression overlap EVM execution. The fetch reader is
+	// mutex-guarded, so bisect's direct GetByHeight calls stay safe.
+	type pfItem struct {
+		n   uint64
+		raw []byte
+		err error
+	}
+	pfCtx, pfCancel := context.WithCancel(ctx)
+	defer pfCancel()
+	pf := make(chan pfItem, 512)
+	go func() {
+		defer close(pf)
+		for h := next; ; h++ {
+			if e.cfg.StopAt > 0 && h > e.cfg.StopAt {
+				return
+			}
+			raw, ok, err := e.cfg.Blocks.GetByHeight(h)
+			if err != nil {
+				select {
+				case pf <- pfItem{n: h, err: err}:
+				case <-pfCtx.Done():
+				}
+				return
+			}
+			if !ok {
+				select {
+				case <-pfCtx.Done():
+					return
+				case <-time.After(200 * time.Millisecond):
+				}
+				h--
+				continue
+			}
+			select {
+			case pf <- pfItem{n: h, raw: raw}:
+			case <-pfCtx.Done():
+				return
+			}
+		}
+	}()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -553,10 +637,26 @@ func (e *Executor) Run(ctx context.Context) error {
 			log.Printf("exec: reached --stop height %d", e.cfg.StopAt)
 			return nil
 		}
-		raw, ok, err := e.cfg.Blocks.GetByHeight(next)
-		if err != nil {
-			return err
+		tRead := time.Now()
+		var raw []byte
+		ok := false
+		select {
+		case it, alive := <-pf:
+			if !alive {
+				// Prefetcher finished (StopAt delivered): the loop-top
+				// check ends the run once next passes StopAt.
+			} else if it.err != nil {
+				e.spl.read += time.Since(tRead)
+				return it.err
+			} else if it.n != next {
+				return fmt.Errorf("prefetch out of order: got %d want %d", it.n, next)
+			} else {
+				raw, ok = it.raw, true
+			}
+		case <-time.After(200 * time.Millisecond):
+			// Staging dry or prefetcher behind: same stall path as before.
 		}
+		e.spl.read += time.Since(tRead)
 		if !ok {
 			// Stall: close the open batch so tip-following and crash
 			// windows stay bounded even when staging runs dry mid-batch.
@@ -599,6 +699,11 @@ func (e *Executor) Run(ctx context.Context) error {
 				hitPct,
 				float64(e.wrapDB.cacheSize)/1e6,
 			)
+			log.Printf("exec: split read=%.2fs evm=%.2fs hash=%.2fs fw=%.2fs fsync=%.2fs flusher=%.2fs of %.1fs",
+				e.spl.read.Seconds(), e.spl.evm.Seconds(), e.spl.hash.Seconds(),
+				e.spl.fw.Seconds(), e.spl.fsync.Seconds(),
+				time.Duration(e.flushBusyNs.Swap(0)).Seconds(), dt)
+			e.spl = struct{ read, evm, hash, fw, fsync time.Duration }{}
 			if e.sae != nil && e.sae.settledSeen {
 				log.Printf("sae: settled=%d (lag %d..%d over %d settlements)",
 					e.sae.settledHeight, e.sae.lagMin, e.sae.lagMax, e.sae.settlements)
@@ -696,6 +801,20 @@ func (e *Executor) SettledHeight() uint64 {
 // not identify the frontier.
 func (e *Executor) maybeFlush(blockNum uint64) error {
 	if blockNum%flushEvery != 0 {
+		return nil
+	}
+	tSync := time.Now()
+	defer func() { e.spl.fsync += time.Since(tSync) }()
+	if e.flushReq != nil {
+		select {
+		case err := <-e.flushErr:
+			return err
+		default:
+		}
+		select {
+		case e.flushReq <- blockNum:
+		default: // flusher busy; coalesce into the next multiple
+		}
 		return nil
 	}
 	if err := e.ring.sync(); err != nil {
@@ -892,6 +1011,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 		// Empty block: header only, no EVM, no Firewood.
 		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, hash: blk.Hash(), headerRLP: headerRLP})
 	} else {
+		tEVM := time.Now()
 		frame := &blockFrame{}
 		e.wrapDB.setFrame(frame)
 		statedb, err := ethstate.New(e.batchStartRoot, e.wrapDB, nil)
@@ -912,6 +1032,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 			return fmt.Errorf("statedb drain commit: %w", err)
 		}
 		e.wrapDB.setFrame(nil)
+		e.spl.evm += time.Since(tEVM)
 		e.batchDirty = true
 		e.batchBuf = append(e.batchBuf, batchItem{
 			num: blockNum, hash: blk.Hash(), headerRLP: headerRLP,
@@ -953,7 +1074,9 @@ func (e *Executor) flushBatch() error {
 
 	computed := e.batchStartRoot
 	if e.batchDirty {
+		tHash := time.Now()
 		computed = e.wrapDB.batchProposalRoot()
+		e.spl.hash += time.Since(tHash)
 	}
 	if computed != boundaryRoot {
 		return e.bisect(computed, boundaryNum, boundaryRoot)
@@ -998,6 +1121,7 @@ func (e *Executor) flushBatch() error {
 	}
 
 	if e.batchDirty {
+		tFw := time.Now()
 		opt := stateconf.WithTrieDBUpdatePayload(e.lastFwHash, boundaryHash)
 		if err := e.triedb.Update(computed, e.batchStartRoot, e.fwHeight+1, nil, nil, opt); err != nil {
 			return fmt.Errorf("batch update [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
@@ -1005,6 +1129,7 @@ func (e *Executor) flushBatch() error {
 		if err := e.triedb.Commit(computed, false); err != nil {
 			return fmt.Errorf("batch commit [%d..%d]: %w", e.batchStartNum+1, boundaryNum, err)
 		}
+		e.spl.fw += time.Since(tFw)
 		e.fwHeight++
 	} else {
 		// Whole batch empty: no proposal, just register the boundary hash.

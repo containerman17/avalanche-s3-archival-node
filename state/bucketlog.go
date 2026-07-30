@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -330,15 +331,26 @@ func (l *bucketLog) Bytes() uint64 {
 	return l.bytes
 }
 
-// Sync fsyncs every dirty open pair.
+// Sync fsyncs every dirty open pair. The fsyncs run OUTSIDE the mutex so
+// concurrent Appends are not stalled behind a slow disk: the dirty flags
+// are cleared under the lock first (an append that lands mid-fsync re-sets
+// them, so it is caught by the next Sync). A pair evicted by closePair
+// mid-fsync was flushed by the eviction itself, so ErrClosed here means
+// the data is already durable.
 func (l *bucketLog) Sync() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	var files []*os.File
 	for _, p := range l.pairs {
 		if !p.dirty {
 			continue
 		}
-		if err := p.flush(); err != nil {
+		p.dirty = false
+		// data before index, same crash rule as blPair.flush.
+		files = append(files, p.data, p.index)
+	}
+	l.mu.Unlock()
+	for _, f := range files {
+		if err := f.Sync(); err != nil && !errors.Is(err, os.ErrClosed) {
 			return err
 		}
 	}
