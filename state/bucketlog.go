@@ -37,6 +37,12 @@ type bucketLog struct {
 	useCounter  uint64
 	bytes       uint64 // total payload bytes on disk (for progress logging)
 
+	// roOff is the consumed prefix of each bucket's index sidecar, non-nil
+	// ONLY on a read-only opener (openBucketLogRO). It is what lets scanRO
+	// resume, i.e. what lets a reader process follow a live writer's appends
+	// instead of seeing an open-time snapshot. nil on a writer log.
+	roOff map[uint64]int64
+
 	// mu guards the pair map, its LRU state, reads through pair file
 	// handles (eviction closes them, so ReadAt must stay under the lock),
 	// AND the idx/maxBlock/bytes bookkeeping. The bookkeeping half matters

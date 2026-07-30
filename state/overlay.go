@@ -79,6 +79,10 @@ type History struct {
 	// nil everywhere else (cook, seal, fold, read-only openers), where every
 	// read is historical by definition.
 	tail *tail
+	// tailApplied is the highest block folded into the overlay, owned by the
+	// single goroutine that calls EnableTail/AdvanceTail. It only moves up, so
+	// a prune (which drops cooked entries) never makes work reappear.
+	tailApplied uint64
 
 	// mu guards buckets and deletes, which Refresh swaps when cook lands new
 	// sorted files. Everything else here is immutable after open.
@@ -879,8 +883,39 @@ func (h *History) EnableTail(executedHead uint64) (blocks int, entries int, size
 	}
 	h.tail = t
 	h.store.tail = t
+	h.tailApplied = max(from-1, executedHead)
 	entries, size = t.stats()
 	return blocks, entries, size, nil
+}
+
+// AdvanceTail folds the write frames of (lastApplied, head] into the overlay.
+// It is the TAILING counterpart of the executor's Store.AppendWrites: a reader
+// process that follows a live writer sees new frames through Store.RescanRO
+// and folds them in here, so its `latest` reads answer at the writer's head
+// with no cook, no RPC hop and no second read path. EnableTail sets the
+// starting point; head comes from Store.HeadersMax (see RescanRO for why that
+// is the highest fully appended block).
+//
+// Single-caller, exactly like EnableTail: one tailing goroutine owns it. A
+// block with no frame at all is an empty block and is simply skipped.
+func (h *History) AdvanceTail(head uint64) (blocks int, err error) {
+	if h.tail == nil {
+		return 0, errors.New("tail overlay not enabled (call EnableTail first)")
+	}
+	for n := h.tailApplied + 1; n <= head; n++ {
+		frame, ok, err := h.store.wl.Get(n)
+		if err != nil {
+			return blocks, fmt.Errorf("tail advance block %d: %w", n, err)
+		}
+		if ok {
+			if err := h.tail.apply(n, frame); err != nil {
+				return blocks, fmt.Errorf("tail advance block %d: %w", n, err)
+			}
+			blocks++
+		}
+		h.tailApplied = n
+	}
+	return blocks, nil
 }
 
 // PruneTail drops overlay entries the cook has taken over. MUST be called
