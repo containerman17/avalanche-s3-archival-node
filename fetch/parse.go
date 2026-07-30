@@ -23,6 +23,7 @@ import (
 //   - extstate installs the state-key normalization hook so storage reads
 //     and writes match coreth's multi-coin slot layout. This one matters for
 //     state root verification even if we don't use coreth's VM directly.
+//
 // RegisterExtras installs the avalanchego graft submodule extras that
 // all C-Chain state-touching code paths depend on. Safe to call from
 // packages that don't open a Fetcher (e.g. debug/bench commands);

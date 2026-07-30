@@ -127,7 +127,6 @@ func TestModifiedAccountsOnCorpus(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
 	head := env.srv.hist.Head()
 
-
 	checked, emptyChecked := 0, 0
 	for tries := 0; tries < 6000 && (checked < 100 || emptyChecked < 5); tries++ {
 		n := 1 + uint64(rng.Int63n(int64(min(head, 9_000_000))))

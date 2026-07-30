@@ -93,10 +93,10 @@ const (
 	// full-mainnet target per DESIGN.md is 10M.
 	EpochTxs = 25_000
 
-	framedGroup     = 16        // containers/headers per zstd frame (07-17: 2.24x, 34us access)
-	dictTargetSize  = 512 << 10 // 07-17 experiment optimum
-	dictMaxSamples  = 4096      // training sample cap, keeps seal-time bounded
-	sstBlockTarget  = 64 << 10  // raw bytes per compressed SST block
+	framedGroup    = 16        // containers/headers per zstd frame (07-17: 2.24x, 34us access)
+	dictTargetSize = 512 << 10 // 07-17 experiment optimum
+	dictMaxSamples = 4096      // training sample cap, keeps seal-time bounded
+	sstBlockTarget = 64 << 10  // raw bytes per compressed SST block
 	// A key nothing ever wrote (an unset storage slot, the common case in
 	// any eth_call) has NO early exit: History.search probes
 	// every epoch, so the expected number of wasted SST block reads per

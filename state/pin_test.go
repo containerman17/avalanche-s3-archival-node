@@ -9,9 +9,9 @@ import (
 	"io"
 	"math/bits"
 	"math/rand"
-	"os"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -402,13 +402,13 @@ func heapDecodeTxIdx(t *testing.T, b []byte) (*efHeap, *packedHeap) {
 		secs[i], pos = ws, pos+8*n
 	}
 	return &efHeap{
-			n:    int(nTx),
-			l:    l,
-			lows: &packedHeap{w: secs[0], bits: l},
-			high: secs[1],
-			sel0: secs[2],
-			sel1: secs[3],
-		}, &packedHeap{w: secs[4], bits: blkBits}
+		n:    int(nTx),
+		l:    l,
+		lows: &packedHeap{w: secs[0], bits: l},
+		high: secs[1],
+		sel0: secs[2],
+		sel1: secs[3],
+	}, &packedHeap{w: secs[4], bits: blkBits}
 }
 
 type packedHeap struct {
