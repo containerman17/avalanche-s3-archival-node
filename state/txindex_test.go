@@ -26,7 +26,7 @@ func TestEFRoundtripAndDuplicates(t *testing.T) {
 	vals[100], vals[101], vals[102] = 7777777, 7777777, 7777777
 	sort.Slice(vals, func(i, j int) bool { return vals[i] < vals[j] })
 
-	e := buildEF(vals, 1<<fpBits)
+	e := efRoundtrip(t, buildEF(vals, 1<<fpBits))
 	for i, v := range vals {
 		if got := e.get(i); got != v {
 			t.Fatalf("get(%d)=%d want %d", i, got, v)
@@ -68,9 +68,20 @@ func TestEFRoundtripAndDuplicates(t *testing.T) {
 		t.Fatalf("%d phantom matches on absent values", misses)
 	}
 	// empty EF must not blow up
-	if lo, hi := buildEF(nil, 1<<fpBits).lookup(42); lo != hi {
+	if lo, hi := efRoundtrip(t, buildEF(nil, 1<<fpBits)).lookup(42); lo != hi {
 		t.Fatal("empty EF matched something")
 	}
+}
+
+// efRoundtrip serializes a built index and hands back the READER over those
+// bytes, which is the only shape the read path ever sees.
+func efRoundtrip(t *testing.T, b *efBuild) *ef {
+	t.Helper()
+	e, _, err := efUnmarshal(efMarshal(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
 }
 
 // writeStagingBlock appends one synthetic eth block to a fake staging

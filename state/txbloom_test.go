@@ -61,12 +61,6 @@ func TestUnknownTxHashLoadsNoIndex(t *testing.T) {
 			t.Fatalf("epoch %d loaded its tx index for an unknown hash (%d loads)", i, n)
 		}
 	}
-	for _, e := range s.Epochs {
-		if e.txIdx != nil {
-			t.Fatalf("epoch %d holds a decoded tx index after a bloom reject", e.Start)
-		}
-	}
-
 	// And the filter is actually selective, not merely lucky on one hash.
 	const probes = 2000
 	fps := 0
@@ -157,34 +151,5 @@ func TestKnownTxWalkStopsAtFirstHit(t *testing.T) {
 		if all[i] != want[i] {
 			t.Fatalf("duplicate fp: walked %v, want %v", all, want)
 		}
-	}
-}
-
-// TestTxIndexLRUEvicts: past txHotEpochs decoded indexes the oldest one is
-// dropped, which is what bounds the heap at a few epochs instead of all of
-// history.
-func TestTxIndexLRUEvicts(t *testing.T) {
-	_, s, ins := synthSet(t, txHotEpochs+1)
-	c := CombinedTxIndex{Epochs: s}
-	for _, in := range ins {
-		for _, hashes := range in.TxHashes {
-			h := common.Hash(hashes[0])
-			if err := c.WalkCandidates(h, func(uint64) (bool, error) { return false, nil }); err != nil {
-				t.Fatal(err)
-			}
-			break
-		}
-	}
-	hot := 0
-	for _, e := range s.Epochs {
-		if e.txIdx != nil {
-			hot++
-		}
-	}
-	if hot != txHotEpochs {
-		t.Fatalf("%d epochs hold a decoded tx index, want %d", hot, txHotEpochs)
-	}
-	if len(s.txHot) != txHotEpochs {
-		t.Fatalf("LRU holds %d entries, want %d", len(s.txHot), txHotEpochs)
 	}
 }

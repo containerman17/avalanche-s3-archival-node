@@ -731,7 +731,7 @@ func buildLogidx(logs []LogRec, start, count uint64) []byte {
 
 // efMarshal serializes an ef as: n u64 | l u32 | 4 length-prefixed word
 // sections (lows, high, sel0, sel1).
-func efMarshal(e *ef) []byte {
+func efMarshal(e *efBuild) []byte {
 	out := binary.LittleEndian.AppendUint64(nil, uint64(e.n))
 	out = binary.LittleEndian.AppendUint32(out, uint32(e.l))
 	out = writeWords(out, e.lows.w)
@@ -741,31 +741,29 @@ func efMarshal(e *ef) []byte {
 	return out
 }
 
-// efUnmarshal is the inverse; u is the universe the ef was built with.
-func efUnmarshal(b []byte, u uint64) (*ef, int, error) {
+// efUnmarshal is the inverse: a reader over b, copying nothing.
+func efUnmarshal(b []byte) (*ef, int, error) {
 	if len(b) < 12 {
 		return nil, 0, fmt.Errorf("ef: truncated header")
 	}
 	n := binary.LittleEndian.Uint64(b[0:8])
 	l := uint(binary.LittleEndian.Uint32(b[8:12]))
 	pos := 12
-	var secs [4][]uint64
+	var secs [4]words
 	var err error
 	for i := range secs {
-		if secs[i], pos, err = readWords(b, pos); err != nil {
+		if secs[i], pos, err = sliceWords(b, pos); err != nil {
 			return nil, 0, err
 		}
 	}
-	e := &ef{
+	return &ef{
 		n:    int(n),
 		l:    l,
-		lows: &packed{w: secs[0], bits: l},
+		lows: packed{w: secs[0], bits: l},
 		high: secs[1],
 		sel0: secs[2],
 		sel1: secs[3],
-	}
-	e.highBits = n + (u >> l) + 1
-	return e, pos, nil
+	}, pos, nil
 }
 
 // values returns the decoded sequence (posting-list read path).

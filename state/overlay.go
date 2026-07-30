@@ -77,9 +77,25 @@ type History struct {
 	buckets []*sortedBucket // ascending bucket number
 
 	// deletes: account key -> ascending blocks of explicit account-delete
-	// records (SELFDESTRUCT). Built by one sequential scan at open; rare
-	// enough to keep resident, and it turns the per-read delete check into a
-	// map lookup (a linear run scan here was 96% of backfill CPU).
+	// records (SELFDESTRUCT, and EIP-158 empty-account deletion). Built by one
+	// sequential scan at open; rare enough to keep resident, and it turns the
+	// per-read delete check into a map lookup (a linear run scan here was 96%
+	// of backfill CPU).
+	//
+	// MEASURED 2026-07-31 before deciding whether this had to become a mapped
+	// binary search like the tx index (DESIGN.md ruling 3): over mainnet
+	// blocks 1..200,000 (data-v3's cooked buckets, 1.71M rows) there are
+	// 13,747 delete rows and exactly TWO distinct deleted accounts, 0x..01 and
+	// 0x..02, the ecrecover and sha256 precompiles emptied by touch-and-delete.
+	// So this map is a couple of dense []uint64 runs, 8 B per row, against the
+	// 61 B per row the epochs' deletes sections spend on the same facts, and
+	// the row count is bounded by BLOCK count (one post-image row per key per
+	// block), not by tx count: 0.069 rows/block measured, i.e. ~6.2M rows and
+	// ~50MB at mainnet's 90M blocks, a few hundred MB even if every block
+	// starts emptying a precompile. It stays a heap map. REVISIT only if a
+	// real corpus shows delete rows approaching one per block AND many
+	// distinct accounts, which is when the per-epoch bloom-gated binary search
+	// (over sections that are already mapped and pinned) starts paying.
 	deletes map[string][]uint64
 }
 

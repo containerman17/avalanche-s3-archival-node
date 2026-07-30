@@ -66,35 +66,68 @@ func BlockHashFromHeaderRLP(headerRLP []byte) common.Hash {
 	return common.BytesToHash(crypto.Keccak256(headerRLP))
 }
 
+// ---------- words: a u64 array read in place ----------
+//
+// Every serialized index below is little-endian u64 words, and the READ side
+// never copies them onto the Go heap: it indexes the section bytes straight
+// out of the mapping with binary.LittleEndian.Uint64, which needs no
+// alignment. That is the whole of DESIGN.md ruling 3's "the Elias-Fano tx
+// index becomes a mapped byte view": the kernel tiers those pages, and the
+// caller keeps the range pinned for as long as it reads them.
+
+type words []byte
+
+func (w words) get(i int) uint64 { return binary.LittleEndian.Uint64(w[i*8:]) }
+
+// sliceWords returns the length-prefixed word section at pos as a view.
+func sliceWords(b []byte, pos int) (words, int, error) {
+	if pos+8 > len(b) {
+		return nil, 0, fmt.Errorf("truncated section length at %d", pos)
+	}
+	n := int(binary.LittleEndian.Uint64(b[pos:]))
+	pos += 8
+	if n < 0 || pos+8*n > len(b) {
+		return nil, 0, fmt.Errorf("truncated section (%d words) at %d", n, pos)
+	}
+	return words(b[pos : pos+8*n]), pos + 8*n, nil
+}
+
 // ---------- bit-packed array ----------
 
+// packed reads a bit-packed array out of serialized words.
 type packed struct {
+	w    words
+	bits uint
+}
+
+func (p packed) get(i int) uint64 {
+	bit := uint64(i) * uint64(p.bits)
+	w, off := bit/64, bit%64
+	v := p.w.get(int(w)) >> off
+	if off+uint64(p.bits) > 64 {
+		v |= p.w.get(int(w)+1) << (64 - off)
+	}
+	return v & (1<<p.bits - 1)
+}
+
+// packedBuild is the seal/cook side: materialize in heap, then serialize.
+type packedBuild struct {
 	w    []uint64
 	bits uint
 }
 
-func newPacked(n int, bitsPer uint) *packed {
-	// +1 word so unaligned tail reads in get never run off the slice.
-	return &packed{w: make([]uint64, (uint64(n)*uint64(bitsPer)+63)/64+1), bits: bitsPer}
+func newPacked(n int, bitsPer uint) *packedBuild {
+	// +1 word so unaligned tail reads in get never run off the array.
+	return &packedBuild{w: make([]uint64, (uint64(n)*uint64(bitsPer)+63)/64+1), bits: bitsPer}
 }
 
-func (p *packed) set(i int, v uint64) {
+func (p *packedBuild) set(i int, v uint64) {
 	bit := uint64(i) * uint64(p.bits)
 	w, off := bit/64, bit%64
 	p.w[w] |= v << off
 	if off+uint64(p.bits) > 64 {
 		p.w[w+1] |= v >> (64 - off)
 	}
-}
-
-func (p *packed) get(i int) uint64 {
-	bit := uint64(i) * uint64(p.bits)
-	w, off := bit/64, bit%64
-	v := p.w[w] >> off
-	if off+uint64(p.bits) > 64 {
-		v |= p.w[w+1] << (64 - off)
-	}
-	return v & (1<<p.bits - 1)
 }
 
 // ---------- Elias-Fano ----------
@@ -104,14 +137,26 @@ func (p *packed) get(i int) uint64 {
 // the i-th one in a bitvector: pos(i) = (v_i >> l) + i. Duplicate values
 // are legal (consecutive ones in the same high bucket), which is exactly
 // how duplicate fp48s map to multiple candidate blocks.
+//
+// This is the READER: every field is a view of the serialized bytes, so an
+// open costs a header parse and four slices whatever the entry count.
 type ef struct {
-	n        int
-	l        uint
-	lows     *packed
-	high     []uint64
-	highBits uint64
-	sel0     []uint64 // position of every sel0Sample-th zero (bucket skip)
-	sel1     []uint64 // position of every sel1Sample-th one (for get)
+	n    int
+	l    uint
+	lows packed
+	high words
+	sel0 words // position of every sel0Sample-th zero (bucket skip)
+	sel1 words // position of every sel1Sample-th one (for get)
+}
+
+// efBuild is the seal/cook side of the same structure.
+type efBuild struct {
+	n    int
+	l    uint
+	lows *packedBuild
+	high []uint64
+	sel0 []uint64
+	sel1 []uint64
 }
 
 const (
@@ -119,10 +164,10 @@ const (
 	sel1Sample = 1024
 )
 
-func buildEF(vals []uint64, u uint64) *ef {
+func buildEF(vals []uint64, u uint64) *efBuild {
 	n := len(vals)
 	if n == 0 {
-		return &ef{lows: newPacked(0, 0)}
+		return &efBuild{lows: newPacked(0, 0)}
 	}
 	// pick l minimizing total bits (floor(log2(u/n)) +-1 candidates)
 	best, bestBits := uint(0), uint64(math.MaxUint64)
@@ -137,9 +182,9 @@ func buildEF(vals []uint64, u uint64) *ef {
 		}
 	}
 	l := best
-	e := &ef{n: n, l: l, lows: newPacked(n, l)}
-	e.highBits = uint64(n) + (u >> l) + 1
-	e.high = make([]uint64, (e.highBits+63)/64)
+	e := &efBuild{n: n, l: l, lows: newPacked(n, l)}
+	highBits := uint64(n) + (u >> l) + 1
+	e.high = make([]uint64, (highBits+63)/64)
 	for i, v := range vals {
 		if l > 0 {
 			e.lows.set(i, v&(1<<l-1))
@@ -150,7 +195,7 @@ func buildEF(vals []uint64, u uint64) *ef {
 	var ones, zeros uint64
 	for w, word := range e.high {
 		base := uint64(w) * 64
-		limit := e.highBits - base
+		limit := highBits - base
 		for b := uint64(0); b < 64 && b < limit; b++ {
 			if word&(1<<b) != 0 {
 				if ones%sel1Sample == 0 {
@@ -170,10 +215,10 @@ func buildEF(vals []uint64, u uint64) *ef {
 
 // select0 returns the position of the (k+1)-th zero (0-indexed k).
 func (e *ef) select0(k uint64) uint64 {
-	pos := e.sel0[k/sel0Sample]
+	pos := e.sel0.get(int(k / sel0Sample))
 	need := k%sel0Sample + 1
 	w := pos / 64
-	word := ^e.high[w] >> (pos % 64) << (pos % 64)
+	word := ^e.high.get(int(w)) >> (pos % 64) << (pos % 64)
 	for {
 		c := uint64(bits.OnesCount64(word))
 		if c >= need {
@@ -184,16 +229,16 @@ func (e *ef) select0(k uint64) uint64 {
 		}
 		need -= c
 		w++
-		word = ^e.high[w]
+		word = ^e.high.get(int(w))
 	}
 }
 
 // select1 returns the position of the (k+1)-th one (0-indexed k).
 func (e *ef) select1(k uint64) uint64 {
-	pos := e.sel1[k/sel1Sample]
+	pos := e.sel1.get(int(k / sel1Sample))
 	need := k%sel1Sample + 1
 	w := pos / 64
-	word := e.high[w] >> (pos % 64) << (pos % 64)
+	word := e.high.get(int(w)) >> (pos % 64) << (pos % 64)
 	for {
 		c := uint64(bits.OnesCount64(word))
 		if c >= need {
@@ -204,7 +249,7 @@ func (e *ef) select1(k uint64) uint64 {
 		}
 		need -= c
 		w++
-		word = e.high[w]
+		word = e.high.get(int(w))
 	}
 }
 
@@ -464,7 +509,7 @@ func writeWords(buf []byte, ws []uint64) []byte {
 	return buf
 }
 
-func writeTxIdx(path string, nTx, nRecords uint64, e *ef, blk *packed, hasTx []uint64) (int64, error) {
+func writeTxIdx(path string, nTx, nRecords uint64, e *efBuild, blk *packedBuild, hasTx []uint64) (int64, error) {
 	buf := make([]byte, 0, txidxHdrSize+8*(len(e.lows.w)+len(e.high)+len(e.sel0)+len(e.sel1)+len(blk.w)+len(hasTx)+6))
 	buf = append(buf, txidxMagic...)
 	buf = binary.LittleEndian.AppendUint32(buf, txidxVersion)
@@ -492,8 +537,8 @@ type txBucket struct {
 	nRecords uint64
 	fileSize int64
 	e        *ef
-	blk      *packed
-	hasTx    []uint64 // bit i = block bucket*BucketBlocks+i has >=1 regular tx
+	blk      packed
+	hasTx    words // bit i = block bucket*BucketBlocks+i has >=1 regular tx
 }
 
 // TxIndex answers hash -> candidate-block queries (tx hashes and block
@@ -531,22 +576,6 @@ func OpenTxIndex(dir string) (*TxIndex, error) {
 // block for its own block hash).
 func (t *TxIndex) NumEntries() uint64 { return t.nTx }
 
-func readWords(b []byte, pos int) ([]uint64, int, error) {
-	if pos+8 > len(b) {
-		return nil, 0, fmt.Errorf("truncated section length at %d", pos)
-	}
-	n := int(binary.LittleEndian.Uint64(b[pos:]))
-	pos += 8
-	if pos+8*n > len(b) {
-		return nil, 0, fmt.Errorf("truncated section (%d words) at %d", n, pos)
-	}
-	ws := make([]uint64, n)
-	for i := range ws {
-		ws[i] = binary.LittleEndian.Uint64(b[pos+8*i:])
-	}
-	return ws, pos + 8*n, nil
-}
-
 func openTxBucket(path string, bucket uint64) (*txBucket, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -561,27 +590,26 @@ func openTxBucket(path string, bucket uint64) (*txBucket, error) {
 	blkBits := uint(binary.LittleEndian.Uint32(b[28:32]))
 
 	pos := txidxHdrSize
-	var sections [6][]uint64
+	var sections [6]words
 	for i := range sections {
-		if sections[i], pos, err = readWords(b, pos); err != nil {
+		if sections[i], pos, err = sliceWords(b, pos); err != nil {
 			return nil, err
 		}
 	}
 	e := &ef{
 		n:    int(nTx),
 		l:    l,
-		lows: &packed{w: sections[0], bits: l},
+		lows: packed{w: sections[0], bits: l},
 		high: sections[1],
 		sel0: sections[2],
 		sel1: sections[3],
 	}
-	e.highBits = nTx + (uint64(1)<<fpBits)>>l + 1
 	return &txBucket{
 		bucket:   bucket,
 		nRecords: nRecords,
 		fileSize: int64(len(b)),
 		e:        e,
-		blk:      &packed{w: sections[4], bits: blkBits},
+		blk:      packed{w: sections[4], bits: blkBits},
 		hasTx:    sections[5],
 	}, nil
 }
@@ -600,7 +628,7 @@ func (t *TxIndex) BlocksWithTxs(bucket uint64) []bool {
 			continue
 		}
 		for i := range out {
-			if w := i / 64; w < len(tb.hasTx) && tb.hasTx[w]&(1<<(i%64)) != 0 {
+			if w := i / 64; w*8 < len(tb.hasTx) && tb.hasTx.get(w)&(1<<(i%64)) != 0 {
 				out[i] = true
 			}
 		}

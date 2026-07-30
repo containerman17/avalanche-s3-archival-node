@@ -34,11 +34,12 @@ func (e *Epoch) walkFramedRange(dataSec int, index []byte, from, to uint64, fn f
 	for f := (from - e.Start) / framedGroup; f*framedGroup < to-e.Start; f++ {
 		lo := binary.LittleEndian.Uint64(index[f*8:])
 		hi := binary.LittleEndian.Uint64(index[(f+1)*8:])
-		frame, err := e.read(dataSec, lo, hi-lo)
+		frame, release, err := e.read(dataSec, lo, hi-lo)
 		if err != nil {
 			return fmt.Errorf("frame %d: %w", f, err)
 		}
 		raw, err := e.decodeAll(frame)
+		release()
 		if err != nil {
 			return fmt.Errorf("frame %d: %w", f, err)
 		}

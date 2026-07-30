@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"github.com/ava-labs/libevm/common"
@@ -43,11 +42,13 @@ type Epoch struct {
 	keyBloom bloomView
 	txBloom  bloomView
 
-	// The tx index is loaded lazily (only when txBloom says maybe) and
-	// dropped by the EpochSet's LRU, so it is heap for a handful of epochs
-	// instead of for all of history. txLoads counts real loads (tests).
-	txMu    sync.Mutex
-	txIdx   *epochTxIdx
+	// pinned is the resident sections' byte ranges, held against casfs
+	// eviction for the life of the epoch and released at Close. Without S3
+	// credentials pinning is a no-op (nothing can evict a spool file).
+	pinned [][2]uint64
+
+	// txLoads counts tx-index traversals, i.e. how often the tx bloom failed
+	// to reject (tests).
 	txLoads atomic.Uint64
 }
 
@@ -88,16 +89,9 @@ func (b bloomView) mayContain(key []byte) bool {
 	return true
 }
 
-// epochTxIdx is the decoded Elias-Fano tx index of one epoch: fp48 -> the
-// epoch-relative blocks that may hold the tx.
-type epochTxIdx struct {
-	ef  *ef
-	blk *packed
-}
-
-// residentSections are read at open and kept for the life of the epoch: the
-// indexes and filters every query starts from. Everything else is ranged.
-// secTxidx is deliberately NOT here (see Epoch.txIndex).
+// residentSections are read at open, PINNED, and kept for the life of the
+// epoch: the indexes and filters every query starts from. Everything else is
+// ranged. secTxidx is deliberately NOT here (see Epoch.TxCandidates).
 var residentSections = []int{
 	secDict, secBodiesIdx, secHeadersIdx, secSSTIdx, secDeletes,
 	secTxBloom, secKeybloom, secLogsDict, secFullLogsIdx, secRcptIdx,
@@ -172,7 +166,8 @@ func openEpochBlob(blob *dist.Blob, hash string) (*Epoch, error) {
 		e.off[i] = [2]uint64{off, ln}
 	}
 	for _, id := range residentSections {
-		if e.sec[id], err = e.read(id, 0, e.off[id][1]); err != nil {
+		if e.sec[id], err = e.pinSection(id); err != nil {
+			e.Close()
 			return nil, fmt.Errorf("epoch %s: section %d: %w", hash, id, err)
 		}
 	}
@@ -207,6 +202,10 @@ func (e *Epoch) Close() {
 		e.dec.Close()
 		e.dec = nil
 	}
+	for _, p := range e.pinned {
+		e.blob.Unpin(p[0], p[1])
+	}
+	e.pinned = nil
 	if e.blob != nil {
 		e.blob.Close()
 		e.blob = nil
@@ -215,18 +214,38 @@ func (e *Epoch) Close() {
 		e.sec[i] = nil
 	}
 	e.keyBloom, e.txBloom = bloomView{}, bloomView{}
-	e.txMu.Lock()
-	e.txIdx = nil
-	e.txMu.Unlock()
 }
 
-// read returns bytes [off, off+n) of one section. The result may alias the
-// mapping of a local file: read-only, and invalid after Close.
-func (e *Epoch) read(id int, off, n uint64) ([]byte, error) {
-	if off > e.off[id][1] || n > e.off[id][1]-off {
-		return nil, fmt.Errorf("epoch %d: section %d range [%d,%d) outside %d bytes", e.Start, id, off, off+n, e.off[id][1])
+// pinSection maps a whole section and holds it against eviction until Close.
+// A resident section is read all the time and must never turn into zeros
+// under a live view, which is what an unpinned hole punch would silently do.
+func (e *Epoch) pinSection(id int) ([]byte, error) {
+	off, n := e.off[id][0], e.off[id][1]
+	if err := e.blob.Pin(off, n); err != nil {
+		return nil, err
 	}
-	return e.blob.Slice(e.off[id][0]+off, n)
+	e.pinned = append(e.pinned, [2]uint64{off, n})
+	return e.blob.Slice(off, n)
+}
+
+// read returns bytes [off, off+n) of one section, PINNED until the returned
+// release runs. The result aliases the artifact's mapping: read-only, invalid
+// after Close, and guaranteed to be the file's real bytes only until release
+// (casfs evicts by punching a hole, which reads back as zeros, silently).
+func (e *Epoch) read(id int, off, n uint64) ([]byte, func(), error) {
+	if off > e.off[id][1] || n > e.off[id][1]-off {
+		return nil, nil, fmt.Errorf("epoch %d: section %d range [%d,%d) outside %d bytes", e.Start, id, off, off+n, e.off[id][1])
+	}
+	abs := e.off[id][0] + off
+	if err := e.blob.Pin(abs, n); err != nil {
+		return nil, nil, err
+	}
+	b, err := e.blob.Slice(abs, n)
+	if err != nil {
+		e.blob.Unpin(abs, n)
+		return nil, nil, err
+	}
+	return b, func() { e.blob.Unpin(abs, n) }, nil
 }
 
 // decodeAll is goroutine-safe: zstd Decoder.DecodeAll is documented
@@ -243,11 +262,12 @@ func (e *Epoch) framedBlob(dataSec int, index []byte, rel uint64) ([]byte, error
 	}
 	lo := binary.LittleEndian.Uint64(index[frame*8:])
 	hi := binary.LittleEndian.Uint64(index[(frame+1)*8:])
-	frameBytes, err := e.read(dataSec, lo, hi-lo)
+	frameBytes, release, err := e.read(dataSec, lo, hi-lo)
 	if err != nil {
 		return nil, err
 	}
 	raw, err := e.decodeAll(frameBytes)
+	release() // the decode copied; nothing below reads the mapping
 	if err != nil {
 		return nil, err
 	}
@@ -299,11 +319,13 @@ func (e *Epoch) sstBlock(idx []byte, bi, nEntries int) ([]byte, error) {
 	if bi+1 < nEntries {
 		hi = binary.LittleEndian.Uint64(idx[(bi+1)*sstIdxEntrySize+sortedKeySize+8:])
 	}
-	block, err := e.read(secSST, lo, hi-lo)
+	block, release, err := e.read(secSST, lo, hi-lo)
 	if err != nil {
 		return nil, err
 	}
-	return e.decodeAll(block)
+	raw, err := e.decodeAll(block)
+	release()
+	return raw, err
 }
 
 // StateSearch finds the largest write <= n of key inside this epoch.
@@ -402,79 +424,59 @@ func (e *Epoch) AccountDeletes(fn func(key []byte, block uint64)) {
 	}
 }
 
-// txIndex decodes this epoch's tx index, once. The section is NOT resident:
-// it is ~6.4 B/tx of Elias-Fano that used to sit in the Go heap for every
-// epoch of history, and it is only ever needed after the tx bloom says maybe.
-// The bytes arrive through dist (an mmap slice without S3 credentials, a
-// fresh copy with them) and readWords copies them into heap words either way,
-// so the decoded index outlives the epoch's mapping safely.
-//
-// ponytail: the load runs under the epoch's own mutex, so concurrent RPC
-// goroutines hitting the same cold epoch load it once and the others wait for
-// that read. Split into a per-epoch sync.Once + refcount only if a cold
-// ranged GET on this path ever shows up as tail latency.
-func (e *Epoch) txIndex() (*epochTxIdx, error) {
-	e.txMu.Lock()
-	defer e.txMu.Unlock()
-	if e.txIdx != nil {
-		return e.txIdx, nil
-	}
-	tx, err := e.read(secTxidx, 0, e.off[secTxidx][1])
-	if err != nil {
-		return nil, err
-	}
+// txIndex is a READER over the txidx section bytes: a 16-byte header and five
+// slices, nothing decoded and nothing on the Go heap (DESIGN.md ruling 3).
+// The caller must hold the section pinned for as long as it uses the result,
+// because every accessor reads the mapping.
+func (e *Epoch) txIndex(tx []byte) (efIdx *ef, blk packed, err error) {
 	if len(tx) < 16 {
-		return nil, fmt.Errorf("epoch %d: truncated txidx", e.Start)
+		return nil, packed{}, fmt.Errorf("epoch %d: truncated txidx", e.Start)
 	}
 	nTx := binary.LittleEndian.Uint64(tx[0:8])
 	efL := uint(binary.LittleEndian.Uint32(tx[8:12]))
 	blkBits := uint(binary.LittleEndian.Uint32(tx[12:16]))
 	pos := 16
-	var secs [5][]uint64
+	var secs [5]words
 	for i := range secs {
-		if secs[i], pos, err = readWords(tx, pos); err != nil {
-			return nil, fmt.Errorf("epoch %d: txidx: %w", e.Start, err)
+		if secs[i], pos, err = sliceWords(tx, pos); err != nil {
+			return nil, packed{}, fmt.Errorf("epoch %d: txidx: %w", e.Start, err)
 		}
 	}
-	idx := &epochTxIdx{
-		ef: &ef{
-			n:    int(nTx),
-			l:    efL,
-			lows: &packed{w: secs[0], bits: efL},
-			high: secs[1],
-			sel0: secs[2],
-			sel1: secs[3],
-		},
-		blk: &packed{w: secs[4], bits: blkBits},
-	}
-	idx.ef.highBits = nTx + (uint64(1)<<fpBits)>>efL + 1
-	e.txIdx = idx
-	e.txLoads.Add(1)
-	return idx, nil
-}
-
-// dropTxIndex releases the decoded tx index (LRU eviction).
-func (e *Epoch) dropTxIndex() {
-	e.txMu.Lock()
-	e.txIdx = nil
-	e.txMu.Unlock()
+	return &ef{
+		n:    int(nTx),
+		l:    efL,
+		lows: packed{w: secs[0], bits: efL},
+		high: secs[1],
+		sel0: secs[2],
+		sel1: secs[3],
+	}, packed{w: secs[4], bits: blkBits}, nil
 }
 
 // TxCandidates returns absolute candidate blocks for a fingerprint (a tx
 // hash, or since v6 a block hash mapping to its own height), descending.
-// Bloom first: an unknown fingerprint never loads the index.
+//
+// The txidx section is not resident, so the walk PINS it for the traversal and
+// unpins after: an unpinned page could be punched mid-walk and read back as
+// zeros, which is a wrong answer rather than a slow one. The bloom rejects
+// first and IS resident, so an unknown hash still touches no Elias-Fano page.
 func (e *Epoch) TxCandidates(fp uint64) ([]uint64, error) {
 	if !e.MayContainTx(fp) {
 		return nil, nil
 	}
-	idx, err := e.txIndex()
+	tx, release, err := e.read(secTxidx, 0, e.off[secTxidx][1])
 	if err != nil {
 		return nil, err
 	}
-	lo, hi := idx.ef.lookup(fp)
+	defer release()
+	e.txLoads.Add(1)
+	idx, blk, err := e.txIndex(tx)
+	if err != nil {
+		return nil, err
+	}
+	lo, hi := idx.lookup(fp)
 	var out []uint64
 	for i := hi - 1; i >= lo; i-- {
-		out = append(out, e.Start+idx.blk.get(i))
+		out = append(out, e.Start+blk.get(i))
 	}
 	return out, nil
 }
@@ -492,20 +494,32 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if total < 4 {
 		return nil, nil
 	}
-	hdr, err := e.read(secLogidx, 0, 4)
+	// Each probe pins the few bytes it reads and releases them immediately:
+	// the section is far too big to hold pinned (pinning fills), and a view
+	// read outside its pin can silently be a punched hole full of zeros.
+	u32 := func(off uint64) (uint32, error) {
+		b, release, err := e.read(secLogidx, off, 4)
+		if err != nil {
+			return 0, err
+		}
+		v := binary.LittleEndian.Uint32(b)
+		release()
+		return v, nil
+	}
+	nAddr64, err := u32(0)
 	if err != nil {
 		return nil, err
 	}
-	nAddr := uint64(binary.LittleEndian.Uint32(hdr))
+	nAddr := uint64(nAddr64)
 	topicHdr := 4 + nAddr*(20+8)
 	if topicHdr+4 > total {
 		return nil, fmt.Errorf("epoch %d: logidx truncated", e.Start)
 	}
-	hdr, err = e.read(secLogidx, topicHdr, 4)
+	nTopic64, err := u32(topicHdr)
 	if err != nil {
 		return nil, err
 	}
-	nTopic := uint64(binary.LittleEndian.Uint32(hdr))
+	nTopic := uint64(nTopic64)
 	listsOff := topicHdr + 4 + nTopic*(32+8)
 	if listsOff > total {
 		return nil, fmt.Errorf("epoch %d: logidx truncated", e.Start)
@@ -536,21 +550,25 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	}
 	listAt := func(i uint64) (uint64, error) {
 		entOff, width, _ := entryOff(i)
-		ent, err := e.read(secLogidx, entOff, width)
+		ent, release, err := e.read(secLogidx, entOff, width)
 		if err != nil {
 			return 0, err
 		}
-		return binary.LittleEndian.Uint64(ent[width-8:]), nil
+		v := binary.LittleEndian.Uint64(ent[width-8:])
+		release()
+		return v, nil
 	}
 
 	var searchErr error
 	i := uint64(sort.Search(int(count), func(i int) bool {
-		ent, err := e.read(secLogidx, base+uint64(i)*stride, uint64(len(key)))
+		ent, release, err := e.read(secLogidx, base+uint64(i)*stride, uint64(len(key)))
 		if err != nil {
 			searchErr = err
 			return true
 		}
-		return bytes.Compare(ent, key) >= 0
+		ge := bytes.Compare(ent, key) >= 0
+		release()
+		return ge
 	}))
 	if searchErr != nil {
 		return nil, searchErr
@@ -558,14 +576,16 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if i >= count {
 		return nil, nil
 	}
-	ent, err := e.read(secLogidx, base+i*stride, stride)
+	ent, release, err := e.read(secLogidx, base+i*stride, stride)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(ent[:len(key)], key) {
+	match := bytes.Equal(ent[:len(key)], key)
+	off := binary.LittleEndian.Uint64(ent[len(key):])
+	release()
+	if !match {
 		return nil, nil
 	}
-	off := binary.LittleEndian.Uint64(ent[len(key):])
 	end := total - listsOff
 	if _, _, ok := entryOff(i + 1); ok {
 		if end, err = listAt(i + 1); err != nil {
@@ -575,11 +595,12 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if end < off {
 		return nil, fmt.Errorf("epoch %d: logidx list [%d,%d) is inverted", e.Start, off, end)
 	}
-	raw, err := e.read(secLogidx, listsOff+off, end-off)
+	raw, release, err := e.read(secLogidx, listsOff+off, end-off)
 	if err != nil {
 		return nil, err
 	}
-	ef, _, err := efUnmarshal(raw, e.Count)
+	defer release() // ef reads the mapping straight through, values() copies
+	ef, _, err := efUnmarshal(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -622,11 +643,12 @@ func (e *Epoch) storedRecord(dataSec int, index []byte, n uint64) ([]byte, bool,
 	slot := binary.LittleEndian.Uint32(members[i*12+8:])
 	lo := binary.LittleEndian.Uint64(offs[frame*8:])
 	hi := binary.LittleEndian.Uint64(offs[(frame+1)*8:])
-	frameBytes, err := e.read(dataSec, lo, hi-lo)
+	frameBytes, release, err := e.read(dataSec, lo, hi-lo)
 	if err != nil {
 		return nil, false, err
 	}
 	raw, err := e.decodeAll(frameBytes)
+	release()
 	if err != nil {
 		return nil, false, err
 	}
@@ -749,37 +771,6 @@ type EpochSet struct {
 	covered  uint64 // last block of the contiguous prefix from genesis
 	gapStart uint64 // expected Start of the first missing epoch (covered+1)
 	gapped   bool   // true when at least one epoch above the prefix exists
-
-	txHotMu sync.Mutex
-	txHot   []*Epoch // epochs whose tx index is decoded, most recent first
-}
-
-// txHotEpochs bounds how many epochs keep a decoded tx index in the heap. A
-// tx lookup that gets past the bloom is overwhelmingly recent, and recent
-// epochs stay hot by themselves, so a handful is plenty: at mainnet shape
-// (10M txs, ~6.4 B/tx) this is ~64MB per hot epoch against the ~7.1GB the
-// whole history used to cost resident.
-const txHotEpochs = 4
-
-// touchTxIndex records e as the most recently used tx index and drops the
-// least recently used beyond txHotEpochs.
-func (s *EpochSet) touchTxIndex(e *Epoch) {
-	s.txHotMu.Lock()
-	defer s.txHotMu.Unlock()
-	for i, h := range s.txHot {
-		if h == e {
-			copy(s.txHot[1:i+1], s.txHot[:i])
-			s.txHot[0] = e
-			return
-		}
-	}
-	s.txHot = append(s.txHot, nil)
-	copy(s.txHot[1:], s.txHot)
-	s.txHot[0] = e
-	for len(s.txHot) > txHotEpochs {
-		s.txHot[len(s.txHot)-1].dropTxIndex()
-		s.txHot = s.txHot[:len(s.txHot)-1]
-	}
 }
 
 // OpenEpochSet opens every epoch the store's data directory indexes. An empty
@@ -867,9 +858,6 @@ func (s *EpochSet) Close() {
 		e.Close()
 	}
 	s.Epochs = nil
-	s.txHotMu.Lock()
-	s.txHot = nil
-	s.txHotMu.Unlock()
 }
 
 // SealedEnd returns the last sealed block, ok=false for an empty set.
@@ -961,7 +949,6 @@ func (c CombinedTxIndex) WalkCandidates(hash common.Hash, fn func(blk uint64) (b
 		if err != nil {
 			return err
 		}
-		c.Epochs.touchTxIndex(e)
 		for _, blk := range blocks {
 			stop, err := visit(blk)
 			if stop || err != nil {

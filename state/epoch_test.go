@@ -386,12 +386,14 @@ func TestEpochStoredLogsSections(t *testing.T) {
 }
 
 // TestEpochThroughRangedReads is the S3 path in miniature: the same epoch read
-// through ReadAt copies instead of the local mapping must answer identically,
-// section by section. Without it the whole credentials-configured read path
-// would be untested until a bucket exists.
+// out of the bucket through casfs must answer identically to the local
+// mapping, section by section. The local side is opened while the artifact is
+// still spool-resident; the ranged side after Sync uploaded it and unlinked
+// the local copy, so every byte it reads is a ranged GET.
 func TestEpochThroughRangedReads(t *testing.T) {
-	st := testStore(t, t.TempDir())
-	in, hash := synthEpoch(t, st, 1000)
+	dir := t.TempDir()
+	st, _ := credStore(t, dir, 1<<30)
+	in, _ := synthEpoch(t, st, 1000)
 	in.FullLogs = map[uint64][]byte{1007: {7, 7, 7}}
 	in.RcptRecs = map[uint64][]byte{1007: {0x21, 1}}
 	hash, err := BuildEpoch(st, in)
@@ -405,15 +407,13 @@ func TestEpochThroughRangedReads(t *testing.T) {
 	}
 	defer local.Close()
 
-	f, err := os.Open(st.SpoolPath(hash))
-	if err != nil {
+	if err := st.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	fi, err := f.Stat()
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(st.SpoolPath(hash)); err == nil {
+		t.Fatal("Sync must release the spool copy")
 	}
-	ranged, err := openEpochBlob(dist.ReaderBlob(f, uint64(fi.Size()), f), hash)
+	ranged, err := OpenEpoch(st, hash)
 	if err != nil {
 		t.Fatal(err)
 	}

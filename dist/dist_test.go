@@ -96,35 +96,6 @@ func TestStoreLocalRoundtrip(t *testing.T) {
 	}
 }
 
-// TestReaderBlobMatchesMmap covers the path a node with S3 credentials takes:
-// the same bytes arrive through ReadAt copies instead of the mapping.
-func TestReaderBlobMatchesMmap(t *testing.T) {
-	dir := t.TempDir()
-	body := bytes.Repeat([]byte("0123456789"), 5000)
-	p := dir + "/blob"
-	if err := os.WriteFile(p, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Open(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ra := ReaderBlob(f, uint64(len(body)), f)
-	defer ra.Close()
-	mm, err := MmapBlob(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mm.Close()
-	for _, r := range [][2]uint64{{0, 1}, {17, 4096}, {uint64(len(body)) - 3, 3}} {
-		a, err1 := ra.Slice(r[0], r[1])
-		b, err2 := mm.Slice(r[0], r[1])
-		if err1 != nil || err2 != nil || !bytes.Equal(a, b) {
-			t.Fatalf("range %v: %v %v", r, err1, err2)
-		}
-	}
-}
-
 func TestLatestPointer(t *testing.T) {
 	s, err := Local(t.TempDir())
 	if err != nil {

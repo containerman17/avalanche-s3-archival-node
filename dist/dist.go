@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"hash"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -247,6 +246,10 @@ func (s *Store) Chunks(hash string) ([]byte, error) {
 		return nil, err
 	}
 	defer b.Close()
+	if err := b.Pin(0, b.Size()); err != nil {
+		return nil, err
+	}
+	defer b.Unpin(0, b.Size())
 	list, err := b.Slice(0, b.Size())
 	if err != nil {
 		return nil, err
@@ -287,8 +290,9 @@ func (s *Store) Close() error {
 }
 
 // Open returns the bytes of one artifact. Without credentials that is an mmap
-// of the spool file; with them it is casfs, which reads through its chunk
-// cache and fills misses from the spool file or a ranged GET.
+// of the spool file; with them it is casfs, whose View is a window onto a
+// mapping of the sparse cache file, filled from the spool or a ranged GET.
+// Either way Slice is zero-copy: nothing an epoch reads lands on the Go heap.
 func (s *Store) Open(hash string) (*Blob, error) {
 	if s.cas == nil {
 		b, err := MmapBlob(s.SpoolPath(hash))
@@ -301,17 +305,21 @@ func (s *Store) Open(hash string) (*Blob, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Blob{size: uint64(f.Size()), ra: f, closer: f}, nil
+	return &Blob{size: uint64(f.Size()), f: f}, nil
 }
 
-// Blob is one artifact's bytes. Slice hands back a view into the mapping when
-// the file is local and a fresh copy when it is not, which is the only
-// difference between the two states above this package.
+// Blob is one artifact's bytes, always as a mapping: the spool file without
+// credentials, casfs's sparse cache file with them.
+//
+// THE PIN CONTRACT, and it is correctness, not tuning: casfs evicts by
+// punching a hole, and a hole under a live mapping reads back as ZEROS with no
+// error. A zeroed bloom page is a false negative, i.e. a wrong answer. So
+// every read of a Slice must happen inside Pin/Unpin of that range. Both are
+// no-ops without credentials, where nothing can evict anything.
 type Blob struct {
-	size   uint64
-	mm     []byte
-	ra     io.ReaderAt
-	closer io.Closer
+	size uint64
+	mm   []byte      // no credentials: whole-file mapping of the spool file
+	f    *casfs.File // credentials: View/Pin/Unpin over the chunk cache
 }
 
 // MmapBlob maps a plain file. Used for spool-resident artifacts and by tools
@@ -336,16 +344,10 @@ func MmapBlob(path string) (*Blob, error) {
 	return &Blob{size: uint64(st.Size()), mm: mm}, nil
 }
 
-// ReaderBlob wraps any ReaderAt as a blob (the copy path, exercised by tests
-// without an S3 endpoint).
-func ReaderBlob(ra io.ReaderAt, size uint64, closer io.Closer) *Blob {
-	return &Blob{size: size, ra: ra, closer: closer}
-}
-
 func (b *Blob) Size() uint64 { return b.size }
 
-// Slice returns bytes [off, off+n). The result MAY alias the mapping, so
-// callers must treat it as read-only and must not retain it past Close.
+// Slice returns bytes [off, off+n) as a view of the mapping: read-only, never
+// valid past Close, and only stable while the range is pinned (see Blob).
 func (b *Blob) Slice(off, n uint64) ([]byte, error) {
 	if off > b.size || n > b.size-off {
 		return nil, fmt.Errorf("dist: range [%d,%d) outside a %d byte artifact", off, off+n, b.size)
@@ -353,14 +355,27 @@ func (b *Blob) Slice(off, n uint64) ([]byte, error) {
 	if n == 0 {
 		return nil, nil
 	}
-	if b.mm != nil {
-		return b.mm[off : off+n], nil
+	if b.f != nil {
+		return b.f.View(int64(off), int64(n))
 	}
-	p := make([]byte, n)
-	if _, err := b.ra.ReadAt(p, int64(off)); err != nil {
-		return nil, err
+	return b.mm[off : off+n], nil
+}
+
+// Pin holds [off, off+n) against eviction until Unpin. Nested and overlapping
+// pins are counted, so an inner read of an already-pinned range is free to pin
+// it again.
+func (b *Blob) Pin(off, n uint64) error {
+	if b.f == nil || n == 0 {
+		return nil
 	}
-	return p, nil
+	return b.f.Pin(int64(off), int64(n))
+}
+
+func (b *Blob) Unpin(off, n uint64) error {
+	if b.f == nil || n == 0 {
+		return nil
+	}
+	return b.f.Unpin(int64(off), int64(n))
 }
 
 func (b *Blob) Close() error {
@@ -369,9 +384,9 @@ func (b *Blob) Close() error {
 		b.mm = nil
 		return err
 	}
-	if b.closer != nil {
-		err := b.closer.Close()
-		b.closer = nil
+	if b.f != nil {
+		err := b.f.Close()
+		b.f = nil
 		return err
 	}
 	return nil
