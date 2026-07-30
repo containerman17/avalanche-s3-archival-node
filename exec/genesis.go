@@ -53,7 +53,7 @@ func snowContextFor(networkID uint32) (*snow.Context, error) {
 
 // loadCChainGenesis parses the C-Chain genesis for networkID from
 // avalanchego's embedded config and wires the Avalanche network upgrades
-// BEFORE SetEthUpgrades — without configExtra.NetworkUpgrades the
+// BEFORE SetEthUpgrades: without configExtra.NetworkUpgrades the
 // Avalanche phases never activate, state roots diverge at the first AP1
 // block, and SetEthUpgrades cannot place Berlin or London (Fuji
 // 184985/805078, mainnet 1640340/3308552). Mirrors
