@@ -4,7 +4,6 @@ import (
 	"math/big"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
@@ -14,6 +13,7 @@ import (
 	"github.com/ava-labs/libevm/trie"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -282,7 +282,7 @@ func sealEpochs(t *testing.T, dir string, blocks []tblock, mutate func(in *state
 		if mutate != nil {
 			mutate(in)
 		}
-		if _, err := state.BuildEpoch(dir, in); err != nil {
+		if _, err := state.BuildEpoch(testStore(t, dir), in); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -291,7 +291,7 @@ func sealEpochs(t *testing.T, dir string, blocks []tblock, mutate func(in *state
 // runVerify verifies dir's epoch set with a fresh anchorless Verifier.
 func runVerify(t *testing.T, dir string) (*Verifier, error) {
 	t.Helper()
-	set, err := state.OpenEpochSet(dir)
+	set, err := state.OpenEpochSet(testStore(t, dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,22 +399,13 @@ func TestVerifyCorruptions(t *testing.T) {
 	})
 }
 
-// TestCursorPipelines feeds epochs out of order: the cursor must hold the
-// later epoch until the prefix arrives, then verify both and report nil.
-func TestCursorPipelines(t *testing.T) {
-	blocks := buildChain(t)
-	dir := t.TempDir()
-	sealEpochs(t, dir, blocks, nil)
-
-	c := StartCursor(dir, t.TempDir(), 0, 2, 2)
-	c.Notify(state.EpochFileName(7, 6)) // out of order: nothing verifiable yet
-	c.Notify(state.EpochFileName(1, 6))
-	select {
-	case err := <-c.Done():
-		if err != nil {
-			t.Fatalf("cursor: %v", err)
-		}
-	case <-time.After(2 * time.Minute):
-		t.Fatal("cursor did not finish")
+// testStore is a credential-free artifact store over dir: the spool is the
+// whole of it, exactly like a node with no bucket configured.
+func testStore(t *testing.T, dir string) *dist.Store {
+	t.Helper()
+	st, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return st
 }

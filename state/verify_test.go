@@ -10,9 +10,9 @@ import (
 // cursor must yield exactly the SST's rows, blocks strictly ascending,
 // rows key-sorted within each block.
 func TestSpillDiffs(t *testing.T) {
-	dir := t.TempDir()
-	_, path := synthEpoch(t, dir, 1000)
-	e, err := OpenEpoch(path)
+	st := testStore(t, t.TempDir())
+	_, hash := synthEpoch(t, st, 1000)
+	e, err := OpenEpoch(st, hash)
 	if err != nil {
 		t.Fatal(err)
 	}

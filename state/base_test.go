@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"math/big"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/holiman/uint256"
 )
 
@@ -45,10 +45,10 @@ func codeAccRLP(t *testing.T, nonce uint64, balance int64, codeHash common.Hash)
 }
 
 var (
-	baseA   = common.HexToAddress("0x1111111111111111111111111111111111111111")
-	baseB   = common.HexToAddress("0x2222222222222222222222222222222222222222")
-	baseC   = common.HexToAddress("0x3333333333333333333333333333333333333333")
-	baseD   = common.HexToAddress("0x4444444444444444444444444444444444444444")
+	baseA = common.HexToAddress("0x1111111111111111111111111111111111111111")
+	baseB = common.HexToAddress("0x2222222222222222222222222222222222222222")
+	baseC = common.HexToAddress("0x3333333333333333333333333333333333333333")
+	baseD = common.HexToAddress("0x4444444444444444444444444444444444444444")
 
 	baseSlot1 = common.HexToHash("0x01")
 	baseSlot2 = common.HexToHash("0x02")
@@ -61,7 +61,7 @@ var (
 
 // writeTestBase builds a small base file covering all three row kinds.
 // Rows are handed in unsorted on purpose: WriteBase owns the ordering.
-func writeTestBase(t *testing.T, dir string, block uint64) string {
+func writeTestBase(t *testing.T, st *dist.Store, block uint64) string {
 	t.Helper()
 	row := func(key []byte, val []byte) BaseRow {
 		var r BaseRow
@@ -84,20 +84,21 @@ func writeTestBase(t *testing.T, dir string, block uint64) string {
 	for n := m.HdrFrom; n <= block; n++ {
 		m.Headers = append(m.Headers, baseHdr(t, n, baseRoot(n)))
 	}
-	path, err := WriteBase(dir, m, rows)
+	hash, err := WriteBase(st, m, rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return path
+	return hash
 }
 
 func TestBaseWriteAndRead(t *testing.T) {
-	dir := t.TempDir()
-	if got := filepath.Base(writeTestBase(t, dir, 65)); got != "base_65" {
-		t.Fatalf("path %s", got)
+	st := testStore(t, t.TempDir())
+	hash := writeTestBase(t, st, 65)
+	if got, err := ReadMarker(st.Dir(), "base_65.cas"); err != nil || got != hash {
+		t.Fatalf("marker: %s %v, want %s", got, err, hash)
 	}
 
-	b, ok, err := OpenBase(dir)
+	b, ok, err := OpenBase(st)
 	if err != nil || !ok {
 		t.Fatalf("OpenBase: ok=%v err=%v", ok, err)
 	}
@@ -185,9 +186,9 @@ func TestBaseWriteAndRead(t *testing.T) {
 // is byte-identical to the 53-byte epoch/bucket key, and the same value comes
 // back through the raw row walk.
 func TestBaseReadsWithoutKeccak(t *testing.T) {
-	dir := t.TempDir()
-	writeTestBase(t, dir, 65)
-	b, ok, err := OpenBase(dir)
+	st := testStore(t, t.TempDir())
+	writeTestBase(t, st, 65)
+	b, ok, err := OpenBase(st)
 	if err != nil || !ok {
 		t.Fatalf("OpenBase: ok=%v err=%v", ok, err)
 	}
@@ -221,9 +222,9 @@ func TestBaseReadsWithoutKeccak(t *testing.T) {
 // 65-byte HASHED keys computed at iteration time, while the disk stays
 // preimage-keyed.
 func TestBaseWalkRowsHashes(t *testing.T) {
-	dir := t.TempDir()
-	writeTestBase(t, dir, 65)
-	b, ok, err := OpenBase(dir)
+	st := testStore(t, t.TempDir())
+	writeTestBase(t, st, 65)
+	b, ok, err := OpenBase(st)
 	if err != nil || !ok {
 		t.Fatalf("OpenBase: ok=%v err=%v", ok, err)
 	}
@@ -264,24 +265,29 @@ func TestBaseWalkRowsHashes(t *testing.T) {
 }
 
 func TestOpenBaseFailsLoudly(t *testing.T) {
-	src := t.TempDir()
-	good, err := os.ReadFile(writeTestBase(t, src, 65))
+	src := testStore(t, t.TempDir())
+	good, err := os.ReadFile(src.SpoolPath(writeTestBase(t, src, 65)))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, ok, err := OpenBase(t.TempDir()); ok || err != nil {
+	if _, ok, err := OpenBase(testStore(t, t.TempDir())); ok || err != nil {
 		t.Fatalf("empty dir: ok=%v err=%v, want false/nil", ok, err)
 	}
 
 	corrupt := func(name string, b []byte, wantMsg string) {
 		t.Helper()
-		dir := t.TempDir()
-		p := filepath.Join(dir, "base_65")
-		if err := os.WriteFile(p, b, 0o644); err != nil {
+		st := testStore(t, t.TempDir())
+		// The marker names a hash whose spool file says something else: only
+		// the artifact's own bytes are being tested here.
+		const fake = "0000000000000000000000000000000000000000000000000000000000000065"
+		if err := os.WriteFile(st.SpoolPath(fake), b, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		bs, ok, err := OpenBase(dir)
+		if err := WriteMarker(st.Dir(), BaseMarkerName(65), fake); err != nil {
+			t.Fatal(err)
+		}
+		bs, ok, err := OpenBase(st)
 		if err == nil {
 			if ok {
 				bs.Close()
@@ -314,7 +320,7 @@ func TestOpenBaseFailsLoudly(t *testing.T) {
 	// refusing to guess left exec and serve unable to start at all. The
 	// rename is ordered after the new file's fsync, so the highest B is
 	// always the complete one.
-	two := t.TempDir()
+	two := testStore(t, t.TempDir())
 	writeTestBase(t, two, 65)
 	writeTestBase(t, two, 66)
 	b, ok, err := OpenBase(two)
@@ -325,7 +331,7 @@ func TestOpenBaseFailsLoudly(t *testing.T) {
 	if b.Block() != 66 {
 		t.Fatalf("two base files: opened block %d, want the newest (66)", b.Block())
 	}
-	if blk, ok, err := PeekBase(two); err != nil || !ok || blk != 66 {
+	if blk, ok, err := PeekBase(two.Dir()); err != nil || !ok || blk != 66 {
 		t.Fatalf("PeekBase with two base files: %d ok=%v err=%v, want 66", blk, ok, err)
 	}
 }
@@ -335,8 +341,7 @@ func TestOpenBaseFailsLoudly(t *testing.T) {
 // make the file answer two values for one key (the sparse index and the
 // lookup binary search both assume strict ascent).
 func TestBaseWriterRejectsBadOrder(t *testing.T) {
-	dir := t.TempDir()
-	w, err := newBaseWriter(dir, BaseMeta{Block: 5}, 2)
+	w, err := newBaseWriter(testStore(t, t.TempDir()), BaseMeta{Block: 5}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}

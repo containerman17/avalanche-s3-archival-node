@@ -40,14 +40,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"sort"
-	"syscall"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/crypto"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -74,30 +74,36 @@ const (
 	secBaseHeaders
 )
 
-func BaseFileName(block uint64) string { return fmt.Sprintf("base_%d", block) }
+// BaseMarkerName is the local index entry for the snapshot at block: the file
+// name carries B, the 64 hex bytes inside carry the artifact's sha256.
+func BaseMarkerName(block uint64) string { return fmt.Sprintf("base_%d%s", block, markerSuffix) }
 
-// ParseBaseFileName returns (block, ok).
-func ParseBaseFileName(name string) (uint64, bool) {
+// ParseBaseMarkerName returns (block, ok).
+func ParseBaseMarkerName(name string) (uint64, bool) {
 	var block uint64
-	if n, err := fmt.Sscanf(name, "base_%d", &block); n != 1 || err != nil {
+	if n, err := fmt.Sscanf(name, "base_%d"+markerSuffix, &block); n != 1 || err != nil {
 		return 0, false
 	}
-	return block, BaseFileName(block) == name
+	return block, BaseMarkerName(block) == name
 }
 
 // ---------- reader ----------
 
-// Base is one open (mmap'd) base file: the read floor at block B.
-// Goroutine-safe for reads (everything is immutable after open and
-// zstd DecodeAll is concurrent-safe).
+// Base is one open base artifact: the read floor at block B. Bytes come from
+// dist exactly like an epoch's (mmap of the spool file without credentials,
+// casfs with them); the sparse index and the bloom are resident, the SST is
+// read by range. Goroutine-safe for reads (everything is immutable after open
+// and zstd DecodeAll is concurrent-safe).
 type Base struct {
 	block uint64
 	cumTx uint64
 	root  common.Hash
 
-	mm  []byte
-	sec [baseNumSections][]byte
-	dec *zstd.Decoder
+	hash string
+	blob *dist.Blob
+	off  [baseNumSections][2]uint64
+	sec  [baseNumSections][]byte // resident sections (sstIdx, keybloom)
+	dec  *zstd.Decoder
 
 	bloomM    uint64
 	bloomK    uint32
@@ -107,31 +113,39 @@ type Base struct {
 	headers [][]byte // hdrFrom..hdrFrom+len-1, nil entry = absent
 }
 
-// OpenBase opens the newest base_<block> file in dir. ok=false means the
-// directory has no base file (a full-history node); a present but corrupt
-// file is an error, never a silent miss.
+// OpenBase opens the snapshot the local index names. ok=false means the
+// directory has no snapshot (a full-history node); a present but broken one is
+// an error, never a silent miss.
 //
-// NEWEST WINS, deliberately (fold's crash table): the fold commits a new
-// snapshot by renaming base_<B>.tmp into place and only then unlinks the
-// older one, so two base files is a normal transient state after a kill -9
-// in that window. The rename is ordered strictly after the new file's fsync,
-// so the highest B on disk is always the complete one. Refusing to guess
-// here (the pre-fold rule) left exec and serve unable to start at all until
-// the next fold ran; the fold's own sweep is what removes the loser.
-func OpenBase(dir string) (*Base, bool, error) {
-	name, _, ok, err := newestBase(dir)
+// NEWEST WINS, deliberately (fold's crash table): the fold commits a snapshot
+// by writing the new marker and only then dropping the older one, so two
+// markers is a normal transient state after a kill -9 in that window. The
+// marker is written strictly after the artifact is durable, so the highest B
+// indexed is always complete. Refusing to guess here (the pre-fold rule) left
+// exec and serve unable to start at all until the next fold ran; the fold's
+// own sweep is what removes the loser.
+func OpenBase(st *dist.Store) (*Base, bool, error) {
+	name, _, ok, err := newestBase(st.Dir())
 	if err != nil || !ok {
 		return nil, false, err
 	}
-	b, err := openBaseFile(filepath.Join(dir, name))
+	hash, err := ReadMarker(st.Dir(), name)
 	if err != nil {
 		return nil, false, err
+	}
+	b, err := OpenBaseHash(st, hash)
+	if err != nil {
+		return nil, false, err
+	}
+	if want, _ := ParseBaseMarkerName(name); want != b.block {
+		b.Close()
+		return nil, false, fmt.Errorf("base %s: marker %s names block %d", hash, name, b.block)
 	}
 	return b, true, nil
 }
 
-// newestBase returns the highest-numbered base file in dir, plus every base
-// file name found (ascending by block) so the fold can unlink the losers.
+// newestBase returns the highest-numbered base marker in dir, plus every
+// marker name found (ascending by block) so the fold can unlink the losers.
 func newestBase(dir string) (name string, all []string, ok bool, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -143,7 +157,7 @@ func newestBase(dir string) (name string, all []string, ok bool, err error) {
 	}
 	var found []bf
 	for _, en := range entries {
-		if blk, ok := ParseBaseFileName(en.Name()); ok {
+		if blk, ok := ParseBaseMarkerName(en.Name()); ok {
 			found = append(found, bf{blk, en.Name()})
 		}
 	}
@@ -155,105 +169,130 @@ func newestBase(dir string) (name string, all []string, ok bool, err error) {
 		all = append(all, f.name)
 	}
 	if len(found) > 1 {
-		log.Printf("state: %d base files in %s (%v): a fold was killed between its rename and its cleanup; using the newest, %s",
+		log.Printf("state: %d snapshots indexed in %s (%v): a fold was killed between its marker write and its cleanup; using the newest, %s",
 			len(all), dir, all, all[len(all)-1])
 	}
 	return all[len(all)-1], all, true, nil
 }
 
-// OpenBaseFile opens one base file by path. Unlike OpenBase it does not scan
-// a directory, which is what the fold's pre-rename gate needs: it verifies
-// base_<B>.tmp before that name ever becomes visible.
-func OpenBaseFile(path string) (*Base, error) { return openBaseFile(path) }
+// OpenBaseHash opens one snapshot artifact by hash.
+func OpenBaseHash(st *dist.Store, hash string) (*Base, error) {
+	blob, err := st.Open(hash)
+	if err != nil {
+		return nil, err
+	}
+	b, err := openBaseBlob(blob, hash)
+	if err != nil {
+		blob.Close()
+		return nil, err
+	}
+	return b, nil
+}
 
-func openBaseFile(path string) (*Base, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	size := int(st.Size())
+func openBaseBlob(blob *dist.Blob, hash string) (*Base, error) {
+	size := blob.Size()
 	if size < baseFooterSize {
-		return nil, fmt.Errorf("base %s: too small (%d bytes)", path, size)
+		return nil, fmt.Errorf("base %s: too small (%d bytes)", hash, size)
 	}
-	mm, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
+	ft, err := blob.Slice(size-baseFooterSize, baseFooterSize)
 	if err != nil {
 		return nil, err
 	}
-	ft := mm[size-baseFooterSize:]
 	if !bytes.Equal(ft[0:4], baseMagic[:]) || !bytes.Equal(ft[baseFooterSize-4:], baseMagic[:]) {
-		syscall.Munmap(mm)
-		return nil, fmt.Errorf("base %s: bad footer magic (truncated or corrupt)", path)
+		return nil, fmt.Errorf("base %s: bad footer magic (truncated or corrupt)", hash)
 	}
 	if v := binary.LittleEndian.Uint32(ft[4:8]); v != baseVersion {
-		syscall.Munmap(mm)
 		// No migration, ever (user ruling 2026-07-28): v1 was hash-keyed and
 		// nothing can re-key it without the preimages it never stored.
-		return nil, fmt.Errorf("base %s: format v%d, unsupported: delete it and re-fetch the snapshot (only v%d is readable)", path, v, baseVersion)
+		return nil, fmt.Errorf("base %s: format v%d, unsupported: delete it and re-fetch the snapshot (only v%d is readable)", hash, v, baseVersion)
 	}
 	b := &Base{
 		block:   binary.LittleEndian.Uint64(ft[8:16]),
 		hdrFrom: binary.LittleEndian.Uint64(ft[16:24]),
 		cumTx:   binary.LittleEndian.Uint64(ft[24:32]),
-		mm:      mm,
+		hash:    hash,
+		blob:    blob,
 	}
 	copy(b.root[:], ft[32:64])
-	if want, ok := ParseBaseFileName(filepath.Base(path)); ok && want != b.block {
-		syscall.Munmap(mm)
-		return nil, fmt.Errorf("base %s: footer says block %d", path, b.block)
-	}
+	body := size - baseFooterSize
 	for i := 0; i < baseNumSections; i++ {
 		off := binary.LittleEndian.Uint64(ft[64+i*16:])
 		ln := binary.LittleEndian.Uint64(ft[72+i*16:])
-		body := uint64(size - baseFooterSize)
 		if off > body || ln > body-off { // overflow-safe bounds check
-			syscall.Munmap(mm)
-			return nil, fmt.Errorf("base %s: section %d out of bounds", path, i)
+			return nil, fmt.Errorf("base %s: section %d out of bounds", hash, i)
 		}
-		b.sec[i] = mm[off : off+ln]
+		b.off[i] = [2]uint64{off, ln}
+	}
+	for _, id := range []int{secBaseSSTIdx, secBaseKeybloom} {
+		if b.sec[id], err = b.read(id, 0, b.off[id][1]); err != nil {
+			return nil, fmt.Errorf("base %s: section %d: %w", hash, id, err)
+		}
 	}
 	if b.dec, err = zstd.NewReader(nil); err != nil {
-		syscall.Munmap(mm)
 		return nil, err
 	}
 	bl := b.sec[secBaseKeybloom]
 	if len(bl) < 16 {
 		b.Close()
-		return nil, fmt.Errorf("base %s: truncated bloom", path)
+		return nil, fmt.Errorf("base %s: truncated bloom", hash)
 	}
 	b.bloomM = binary.LittleEndian.Uint64(bl[0:8])
 	b.bloomK = binary.LittleEndian.Uint32(bl[8:12])
 	b.bloomBits = bl[16:]
 	if b.bloomM == 0 || uint64(len(b.bloomBits))*8 < b.bloomM {
 		b.Close()
-		return nil, fmt.Errorf("base %s: bloom claims %d bits over %d bytes", path, b.bloomM, len(b.bloomBits))
+		return nil, fmt.Errorf("base %s: bloom claims %d bits over %d bytes", hash, b.bloomM, len(b.bloomBits))
 	}
-	if len(b.sec[secBaseHeaders]) > 0 {
-		raw, err := b.dec.DecodeAll(b.sec[secBaseHeaders], nil)
+	if b.off[secBaseHeaders][1] > 0 {
+		sec, err := b.read(secBaseHeaders, 0, b.off[secBaseHeaders][1])
 		if err != nil {
 			b.Close()
-			return nil, fmt.Errorf("base %s: headers: %w", path, err)
+			return nil, err
+		}
+		raw, err := b.dec.DecodeAll(sec, nil)
+		if err != nil {
+			b.Close()
+			return nil, fmt.Errorf("base %s: headers: %w", hash, err)
 		}
 		for pos := 0; pos < len(raw); {
 			ln, n := binary.Uvarint(raw[pos:])
 			if n <= 0 || pos+n+int(ln) > len(raw) {
 				b.Close()
-				return nil, fmt.Errorf("base %s: bad header payload", path)
+				return nil, fmt.Errorf("base %s: bad header payload", hash)
 			}
 			pos += n
 			var hdr []byte
 			if ln > 0 {
-				hdr = raw[pos : pos+int(ln)]
+				hdr = append([]byte(nil), raw[pos:pos+int(ln)]...)
 			}
 			b.headers = append(b.headers, hdr)
 			pos += int(ln)
 		}
 	}
 	return b, nil
+}
+
+// read returns bytes [off, off+n) of one section (see Epoch.read).
+func (b *Base) read(id int, off, n uint64) ([]byte, error) {
+	if off > b.off[id][1] || n > b.off[id][1]-off {
+		return nil, fmt.Errorf("base %d: section %d range [%d,%d) outside %d bytes", b.block, id, off, off+n, b.off[id][1])
+	}
+	return b.blob.Slice(b.off[id][0]+off, n)
+}
+
+// sstBlock decodes the SST block the sparse-index entry bi points at.
+func (b *Base) sstBlock(bi, n int, into []byte) ([]byte, error) {
+	idx := b.sec[secBaseSSTIdx]
+	lo := binary.LittleEndian.Uint64(idx[bi*baseIdxEntrySize+baseKeySize:])
+	hi := b.off[secBaseSST][1]
+	if bi+1 < n {
+		hi = binary.LittleEndian.Uint64(idx[(bi+1)*baseIdxEntrySize+baseKeySize:])
+	}
+	block, err := b.read(secBaseSST, lo, hi-lo)
+	if err != nil {
+		return nil, err
+	}
+	return b.dec.DecodeAll(block, into)
 }
 
 // Block returns the floor block B: this file is the state at the end of B.
@@ -272,10 +311,14 @@ func (b *Base) Close() {
 		b.dec.Close()
 		b.dec = nil
 	}
-	if b.mm != nil {
-		syscall.Munmap(b.mm)
-		b.mm = nil
+	if b.blob != nil {
+		b.blob.Close()
+		b.blob = nil
 	}
+	for i := range b.sec {
+		b.sec[i] = nil
+	}
+	b.bloomBits = nil
 	b.headers = nil
 }
 
@@ -396,19 +439,13 @@ func (it *baseIter) next() (key, val []byte, ok bool, err error) {
 			it.pos = vstart + int(vlen)
 			return key, val, true, nil
 		}
-		idx := it.b.sec[secBaseSSTIdx]
-		n := len(idx) / baseIdxEntrySize
+		n := len(it.b.sec[secBaseSSTIdx]) / baseIdxEntrySize
 		if it.bi >= n {
 			return nil, nil, false, nil
 		}
-		lo := binary.LittleEndian.Uint64(idx[it.bi*baseIdxEntrySize+baseKeySize:])
-		hi := uint64(len(it.b.sec[secBaseSST]))
-		if it.bi+1 < n {
-			hi = binary.LittleEndian.Uint64(idx[(it.bi+1)*baseIdxEntrySize+baseKeySize:])
-		}
-		raw, err := it.b.dec.DecodeAll(it.b.sec[secBaseSST][lo:hi], it.raw[:0])
+		raw, err := it.b.sstBlock(it.bi, n, it.raw[:0])
 		if err != nil {
-			return nil, nil, false, fmt.Errorf("base block %d: decode sst block %d: %w", it.b.block, it.bi, err)
+			return nil, nil, false, fmt.Errorf("base block %d: sst block %d: %w", it.b.block, it.bi, err)
 		}
 		it.raw, it.pos, it.bi = raw, 0, it.bi+1
 	}
@@ -440,14 +477,9 @@ func (b *Base) lookup(key []byte) ([]byte, bool, error) {
 	if bi < 0 {
 		return nil, false, nil
 	}
-	lo := binary.LittleEndian.Uint64(entry(bi)[baseKeySize:])
-	hi := uint64(len(b.sec[secBaseSST]))
-	if bi+1 < n {
-		hi = binary.LittleEndian.Uint64(entry(bi + 1)[baseKeySize:])
-	}
-	raw, err := b.dec.DecodeAll(b.sec[secBaseSST][lo:hi], nil)
+	raw, err := b.sstBlock(bi, n, nil)
 	if err != nil {
-		return nil, false, fmt.Errorf("base block %d: decode sst block %d: %w", b.block, bi, err)
+		return nil, false, fmt.Errorf("base block %d: sst block %d: %w", b.block, bi, err)
 	}
 	for pos := 0; pos+baseKeySize < len(raw); {
 		rk := raw[pos : pos+baseKeySize]
@@ -470,14 +502,14 @@ func (b *Base) lookup(key []byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-// PeekBase reports the floor block of dir's newest base file, without
-// mapping it. Newest-wins for the same reason OpenBase is.
+// PeekBase reports the floor block of dir's newest indexed snapshot without
+// opening it. Newest-wins for the same reason OpenBase is.
 func PeekBase(dir string) (uint64, bool, error) {
 	name, _, ok, err := newestBase(dir)
 	if err != nil || !ok {
 		return 0, false, err
 	}
-	blk, _ := ParseBaseFileName(name)
+	blk, _ := ParseBaseMarkerName(name)
 	return blk, true, nil
 }
 
@@ -505,10 +537,11 @@ type baseWriter struct {
 	enc  *zstd.Encoder
 	f    *os.File
 	out  *bufio.Writer
-	dir  string
+	st   *dist.Store
+	dg   *dist.Digest
 	tmp  string
-	path string
-	done bool // Commit succeeded: Abort is a no-op
+	hash string // set by Commit
+	done bool   // Commit succeeded: Abort is a no-op
 
 	written  uint64 // SST bytes emitted so far, which is also the section offset
 	idx      []byte
@@ -524,23 +557,26 @@ type baseWriter struct {
 	haveLast   bool
 }
 
-// newBaseWriter creates dir/base_<B>.tmp. rowCount must be the exact number
-// of Add calls that follow (Finish refuses otherwise): it sizes the bloom.
-func newBaseWriter(dir string, m BaseMeta, rowCount uint64) (*baseWriter, error) {
+// newBaseWriter writes into a temp file next to the spool, hashing as it goes
+// so the finished snapshot can be renamed straight onto its own content
+// address. rowCount must be the exact number of Add calls that follow (Finish
+// refuses otherwise): it sizes the bloom.
+func newBaseWriter(st *dist.Store, m BaseMeta, rowCount uint64) (*baseWriter, error) {
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, BaseFileName(m.Block))
-	f, err := os.Create(path + ".tmp")
+	tmp := st.SpoolTemp(BaseMarkerName(m.Block))
+	f, err := os.Create(tmp)
 	if err != nil {
 		enc.Close()
 		return nil, err
 	}
 	bits := bloomBits(rowCount)
+	dg := dist.NewDigest()
 	return &baseWriter{
-		m: m, enc: enc, f: f, out: bufio.NewWriterSize(f, 4<<20),
-		dir: dir, tmp: path + ".tmp", path: path,
+		m: m, enc: enc, f: f, out: bufio.NewWriterSize(io.MultiWriter(f, dg), 4<<20),
+		st: st, dg: dg, tmp: tmp,
 		bloomM: bits, words: make([]uint64, bits/64),
 		want: rowCount,
 	}, nil
@@ -662,14 +698,23 @@ func (w *baseWriter) Finish() (string, error) {
 	return w.tmp, nil
 }
 
-// Commit makes the file visible. THE COMMIT POINT: the rename is ordered
-// after the file's own fsync, and the directory fsync after the rename, so a
-// crash either leaves the old base untouched or the new one complete.
+// Commit publishes the snapshot. THE COMMIT POINT, in order: the artifact is
+// renamed onto its own content address (after its own fsync), the data dir is
+// fsynced, and only then does the local index marker start naming it. A crash
+// anywhere leaves the old snapshot untouched or the new one complete.
 func (w *baseWriter) Commit() error {
-	if err := os.Rename(w.tmp, w.path); err != nil {
+	hash, err := w.st.Adopt(w.tmp, w.dg)
+	if err != nil {
 		return err
 	}
-	if err := syncDir(w.dir); err != nil {
+	w.hash = hash
+	if err := syncDir(w.st.Dir()); err != nil {
+		return err
+	}
+	if err := WriteMarker(w.st.Dir(), BaseMarkerName(w.m.Block), hash); err != nil {
+		return err
+	}
+	if err := setLatestSnapshot(w.st, hash); err != nil {
 		return err
 	}
 	w.done = true
@@ -711,13 +756,13 @@ type BaseMeta struct {
 	Headers [][]byte    // RLP for HdrFrom..B, nil entry = absent
 }
 
-// WriteBase writes base_<B> into dir (tmp + rename) and returns its path.
-// Rows are sorted here; the streaming writer refuses duplicates. The fold
-// producer (state/fold.go) drives the same baseWriter directly, so identical
-// row sets produce identical files whichever path built them.
-func WriteBase(dir string, m BaseMeta, rows []BaseRow) (string, error) {
+// WriteBase publishes a snapshot built from rows and returns its hash. Rows
+// are sorted here; the streaming writer refuses duplicates. The fold producer
+// (state/fold.go) drives the same baseWriter directly, so identical row sets
+// produce identical files whichever path built them.
+func WriteBase(st *dist.Store, m BaseMeta, rows []BaseRow) (string, error) {
 	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].Key[:], rows[j].Key[:]) < 0 })
-	w, err := newBaseWriter(dir, m, uint64(len(rows)))
+	w, err := newBaseWriter(st, m, uint64(len(rows)))
 	if err != nil {
 		return "", err
 	}
@@ -733,5 +778,5 @@ func WriteBase(dir string, m BaseMeta, rows []BaseRow) (string, error) {
 	if err := w.Commit(); err != nil {
 		return "", err
 	}
-	return w.path, nil
+	return w.hash, nil
 }

@@ -8,28 +8,48 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"syscall"
+	"strings"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/klauspost/compress/zstd"
 )
 
-// Epoch is one open (mmap'd) sealed epoch file.
+// Epoch is one open sealed epoch artifact. Bytes come from dist: an mmap of
+// the spool file on a node with no S3 credentials, casfs (chunk cache, ranged
+// GETs) on one with them. The SMALL sections are read once at open and kept;
+// the big ones (bodies, headers, sst, logidx, stored logs and receipts) are
+// read by range as queries need them, which is what makes an epoch servable
+// without holding it locally at all.
 type Epoch struct {
 	Start   uint64
 	Count   uint64 // blocks
 	TxCount uint64
 
-	mm  []byte
-	sec [epochNumSections][]byte
-	dec *zstd.Decoder // registered with this epoch's dict
+	// Hash is the artifact's hex sha256, i.e. its name everywhere.
+	Hash string
+	// Prev is sha256 of epoch K-1, or the chain root (sha256 of the genesis
+	// config) for the first epoch of a chain: the hash chain of DESIGN.md
+	// "Distribution".
+	Prev [32]byte
+
+	blob *dist.Blob
+	off  [epochNumSections][2]uint64 // offset, length per section
+	sec  [epochNumSections][]byte    // resident sections (nil = read on demand)
+	dec  *zstd.Decoder               // registered with this epoch's dicts
 
 	txEF      *ef
 	txBlk     *packed
 	bloomM    uint64
 	bloomK    uint32
-	bloomBits []byte // word view into the section
+	bloomBits []byte // word view into the resident bloom section
+}
 
+// residentSections are read at open and kept for the life of the epoch: the
+// indexes and filters every query starts from. Everything else is ranged.
+var residentSections = []int{
+	secDict, secBodiesIdx, secHeadersIdx, secSSTIdx, secDeletes,
+	secTxidx, secKeybloom, secLogsDict, secFullLogsIdx, secRcptIdx,
 }
 
 // End returns the last block in the epoch (inclusive).
@@ -45,59 +65,64 @@ func (e *Epoch) SectionSizes() map[string]uint64 {
 		"sst", "sstIdx", "deletes", "txidx", "logidx", "keybloom"}
 	out := make(map[string]uint64, epochNumSections)
 	for i, n := range names {
-		out[n] = uint64(len(e.sec[i]))
+		out[n] = e.off[i][1]
 	}
 	return out
 }
 
-// OpenEpoch mmaps and validates one epoch file.
-func OpenEpoch(path string) (*Epoch, error) {
-	f, err := os.Open(path)
+// OpenEpoch opens the epoch artifact named by hash.
+func OpenEpoch(st *dist.Store, hash string) (*Epoch, error) {
+	blob, err := st.Open(hash)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	st, err := f.Stat()
+	e, err := openEpochBlob(blob, hash)
 	if err != nil {
+		blob.Close()
 		return nil, err
 	}
-	size := int(st.Size())
+	return e, nil
+}
+
+func openEpochBlob(blob *dist.Blob, hash string) (*Epoch, error) {
+	size := blob.Size()
 	if size < epochFooterSize {
-		return nil, fmt.Errorf("epoch %s: too small", path)
+		return nil, fmt.Errorf("epoch %s: too small", hash)
 	}
-	mm, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
+	ft, err := blob.Slice(size-epochFooterSize, epochFooterSize)
 	if err != nil {
 		return nil, err
 	}
-	// v3 is the only supported format. Older files are recognized far
-	// enough to say so and no further: there is no upgrade path (user
-	// ruling 2026-07-28), the corpus is disposable and gets resynced.
-	// A v2 footer has this layout, so its version reads out directly; v1's
-	// footer was shorter, so its leading magic lands elsewhere and it falls
-	// into the generic refusal.
-	ft := mm[size-epochFooterSize:]
+	// v4 is the only supported format. Older files are recognized far enough
+	// to say so and no further: there is no upgrade path (user ruling
+	// 2026-07-28), the corpus is disposable and gets resynced.
 	if !bytes.Equal(ft[0:4], epochMagic[:]) || !bytes.Equal(ft[epochFooterSize-4:], epochMagic[:]) {
-		syscall.Munmap(mm)
-		return nil, fmt.Errorf("epoch %s: unrecognized footer, not format v%d (older formats are unsupported: delete the corpus and resync)", path, epochVersion)
+		return nil, fmt.Errorf("epoch %s: unrecognized footer, not format v%d (older formats are unsupported: delete the corpus and resync)", hash, epochVersion)
 	}
 	if v := binary.LittleEndian.Uint32(ft[4:8]); v != epochVersion {
-		syscall.Munmap(mm)
-		return nil, fmt.Errorf("epoch %s is format v%d, unsupported: delete the corpus and resync", path, v)
+		return nil, fmt.Errorf("epoch %s is format v%d, unsupported: delete the corpus and resync", hash, v)
 	}
 	e := &Epoch{
 		Start:   binary.LittleEndian.Uint64(ft[8:16]),
 		Count:   binary.LittleEndian.Uint64(ft[16:24]),
 		TxCount: binary.LittleEndian.Uint64(ft[24:32]),
-		mm:      mm,
+		Hash:    hash,
+		blob:    blob,
 	}
+	copy(e.Prev[:], ft[32:64])
+	body := size - epochFooterSize
 	for i := 0; i < epochNumSections; i++ {
-		off := binary.LittleEndian.Uint64(ft[32+i*16:])
-		ln := binary.LittleEndian.Uint64(ft[40+i*16:])
-		if off+ln > uint64(size-epochFooterSize) {
-			syscall.Munmap(mm)
-			return nil, fmt.Errorf("epoch %s: section %d out of bounds", path, i)
+		off := binary.LittleEndian.Uint64(ft[epochTableOff+i*16:])
+		ln := binary.LittleEndian.Uint64(ft[epochTableOff+8+i*16:])
+		if off > body || ln > body-off { // overflow-safe bounds check
+			return nil, fmt.Errorf("epoch %s: section %d out of bounds", hash, i)
 		}
-		e.sec[i] = mm[off : off+ln]
+		e.off[i] = [2]uint64{off, ln}
+	}
+	for _, id := range residentSections {
+		if e.sec[id], err = e.read(id, 0, e.off[id][1]); err != nil {
+			return nil, fmt.Errorf("epoch %s: section %d: %w", hash, id, err)
+		}
 	}
 	var dicts [][]byte
 	if len(e.sec[secDict]) > 0 {
@@ -110,17 +135,15 @@ func OpenEpoch(path string) (*Epoch, error) {
 	if len(dicts) > 0 {
 		decOpts = append(decOpts, zstd.WithDecoderDicts(dicts...))
 	}
-	e.dec, err = zstd.NewReader(nil, decOpts...)
-	if err != nil {
-		syscall.Munmap(mm)
+	if e.dec, err = zstd.NewReader(nil, decOpts...); err != nil {
 		return nil, err
 	}
 
-	// txidx: resident views over the mmap words.
+	// txidx: decoded into heap words, so the section bytes are dropped after.
 	tx := e.sec[secTxidx]
 	if len(tx) < 16 {
 		e.Close()
-		return nil, fmt.Errorf("epoch %s: truncated txidx", path)
+		return nil, fmt.Errorf("epoch %s: truncated txidx", hash)
 	}
 	nTx := binary.LittleEndian.Uint64(tx[0:8])
 	efL := uint(binary.LittleEndian.Uint32(tx[8:12]))
@@ -130,9 +153,10 @@ func OpenEpoch(path string) (*Epoch, error) {
 	for i := range secs {
 		if secs[i], pos, err = readWords(tx, pos); err != nil {
 			e.Close()
-			return nil, fmt.Errorf("epoch %s: txidx: %w", path, err)
+			return nil, fmt.Errorf("epoch %s: txidx: %w", hash, err)
 		}
 	}
+	e.sec[secTxidx] = nil
 	e.txEF = &ef{
 		n:    int(nTx),
 		l:    efL,
@@ -147,7 +171,7 @@ func OpenEpoch(path string) (*Epoch, error) {
 	bl := e.sec[secKeybloom]
 	if len(bl) < 16 {
 		e.Close()
-		return nil, fmt.Errorf("epoch %s: truncated bloom", path)
+		return nil, fmt.Errorf("epoch %s: truncated bloom", hash)
 	}
 	e.bloomM = binary.LittleEndian.Uint64(bl[0:8])
 	e.bloomK = binary.LittleEndian.Uint32(bl[8:12])
@@ -158,11 +182,25 @@ func OpenEpoch(path string) (*Epoch, error) {
 func (e *Epoch) Close() {
 	if e.dec != nil {
 		e.dec.Close()
+		e.dec = nil
 	}
-	if e.mm != nil {
-		syscall.Munmap(e.mm)
-		e.mm = nil
+	if e.blob != nil {
+		e.blob.Close()
+		e.blob = nil
 	}
+	for i := range e.sec {
+		e.sec[i] = nil
+	}
+	e.bloomBits = nil
+}
+
+// read returns bytes [off, off+n) of one section. The result may alias the
+// mapping of a local file: read-only, and invalid after Close.
+func (e *Epoch) read(id int, off, n uint64) ([]byte, error) {
+	if off > e.off[id][1] || n > e.off[id][1]-off {
+		return nil, fmt.Errorf("epoch %d: section %d range [%d,%d) outside %d bytes", e.Start, id, off, off+n, e.off[id][1])
+	}
+	return e.blob.Slice(e.off[id][0]+off, n)
 }
 
 // decodeAll is goroutine-safe: zstd Decoder.DecodeAll is documented
@@ -172,14 +210,18 @@ func (e *Epoch) decodeAll(frame []byte) ([]byte, error) {
 }
 
 // framedBlob returns entry (block - Start) from a framed section pair.
-func (e *Epoch) framedBlob(data, index []byte, rel uint64) ([]byte, error) {
+func (e *Epoch) framedBlob(dataSec int, index []byte, rel uint64) ([]byte, error) {
 	frame := rel / framedGroup
 	if int(frame+2)*8 > len(index) {
 		return nil, fmt.Errorf("frame %d beyond index", frame)
 	}
 	lo := binary.LittleEndian.Uint64(index[frame*8:])
 	hi := binary.LittleEndian.Uint64(index[(frame+1)*8:])
-	raw, err := e.decodeAll(data[lo:hi])
+	frameBytes, err := e.read(dataSec, lo, hi-lo)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := e.decodeAll(frameBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +244,7 @@ func (e *Epoch) Container(n uint64) ([]byte, error) {
 	if n < e.Start || n > e.End() {
 		return nil, fmt.Errorf("block %d outside epoch [%d,%d]", n, e.Start, e.End())
 	}
-	return e.framedBlob(e.sec[secBodies], e.sec[secBodiesIdx], n-e.Start)
+	return e.framedBlob(secBodies, e.sec[secBodiesIdx], n-e.Start)
 }
 
 // HeaderRLP returns the RLP header for block n.
@@ -210,7 +252,7 @@ func (e *Epoch) HeaderRLP(n uint64) ([]byte, error) {
 	if n < e.Start || n > e.End() {
 		return nil, fmt.Errorf("block %d outside epoch [%d,%d]", n, e.Start, e.End())
 	}
-	return e.framedBlob(e.sec[secHeaders], e.sec[secHeadersIdx], n-e.Start)
+	return e.framedBlob(secHeaders, e.sec[secHeadersIdx], n-e.Start)
 }
 
 // MayContainKey is the bloom prefilter for the cross-epoch descent.
@@ -224,6 +266,20 @@ func (e *Epoch) MayContainKey(key []byte) bool {
 		}
 	}
 	return true
+}
+
+// sstBlock decodes the SST block the sparse-index entry bi points at.
+func (e *Epoch) sstBlock(idx []byte, bi, nEntries int) ([]byte, error) {
+	lo := binary.LittleEndian.Uint64(idx[bi*sstIdxEntrySize+sortedKeySize+8:])
+	hi := e.off[secSST][1]
+	if bi+1 < nEntries {
+		hi = binary.LittleEndian.Uint64(idx[(bi+1)*sstIdxEntrySize+sortedKeySize+8:])
+	}
+	block, err := e.read(secSST, lo, hi-lo)
+	if err != nil {
+		return nil, err
+	}
+	return e.decodeAll(block)
 }
 
 // StateSearch finds the largest write <= n of key inside this epoch.
@@ -247,12 +303,7 @@ func (e *Epoch) StateSearch(key []byte, n uint64) (val []byte, blk uint64, found
 	if bi < 0 {
 		return nil, 0, false, nil
 	}
-	lo := binary.LittleEndian.Uint64(entry(bi)[sortedKeySize+8:])
-	hi := uint64(len(e.sec[secSST]))
-	if bi+1 < nEntries {
-		hi = binary.LittleEndian.Uint64(entry(bi + 1)[sortedKeySize+8:])
-	}
-	raw, err := e.decodeAll(e.sec[secSST][lo:hi])
+	raw, err := e.sstBlock(idx, bi, nEntries)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -281,9 +332,8 @@ func (e *Epoch) StateSearch(key []byte, n uint64) (val []byte, blk uint64, found
 	return val, blk, found, nil
 }
 
-// Code returns the contract code blob for hash from this epoch's 'c' rows
-// (format v3). found=false on a v2 file, or when this epoch wrote no account
-// carrying that code.
+// Code returns the contract code blob for hash from this epoch's 'c' rows.
+// found=false = this epoch wrote no account carrying that code.
 func (e *Epoch) Code(hash common.Hash) ([]byte, bool, error) {
 	k := epochCodeKey(hash)
 	if !e.MayContainKey(k[:]) {
@@ -299,12 +349,7 @@ func (e *Epoch) WalkStateRows(fn func(StateRow)) error {
 	idx := e.sec[secSSTIdx]
 	nEntries := len(idx) / sstIdxEntrySize
 	for bi := 0; bi < nEntries; bi++ {
-		lo := binary.LittleEndian.Uint64(idx[bi*sstIdxEntrySize+sortedKeySize+8:])
-		hi := uint64(len(e.sec[secSST]))
-		if bi+1 < nEntries {
-			hi = binary.LittleEndian.Uint64(idx[(bi+1)*sstIdxEntrySize+sortedKeySize+8:])
-		}
-		raw, err := e.decodeAll(e.sec[secSST][lo:hi])
+		raw, err := e.sstBlock(idx, bi, nEntries)
 		if err != nil {
 			return err
 		}
@@ -345,39 +390,105 @@ func (e *Epoch) TxCandidates(fp uint64) []uint64 {
 
 // logidxLookup finds a key's posting list. keyLen distinguishes the addr
 // (20) and topic (32) tables.
+//
+// The logidx section is the one big section with a searchable table in it
+// (10-13% of an epoch, so it is never resident), and the search runs on ranged
+// reads: one small read per binary-search probe, then the list itself. The
+// list's END comes from the NEXT table entry's offset, which is exact because
+// buildLogidx appends lists in table order (addrs, then topics).
 func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
-	li := e.sec[secLogidx]
-	if len(li) < 4 {
+	total := e.off[secLogidx][1]
+	if total < 4 {
 		return nil, nil
 	}
-	nAddr := int(binary.LittleEndian.Uint32(li[0:4]))
-	addrTable := li[4 : 4+nAddr*(20+8)]
+	hdr, err := e.read(secLogidx, 0, 4)
+	if err != nil {
+		return nil, err
+	}
+	nAddr := uint64(binary.LittleEndian.Uint32(hdr))
 	topicHdr := 4 + nAddr*(20+8)
-	nTopic := int(binary.LittleEndian.Uint32(li[topicHdr : topicHdr+4]))
-	topicTable := li[topicHdr+4 : topicHdr+4+nTopic*(32+8)]
-	lists := li[topicHdr+4+nTopic*(32+8):]
+	if topicHdr+4 > total {
+		return nil, fmt.Errorf("epoch %d: logidx truncated", e.Start)
+	}
+	hdr, err = e.read(secLogidx, topicHdr, 4)
+	if err != nil {
+		return nil, err
+	}
+	nTopic := uint64(binary.LittleEndian.Uint32(hdr))
+	listsOff := topicHdr + 4 + nTopic*(32+8)
+	if listsOff > total {
+		return nil, fmt.Errorf("epoch %d: logidx truncated", e.Start)
+	}
 
-	var (
-		table  []byte
-		count  int
-		stride int
-	)
+	var base, stride, count uint64
 	switch len(key) {
 	case 20:
-		table, count, stride = addrTable, nAddr, 20+8
+		base, stride, count = 4, 20+8, nAddr
 	case 32:
-		table, count, stride = topicTable, nTopic, 32+8
+		base, stride, count = topicHdr+4, 32+8, nTopic
 	default:
 		return nil, fmt.Errorf("logidx: bad key length %d", len(key))
 	}
-	i := sort.Search(count, func(i int) bool {
-		return bytes.Compare(table[i*stride:i*stride+len(key)], key) >= 0
-	})
-	if i >= count || !bytes.Equal(table[i*stride:i*stride+len(key)], key) {
+	// entryOff walks the two tables as one sequence, so "the next entry" at
+	// the end of the addr table is the first topic entry.
+	entryOff := func(i uint64) (entOff, width uint64, ok bool) {
+		if len(key) == 20 && i == nAddr {
+			if nTopic == 0 {
+				return 0, 0, false
+			}
+			return topicHdr + 4, 32 + 8, true
+		}
+		if i >= count {
+			return 0, 0, false
+		}
+		return base + i*stride, stride, true
+	}
+	listAt := func(i uint64) (uint64, error) {
+		entOff, width, _ := entryOff(i)
+		ent, err := e.read(secLogidx, entOff, width)
+		if err != nil {
+			return 0, err
+		}
+		return binary.LittleEndian.Uint64(ent[width-8:]), nil
+	}
+
+	var searchErr error
+	i := uint64(sort.Search(int(count), func(i int) bool {
+		ent, err := e.read(secLogidx, base+uint64(i)*stride, uint64(len(key)))
+		if err != nil {
+			searchErr = err
+			return true
+		}
+		return bytes.Compare(ent, key) >= 0
+	}))
+	if searchErr != nil {
+		return nil, searchErr
+	}
+	if i >= count {
 		return nil, nil
 	}
-	off := binary.LittleEndian.Uint64(table[i*stride+len(key):])
-	ef, _, err := efUnmarshal(lists[off:], e.Count)
+	ent, err := e.read(secLogidx, base+i*stride, stride)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(ent[:len(key)], key) {
+		return nil, nil
+	}
+	off := binary.LittleEndian.Uint64(ent[len(key):])
+	end := total - listsOff
+	if _, _, ok := entryOff(i + 1); ok {
+		if end, err = listAt(i + 1); err != nil {
+			return nil, err
+		}
+	}
+	if end < off {
+		return nil, fmt.Errorf("epoch %d: logidx list [%d,%d) is inverted", e.Start, off, end)
+	}
+	raw, err := e.read(secLogidx, listsOff+off, end-off)
+	if err != nil {
+		return nil, err
+	}
+	ef, _, err := efUnmarshal(raw, e.Count)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +513,7 @@ func (e *Epoch) HasStoredLogs() bool {
 }
 
 // storedRecord fetches block n's record from a stored-frames section pair.
-func (e *Epoch) storedRecord(data, index []byte, n uint64) ([]byte, bool, error) {
+func (e *Epoch) storedRecord(dataSec int, index []byte, n uint64) ([]byte, bool, error) {
 	if len(index) < 4 {
 		return nil, false, fmt.Errorf("epoch %d: stored section absent", e.Start)
 	}
@@ -420,7 +531,11 @@ func (e *Epoch) storedRecord(data, index []byte, n uint64) ([]byte, bool, error)
 	slot := binary.LittleEndian.Uint32(members[i*12+8:])
 	lo := binary.LittleEndian.Uint64(offs[frame*8:])
 	hi := binary.LittleEndian.Uint64(offs[(frame+1)*8:])
-	raw, err := e.decodeAll(data[lo:hi])
+	frameBytes, err := e.read(dataSec, lo, hi-lo)
+	if err != nil {
+		return nil, false, err
+	}
+	raw, err := e.decodeAll(frameBytes)
 	if err != nil {
 		return nil, false, err
 	}
@@ -441,13 +556,13 @@ func (e *Epoch) storedRecord(data, index []byte, n uint64) ([]byte, bool, error)
 // StoredLogsRecord returns block n's full-logs record (rpc.DecodeStoredLogs
 // layout). ok=false = block has no logs.
 func (e *Epoch) StoredLogsRecord(n uint64) ([]byte, bool, error) {
-	return e.storedRecord(e.sec[secFullLogs], e.sec[secFullLogsIdx], n)
+	return e.storedRecord(secFullLogs, e.sec[secFullLogsIdx], n)
 }
 
 // StoredRcptRecord returns block n's receipt-fields record (per tx:
 // uvarint gasUsed + status byte). ok=false = block has no txs.
 func (e *Epoch) StoredRcptRecord(n uint64) ([]byte, bool, error) {
-	return e.storedRecord(e.sec[secRcpt], e.sec[secRcptIdx], n)
+	return e.storedRecord(secRcpt, e.sec[secRcptIdx], n)
 }
 
 // sampleSSTRow returns a random (key, block) row for bench probing.
@@ -457,13 +572,7 @@ func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64,
 	if nEntries == 0 {
 		return key, 0, false
 	}
-	bi := r.Intn(nEntries)
-	lo := binary.LittleEndian.Uint64(idx[bi*sstIdxEntrySize+sortedKeySize+8:])
-	hi := uint64(len(e.sec[secSST]))
-	if bi+1 < nEntries {
-		hi = binary.LittleEndian.Uint64(idx[(bi+1)*sstIdxEntrySize+sortedKeySize+8:])
-	}
-	raw, err := e.decodeAll(e.sec[secSST][lo:hi])
+	raw, err := e.sstBlock(idx, r.Intn(nEntries), nEntries)
 	if err != nil {
 		return key, 0, false
 	}
@@ -486,11 +595,61 @@ func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64,
 	return key, blk, ok
 }
 
+// ---------- local index ----------
+//
+// Artifacts are named by hash, so the data directory carries one MARKER per
+// locally known epoch: `epoch_<start>_<count>.cas`, holding that epoch's hex
+// sha256. The marker is the local index, nothing more: it says which artifact
+// covers which heights, the hash inside it is self-verifying, and it is
+// written by whoever learned about the epoch (seal, or bootstrap walking the
+// hash chain). There is no manifest and no global authority anywhere.
+
+const markerSuffix = ".cas"
+
+// EpochMarkerName is the local index entry for the epoch starting at start.
+func EpochMarkerName(start, count uint64) string {
+	return fmt.Sprintf("epoch_%d_%d%s", start, count, markerSuffix)
+}
+
+// ParseEpochMarkerName returns (start, count, ok).
+func ParseEpochMarkerName(name string) (uint64, uint64, bool) {
+	var start, count uint64
+	if n, err := fmt.Sscanf(name, "epoch_%d_%d"+markerSuffix, &start, &count); n != 2 || err != nil {
+		return 0, 0, false
+	}
+	return start, count, EpochMarkerName(start, count) == name
+}
+
+// WriteMarker writes one local index entry (tmp+rename).
+func WriteMarker(dir, name, hash string) error {
+	if !dist.ValidHash(hash) {
+		return fmt.Errorf("marker %s: %q is not a hex sha256", name, hash)
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p+".tmp", []byte(hash+"\n"), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(p+".tmp", p)
+}
+
+// ReadMarker reads one local index entry.
+func ReadMarker(dir, name string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return "", err
+	}
+	hash := strings.TrimSpace(string(raw))
+	if !dist.ValidHash(hash) {
+		return "", fmt.Errorf("marker %s: %q is not a hex sha256", name, hash)
+	}
+	return hash, nil
+}
+
 // ---------- epoch set ----------
 
-// EpochSet is every sealed epoch in a directory, ascending. Sealing is
+// EpochSet is every sealed epoch the local index knows, ascending. Sealing is
 // strictly sequential, but a downloaded set may have holes: coverage
-// is the contiguous prefix from the floor (genesis on a full node, the
+// is the contiguous epoch range from the floor (genesis on a full node, the
 // base-file block B in limited-history mode). Epochs above the first gap
 // stay open (their data is epoch-local and valid for body/tx-by-hash
 // reads), but full-descent reads (state, receipts, logs) must call
@@ -516,21 +675,40 @@ func (e *PrunedError) Error() string {
 	return fmt.Sprintf("block %d is pruned below block %d: this node serves history from block %d up (limited-history mode)", e.Block, e.Floor, e.Floor)
 }
 
-// OpenEpochSet opens every epoch_*.epoch in dir. An empty set is valid.
-func OpenEpochSet(dir string) (*EpochSet, error) {
+// OpenEpochSet opens every epoch the store's data directory indexes. An empty
+// set is valid.
+func OpenEpochSet(st *dist.Store) (*EpochSet, error) {
+	dir := st.Dir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 	s := &EpochSet{}
 	for _, en := range entries {
-		if _, _, ok := ParseEpochFileName(en.Name()); !ok {
+		// A pre-casfs corpus (whole epoch files sitting in the data dir) is
+		// refused by name: there is no migration, only delete and resync.
+		if strings.HasPrefix(en.Name(), "epoch_") && strings.HasSuffix(en.Name(), ".epoch") {
+			s.Close()
+			return nil, fmt.Errorf("%s: %s is a pre-casfs epoch file; epochs are now content-addressed artifacts in %s/cas (no migration: delete the corpus and resync)", dir, en.Name(), dir)
+		}
+		start, count, ok := ParseEpochMarkerName(en.Name())
+		if !ok {
 			continue
 		}
-		e, err := OpenEpoch(filepath.Join(dir, en.Name()))
+		hash, err := ReadMarker(dir, en.Name())
+		if err != nil {
+			s.Close()
+			return nil, err
+		}
+		e, err := OpenEpoch(st, hash)
 		if err != nil {
 			s.Close()
 			return nil, fmt.Errorf("%s: %w", en.Name(), err)
+		}
+		if e.Start != start || e.Count != count {
+			e.Close()
+			s.Close()
+			return nil, fmt.Errorf("%s names blocks %d..%d but %s covers %d..%d", en.Name(), start, start+count-1, hash, e.Start, e.End())
 		}
 		s.Epochs = append(s.Epochs, e)
 	}
@@ -607,6 +785,15 @@ func (s *EpochSet) SealedEnd() (uint64, bool) {
 		return 0, false
 	}
 	return s.Epochs[len(s.Epochs)-1].End(), true
+}
+
+// Head returns the newest epoch, ok=false for an empty set. Seal chains the
+// next epoch's footer onto its hash.
+func (s *EpochSet) Head() (*Epoch, bool) {
+	if len(s.Epochs) == 0 {
+		return nil, false
+	}
+	return s.Epochs[len(s.Epochs)-1], true
 }
 
 // At returns the epoch containing block n.

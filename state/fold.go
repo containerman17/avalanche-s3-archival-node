@@ -25,7 +25,7 @@ package state
 //     is sorted on disk (a base file) or sorted in RAM (the genesis alloc).
 //  5. zstd: klauspost EncodeAll SpeedBestCompression, no dict, pinned in
 //     go.mod. Same policy as epochs: a library bump changes the bytes at the
-//     next boundary and shows up loudly as manifest disagreement.
+//     next boundary and shows up loudly as two producers disagreeing.
 //  6. SST block boundaries: flush at >= sstBlockTarget raw bytes, a function
 //     of the row bytes in order, shared with WriteBase by construction.
 //  7. Bloom: m from the exact row count, bits OR-accumulated. Headers are
@@ -61,6 +61,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/holiman/uint256"
 )
@@ -70,8 +71,9 @@ import (
 // Loop invariant: nothing is persisted about the fold itself, so every
 // restart re-derives (floor, boundary, rows) from the newest base footer, the
 // containers and exechead. Idempotence IS determinism here.
-func FoldSnapshots(dir string, alloc types.GenesisAlloc, epochTxs uint64) error {
-	if err := sweepBases(dir); err != nil {
+func FoldSnapshots(st *dist.Store, alloc types.GenesisAlloc, epochTxs uint64) error {
+	dir := st.Dir()
+	if err := sweepBases(st); err != nil {
 		return err
 	}
 	// A pruning node never seals. An epoch file here means the directory was
@@ -82,7 +84,7 @@ func FoldSnapshots(dir string, alloc types.GenesisAlloc, epochTxs uint64) error 
 		return err
 	}
 	for _, e := range entries {
-		if _, _, ok := ParseEpochFileName(e.Name()); ok {
+		if _, _, ok := ParseEpochMarkerName(e.Name()); ok {
 			return fmt.Errorf("fold: %s holds sealed epochs (%s): a node either seals epochs or folds snapshots, never both", dir, e.Name())
 		}
 	}
@@ -92,7 +94,7 @@ func FoldSnapshots(dir string, alloc types.GenesisAlloc, epochTxs uint64) error 
 		if err := CookIndex(dir); err != nil {
 			return err
 		}
-		more, err := foldOnce(dir, alloc, epochTxs)
+		more, err := foldOnce(st, alloc, epochTxs)
 		if err != nil || !more {
 			return err
 		}
@@ -102,7 +104,8 @@ func FoldSnapshots(dir string, alloc types.GenesisAlloc, epochTxs uint64) error 
 // sweepBases removes crash leftovers: every base_*.tmp, and every base file
 // but the newest (the fold commits by rename and unlinks the old one after,
 // so two can coexist for one window).
-func sweepBases(dir string) error {
+func sweepBases(st *dist.Store) error {
+	dir := st.Dir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -123,7 +126,19 @@ func sweepBases(dir string) error {
 		return err
 	}
 	if ok && len(all) > 1 {
+		keep, err := ReadMarker(dir, all[len(all)-1])
+		if err != nil {
+			return err
+		}
 		for _, n := range all[:len(all)-1] {
+			// Drop the superseded artifact with its marker, unless it IS the
+			// surviving one (two markers can name the same content). A spool
+			// file already uploaded and released is simply not there.
+			if hash, err := ReadMarker(dir, n); err == nil && hash != keep {
+				if err := os.Remove(st.SpoolPath(hash)); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
 			if err := os.Remove(filepath.Join(dir, n)); err != nil && !os.IsNotExist(err) {
 				return err
 			}
@@ -139,7 +154,8 @@ func sweepBases(dir string) error {
 
 // foldOnce produces at most one snapshot. more=true means a boundary was
 // crossed and the caller should look for the next one.
-func foldOnce(dir string, alloc types.GenesisAlloc, epochTxs uint64) (more bool, err error) {
+func foldOnce(st *dist.Store, alloc types.GenesisAlloc, epochTxs uint64) (more bool, err error) {
+	dir := st.Dir()
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return false, err
@@ -156,7 +172,7 @@ func foldOnce(dir string, alloc types.GenesisAlloc, epochTxs uint64) (more bool,
 	defer reader.Close()
 
 	f := &folder{dir: dir, store: store, alloc: alloc}
-	if base, ok, err := OpenBase(dir); err != nil {
+	if base, ok, err := OpenBase(st); err != nil {
 		return false, err
 	} else if ok {
 		defer base.Close()
@@ -202,7 +218,7 @@ func foldOnce(dir string, alloc types.GenesisAlloc, epochTxs uint64) (more bool,
 		return false, err
 	}
 
-	w, err := newBaseWriter(dir, meta, rowCount)
+	w, err := newBaseWriter(st, meta, rowCount)
 	if err != nil {
 		return false, err
 	}
@@ -217,12 +233,12 @@ func foldOnce(dir string, alloc types.GenesisAlloc, epochTxs uint64) (more bool,
 		return false, err
 	}
 
-	st, _ := os.Stat(w.path)
-	log.Printf("fold: %s rows=%d txs=%d (cum %d) root=%x size=%.1fMB in %s",
-		filepath.Base(w.path), rowCount, periodTx, meta.CumTx, meta.Root,
-		float64(st.Size())/1e6, time.Since(t0).Round(time.Millisecond))
+	fi, _ := os.Stat(st.SpoolPath(w.hash))
+	log.Printf("fold: %s (%s) rows=%d txs=%d (cum %d) root=%x size=%.1fMB in %s",
+		BaseMarkerName(meta.Block), w.hash[:12], rowCount, periodTx, meta.CumTx, meta.Root,
+		float64(fi.Size())/1e6, time.Since(t0).Round(time.Millisecond))
 
-	if err := sweepBases(dir); err != nil {
+	if err := sweepBases(st); err != nil {
 		return false, err
 	}
 	// Single deleter, reused verbatim from seal: idempotent and

@@ -7,6 +7,8 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/containerman17/epochdb/dist"
+
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
@@ -208,7 +210,7 @@ func (b *fakeBase) Close() { b.closed = true }
 func withBase(t *testing.T, fb *fakeBase) {
 	t.Helper()
 	prev := openBase
-	openBase = func(string) (baseState, bool, error) { return fb, true, nil }
+	openBase = func(*dist.Store) (baseState, bool, error) { return fb, true, nil }
 	t.Cleanup(func() { openBase = prev })
 }
 

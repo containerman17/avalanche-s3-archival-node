@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/containerman17/epochdb/dist"
 )
 
 // OpenReadOnly opens the state layer without EVER writing or truncating:
@@ -60,7 +61,17 @@ func OpenReadOnly(dir string) (*Store, error) {
 		code.Close()
 		return nil, fmt.Errorf("open misc store ro: %w", err)
 	}
-	s := &Store{dir: dir, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
+	cas, err := dist.Open(dir)
+	if err != nil {
+		wl.Close()
+		hd.Close()
+		lg.Close()
+		rc.Close()
+		code.Close()
+		misc.Close()
+		return nil, err
+	}
+	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
 	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
 	if err == nil && len(raw) == 8 {
 		s.execHead = binary.BigEndian.Uint64(raw)

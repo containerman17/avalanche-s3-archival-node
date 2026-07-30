@@ -23,8 +23,7 @@ func codeBlob(seed byte, n int) []byte {
 // it, i.e. an epoch that deploys code.
 func codeEpochInput(t *testing.T, start uint64) (*EpochInput, map[common.Hash][]byte) {
 	t.Helper()
-	dir := t.TempDir()
-	in, _ := synthEpoch(t, dir, start)
+	in, _ := synthEpoch(t, testStore(t, t.TempDir()), start)
 	code := map[common.Hash][]byte{}
 	for i := byte(1); i <= 5; i++ {
 		blob := codeBlob(i, 200*int(i))
@@ -49,13 +48,13 @@ func accountKeyArr(addr common.Address) (k [sortedKeySize]byte) {
 // TestEpochCodeRoundtrip: code rows survive seal and read, ride the bloom,
 // and do not disturb the state rows sharing the keyspace.
 func TestEpochCodeRoundtrip(t *testing.T) {
-	dir := t.TempDir()
+	st := testStore(t, t.TempDir())
 	in, code := codeEpochInput(t, 2000)
-	path, err := BuildEpoch(dir, in)
+	hash, err := BuildEpoch(st, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := OpenEpoch(path)
+	e, err := OpenEpoch(st, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,9 +112,9 @@ func accountKeyArrSlice(addr common.Address) []byte {
 // identical bytes. The code map is a Go map, so this is the guard that map
 // iteration order never reaches the file.
 func TestEpochCodeDeterminism(t *testing.T) {
-	dirA, dirB := t.TempDir(), t.TempDir()
+	stA, stB := testStore(t, t.TempDir()), testStore(t, t.TempDir())
 	inA, code := codeEpochInput(t, 3000)
-	pathA, err := BuildEpoch(dirA, inA)
+	hashA, err := BuildEpoch(stA, inA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,15 +124,18 @@ func TestEpochCodeDeterminism(t *testing.T) {
 	if len(inB.Code) != len(code) {
 		t.Fatal("inputs diverged")
 	}
-	pathB, err := BuildEpoch(dirB, inB)
+	hashB, err := BuildEpoch(stB, inB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := os.ReadFile(pathA)
+	if hashA != hashB {
+		t.Fatalf("independent seals differ: %s vs %s", hashA, hashB)
+	}
+	a, err := os.ReadFile(stA.SpoolPath(hashA))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(pathB)
+	b, err := os.ReadFile(stB.SpoolPath(hashB))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,11 +195,12 @@ func TestSealCodeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 3 txs/block, boundary 10 => epochs 1-4 and 5-8.
-	if err := sealEpochs(dir, dir, 10); err != nil {
+	cas := testStore(t, dir)
+	if err := sealEpochs(dir, cas, 10, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 
-	set, err := OpenEpochSet(dir)
+	set, err := OpenEpochSet(cas)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +248,7 @@ func TestSealCodeEndToEnd(t *testing.T) {
 func TestCodeFromEpochsWithoutCodeLog(t *testing.T) {
 	dir := t.TempDir()
 	in, code := codeEpochInput(t, 1)
-	if _, err := BuildEpoch(dir, in); err != nil {
+	if _, err := BuildEpoch(testStore(t, dir), in); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "code.log")); !os.IsNotExist(err) {

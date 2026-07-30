@@ -83,10 +83,11 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// 3 txs/block, boundary 10 => blocks 1-4 (12 txs), 5-8 (12 txs); 9,10
 	// beyond the exec head.
-	if err := sealEpochs(dir, dir, 10); err != nil {
+	cas := testStore(t, dir)
+	if err := sealEpochs(dir, cas, 10, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
-	set, err := OpenEpochSet(dir)
+	set, err := OpenEpochSet(cas)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,16 +125,27 @@ func TestSealCutAndResume(t *testing.T) {
 		t.Fatalf("state at 8 in epoch2: %x %v", v, found)
 	}
 
+	// the hash chain: epoch 1 links to the chain root, epoch 2 to epoch 1
+	if e1.Prev != ([32]byte{}) {
+		t.Fatalf("epoch1 prev %x, want the chain root passed in", e1.Prev)
+	}
+	if want, _ := hashBytes(e1.Hash); e2.Prev != want {
+		t.Fatalf("epoch2 prev %x, want epoch1 %x", e2.Prev, want)
+	}
+	if l, err := cas.Latest(); err != nil || l.Epoch != e2.Hash {
+		t.Fatalf("latest pointer: %+v %v, want epoch %s", l, err, e2.Hash)
+	}
+
 	// resume: nothing new to seal
 	before, _ := os.ReadDir(dir)
-	if err := sealEpochs(dir, dir, 10); err != nil {
+	if err := sealEpochs(dir, cas, 10, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadDir(dir)
 	if len(before) != len(after) {
 		t.Fatalf("re-seal created files: %d -> %d", len(before), len(after))
 	}
-	if _, err := os.Stat(filepath.Join(dir, EpochFileName(9, 2))); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, EpochMarkerName(9, 2))); err == nil {
 		t.Fatal("blocks beyond exec head must not seal")
 	}
 }

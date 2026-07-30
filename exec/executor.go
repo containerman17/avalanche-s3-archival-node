@@ -353,7 +353,7 @@ func New(cfg Config) (*Executor, error) {
 	// A base file makes this a limited-history node: state below B lives in
 	// the file, not in the replay, and reconcile starts at B+1 instead of
 	// walking back to genesis.
-	if base, ok, err := state.OpenBase(cfg.DataDir); err != nil {
+	if base, ok, err := state.OpenBase(cfg.Store.Cas()); err != nil {
 		tdb.Close()
 		return nil, fmt.Errorf("open base file: %w", err)
 	} else if ok {

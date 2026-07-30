@@ -14,6 +14,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/cespare/xxhash/v2"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -49,7 +50,8 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 	return d
 }
 
-// Sealed epoch file: epoch_<startblock>_<blockcount>.epoch. Immutable,
+// Sealed epoch artifact, named by its own hex sha256 (the local index marker
+// epoch_<startblock>_<blockcount>.cas carries that name). Immutable,
 // self-described, bit-identical when rebuilt from the same chain content.
 // Sections in write order, fixed-size footer last (reader seeks from EOF):
 //
@@ -71,6 +73,12 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 //	logidx     posting lists addr->EF blocklist, topic->EF blocklist
 //	keybloom   bloom over keys written in this epoch (bloomBitsPerKey)
 //
+// The footer carries the HASH CHAIN: epoch K's footer embeds sha256 of epoch
+// K-1's whole file, and the first epoch of a chain embeds the chain root,
+// sha256 of that chain's genesis config (dist.ChainRoot). Prev-hash is chain
+// content like everything else here, so two honest builders still emit
+// identical bytes, and one head hash authenticates every epoch below it.
+//
 // All hardcoded parameters below are pre-freeze tunables (user directive:
 // constants in code, no config).
 const (
@@ -88,15 +96,16 @@ const (
 	bloomBitsPerKey = 10
 	bloomHashes     = 7
 
-	// Format v3 is the ONLY supported format: stored-logs sections (v2,
-	// 2026-07-20) plus contract code as 'c' rows in the SST (v3,
-	// 2026-07-28), so an epoch is self-contained and a download-bootstrapped
-	// node serves eth_getCode. There is no upgrade path: OpenEpoch refuses
-	// an older file and the corpus is rebuilt by a fresh sync (user ruling
-	// 2026-07-28).
-	epochVersion     = 3
+	// Format v4 is the ONLY supported format: stored-logs sections (v2,
+	// 2026-07-20), contract code as 'c' rows in the SST (v3, 2026-07-28),
+	// and the HASH-CHAIN footer field (v4, 2026-07-30) that makes one head
+	// hash authenticate all of a chain's history. There is no upgrade path:
+	// OpenEpoch refuses an older file and the corpus is rebuilt by a fresh
+	// sync (user ruling 2026-07-28).
+	epochVersion     = 4
 	epochNumSections = 16
-	epochFooterSize  = 4 + 4 + 8 + 8 + 8 + epochNumSections*16 + 4 // magics + version + start/count/txs + table
+	epochTableOff    = 4 + 4 + 8 + 8 + 8 + 32                  // magic, version, start, count, txs, prev hash
+	epochFooterSize  = epochTableOff + epochNumSections*16 + 4 // + table + trailing magic
 
 	logsDictTarget = 128 << 10 // dedicated logs dict (measured better than container dict)
 )
@@ -123,19 +132,6 @@ const (
 )
 
 var epochMagic = [4]byte{'E', 'P', 'O', 'C'}
-
-func EpochFileName(start, count uint64) string {
-	return fmt.Sprintf("epoch_%d_%d.epoch", start, count)
-}
-
-// ParseEpochFileName returns (start, count, ok).
-func ParseEpochFileName(name string) (uint64, uint64, bool) {
-	var start, count uint64
-	if n, err := fmt.Sscanf(name, "epoch_%d_%d.epoch", &start, &count); n != 2 || err != nil {
-		return 0, 0, false
-	}
-	return start, count, true
-}
 
 // ---------- builder input ----------
 
@@ -204,6 +200,10 @@ type EpochInput struct {
 	Logs       []LogRec
 	TxCount    uint64
 
+	// Prev is the hash-chain link: sha256 of epoch K-1's file, or the chain
+	// root (sha256 of the genesis config) for a chain's first epoch.
+	Prev [32]byte
+
 	// Stored-logs sections (v2, unconditional): per-block encoded records
 	// derived by re-execution (rpc.EncodeStoredLogs/EncodeStoredReceipts).
 	// nil maps = seal without the sections (unit tests only; production
@@ -270,9 +270,10 @@ func (c *codeCursor) upTo(w *sstWriter, key []byte) {
 
 // ---------- builder ----------
 
-// BuildEpoch assembles and atomically writes one epoch file into dir.
-// Returns the final path.
-func BuildEpoch(dir string, in *EpochInput) (string, error) {
+// BuildEpoch assembles one epoch and publishes it as a content-addressed
+// artifact: the bytes land in the store's spool under their own sha256 and the
+// data directory gets the local index marker naming it. Returns the hash.
+func BuildEpoch(st *dist.Store, in *EpochInput) (string, error) {
 	count := uint64(len(in.Containers))
 	if count == 0 || len(in.Headers) != len(in.Containers) {
 		return "", fmt.Errorf("epoch build: %d containers, %d headers", len(in.Containers), len(in.Headers))
@@ -355,19 +356,19 @@ func BuildEpoch(dir string, in *EpochInput) (string, error) {
 	binary.LittleEndian.PutUint64(ft[8:16], in.Start)
 	binary.LittleEndian.PutUint64(ft[16:24], count)
 	binary.LittleEndian.PutUint64(ft[24:32], in.TxCount)
+	copy(ft[32:64], in.Prev[:])
 	for i := 0; i < epochNumSections; i++ {
-		binary.LittleEndian.PutUint64(ft[32+i*16:], offsets[i][0])
-		binary.LittleEndian.PutUint64(ft[40+i*16:], offsets[i][1])
+		binary.LittleEndian.PutUint64(ft[epochTableOff+i*16:], offsets[i][0])
+		binary.LittleEndian.PutUint64(ft[epochTableOff+8+i*16:], offsets[i][1])
 	}
 	copy(ft[epochFooterSize-4:], epochMagic[:])
 	buf.Write(ft[:])
 
-	path := filepath.Join(dir, EpochFileName(in.Start, count))
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+	hash, err := st.Put(buf.Bytes())
+	if err != nil {
 		return "", err
 	}
-	return path, os.Rename(tmp, path)
+	return hash, WriteMarker(st.Dir(), EpochMarkerName(in.Start, count), hash)
 }
 
 // buildStoredSections derives the five v2 sections from filled stored-log

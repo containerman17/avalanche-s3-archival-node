@@ -2,7 +2,10 @@ package state
 
 import (
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,6 +13,7 @@ import (
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/fetch"
 )
 
@@ -30,11 +34,43 @@ import (
 // outDir is where sealed epoch files land (usually dir itself; a separate
 // dir cuts an alternate epoch size from the same raw captures without
 // touching existing epochs).
-func SealEpochs(dir, outDir string, epochTxs uint64) error {
-	return sealEpochs(dir, outDir, epochTxs)
+func SealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte) error {
+	return sealEpochs(dir, out, epochTxs, chainRoot)
 }
 
-func sealEpochs(dir, outDir string, epochTxs uint64) error {
+// hashBytes decodes a hex sha256 artifact name into the footer's link field.
+func hashBytes(hash string) ([32]byte, error) {
+	var out [32]byte
+	b, err := hex.DecodeString(hash)
+	if err != nil || len(b) != len(out) {
+		return out, fmt.Errorf("state: %q is not a hex sha256", hash)
+	}
+	copy(out[:], b)
+	return out, nil
+}
+
+// setLatestEpoch advances the `latest` pointer's epoch half, leaving the
+// snapshot half (the pruning node's artifact) untouched.
+func setLatestEpoch(st *dist.Store, hash string) error {
+	l, err := st.Latest()
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	l.Epoch = hash
+	return st.SetLatest(l)
+}
+
+// setLatestSnapshot advances the `latest` pointer's snapshot half.
+func setLatestSnapshot(st *dist.Store, hash string) error {
+	l, err := st.Latest()
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	l.Snapshot = hash
+	return st.SetLatest(l)
+}
+
+func sealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte) error {
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return err
@@ -50,19 +86,27 @@ func sealEpochs(dir, outDir string, epochTxs uint64) error {
 	}
 	defer reader.Close()
 
-	set, err := OpenEpochSet(outDir)
+	set, err := OpenEpochSet(out)
 	if err != nil {
 		return err
 	}
+	// prev is the hash-chain link the next epoch's footer carries: the head
+	// epoch's own hash, or the chain root for the very first epoch.
+	prev := chainRoot
 	next := uint64(1) // block 0 is genesis: no container, state in the alloc
-	if end, ok := set.SealedEnd(); ok {
-		next = end + 1
-	} else if b, ok, err := PeekBase(dir); err != nil {
+	if head, ok := set.Head(); ok {
+		next = head.End() + 1
+		if prev, err = hashBytes(head.Hash); err != nil {
+			return err
+		}
+	} else if b, ok, err := PeekBase(out.Dir()); err != nil {
 		return err
 	} else if ok {
 		// Limited-history node: nothing below the floor exists, so the
 		// first epoch starts at B+1 and the tx count is counted from there.
-		next = b + 1
+		// Its predecessor is the epoch ending at B, whose hash only the local
+		// index can supply; refuse rather than fork the chain at the root.
+		return fmt.Errorf("seal: this node starts at snapshot floor %d with no epoch in its local index, so the hash chain has no link at %d: bootstrap the epoch index first", b, b+1)
 	}
 	set.Close()
 
@@ -80,16 +124,23 @@ func sealEpochs(dir, outDir string, epochTxs uint64) error {
 			break
 		}
 		t0 := time.Now()
-		path, err := BuildEpoch(outDir, in)
+		in.Prev = prev
+		hash, err := BuildEpoch(out, in)
 		if err != nil {
 			return fmt.Errorf("seal epoch at %d: %w", in.Start, err)
 		}
-		st, _ := os.Stat(path)
-		log.Printf("seal: %s blocks=%d txs=%d code=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
-			filepath.Base(path), len(in.Containers), in.TxCount, len(in.Code),
+		if prev, err = hashBytes(hash); err != nil {
+			return err
+		}
+		if err := setLatestEpoch(out, hash); err != nil {
+			return err
+		}
+		st, _ := os.Stat(out.SpoolPath(hash))
+		log.Printf("seal: %s (%s) blocks=%d txs=%d code=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
+			EpochMarkerName(in.Start, uint64(len(in.Containers))), hash[:12], len(in.Containers), in.TxCount, len(in.Code),
 			float64(rawBytes.total())/1e6, float64(st.Size())/1e6,
 			float64(rawBytes.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
-		if e, err := OpenEpoch(path); err == nil {
+		if e, err := OpenEpoch(out, hash); err == nil {
 			s := e.SectionSizes()
 			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB rcpt=%.2fMB",
 				float64(rawBytes.containers)/1e6, float64(rawBytes.headers)/1e6,

@@ -19,22 +19,26 @@ import (
 // [from, to), decoding each zstd frame once. The byte slice is a view into
 // a per-frame decode buffer: copy to retain beyond the callback.
 func (e *Epoch) WalkHeadersRange(from, to uint64, fn func(n uint64, hdrRLP []byte) error) error {
-	return e.walkFramedRange(e.sec[secHeaders], e.sec[secHeadersIdx], from, to, fn)
+	return e.walkFramedRange(secHeaders, e.sec[secHeadersIdx], from, to, fn)
 }
 
 // WalkContainersRange is WalkHeadersRange over the raw containers.
 func (e *Epoch) WalkContainersRange(from, to uint64, fn func(n uint64, raw []byte) error) error {
-	return e.walkFramedRange(e.sec[secBodies], e.sec[secBodiesIdx], from, to, fn)
+	return e.walkFramedRange(secBodies, e.sec[secBodiesIdx], from, to, fn)
 }
 
-func (e *Epoch) walkFramedRange(data, index []byte, from, to uint64, fn func(uint64, []byte) error) error {
+func (e *Epoch) walkFramedRange(dataSec int, index []byte, from, to uint64, fn func(uint64, []byte) error) error {
 	if from < e.Start || to > e.End()+1 || from >= to {
 		return fmt.Errorf("walk range [%d,%d) outside epoch [%d,%d]", from, to, e.Start, e.End())
 	}
 	for f := (from - e.Start) / framedGroup; f*framedGroup < to-e.Start; f++ {
 		lo := binary.LittleEndian.Uint64(index[f*8:])
 		hi := binary.LittleEndian.Uint64(index[(f+1)*8:])
-		raw, err := e.decodeAll(data[lo:hi])
+		frame, err := e.read(dataSec, lo, hi-lo)
+		if err != nil {
+			return fmt.Errorf("frame %d: %w", f, err)
+		}
+		raw, err := e.decodeAll(frame)
 		if err != nil {
 			return fmt.Errorf("frame %d: %w", f, err)
 		}
@@ -69,7 +73,7 @@ func (e *Epoch) SpillDiffs(tmpDir string) (*DiffCursor, error) {
 	const bucketTarget = 512 << 20
 	// ponytail: ~3x zstd expansion estimate sizes the bucket count; a
 	// skewed epoch just gets bigger in-memory buckets.
-	nB := len(e.sec[secSST])*3/bucketTarget + 1
+	nB := int(e.off[secSST][1])*3/bucketTarget + 1
 	if nB > 64 {
 		nB = 64
 	}

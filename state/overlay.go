@@ -22,6 +22,7 @@ import (
 	"github.com/ava-labs/libevm/trie"
 	"github.com/ava-labs/libevm/trie/trienode"
 	"github.com/ava-labs/libevm/triedb"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/holiman/uint256"
 )
 
@@ -107,8 +108,8 @@ type sortedBucket struct {
 // openBase is the base-file opener, indirected so the floor plumbing can be
 // tested with a synthetic base (building a real base file is the snapshot
 // tool's job).
-var openBase = func(dir string) (baseState, bool, error) {
-	b, ok, err := OpenBase(dir)
+var openBase = func(st *dist.Store) (baseState, bool, error) {
+	b, ok, err := OpenBase(st)
 	if err != nil || !ok {
 		return nil, false, err
 	}
@@ -121,7 +122,7 @@ var openBase = func(dir string) (baseState, bool, error) {
 func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, error) {
 	h := &History{dir: dir, store: store, genesis: alloc}
 	stateHead := uint64(0)
-	if base, ok, err := openBase(dir); err != nil {
+	if base, ok, err := openBase(store.Cas()); err != nil {
 		return nil, fmt.Errorf("open base file: %w", err)
 	} else if ok {
 		h.base, h.floor, stateHead = base, base.Block(), base.Block()
@@ -131,7 +132,7 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 		h.Close()
 		return nil, err
 	}
-	if h.epochs, err = OpenEpochSet(dir); err != nil {
+	if h.epochs, err = OpenEpochSet(store.Cas()); err != nil {
 		h.Close()
 		return nil, err
 	}

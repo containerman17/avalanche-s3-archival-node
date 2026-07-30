@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/containerman17/epochdb/dist"
 )
 
 // Store is the executor's flat-file state layer inside the data directory:
@@ -25,6 +26,7 @@ import (
 // never claims more than what is on disk.
 type Store struct {
 	dir  string
+	cas  *dist.Store
 	wl   *bucketLog
 	hd   *bucketLog
 	lg   *bucketLog
@@ -56,6 +58,10 @@ const (
 // Open opens (or creates) the state layer inside dir.
 func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	cas, err := dist.Open(dir)
+	if err != nil {
 		return nil, err
 	}
 	wl, err := openBucketLog(dir, "writelog")
@@ -97,7 +103,7 @@ func Open(dir string) (*Store, error) {
 		code.Close()
 		return nil, fmt.Errorf("open misc store: %w", err)
 	}
-	s := &Store{dir: dir, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
+	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
 	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
 	if err == nil && len(raw) == 8 {
 		s.execHead = binary.BigEndian.Uint64(raw)
@@ -245,3 +251,8 @@ func (s *Store) CodeCount() int { return s.code.Count() }
 
 // WritelogBytes returns total writelog payload bytes on disk.
 func (s *Store) WritelogBytes() uint64 { return s.wl.Bytes() }
+
+// Cas is the process's artifact store for this data directory: sealed epochs,
+// snapshots and the `latest` pointer (dist). One per state layer, so one chunk
+// cache per process.
+func (s *Store) Cas() *dist.Store { return s.cas }

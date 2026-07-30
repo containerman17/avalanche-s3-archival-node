@@ -19,6 +19,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
@@ -313,7 +314,11 @@ func benchTxMain(args []string) {
 		log.Fatalf("ab-bench-tx: open reader: %v", err)
 	}
 	defer fr.Close()
-	epochs, err := state.OpenEpochSet(*dataDir)
+	cas, err := dist.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("ab-bench-tx: open store: %v", err)
+	}
+	epochs, err := state.OpenEpochSet(cas)
 	if err != nil {
 		log.Fatalf("ab-bench-tx: open epochs: %v", err)
 	}
@@ -524,12 +529,12 @@ func benchLogsMain(args []string) {
 	json.Unmarshal(res, &headHex)
 	head, _ := hexutil.DecodeUint64(headHex)
 	// Logs are stored-only: sample and query within the sealed range (the
-	// raw tail above it errors by design). Epoch files are self-described,
-	// so the filenames alone give the sealed end.
-	if names, _ := filepath.Glob(filepath.Join(*dataDir, "epoch_*.epoch")); len(names) > 0 {
+	// raw tail above it errors by design). The local index names every epoch's
+	// height range, so the marker names alone give the sealed end.
+	if names, _ := filepath.Glob(filepath.Join(*dataDir, "epoch_*.cas")); len(names) > 0 {
 		var end uint64
 		for _, p := range names {
-			if start, count, ok := state.ParseEpochFileName(filepath.Base(p)); ok && start+count-1 > end {
+			if start, count, ok := state.ParseEpochMarkerName(filepath.Base(p)); ok && start+count-1 > end {
 				end = start + count - 1
 			}
 		}

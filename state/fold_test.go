@@ -2,8 +2,6 @@ package state
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -138,14 +136,14 @@ func foldCorpusRound2(t *testing.T) []foldBlk {
 
 func mustFold(t *testing.T, dir string) {
 	t.Helper()
-	if err := FoldSnapshots(dir, foldAlloc(), foldEpochTxs); err != nil {
+	if err := FoldSnapshots(testStore(t, dir), foldAlloc(), foldEpochTxs); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func openFolded(t *testing.T, dir string, wantBlock uint64) *Base {
 	t.Helper()
-	b, ok, err := OpenBase(dir)
+	b, ok, err := OpenBase(testStore(t, dir))
 	if err != nil || !ok {
 		t.Fatalf("OpenBase(%s): ok=%v err=%v", dir, ok, err)
 	}
@@ -156,13 +154,15 @@ func openFolded(t *testing.T, dir string, wantBlock uint64) *Base {
 	return b
 }
 
-func fileSHA(t *testing.T, path string) string {
+// baseSHA is the snapshot's own name: content addressing means the local index
+// marker already holds the sha256 this test used to compute.
+func baseSHA(t *testing.T, dir string, block uint64) string {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	hash, err := ReadMarker(dir, BaseMarkerName(block))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return fmt.Sprintf("%x", sha256.Sum256(raw))
+	return hash
 }
 
 // ---------------------------------------------------------------------------
@@ -447,8 +447,8 @@ func TestFoldByteIdentityAcrossNodes(t *testing.T) {
 		mustFold(t, d)
 	}
 	// K=1: the genesis alloc is the bottom.
-	shaA := fileSHA(t, filepath.Join(dirA, "base_4"))
-	shaB := fileSHA(t, filepath.Join(dirB, "base_4"))
+	shaA := baseSHA(t, dirA, 4)
+	shaB := baseSHA(t, dirB, 4)
 	if shaA != shaB {
 		t.Fatalf("K=1 snapshots differ across independent nodes:\n  %s\n  %s", shaA, shaB)
 	}
@@ -458,8 +458,8 @@ func TestFoldByteIdentityAcrossNodes(t *testing.T) {
 		writeFoldCorpus(t, d, foldCorpusRound2(t))
 		mustFold(t, d)
 	}
-	shaA = fileSHA(t, filepath.Join(dirA, "base_8"))
-	shaB = fileSHA(t, filepath.Join(dirB, "base_8"))
+	shaA = baseSHA(t, dirA, 8)
+	shaB = baseSHA(t, dirB, 8)
 	if shaA != shaB {
 		t.Fatalf("K=2 snapshots differ across independent nodes:\n  %s\n  %s", shaA, shaB)
 	}
@@ -521,32 +521,29 @@ func TestFoldCrashAndIdempotence(t *testing.T) {
 	dir := t.TempDir()
 	writeFoldCorpus(t, dir, foldCorpusRound1(t))
 
-	// Kill mid-merge: a partial temp file. It is never matched by
-	// ParseBaseFileName, the sweep removes it, and the deterministic boundary
-	// means the rerun recreates the same name with identical bytes.
-	if err := os.WriteFile(filepath.Join(dir, "base_4.tmp"), []byte("half a snapshot"), 0o644); err != nil {
+	// Kill mid-merge: a partial temp file next to the spool. It is never
+	// matched by ParseBaseMarkerName, the sweep removes it, and the
+	// deterministic boundary means the rerun produces identical bytes.
+	tmpLeftover := testStore(t, dir).SpoolTemp(BaseMarkerName(4))
+	if err := os.WriteFile(tmpLeftover, []byte("half a snapshot"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	mustFold(t, dir)
-	if _, err := os.Stat(filepath.Join(dir, "base_4.tmp")); !os.IsNotExist(err) {
+	if _, err := os.Stat(tmpLeftover); !os.IsNotExist(err) {
 		t.Fatalf("crash leftover survived: %v", err)
 	}
-	sha1 := fileSHA(t, filepath.Join(dir, "base_4"))
+	sha1 := baseSHA(t, dir, 4)
 
 	// Rerunning the whole command changes nothing: no new boundary exists.
 	mustFold(t, dir)
-	if got := fileSHA(t, filepath.Join(dir, "base_4")); got != sha1 {
+	if got := baseSHA(t, dir, 4); got != sha1 {
 		t.Fatalf("rerun rewrote the snapshot: %s -> %s", sha1, got)
 	}
 
-	// Kill between rename and the old-base unlink: two base files. Newest
-	// wins for readers, and the next fold sweeps the loser.
-	stale := filepath.Join(dir, "base_2")
-	raw, err := os.ReadFile(filepath.Join(dir, "base_4"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(stale, raw, 0o644); err != nil {
+	// Kill between the marker write and the old-base cleanup: two snapshots
+	// indexed. Newest wins for readers, and the next fold sweeps the loser.
+	stale := filepath.Join(dir, BaseMarkerName(2))
+	if err := WriteMarker(dir, BaseMarkerName(2), sha1); err != nil {
 		t.Fatal(err)
 	}
 	blk, ok, err := PeekBase(dir)
@@ -557,7 +554,7 @@ func TestFoldCrashAndIdempotence(t *testing.T) {
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("superseded base survived the sweep: %v", err)
 	}
-	if got := fileSHA(t, filepath.Join(dir, "base_4")); got != sha1 {
+	if got := baseSHA(t, dir, 4); got != sha1 {
 		t.Fatalf("sweep disturbed the surviving snapshot")
 	}
 }
@@ -579,7 +576,7 @@ func TestFoldRetirementGuard(t *testing.T) {
 	st.Close()
 
 	mustFold(t, dir)
-	if _, ok, err := OpenBase(dir); ok || err != nil {
+	if _, ok, err := OpenBase(testStore(t, dir)); ok || err != nil {
 		t.Fatalf("fold published without a bucket of retirement headroom: ok=%v err=%v", ok, err)
 	}
 }
@@ -588,10 +585,10 @@ func TestFoldRetirementGuard(t *testing.T) {
 func TestFoldRefusesSealedDir(t *testing.T) {
 	dir := t.TempDir()
 	writeFoldCorpus(t, dir, foldCorpusRound1(t))
-	if err := os.WriteFile(filepath.Join(dir, EpochFileName(1, 4)), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, EpochMarkerName(1, 4)), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := FoldSnapshots(dir, foldAlloc(), foldEpochTxs)
+	err := FoldSnapshots(testStore(t, dir), foldAlloc(), foldEpochTxs)
 	if err == nil || !strings.Contains(err.Error(), "sealed epochs") {
 		t.Fatalf("fold accepted a sealed dir: %v", err)
 	}

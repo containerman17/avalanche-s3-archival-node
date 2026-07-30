@@ -7,15 +7,16 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/containerman17/epochdb/dist"
 )
 
 // synthEpoch builds a deterministic synthetic epoch: 100 blocks from start,
 // containers/headers with repetitive structure (so the dict has something
 // to learn), state rows incl. exact-boundary and delete cases, txs, logs.
-func synthEpoch(t *testing.T, dir string, start uint64) (*EpochInput, string) {
+func synthEpoch(t *testing.T, st *dist.Store, start uint64) (*EpochInput, string) {
 	t.Helper()
 	rng := rand.New(rand.NewSource(int64(start) + 7))
 	const nBlocks = 100
@@ -71,11 +72,22 @@ func synthEpoch(t *testing.T, dir string, start uint64) (*EpochInput, string) {
 		{Block: start + 77, Addrs: [][20]byte{addr20(1), addr20(2)}, Topics: [][32]byte{topic32(9)}},
 	}
 
-	path, err := BuildEpoch(dir, in)
+	hash, err := BuildEpoch(st, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return in, path
+	return in, hash
+}
+
+// testStore is a store with no S3 credentials whatever the environment says:
+// the spool directory is the whole of it.
+func testStore(t *testing.T, dir string) *dist.Store {
+	t.Helper()
+	st, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
 }
 
 func addr20(seed byte) (a [20]byte)  { a[0], a[19] = seed, seed; return }
@@ -88,9 +100,9 @@ func synthKey(kind byte, seed int) (k [sortedKeySize]byte) {
 }
 
 func TestEpochRoundtrip(t *testing.T) {
-	dir := t.TempDir()
-	in, path := synthEpoch(t, dir, 1000)
-	e, err := OpenEpoch(path)
+	st := testStore(t, t.TempDir())
+	in, hash := synthEpoch(t, st, 1000)
+	e, err := OpenEpoch(st, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,10 +214,10 @@ func TestEpochRoundtrip(t *testing.T) {
 }
 
 func TestEpochSetContiguity(t *testing.T) {
-	dir := t.TempDir()
-	synthEpoch(t, dir, 0)
-	synthEpoch(t, dir, 100)
-	s, err := OpenEpochSet(dir)
+	st := testStore(t, t.TempDir())
+	synthEpoch(t, st, 0)
+	synthEpoch(t, st, 100)
+	s, err := OpenEpochSet(st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,10 +234,10 @@ func TestEpochSetContiguity(t *testing.T) {
 
 	// A gap opens as a contiguous prefix: epoch-local reads above the gap
 	// stay available, full-descent reads must refuse via RequireCovered.
-	dir2 := t.TempDir()
-	synthEpoch(t, dir2, 0)
-	synthEpoch(t, dir2, 300)
-	s2, err := OpenEpochSet(dir2)
+	st2 := testStore(t, t.TempDir())
+	synthEpoch(t, st2, 0)
+	synthEpoch(t, st2, 300)
+	s2, err := OpenEpochSet(st2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,11 +263,11 @@ func TestEpochSetContiguity(t *testing.T) {
 // TestEpochSetFloorCoverage: in limited-history mode coverage anchors at
 // the base file's block, not genesis.
 func TestEpochSetFloorCoverage(t *testing.T) {
-	dir := t.TempDir()
-	synthEpoch(t, dir, 500) // [500,599]
-	synthEpoch(t, dir, 600) // [600,699]
-	synthEpoch(t, dir, 900) // hole at 700
-	s, err := OpenEpochSet(dir)
+	st := testStore(t, t.TempDir())
+	synthEpoch(t, st, 500) // [500,599]
+	synthEpoch(t, st, 600) // [600,699]
+	synthEpoch(t, st, 900) // hole at 700
+	s, err := OpenEpochSet(st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,11 +299,14 @@ func TestEpochSetFloorCoverage(t *testing.T) {
 }
 
 func TestEpochDeterminism(t *testing.T) {
-	d1, d2 := t.TempDir(), t.TempDir()
-	_, p1 := synthEpoch(t, d1, 500)
-	_, p2 := synthEpoch(t, d2, 500)
-	b1, _ := readFileT(t, p1)
-	b2, _ := readFileT(t, p2)
+	s1, s2 := testStore(t, t.TempDir()), testStore(t, t.TempDir())
+	_, h1 := synthEpoch(t, s1, 500)
+	_, h2 := synthEpoch(t, s2, 500)
+	if h1 != h2 {
+		t.Fatalf("same input must produce bit-identical epochs: %s vs %s", h1, h2)
+	}
+	b1, _ := readFileT(t, s1.SpoolPath(h1))
+	b2, _ := readFileT(t, s2.SpoolPath(h2))
 	if !bytes.Equal(b1, b2) {
 		t.Fatal("same input must produce bit-identical epoch files")
 	}
@@ -300,14 +315,14 @@ func TestEpochDeterminism(t *testing.T) {
 // TestOpenEpochRefusesOldFormat: there is no upgrade path, so an older file
 // must be named as such at open rather than half-read.
 func TestOpenEpochRefusesOldFormat(t *testing.T) {
-	dir := t.TempDir()
-	_, path := synthEpoch(t, dir, 700)
-	raw, _ := readFileT(t, path)
+	st := testStore(t, t.TempDir())
+	_, hash := synthEpoch(t, st, 700)
+	raw, _ := readFileT(t, st.SpoolPath(hash))
 	binary.LittleEndian.PutUint32(raw[len(raw)-epochFooterSize+4:], 2)
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
+	if err := os.WriteFile(st.SpoolPath(hash), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := OpenEpoch(path)
+	_, err := OpenEpoch(st, hash)
 	if err == nil || !strings.Contains(err.Error(), "format v2, unsupported") {
 		t.Fatalf("OpenEpoch on a v2 file: %v, want a format refusal", err)
 	}
@@ -323,9 +338,9 @@ func readFileT(t *testing.T, p string) ([]byte, error) {
 }
 
 func TestEpochStoredLogsSections(t *testing.T) {
-	dir := t.TempDir()
-	in, _ := synthEpoch(t, dir, 3000) // sealed without the stored sections
-	e0, err := OpenEpoch(filepath.Join(dir, EpochFileName(3000, 100)))
+	st := testStore(t, t.TempDir())
+	in, hash := synthEpoch(t, st, 3000) // sealed without the stored sections
+	e0, err := OpenEpoch(st, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,10 +358,11 @@ func TestEpochStoredLogsSections(t *testing.T) {
 		3007: {0x21, 1},
 		3042: {0x33, 0},
 	}
-	if _, err := BuildEpoch(dir, in); err != nil {
+	hash2, err := BuildEpoch(st, in)
+	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := OpenEpoch(filepath.Join(dir, EpochFileName(3000, 100)))
+	e, err := OpenEpoch(st, hash2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,5 +390,84 @@ func TestEpochStoredLogsSections(t *testing.T) {
 	}
 	if rows == 0 {
 		t.Fatal("no SST rows walked")
+	}
+}
+
+// TestEpochThroughRangedReads is the S3 path in miniature: the same epoch read
+// through ReadAt copies instead of the local mapping must answer identically,
+// section by section. Without it the whole credentials-configured read path
+// would be untested until a bucket exists.
+func TestEpochThroughRangedReads(t *testing.T) {
+	st := testStore(t, t.TempDir())
+	in, hash := synthEpoch(t, st, 1000)
+	in.FullLogs = map[uint64][]byte{1007: {7, 7, 7}}
+	in.RcptRecs = map[uint64][]byte{1007: {0x21, 1}}
+	hash, err := BuildEpoch(st, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	local, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+
+	f, err := os.Open(st.SpoolPath(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranged, err := openEpochBlob(dist.ReaderBlob(f, uint64(fi.Size()), f), hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ranged.Close()
+
+	for n := local.Start; n <= local.End(); n++ {
+		a, err1 := local.Container(n)
+		b, err2 := ranged.Container(n)
+		if err1 != nil || err2 != nil || !bytes.Equal(a, b) {
+			t.Fatalf("container %d: %v %v", n, err1, err2)
+		}
+		ha, _ := local.HeaderRLP(n)
+		hb, _ := ranged.HeaderRLP(n)
+		if !bytes.Equal(ha, hb) {
+			t.Fatalf("header %d differs", n)
+		}
+	}
+	k1 := synthKey('s', 1)
+	va, ba, fa, _ := local.StateSearch(k1[:], 1099)
+	vb, bb, fb, _ := ranged.StateSearch(k1[:], 1099)
+	if !bytes.Equal(va, vb) || ba != bb || fa != fb {
+		t.Fatalf("state search: %x@%d(%v) vs %x@%d(%v)", va, ba, fa, vb, bb, fb)
+	}
+	la, err1 := local.LogAddrBlocks(addr20(1))
+	lb, err2 := ranged.LogAddrBlocks(addr20(1))
+	if err1 != nil || err2 != nil || len(la) != len(lb) || la[0] != lb[0] {
+		t.Fatalf("log addr blocks: %v %v %v %v", la, err1, lb, err2)
+	}
+	ta, _ := local.LogTopicBlocks(topic32(9))
+	tb, _ := ranged.LogTopicBlocks(topic32(9))
+	if len(ta) != len(tb) {
+		t.Fatalf("log topic blocks: %v vs %v", ta, tb)
+	}
+	ra, oka, _ := ranged.StoredLogsRecord(1007)
+	if !oka || !bytes.Equal(ra, []byte{7, 7, 7}) {
+		t.Fatalf("stored logs through ranged reads: %x %v", ra, oka)
+	}
+	rows := 0
+	if err := ranged.WalkStateRows(func(StateRow) { rows++ }); err != nil {
+		t.Fatal(err)
+	}
+	localRows := 0
+	if err := local.WalkStateRows(func(StateRow) { localRows++ }); err != nil {
+		t.Fatal(err)
+	}
+	if rows != localRows || rows == 0 {
+		t.Fatalf("walked %d rows, local walked %d", rows, localRows)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/state"
 )
@@ -59,7 +60,11 @@ func newPrunedServer(t *testing.T, floor uint64) *Server {
 		m.Headers = append(m.Headers, hdr)
 	}
 	dst := t.TempDir()
-	if _, err := state.WriteBase(dst, m, []state.BaseRow{row}); err != nil {
+	cas, err := dist.Local(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.WriteBase(cas, m, []state.BaseRow{row}); err != nil {
 		t.Fatal(err)
 	}
 

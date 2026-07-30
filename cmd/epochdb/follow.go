@@ -19,6 +19,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
@@ -69,6 +70,7 @@ func serveMain(args []string) {
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL to this height instead of a consensus follower (fixed-corpus builds and integration runs: the executor still chases staging live)")
 	walks := fs.Int("walks", 16, "concurrent backward walks (--tip-override)")
+	syncEvery := fs.Duration("sync-every", 5*time.Minute, "cadence for uploading spooled artifacts to the bucket and releasing the local copies (no-op without S3 credentials)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
 
@@ -212,6 +214,7 @@ func serveMain(args []string) {
 	go func() { report(fatal, "rpc server", srv.ListenAndServe(fmt.Sprintf(":%d", *port))) }()
 	go func() { report(fatal, "executor", e.Run(ctx)) }()
 	go cookLoop(ctx, *dataDir, hist, txidx, *cookEvery)
+	go syncLoop(ctx, store.Cas(), *syncEvery)
 	go statusLoop(ctx, e, hist, accepted)
 
 	if floor := hist.Floor(); floor > 0 {
@@ -288,6 +291,28 @@ func cookLoop(ctx context.Context, dir string, hist *state.History, txidx *txInd
 		case <-t.C:
 		}
 		cookOnce(dir, hist, txidx)
+	}
+}
+
+// syncLoop pushes whatever the producers left in the spool to the bucket and
+// unlinks the local copy once the bucket confirms it. Fail-loud but never
+// fatal: an upload that cannot happen leaves the artifact durable in the spool
+// and the next tick retries. Without S3 credentials it never does anything.
+func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
+	if !st.Remote() {
+		return
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if err := st.Sync(); err != nil {
+			log.Printf("epochdb: SYNC FAILED (artifacts stay in the spool, chain unaffected): %v", err)
+		}
 	}
 }
 

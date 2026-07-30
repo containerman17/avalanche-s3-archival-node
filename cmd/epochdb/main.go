@@ -24,6 +24,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
@@ -138,8 +139,6 @@ func main() {
 		sealMain(os.Args[2:])
 	case "fold":
 		foldMain(os.Args[2:])
-	case "manifest":
-		manifestMain(os.Args[2:])
 	case "bootstrap":
 		bootstrapMain(os.Args[2:])
 	case "verify":
@@ -163,10 +162,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300] [--floor N]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120] [--floor N]")
-	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--epoch-txs <n>]")
+	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet] [--epoch-txs <n>]")
 	fmt.Fprintln(os.Stderr, "       epochdb fold [--data <dir>] [--network mainnet] [--epoch-txs <n>]")
-	fmt.Fprintln(os.Stderr, "       epochdb manifest [--data <dir>] [--out <file>]")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap --url <base-url> [--data <dir>] [--manifest <file>] [--attempts 3] [--verify] [--network mainnet]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--verify]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
@@ -189,7 +187,8 @@ func cookMain(args []string) {
 func sealMain(args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	outDir := fs.String("out", "", "directory for the sealed epoch files (default --data; a separate dir cuts an alternate epoch size from the same raws)")
+	outDir := fs.String("out", "", "directory the sealed epochs are published into (default --data; a separate dir cuts an alternate epoch size from the same raws)")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the hash chain roots at sha256 of this network's genesis config)")
 	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "epoch boundary tx count override")
 	fs.Parse(args)
 	if *outDir == "" {
@@ -199,11 +198,19 @@ func sealMain(args []string) {
 	}
 	fetch.RegisterExtras()
 
-	// No genesis, no overlay, no EVM: the stored-logs/receipt sections are a
-	// byte copy of the executor's live capture, so seal never re-executes and
-	// needs no chain config (the --network and --workers flags went with the
-	// DeriveStored stage, 2026-07-29).
-	if err := state.SealEpochs(*dataDir, *outDir, *epochTxs); err != nil {
+	// Still no overlay and no EVM: the stored-logs/receipt sections are a byte
+	// copy of the executor's live capture, so seal never re-executes (the
+	// --workers flag went with the DeriveStored stage, 2026-07-29). --network
+	// is back only for the chain root the first epoch's footer links to.
+	chainRoot, err := dist.ChainRoot(execNetID(*network))
+	if err != nil {
+		log.Fatalf("epochdb: seal: %v", err)
+	}
+	out, err := dist.Open(*outDir)
+	if err != nil {
+		log.Fatalf("epochdb: seal: %v", err)
+	}
+	if err := state.SealEpochs(*dataDir, out, *epochTxs, chainRoot); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
 }
@@ -218,7 +225,7 @@ func foldMain(args []string) {
 	fs := flag.NewFlagSet("fold", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (the genesis alloc is snapshot(0), the bottom of the first fold)")
-	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "canonical boundary tx count: MUST match every other producer's --epoch-txs or the manifest cannot pair a snapshot with the epochs")
+	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "canonical boundary tx count: MUST match every other producer's --epoch-txs or snapshots and epochs cut at different heights")
 	fs.Parse(args)
 	fetch.RegisterExtras()
 
@@ -226,7 +233,11 @@ func foldMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: fold: genesis: %v", err)
 	}
-	if err := state.FoldSnapshots(*dataDir, g.Alloc, *epochTxs); err != nil {
+	st, err := dist.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: fold: %v", err)
+	}
+	if err := state.FoldSnapshots(st, g.Alloc, *epochTxs); err != nil {
 		log.Fatalf("epochdb: fold: %v", err)
 	}
 }
@@ -242,93 +253,47 @@ func cookTxMain(args []string) {
 	}
 }
 
-// manifestMain hashes every sealed epoch plus the local snapshot into the
-// shipped manifest JSON: name, size, sha256. Epochs are bit-identical across
-// builders, so these are stable facts.
-func manifestMain(args []string) {
-	fs := flag.NewFlagSet("manifest", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "shared data directory")
-	out := fs.String("out", "", "output path (default <data>/epochs.manifest)")
-	fs.Parse(args)
-	*out = defaultManifestPath(*dataDir, *out)
-	m, err := buildManifest(*dataDir)
-	if err != nil {
-		log.Fatalf("epochdb: manifest: %v", err)
-	}
-	if err := writeManifest(*out, m); err != nil {
-		log.Fatalf("epochdb: manifest: %v", err)
-	}
-	var total int64
-	snap := "none"
-	for _, e := range m.Epochs {
-		total += e.Size
-	}
-	if m.Snapshot != nil {
-		total += m.Snapshot.Size
-		snap = m.Snapshot.Name
-	}
-	log.Printf("manifest: %d epochs + snapshot %s, %.1f GB, wrote %s", len(m.Epochs), snap, float64(total)/1e9, *out)
-}
-
-// bootstrapMain downloads every manifest file missing from --data over plain
-// HTTP (sha256-verified, tmp+rename), then exits 0. Operator flow on a new
+// bootstrapMain learns a chain's history from the `latest` pointer: walk the
+// epoch hash chain backward, write the local index, done. Nothing is
+// downloaded eagerly (with credentials the node reads history lazily; without
+// them the artifacts are already in the spool). Operator flow on a new
 // machine: bootstrap, then serve.
 func bootstrapMain(args []string) {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	manifestPath := fs.String("manifest", "", "manifest JSON path (default <data>/epochs.manifest)")
-	baseURL := fs.String("url", "", "base URL the manifest files hang off, e.g. https://pub.example.com/mainnet (required)")
-	attempts := fs.Int("attempts", 3, "GET attempts per file before giving up")
-	doVerify := fs.Bool("verify", false, "pipelined no-execution verification: verify the contiguous epoch prefix as downloads complete; exit 0 only when all manifest epochs are downloaded AND verified")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (--verify genesis anchor)")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the chain root the walk must land on)")
+	doVerify := fs.Bool("verify", false, "after the walk, run the no-execution verification over the whole indexed set (pulls every byte)")
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
-	if *baseURL == "" {
-		log.Fatalf("epochdb: bootstrap: --url is required")
-	}
-	*manifestPath = defaultManifestPath(*dataDir, *manifestPath)
-	m, err := loadManifest(*manifestPath)
+	fetch.RegisterExtras()
+
+	chainRoot, err := dist.ChainRoot(execNetID(*network))
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
-	url := trimURL(*baseURL)
-
+	st, err := dist.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: bootstrap: %v", err)
+	}
+	epochs, floor, err := bootstrapChain(st, chainRoot)
+	if err != nil {
+		log.Fatalf("epochdb: bootstrap: %v", err)
+	}
+	log.Printf("bootstrap: %d epochs indexed, floor %d, chain rooted at %x", epochs, floor, chainRoot[:8])
 	if !*doVerify {
-		if err := fetchMissing(*dataDir, url, m, *attempts, nil); err != nil {
-			log.Fatalf("epochdb: bootstrap: %v", err)
-		}
-		log.Printf("bootstrap: complete, local set matches the manifest (%d files)", len(m.Files()))
 		return
 	}
-
-	// Verification is transport-independent: the cursor chases the contiguous
-	// epoch prefix as files land, whatever moved the bytes.
 	tmp, err := os.MkdirTemp(*dataDir, ".verify-")
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
 	defer os.RemoveAll(tmp)
-	cur := verify.StartCursor(*dataDir, tmp, execNetID(*network), *workers, len(m.Epochs))
-	bootErr := make(chan error, 1)
-	go func() { bootErr <- fetchMissing(*dataDir, url, m, *attempts, cur.Notify) }()
-	bootDone, verDone := false, false
-	for !bootDone || !verDone {
-		select {
-		case err := <-bootErr:
-			if err != nil {
-				os.RemoveAll(tmp)
-				log.Fatalf("epochdb: bootstrap: %v", err)
-			}
-			bootDone = true
-		case err := <-cur.Done():
-			if err != nil {
-				os.RemoveAll(tmp)
-				log.Fatalf("epochdb: bootstrap: %v", err)
-			}
-			verDone = true
-		}
+	blocks, wall, err := verify.VerifySet(st, tmp, execNetID(*network), *workers)
+	if err != nil {
+		os.RemoveAll(tmp)
+		log.Fatalf("epochdb: bootstrap: verify FAIL after %d blocks in %s: %v", blocks, wall.Round(time.Second), err)
 	}
-	log.Printf("bootstrap: all %d epochs downloaded and verified", len(m.Epochs))
+	log.Printf("bootstrap: %d epochs downloaded and verified (%d blocks in %s)", epochs, blocks, wall.Round(time.Second))
 }
 
 // verifyMain runs the no-execution verification over an already-downloaded
@@ -346,7 +311,11 @@ func verifyMain(args []string) {
 		log.Fatalf("epochdb: verify: %v", err)
 	}
 	defer os.RemoveAll(tmp)
-	blocks, wall, err := verify.VerifySet(*dataDir, tmp, execNetID(*network), *workers)
+	st, err := dist.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: verify: %v", err)
+	}
+	blocks, wall, err := verify.VerifySet(st, tmp, execNetID(*network), *workers)
 	if err != nil {
 		os.RemoveAll(tmp)
 		log.Fatalf("epochdb: verify: FAIL after %d blocks in %s: %v", blocks, wall.Round(time.Second), err)

@@ -11,7 +11,6 @@ package verify
 import (
 	"fmt"
 	"log"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -27,6 +26,7 @@ import (
 	"github.com/ava-labs/libevm/trie"
 	"github.com/ava-labs/libevm/triedb"
 
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
@@ -404,17 +404,19 @@ func reconstructReceipts(e *state.Epoch, n uint64, txs types.Transactions) (type
 	return receipts, nil
 }
 
-// VerifySet verifies every epoch of an already-downloaded set in chain
-// order (the standalone `epochdb verify` path). Returns total blocks and
-// wall time for the runbook numbers.
-func VerifySet(dataDir, tmpDir string, networkID uint32, workers int) (blocks uint64, wall time.Duration, err error) {
-	set, err := state.OpenEpochSet(dataDir)
+// VerifySet verifies every epoch of the local set in chain order (the
+// standalone `epochdb verify` path, and `bootstrap --verify`, which just runs
+// it once the hash chain has been walked). Reads pull whatever bytes they need
+// through dist, so a node with S3 credentials verifies history it does not
+// hold locally. Returns total blocks and wall time for the runbook numbers.
+func VerifySet(st *dist.Store, tmpDir string, networkID uint32, workers int) (blocks uint64, wall time.Duration, err error) {
+	set, err := state.OpenEpochSet(st)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer set.Close()
 	if len(set.Epochs) == 0 {
-		return 0, 0, fmt.Errorf("no sealed epochs in %s", dataDir)
+		return 0, 0, fmt.Errorf("no sealed epochs indexed in %s", st.Dir())
 	}
 	v, err := New(tmpDir, networkID, workers)
 	if err != nil {
@@ -428,75 +430,4 @@ func VerifySet(dataDir, tmpDir string, networkID uint32, workers int) (blocks ui
 		}
 	}
 	return v.blocks, time.Since(t0), nil
-}
-
-// Cursor is the pipelined bootstrap companion: dist notifies it as epochs
-// become locally present (in any order) and a single worker goroutine
-// verifies the contiguous prefix in chain order. Done() yields nil once
-// all `total` epochs verified, or the first error (which names the epoch).
-type Cursor struct {
-	dataDir string
-	ch      chan string
-	done    chan error
-}
-
-// StartCursor launches the verification worker. total is the manifest
-// epoch count; the worker exits after that many epochs verify.
-func StartCursor(dataDir, tmpDir string, networkID uint32, workers, total int) *Cursor {
-	c := &Cursor{dataDir: dataDir, ch: make(chan string, 2*total+8), done: make(chan error, 1)}
-	go c.run(tmpDir, networkID, workers, total)
-	return c
-}
-
-// Notify reports one locally-present epoch file name. Safe to call from
-// multiple goroutines; duplicates are ignored.
-func (c *Cursor) Notify(name string) { c.ch <- name }
-
-// Done yields the final verdict once.
-func (c *Cursor) Done() <-chan error { return c.done }
-
-func (c *Cursor) run(tmpDir string, networkID uint32, workers, total int) {
-	v, err := New(tmpDir, networkID, workers)
-	if err != nil {
-		c.done <- err
-		return
-	}
-	defer v.Close()
-	pending := map[uint64]string{} // epoch start -> file name
-	seen := map[string]bool{}
-	verified := 0
-	for name := range c.ch {
-		start, _, ok := state.ParseEpochFileName(name)
-		if !ok || seen[name] {
-			continue
-		}
-		seen[name] = true
-		pending[start] = name
-		for {
-			nm, ok := pending[v.next]
-			if !ok {
-				break
-			}
-			e, err := state.OpenEpoch(filepath.Join(c.dataDir, nm))
-			if err != nil {
-				c.done <- fmt.Errorf("verify %s: %w", nm, err)
-				return
-			}
-			delete(pending, e.Start)
-			err = v.VerifyEpoch(e)
-			e.Close()
-			if err != nil {
-				c.done <- fmt.Errorf("verify %s: %w", nm, err)
-				return
-			}
-			if verified++; verified == total {
-				c.done <- nil
-				return
-			}
-		}
-		if len(seen) == total && verified < total {
-			c.done <- fmt.Errorf("all %d epochs present but the set is not contiguous: no epoch starts at block %d", total, v.next)
-			return
-		}
-	}
 }
