@@ -226,11 +226,12 @@ func cookTxMain(args []string) {
 // epoch hash chain backward, write the local index, done. Nothing is
 // downloaded eagerly (with credentials the node reads history lazily; without
 // them the artifacts are already in the spool). Operator flow on a new
-// machine: bootstrap, then serve.
+// machine: bootstrap --frontier, then serve.
 func bootstrapMain(args []string) {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (the chain root the walk must land on)")
+	frontier := fs.Bool("frontier", false, "after the walk, MERGE the epochs into a Firewood state frontier at the last sealed block, so serve can start executing at H+1 (reads every epoch's SST section once)")
 	doVerify := fs.Bool("verify", false, "after the walk, run the no-execution verification over the whole indexed set (pulls every byte)")
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
@@ -249,6 +250,9 @@ func bootstrapMain(args []string) {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
 	log.Printf("bootstrap: %d epochs indexed, chain rooted at %x", epochs, chainRoot[:8])
+	if *frontier {
+		buildFrontier(*dataDir, st, execNetID(*network))
+	}
 	if !*doVerify {
 		return
 	}

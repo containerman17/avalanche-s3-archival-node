@@ -2,17 +2,17 @@ package verify
 
 // Does a Firewood frontier need key PREIMAGES?
 //
-// It is the question that decides whether a limited-history node can verify
-// roots for blocks above B, because a network state sync hands over hashed
-// keys only and the base file is hash-keyed forever (DESIGN.md). The trie API
-// epochdb executes through is preimage-keyed (UpdateAccount takes an address),
-// which is what made this look like a wall.
+// It is the question behind every frontier that is not built by replaying:
+// exec.BuildFrontier hashes the epochs' preimage keys itself and puts them
+// straight into Firewood. The trie API epochdb executes through is
+// preimage-keyed (UpdateAccount takes an address), which is what made this
+// look like a wall.
 //
 // It is not a wall. Firewood's own key space is ALREADY hashed:
 // graft/evm/firewood/base_trie.go hashes on the way in and stores
 // keccak(addr) for an account and keccak(addr)||keccak(slot) for a slot, with
 // the account's trie leaf RLP and rlp(trimmed slot value) as the values, i.e.
-// byte-for-byte the keys and values a state sync yields. So the preimage-keyed
+// byte-for-byte the keys and values the frontier builder produces. So the preimage-keyed
 // API is a convenience layer over a hash-keyed store, and a frontier can be
 // built straight from hashed rows with ffi.Put.
 //

@@ -13,8 +13,10 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"log"
 
 	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/state"
 )
 
@@ -54,4 +56,40 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 		hash = hex.EncodeToString(prev[:])
 	}
 	return epochs, nil
+}
+
+// buildFrontier is `bootstrap --frontier`: the state half of bootstrapping.
+// The chain walk above only writes the local index; this merges every epoch's
+// SST section into a fresh Firewood at H (the last sealed block), checks the
+// result against header(H).Root and parks the exec head there, so `epochdb
+// serve` starts executing at H+1 and follows. Snapshots are dead; the epochs
+// ARE the state (DESIGN.md ruling 1 of 2026-07-31).
+//
+// Runs as its own step, not inside serve: it is a full pass over the corpus
+// (hours at mainnet scale) and a node has no business starting an RPC port
+// while it happens.
+func buildFrontier(dataDir string, st *dist.Store, networkID uint32) {
+	set, err := state.OpenEpochSet(st)
+	if err != nil {
+		log.Fatalf("epochdb: bootstrap --frontier: %v", err)
+	}
+	defer set.Close()
+	store, err := state.Open(dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: bootstrap --frontier: open state layer: %v", err)
+	}
+	defer store.Close()
+	e, err := exec.New(exec.Config{
+		DataDir:   dataDir,
+		Blocks:    set, // containers come from the epochs; nothing is staged yet
+		Store:     store,
+		NetworkID: networkID,
+	})
+	if err != nil {
+		log.Fatalf("epochdb: bootstrap --frontier: exec.New: %v", err)
+	}
+	defer e.Close()
+	if err := e.BuildFrontier(set); err != nil {
+		log.Fatalf("epochdb: bootstrap --frontier: %v", err)
+	}
 }

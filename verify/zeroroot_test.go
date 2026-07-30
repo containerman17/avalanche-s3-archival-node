@@ -2,21 +2,20 @@ package verify
 
 // THE ZERO-ROOT PREMISE, pinned.
 //
-// The snapshot fold emits captured post-images VERBATIM: no StackTrie pass,
-// no storage-root reconstruction, no RLP patching. That is only sound because
+// Epochs carry captured post-images VERBATIM: no StackTrie pass, no
+// storage-root reconstruction, no RLP patching. That is only sound because
 // firewood-ethhash manages storage roots internally, so the StorageRoot field
 // of a captured account RLP is the ZERO hash and Firewood substitutes the real
-// one when it hashes. If that ever stopped being true, every snapshot would
-// load to a wrong root.
+// one when it hashes. If that ever stopped being true, every bootstrapped node
+// would build a wrong frontier.
 //
-// This is a LIBRARY-BEHAVIOUR pin, not a producer gate (the pre-rename fold
-// gate was deleted 2026-07-29: verification is the load). It stays because
-// exec.startFromBase depends on exactly this equality: it bulk-loads a
-// snapshot's zero-rooted rows through raw ffi.Put and then expects the
-// resulting frontier to answer as the canonical state at B. The same rows,
-// once through the preimage-keyed UpdateAccount/UpdateStorage path the
-// executor writes with, once through the raw ffi.Put path startFromBase reads
-// with, must produce the same root.
+// This is a LIBRARY-BEHAVIOUR pin, not a producer gate (verification is the
+// load). It stays because exec.BuildFrontier depends on exactly this equality:
+// it bulk-loads the epochs' zero-rooted winning rows through raw ffi.Put and
+// then expects the resulting frontier to answer as the canonical state at H.
+// The same rows, once through the preimage-keyed UpdateAccount/UpdateStorage
+// path the executor writes with, once through the raw ffi.Put path the
+// frontier builder reads with, must produce the same root.
 
 import (
 	"bytes"
@@ -56,7 +55,7 @@ func vbAccount(t *testing.T, nonce uint64, bal int64, codeHash common.Hash) []by
 
 // vbRows is one small state: two contracts with storage plus a plain account.
 // Returned as state rows in the 53-byte preimage keyspace, key-sorted, which
-// is exactly what an epoch SST, a raw bucket and a base file all hold.
+// is exactly what an epoch SST and a raw bucket both hold.
 func vbRows(t *testing.T) []state.StateRow {
 	t.Helper()
 	row := func(kind byte, addr common.Address, slot common.Hash, val []byte) state.StateRow {
@@ -90,7 +89,7 @@ func vbRows(t *testing.T) []state.StateRow {
 }
 
 // vbFirewoodRoot builds the state through the raw hashed-key ffi.Put path,
-// which is what exec.startFromBase does when it loads a snapshot.
+// which is what exec.BuildFrontier does when it loads the merged rows.
 func vbFirewoodRoot(t *testing.T, rows []state.StateRow) common.Hash {
 	t.Helper()
 	tdb, fw, _, err := newThrowawayFirewood(t.TempDir())
@@ -142,7 +141,7 @@ func TestZeroStorageRootPremise(t *testing.T) {
 	viaAPI := tr.Hash()
 
 	// Path B: raw hashed-key puts of the SAME bytes, zero storage roots and
-	// all, which is how a snapshot is loaded.
+	// all, which is how the merged frontier is loaded.
 	viaPut := vbFirewoodRoot(t, rows)
 
 	if viaAPI == (common.Hash{}) || viaAPI == types.EmptyRootHash {
@@ -150,6 +149,6 @@ func TestZeroStorageRootPremise(t *testing.T) {
 	}
 	if viaAPI != viaPut {
 		t.Fatalf("ZERO-ROOT PREMISE BROKEN: UpdateAccount path gives %x, raw ffi.Put of the same zero-rooted rows gives %x. "+
-			"The snapshot fold emits post-images verbatim, and startFromBase loads them, on the strength of these being equal", viaAPI, viaPut)
+			"Epochs carry post-images verbatim, and BuildFrontier loads them, on the strength of these being equal", viaAPI, viaPut)
 	}
 }

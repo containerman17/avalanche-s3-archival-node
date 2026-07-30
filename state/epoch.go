@@ -97,7 +97,7 @@ const (
 	dictMaxSamples  = 4096      // training sample cap, keeps seal-time bounded
 	sstBlockTarget  = 64 << 10  // raw bytes per compressed SST block
 	// A key nothing ever wrote (an unset storage slot, the common case in
-	// any eth_call) has NO early exit: History.searchAboveFloor probes
+	// any eth_call) has NO early exit: History.search probes
 	// every epoch, so the expected number of wasted SST block reads per
 	// miss is epochCount x the per-epoch false-positive rate. At the
 	// original 10 bits / k=7 that was 0.98 on a 120-epoch mainnet, i.e.

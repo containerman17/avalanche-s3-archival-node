@@ -400,7 +400,6 @@ func benchTxMain(args []string) {
 	fmt.Println("RESULT: ZERO mismatches")
 }
 
-
 // benchLogsMain A/B-probes eth_getLogs vs the archive RPC. Query seeds are
 // real logs pulled from the local server at log-bearing blocks (raw
 // capture records tell us where those are); mixes address-only,
@@ -547,7 +546,6 @@ func benchLogsMain(args []string) {
 	}
 	fmt.Println("RESULT: ZERO mismatches")
 }
-
 
 // jsonEqual compares two JSON documents structurally.
 func jsonEqual(a, b json.RawMessage) bool {
