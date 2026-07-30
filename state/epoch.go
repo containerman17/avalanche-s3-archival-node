@@ -93,8 +93,30 @@ const (
 	dictTargetSize  = 512 << 10 // 07-17 experiment optimum
 	dictMaxSamples  = 4096      // training sample cap, keeps seal-time bounded
 	sstBlockTarget  = 64 << 10  // raw bytes per compressed SST block
-	bloomBitsPerKey = 10
-	bloomHashes     = 7
+	// A key nothing ever wrote (an unset storage slot, the common case in
+	// any eth_call) has NO early exit: History.searchAboveFloor probes
+	// every epoch, so the expected number of wasted SST block reads per
+	// miss is epochCount x the per-epoch false-positive rate. At the
+	// original 10 bits / k=7 that was 0.98 on a 120-epoch mainnet, i.e.
+	// EVERY unset-slot read paid a real block read, and under casfs that
+	// read can be a cold 4MB chunk GET. Measured 2026-07-30, 40M probes
+	// per setting, mainnet shape (120 epochs, 1.32B total entries):
+	//
+	//	bits/key  k   per-epoch FP   all blooms   wasted reads/miss
+	//	      10   7      0.8172%       1.65 GB          0.98
+	//	      16  11      0.0449%       2.64 GB          0.054
+	//	      20  14      0.0069%       3.30 GB          0.0083
+	//	      24  17      0.0009%       3.96 GB          0.0011
+	//
+	// 20/14 is the pick: 118x fewer wasted reads for 1.65 GB more resident
+	// bloom and the same 1.65 GB spread across the whole published corpus,
+	// which is noise against ~500 GB of history. Probe cost goes 60ns to
+	// 99ns, irrelevant beside the block read it avoids. This also removes
+	// the need for a separate global union filter over all keys ever.
+	// Readers take m and k from the file, so only newly written epochs
+	// change shape.
+	bloomBitsPerKey = 20
+	bloomHashes     = 14
 
 	// Format v4 is the ONLY supported format: stored-logs sections (v2,
 	// 2026-07-20), contract code as 'c' rows in the SST (v3, 2026-07-28),
