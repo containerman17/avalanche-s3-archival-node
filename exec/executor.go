@@ -16,7 +16,6 @@ import (
 	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/atomic"
 	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/avalanchego/graft/evm/firewood"
-	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	ffi "github.com/ava-labs/firewood-go-ethhash/ffi"
@@ -33,27 +32,6 @@ import (
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
-
-// The AVAX assetID is required by the atomic-tx state-transfer path to
-// credit imported AVAX to the right account. Everything else network-
-// specific (genesis, upgrade schedule) is derived from the network ID.
-const (
-	FujiAVAXAssetID    = "U8iRqJoiJm8xZHAacmvYyZVwqQx6uDNtQeP3CQ6fcgQk3JqnK"
-	MainnetAVAXAssetID = "FvwEAhmxKfeiG8SnEvq42hc6whRyY3EFYAvebMqDNDGCgxN5Z"
-)
-
-// snowContextFor builds the minimal snow.Context for networkID.
-func snowContextFor(networkID uint32) (*snow.Context, error) {
-	assetStr := FujiAVAXAssetID
-	if networkID == avaconstants.MainnetID {
-		assetStr = MainnetAVAXAssetID
-	}
-	avaxAssetID, err := ids.FromString(assetStr)
-	if err != nil {
-		return nil, fmt.Errorf("parse AVAX asset id: %w", err)
-	}
-	return &snow.Context{NetworkID: networkID, AVAXAssetID: avaxAssetID}, nil
-}
 
 // flushEvery is the group-fsync cadence in blocks: writelog/headers/code/
 // misc are fsynced and executorHead advanced every flushEvery executed
@@ -926,6 +904,7 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	}
 
 	if newRoot != header.Root {
+		dumpMismatch(blk, frame, receipts, statedb, newRoot, header.Root)
 		return common.Hash{}, fmt.Errorf("state root mismatch: computed %x, expected %x", newRoot, header.Root)
 	}
 

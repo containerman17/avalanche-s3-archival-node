@@ -11,11 +11,45 @@ import (
 	warpcontract "github.com/ava-labs/avalanchego/graft/coreth/precompile/contracts/warp"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/upgrade"
+	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/triedb"
 )
+
+// snowContextFor builds the snow.Context the EVM sees. Both fields are
+// EXECUTION INPUTS, not bookkeeping, so both are derived from avalanchego's
+// embedded genesis rather than guessed:
+//
+//   - AVAXAssetID: the atomic-tx state transfer credits imported AVAX by it.
+//   - ChainID: the C-Chain's blockchain ID, which the Warp precompile's
+//     getBlockchainID() returns straight into EVM output. Leaving it zero
+//     diverged the state root at Fuji 29,955,803, the first block after
+//     Durango whose transaction called Warp: a TeleporterRegistry deploy
+//     baked the returned value into an immutable, so the deployed code (and
+//     the account's code hash) differed from the chain's.
+func snowContextFor(networkID uint32) (*snow.Context, error) {
+	cfg := genesis.GetConfig(networkID)
+	if cfg == nil {
+		return nil, fmt.Errorf("no embedded genesis config for network %d", networkID)
+	}
+	genesisBytes, avaxAssetID, err := genesis.FromConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build genesis for network %d: %w", networkID, err)
+	}
+	cChain, err := genesis.VMGenesis(genesisBytes, avaconstants.EVMID)
+	if err != nil {
+		return nil, fmt.Errorf("locate C-Chain in genesis for network %d: %w", networkID, err)
+	}
+	return &snow.Context{
+		NetworkID:   networkID,
+		SubnetID:    avaconstants.PrimaryNetworkID,
+		ChainID:     cChain.ID(),
+		CChainID:    cChain.ID(),
+		AVAXAssetID: avaxAssetID,
+	}, nil
+}
 
 // loadCChainGenesis parses the C-Chain genesis for networkID from
 // avalanchego's embedded config and wires the Avalanche network upgrades
