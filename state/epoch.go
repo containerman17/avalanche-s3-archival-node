@@ -88,7 +88,7 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 const (
 	// The epoch boundary schedule, see EpochTxsAt.
 	epochTxsBase = 250_000
-	epochTxsCap  = 6 // doublings before the size stops growing (250k << 6 = 16M)
+	epochTxsCap  = 5 // doublings before the size stops growing (250k << 5 = 8M)
 
 	framedGroup    = 16        // containers/headers per zstd frame (07-17: 2.24x, 34us access)
 	dictTargetSize = 512 << 10 // 07-17 experiment optimum
@@ -149,14 +149,17 @@ const (
 )
 
 // EpochTxsAt is the epoch boundary: epoch i seals at the first block whose
-// cumulative tx count reaches min(16M, 250k << i), i.e. 250k, 500k, 1M, 2M,
-// 4M, 8M, then 16M forever (cumulative boundaries 0.25M, 0.75M, 1.75M, 3.75M,
-// 7.75M, 15.75M, 31.75M, +16M each). A PURE FUNCTION OF THE EPOCH INDEX,
-// identical on every chain and every VM kind, with no flag and no config, so
-// two honest nodes cut byte-identical boundaries without talking to each
-// other. User ruling 2026-07-31; the rationale (small chains seal early
-// instead of hoarding an unevictable raw tail, giants converge to a ~65-80
-// epoch shape) is in DESIGN.md.
+// cumulative tx count reaches min(8M, 250k << i), i.e. 250k, 500k, 1M, 2M,
+// 4M, then 8M forever (cumulative boundaries 0.25M, 0.75M, 1.75M, 3.75M,
+// 7.75M, 15.75M, +8M each). A PURE FUNCTION OF THE EPOCH INDEX, identical on
+// every chain and every VM kind, with no flag and no config, so two honest
+// nodes cut byte-identical boundaries without talking to each other. User
+// ruling 2026-07-31 (cap lowered 16M to 8M same day: the worst-case unsealed
+// tip tail halves to 8M txs, ~50GB disk and ~2GB heap at 1.2 tx/block L1
+// density, while C-chain only goes ~77 to ~152 epochs, still the proven
+// ~120-epoch miss shape). Rationale for the schedule itself (small chains
+// seal early instead of hoarding an unevictable raw tail, giants converge to
+// a fixed epoch shape) is in DESIGN.md.
 func EpochTxsAt(i int) uint64 {
 	if i > epochTxsCap {
 		i = epochTxsCap

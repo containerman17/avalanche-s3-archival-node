@@ -32,16 +32,16 @@ func fixedEpochTxs(t *testing.T, n uint64) {
 }
 
 // TestEpochTxsSchedule pins the ruled boundary schedule: doubling from 250k,
-// flat at 16M from epoch 6 on, and never wrapping at a large index.
+// flat at 8M from epoch 5 on, and never wrapping at a large index.
 func TestEpochTxsSchedule(t *testing.T) {
-	want := []uint64{250_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 16_000_000, 16_000_000}
+	want := []uint64{250_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 8_000_000, 8_000_000}
 	for i, w := range want {
 		if got := EpochTxsAt(i); got != w {
 			t.Fatalf("EpochTxsAt(%d) = %d, want %d", i, got, w)
 		}
 	}
-	if got := EpochTxsAt(1000); got != 16_000_000 {
-		t.Fatalf("EpochTxsAt(1000) = %d, want 16000000", got)
+	if got := EpochTxsAt(1000); got != 8_000_000 {
+		t.Fatalf("EpochTxsAt(1000) = %d, want 8000000", got)
 	}
 }
 
