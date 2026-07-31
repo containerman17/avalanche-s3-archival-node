@@ -3,7 +3,9 @@ package exec
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log"
+	"path/filepath"
 	goatomic "sync/atomic"
 	"time"
 
@@ -232,6 +234,23 @@ func (e *Executor) batchHeaderRLP(num uint64) ([]byte, bool) {
 	return e.batchBuf[idx].headerRLP, true
 }
 
+// dirBytes is the size of dir on disk, 0 if it does not exist yet. Best
+// effort: it sizes a cache, so an unreadable entry is skipped rather than
+// failed on.
+func dirBytes(dir string) uint64 {
+	var total uint64
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr // missing or unreadable: count nothing
+		}
+		if info, err := d.Info(); err == nil {
+			total += uint64(info.Size())
+		}
+		return nil
+	})
+	return total
+}
+
 // New opens Firewood under cfg.DataDir/firewood, materialises the Fuji
 // C-Chain genesis if needed, reconciles any crash gap against the state
 // layer, and returns an Executor ready to Run.
@@ -300,9 +319,18 @@ func New(cfg Config) (*Executor, error) {
 	// Rust library (per-SLOAD trie walks re-reading upper nodes), disk
 	// well under saturation. A real node cache keeps the hot trie
 	// interior resident.
-	// ponytail: fixed 4GB, sized for a 25GB box; make it a flag if this
-	// ever runs somewhere smaller.
-	fwCfg.CacheSizeBytes = 4 << 30
+	//
+	// SIZED BY FORMULA since the fleet ruling (DESIGN "THE FLEET"), because a
+	// hardcoded 4GB is a per-chain grant and the box now runs many chains: the
+	// cache holds DECODED nodes, so it is anon memory, and anon is the one
+	// thing the kernel cannot evict under pressure. The measured-good C-chain
+	// point was 4GB against 157GB of Firewood, i.e. 2.5%, so the calibrated
+	// ratio is 3% of what this chain actually has on disk, clamped to
+	// [64MB, 4GB]. A fresh directory gets the floor and grows into its share.
+	fwBytes := dirBytes(filepath.Join(cfg.DataDir, "firewood"))
+	fwCfg.CacheSizeBytes = uint(min(max(fwBytes*3/100, 64<<20), 4<<30))
+	log.Printf("exec: firewood node cache %d MB (3%% of %d MB on disk, clamped to [64MB, 4GB])",
+		fwCfg.CacheSizeBytes>>20, fwBytes>>20)
 
 	ethdbKV := cfg.Store.EthDB()
 	memdb := rawdb.NewDatabase(ethdbKV)
