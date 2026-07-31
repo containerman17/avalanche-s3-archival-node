@@ -45,10 +45,11 @@ import (
 // the clamp formula off its own dir size and the page cache is the read cache.
 func fleetMain(args []string) {
 	fs := flag.NewFlagSet("fleet", flag.ExitOnError)
-	chains := fs.String("chains", "", "comma-separated chain descriptor JSONs, one per hosted chain")
+	chains := fs.String("chains", "C", "comma-separated chain IDs, one per hosted chain: C for --network's primary C-chain, or an L1's blockchainID")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the network every --chains entry lives on)")
 	root := fs.String("data", "./data", "fleet root: <root>/<blockchainID> per chain, <root>/cas and <root>/chunks shared by all of them")
 	port := fs.Int("port", 9650, "HTTP listen port; every chain answers at /ext/bc/<blockchainID>/rpc")
-	nodeURI := fs.String("node", "", "bootstrap RPC node URI for every chain (default: the public endpoint for each descriptor's networkID)")
+	nodeURI := fs.String("node", "", "bootstrap RPC node URI for every chain (default: the public endpoint for each chain's networkID)")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set")
 	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB, PER CHAIN (0 disables)")
 	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook that drags each chain's historical window up to its head")
@@ -58,7 +59,7 @@ func fleetMain(args []string) {
 	fs.Parse(args)
 
 	if *chains == "" {
-		log.Fatalf("epochdb: fleet: --chains is required (comma-separated descriptor JSONs)")
+		log.Fatalf("epochdb: fleet: --chains is empty (comma-separated chain IDs, or C)")
 	}
 	if err := os.MkdirAll(*root, 0o755); err != nil {
 		log.Fatalf("epochdb: fleet: %v", err)
@@ -74,7 +75,7 @@ func fleetMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	descs := loadFleetChains(ctx, strings.Split(*chains, ","))
+	descs := loadFleetChains(ctx, strings.Split(*chains, ","), execNetID(*network), *root)
 
 	f := &fleet{}
 	mux := http.NewServeMux()
@@ -142,18 +143,30 @@ func fleetMain(args []string) {
 	f.closeAll()
 }
 
-// loadFleetChains reads every descriptor and refuses the mixes that cannot
-// work in one process, BEFORE anything opens or dials.
-func loadFleetChains(ctx context.Context, paths []string) []*chain.Chain {
+// loadFleetChains resolves every chain ID against its own data dir under the
+// fleet root (<root>/<blockchainID>, which is where its cached descriptor and
+// its optional upgrade.json live) and refuses the mixes that cannot work in one
+// process, BEFORE anything opens or dials.
+func loadFleetChains(ctx context.Context, specs []string, networkID uint32, root string) []*chain.Chain {
 	var out []*chain.Chain
 	seen := map[string]bool{}
-	for _, p := range paths {
-		p = strings.TrimSpace(p)
-		if p == "" {
+	for _, spec := range specs {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
 			continue
 		}
+		// The dir is named by the blockchainID, which for an L1 IS the spec;
+		// only "C" has to be resolved to its ID first.
+		dir := filepath.Join(root, spec)
+		if strings.EqualFold(spec, "C") {
+			id, _, err := chain.PrimaryC(networkID)
+			if err != nil {
+				log.Fatalf("epochdb: fleet: %v", err)
+			}
+			dir = filepath.Join(root, id.String())
+		}
 		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		c, err := chain.Load(lctx, p)
+		c, err := chain.Resolve(lctx, spec, networkID, dir)
 		cancel()
 		if err != nil {
 			log.Fatalf("epochdb: fleet: %v", err)
@@ -163,7 +176,7 @@ func loadFleetChains(ctx context.Context, paths []string) []*chain.Chain {
 		// is one process per VM kind. The C-chain runs alone.
 		if len(out) > 0 && c.VMKind != out[0].VMKind {
 			log.Fatalf("epochdb: fleet: %s is %s but this fleet is already %s: libevm extras are process-global, so the C-chain (coreth) runs in its OWN process",
-				p, c.VMKind, out[0].VMKind)
+				spec, c.VMKind, out[0].VMKind)
 		}
 		if id := c.BlockchainID.String(); seen[id] {
 			log.Fatalf("epochdb: fleet: %s listed twice", id)
@@ -173,7 +186,7 @@ func loadFleetChains(ctx context.Context, paths []string) []*chain.Chain {
 		out = append(out, c)
 	}
 	if len(out) == 0 {
-		log.Fatalf("epochdb: fleet: --chains named no descriptor")
+		log.Fatalf("epochdb: fleet: --chains named no chain")
 	}
 	return out
 }

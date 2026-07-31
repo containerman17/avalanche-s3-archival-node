@@ -60,38 +60,40 @@ func ChainRootFrom(genesisData, upgradeBytes []byte) [32]byte {
 	return out
 }
 
-// GenesisData fetches a chain's canonical genesis bytes from a P-chain
-// endpoint: `platform.getTx` on the blockchainID, which IS the CreateChainTx's
-// txID. apiURL is a node base URL, e.g. https://api.avax.network.
+// CreateChainTx fetches a chain's canonical genesis bytes and its subnetID
+// from a P-chain endpoint: `platform.getTx` on the blockchainID, which IS the
+// CreateChainTx's txID. apiURL is a node base URL, e.g. https://api.avax.network.
 //
 // This is the L1 door for ruling 5 and nothing more: a subnet-evm chain has no
 // embedded genesis anywhere, so this is where its root (and later its executor)
-// gets the bytes. The C-chain does not need it, see ChainRoot.
-func GenesisData(ctx context.Context, apiURL, blockchainID string) ([]byte, error) {
+// gets the bytes, and it is also why a blockchainID is the only thing an
+// operator has to type. The C-chain does not need it, see ChainRoot.
+func CreateChainTx(ctx context.Context, apiURL, blockchainID string) (genesisData []byte, subnetID string, err error) {
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"platform.getTx","params":{"txID":%q,"encoding":"json"}}`, blockchainID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+"/ext/bc/P", bytes.NewReader([]byte(body)))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("dist: platform.getTx %s: %w", blockchainID, err)
+		return nil, "", fmt.Errorf("dist: platform.getTx %s: %w", blockchainID, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("dist: platform.getTx %s: %w", blockchainID, err)
+		return nil, "", fmt.Errorf("dist: platform.getTx %s: %w", blockchainID, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("dist: platform.getTx %s: http %d", blockchainID, resp.StatusCode)
+		return nil, "", fmt.Errorf("dist: platform.getTx %s: http %d", blockchainID, resp.StatusCode)
 	}
-	return parseGenesisData(raw)
+	return parseCreateChainTx(raw)
 }
 
-// parseGenesisData pulls genesisData out of a platform.getTx JSON response. Its
-// own function so the FIFA fixture can exercise it with no network call.
-func parseGenesisData(raw []byte) ([]byte, error) {
+// parseCreateChainTx pulls genesisData and subnetID out of a platform.getTx
+// JSON response. Its own function so the FIFA fixture can exercise it with no
+// network call.
+func parseCreateChainTx(raw []byte) ([]byte, string, error) {
 	var r struct {
 		Result struct {
 			Tx struct {
@@ -99,6 +101,7 @@ func parseGenesisData(raw []byte) ([]byte, error) {
 					// []byte through encoding/json is base64, which is what
 					// the API emits for genesisData under encoding "json".
 					GenesisData []byte `json:"genesisData"`
+					SubnetID    string `json:"subnetID"`
 				} `json:"unsignedTx"`
 			} `json:"tx"`
 		} `json:"result"`
@@ -107,14 +110,17 @@ func parseGenesisData(raw []byte) ([]byte, error) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return nil, fmt.Errorf("dist: platform.getTx response: %w", err)
+		return nil, "", fmt.Errorf("dist: platform.getTx response: %w", err)
 	}
 	if r.Error != nil {
-		return nil, fmt.Errorf("dist: platform.getTx: %s", r.Error.Message)
+		return nil, "", fmt.Errorf("dist: platform.getTx: %s", r.Error.Message)
 	}
-	g := r.Result.Tx.UnsignedTx.GenesisData
-	if len(g) == 0 {
-		return nil, fmt.Errorf("dist: platform.getTx returned no genesisData: not a CreateChainTx")
+	u := r.Result.Tx.UnsignedTx
+	if len(u.GenesisData) == 0 {
+		return nil, "", fmt.Errorf("dist: platform.getTx returned no genesisData: not a CreateChainTx")
 	}
-	return g, nil
+	if u.SubnetID == "" {
+		return nil, "", fmt.Errorf("dist: platform.getTx returned no subnetID: not a CreateChainTx")
+	}
+	return u.GenesisData, u.SubnetID, nil
 }

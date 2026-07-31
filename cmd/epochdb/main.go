@@ -45,25 +45,23 @@ func parseContainerID(s string) (ids.ID, error) {
 	return ids.FromString(s)
 }
 
-// chainFlags registers --network and --chain on fs. --network names a primary
-// network, whose C-chain descriptor comes from avalanchego's embedded config;
-// --chain points at a descriptor JSON for an Avalanche L1 (see chain.Load) and
-// wins when both are given. Returns the --network value (some commands still
-// need it for the default node/archive URLs) and a resolver.
-func chainFlags(fs *flag.FlagSet) (*string, func() *chain.Chain) {
-	network := fs.String("network", "fuji", "network: fuji|mainnet (the primary network's C-chain)")
-	path := fs.String("chain", "", "chain descriptor JSON for an Avalanche L1, instead of --network")
-	return network, func() *chain.Chain {
-		if *path == "" {
-			c, err := chain.CChain(execNetID(*network))
-			if err != nil {
-				log.Fatalf("epochdb: --network: %v", err)
-			}
-			return c
-		}
+// chainFlags registers --network and --chain on fs. A chain is named by its ID
+// and nothing else: `C` (the default) is the primary network's C-chain for
+// --network, out of avalanchego's embedded config; anything else is an L1's
+// blockchainID, resolved off the P-chain on first start and cached in the data
+// dir (see chain.Resolve). --network still picks the network to dial and the
+// P-chain endpoint to resolve against, so a mainnet L1 needs --network mainnet.
+//
+// Returns the --network value (some commands still need it for the default
+// node/archive URLs) and a resolver that takes the chain's data dir, which is
+// where both the cache and the optional upgrade.json live.
+func chainFlags(fs *flag.FlagSet) (*string, func(dataDir string) *chain.Chain) {
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the network --chain lives on)")
+	spec := fs.String("chain", "C", "chain: C for --network's primary C-chain, or an L1's blockchainID")
+	return network, func(dataDir string) *chain.Chain {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		c, err := chain.Load(ctx, *path)
+		c, err := chain.Resolve(ctx, *spec, execNetID(*network), dataDir)
 		if err != nil {
 			log.Fatalf("epochdb: --chain: %v", err)
 		}
@@ -192,20 +190,20 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--node <uri>] [--tip <containerID>]")
-	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>]")
+	fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--node <uri>] [--tip <containerID>]")
+	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>] [--network mainnet] [--chain C|<blockchainID>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
-	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override N]")
-	fmt.Fprintln(os.Stderr, "       epochdb fleet [--chains a.json,b.json] [--data <root>] [--port 9650]  (all subnet-evm chains in one process; /ext/bc/<blockchainID>/rpc)")
+	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override N]")
+	fmt.Fprintln(os.Stderr, "       epochdb fleet [--chains <blockchainID>,<blockchainID>] [--data <root>] [--port 9650]  (all subnet-evm chains in one process; /ext/bc/<blockchainID>/rpc)")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120]")
-	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet | --chain <path.json>]")
+	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet] [--chain <blockchainID>]")
 	fmt.Fprintln(os.Stderr, "       epochdb publish [--data <dir>]  (upload the spool to the bucket, then release the local copies; needs EPOCHDB_S3_*)")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet | --chain <path.json>] [--frontier] [--verify]")
-	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet | --chain <path.json>] [--workers N]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--chain <blockchainID>] [--frontier] [--verify]")
+	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--chain <blockchainID>] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
 	os.Exit(2)
@@ -235,7 +233,7 @@ func sealMain(args []string) {
 	} else if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
-	c := resolveChain()
+	c := resolveChain(*dataDir)
 	fetch.RegisterExtras(c.VMKind)
 
 	// Still no overlay and no EVM: the stored-logs/receipt sections are a byte
@@ -279,7 +277,7 @@ func bootstrapMain(args []string) {
 	doVerify := fs.Bool("verify", false, "after the walk, run the no-execution verification over the whole indexed set (pulls every byte)")
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
-	c := resolveChain()
+	c := resolveChain(*dataDir)
 	fetch.RegisterExtras(c.VMKind)
 
 	chainRoot := c.Root()
@@ -321,7 +319,7 @@ func verifyMain(args []string) {
 	_, resolveChain := chainFlags(fs)
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
-	c := resolveChain()
+	c := resolveChain(*dataDir)
 
 	tmp, err := os.MkdirTemp(*dataDir, ".verify-")
 	if err != nil {
@@ -380,7 +378,7 @@ func execMain(args []string) {
 		StateCacheBytes: uint64(*stateCacheGiB) << 30,
 		VerifyCache:     *verifyCache,
 		CommitEvery:     *commitEvery,
-		Chain:           resolveChain(),
+		Chain:           resolveChain(*dataDir),
 		StopAt:          *stopAt,
 	})
 	if err != nil {
@@ -534,9 +532,8 @@ func execNetID(network string) uint32 {
 func fetchMain(args []string) {
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "directory for the segment files")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (sets default node URI)")
-	chainPath := fs.String("chain", "", "chain descriptor JSON for an Avalanche L1, instead of --network")
-	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network, or per the descriptor's networkID)")
+	network, resolveChain := chainFlags(fs)
+	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network)")
 	walks := fs.Int("walks", 16, "concurrent backward walks")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
@@ -549,31 +546,26 @@ func fetchMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var l1 *chain.Chain
-	if *chainPath != "" {
-		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		var err error
-		l1, err = chain.Load(lctx, *chainPath)
-		cancel()
-		if err != nil {
-			log.Fatalf("epochdb: --chain: %v", err)
-		}
-		// The descriptor, not --network, names the network to dial.
-		*network = avaconstants.NetworkIDToNetworkName[l1.NetworkID]
+	// The descriptor comes FIRST, and for a cached L1 it, not --network, names
+	// the network to dial: the cache is what the data dir was built with.
+	c := resolveChain(*dataDir)
+	l1 := c.SubnetID != avaconstants.PrimaryNetworkID
+	if l1 {
+		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
 	}
 	_, defNode, rpcURL := netParams(*network)
 	if *nodeURI == "" {
 		*nodeURI = defNode
 	}
 
-	if l1 != nil && *tipOverride != "" {
+	if l1 && *tipOverride != "" {
 		// resolveTipOverride's whole job is finding the pre-ProposerVM
 		// ceiling, below which a container ID equals the eth block hash.
 		// An L1 has no such range: ProposerVM is active from block 1.
 		log.Fatalf("epochdb: --tip-override is C-chain only (an L1 is ProposerVM-wrapped from block 1); use --tip with a container ID")
 	}
 
-	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer, Chain: l1}
+	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer, Chain: c}
 	if *vdrSources != "" {
 		cfg.VdrSources = strings.Split(*vdrSources, ",")
 	}

@@ -58,48 +58,49 @@ func TestCChainDescriptor(t *testing.T) {
 	}
 }
 
-// TestLoad covers the --chain file: verbatim inline genesis, an upgrade file
-// entering the root (ruling 6), and the refusals. No network call.
-func TestLoad(t *testing.T) {
-	dir := t.TempDir()
-	genesisData := []byte(`{"config":{"chainId":13322},"gasLimit":"0x0"}`)
-	upgrade := []byte(`{"precompileUpgrades":[]}`)
-	upgradePath := filepath.Join(dir, "upgrade.json")
-	if err := os.WriteFile(upgradePath, upgrade, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
+// TestResolveCached covers everything Resolve does without a network call: the
+// cached descriptor is the authority on the dir, upgrade.json enters the root
+// (ruling 6), "C" is the embedded C-chain, and nothing defaults to zero.
+func TestResolveCached(t *testing.T) {
+	ctx := context.Background()
 	const (
 		fifaChain  = "SUDoK9P89PCcguskyof41fZexw7U3zubDP2DZpGf3HbFWwJ4E"
 		fifaSubnet = "h7egyVb6fKHMDpVaEsTEcy7YaEnXrayxZS4A1AEU4pyBzmwGp"
-		fifaVM     = "XxNJpcFRu85cPDeTZofVHdeD5NCLj1XTgZpJNJABexXJ5e2ho"
 	)
-	write := func(t *testing.T, name string, f map[string]any) string {
-		t.Helper()
-		raw, err := json.Marshal(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		p := filepath.Join(dir, name)
-		if err := os.WriteFile(p, raw, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
+	genesisData := []byte(`{"config":{"chainId":13322},"gasLimit":"0x0"}`)
 	base := map[string]any{
 		"networkID":    avaconstants.MainnetID,
 		"blockchainID": fifaChain,
 		"subnetID":     fifaSubnet,
-		"vmID":         fifaVM,
+		"vmKind":       "subnetevm",
 		"genesisData":  base64.StdEncoding.EncodeToString(genesisData),
 	}
+	// dirWith writes a chain.json (and optionally an upgrade.json) into a fresh
+	// data dir, exactly as a first start would have left it.
+	dirWith := func(t *testing.T, f map[string]any, upgrade []byte) string {
+		t.Helper()
+		dir := t.TempDir()
+		raw, err := json.Marshal(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "chain.json"), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if upgrade != nil {
+			if err := os.WriteFile(filepath.Join(dir, "upgrade.json"), upgrade, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
 
-	c, err := Load(context.Background(), write(t, "fifa.json", base))
+	c, err := Resolve(ctx, fifaChain, avaconstants.MainnetID, dirWith(t, base, nil))
 	if err != nil {
-		t.Fatalf("load: %v", err)
+		t.Fatalf("resolve: %v", err)
 	}
 	if c.VMKind != SubnetEVM {
-		t.Errorf("VMKind = %s, want subnetevm (a custom vmID is not coreth)", c.VMKind)
+		t.Errorf("VMKind = %s, want subnetevm", c.VMKind)
 	}
 	if string(c.GenesisJSON) != string(genesisData) {
 		t.Errorf("genesis bytes were not carried verbatim")
@@ -111,51 +112,52 @@ func TestLoad(t *testing.T) {
 		t.Errorf("root is not sha256(genesisData)")
 	}
 
-	withUpgrade := map[string]any{}
-	for k, v := range base {
-		withUpgrade[k] = v
-	}
-	withUpgrade["upgradeFile"] = upgradePath
-	cu, err := Load(context.Background(), write(t, "fifa-upgrade.json", withUpgrade))
+	// upgrade.json in the data dir, avalanchego's convention: verbatim into the
+	// root, no re-serialization.
+	upgrade := []byte("{\"precompileUpgrades\":[]}\n")
+	cu, err := Resolve(ctx, fifaChain, avaconstants.MainnetID, dirWith(t, base, upgrade))
 	if err != nil {
-		t.Fatalf("load with upgrade: %v", err)
-	}
-	if cu.Root() == c.Root() {
-		t.Error("upgrade bytes did not change the chain root (ruling 6)")
+		t.Fatalf("resolve with upgrade: %v", err)
 	}
 	if cu.Root() != dist.ChainRootFrom(genesisData, upgrade) {
 		t.Error("root is not sha256(genesisData || upgradeBytes)")
 	}
-
-	// The C-chain's own vmID means coreth even in a descriptor file.
-	cc := map[string]any{}
-	for k, v := range base {
-		cc[k] = v
+	if cu.Root() == c.Root() {
+		t.Error("upgrade bytes did not change the chain root (ruling 6)")
 	}
-	cc["vmID"] = avaconstants.EVMID.String()
-	ck, err := Load(context.Background(), write(t, "coreth.json", cc))
+
+	// "C" is the embedded C-chain and needs no cache file at all.
+	cc, err := Resolve(ctx, "C", avaconstants.MainnetID, t.TempDir())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("resolve C: %v", err)
 	}
-	if ck.VMKind != Coreth {
-		t.Errorf("VMKind = %s, want coreth for the EVM vmID", ck.VMKind)
+	if cc.VMKind != Coreth || cc.SubnetID != avaconstants.PrimaryNetworkID {
+		t.Errorf("C resolved to %s on subnet %s", cc.VMKind, cc.SubnetID)
 	}
 
-	// Refusals: no snow.Context field may default to zero, and an unknown
-	// vmKind must not silently fall through to subnet-evm.
+	// Refusals. No snow.Context field may default to zero, an unknown vmKind
+	// must not fall through to subnet-evm, and a cache for another chain must
+	// not be read as this one.
 	for name, mutate := range map[string]func(map[string]any){
 		"no-network": func(f map[string]any) { delete(f, "networkID") },
-		"no-chain":   func(f map[string]any) { delete(f, "blockchainID") },
 		"no-subnet":  func(f map[string]any) { delete(f, "subnetID") },
+		"no-genesis": func(f map[string]any) { delete(f, "genesisData") },
 		"bad-kind":   func(f map[string]any) { f["vmKind"] = "erigon" },
+		"other-chain": func(f map[string]any) {
+			f["blockchainID"] = "2tmrrBo1Lgt1mzzvPSFt73kkQKFas5d1AP88tv9cicwoFp8BSn"
+		},
 	} {
 		f := map[string]any{}
 		for k, v := range base {
 			f[k] = v
 		}
 		mutate(f)
-		if _, err := Load(context.Background(), write(t, name+".json", f)); err == nil {
-			t.Errorf("%s: Load accepted an invalid descriptor", name)
+		if _, err := Resolve(ctx, fifaChain, avaconstants.MainnetID, dirWith(t, f, nil)); err == nil {
+			t.Errorf("%s: Resolve accepted an invalid cache", name)
 		}
+	}
+	// A spec that is neither "C" nor a blockchainID is a typo, not a fetch.
+	if _, err := Resolve(ctx, "not-an-id", avaconstants.MainnetID, t.TempDir()); err == nil {
+		t.Error("Resolve accepted a spec that is not an ID")
 	}
 }

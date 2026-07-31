@@ -44,9 +44,12 @@ func TestGenesisDataFromCreateChainTx(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := parseGenesisData(raw)
+	g, subnetID, err := parseCreateChainTx(raw)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if subnetID != "h7egyVb6fKHMDpVaEsTEcy7YaEnXrayxZS4A1AEU4pyBzmwGp" {
+		t.Fatalf("subnetID %q, want FIFA's", subnetID)
 	}
 	if len(g) != 55231 {
 		t.Fatalf("genesisData is %d bytes, want the recorded 55231", len(g))
@@ -65,10 +68,10 @@ func TestGenesisDataFromCreateChainTx(t *testing.T) {
 		t.Fatal("upgrade bytes did not change the chain root")
 	}
 
-	if _, err := parseGenesisData([]byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"not found"},"id":1}`)); err == nil {
+	if _, _, err := parseCreateChainTx([]byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"not found"},"id":1}`)); err == nil {
 		t.Fatal("an error response must not parse as genesis bytes")
 	}
-	if _, err := parseGenesisData([]byte(`{"jsonrpc":"2.0","result":{"tx":{"unsignedTx":{}}},"id":1}`)); err == nil {
+	if _, _, err := parseCreateChainTx([]byte(`{"jsonrpc":"2.0","result":{"tx":{"unsignedTx":{}}},"id":1}`)); err == nil {
 		t.Fatal("a tx with no genesisData must be refused")
 	}
 }

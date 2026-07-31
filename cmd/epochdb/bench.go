@@ -52,7 +52,7 @@ func benchMain(args []string) {
 	defer store.Close()
 	// ChainGenesis registers the descriptor's libevm extras, so an L1 dir is
 	// read with the same registration its writer used.
-	g, err := exec.ChainGenesis(resolveChain())
+	g, err := exec.ChainGenesis(resolveChain(*dataDir))
 	if err != nil {
 		log.Fatalf("ab-bench: genesis: %v", err)
 	}
@@ -247,7 +247,7 @@ func benchTxMain(args []string) {
 		_, _, *remote = netParams(*network)
 	}
 
-	fetch.RegisterExtras(resolveChain().VMKind) // ParseEthBlock needs this chain's libevm extras
+	fetch.RegisterExtras(resolveChain(*dataDir).VMKind) // ParseEthBlock needs this chain's libevm extras
 	rng := rand.New(rand.NewSource(*seed))
 	fr, err := fetch.OpenReader(*dataDir)
 	if err != nil {

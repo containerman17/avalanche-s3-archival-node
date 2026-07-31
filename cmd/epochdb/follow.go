@@ -77,7 +77,7 @@ func serveMain(args []string) {
 	// network to dial, and it is what the fetcher, the executor and the genesis
 	// all key on. An L1 on mainnet with the default `--network fuji` would
 	// otherwise dial the wrong network's bootstrap node.
-	c := resolveChain()
+	c := resolveChain(*dataDir)
 	if c.SubnetID != avaconstants.PrimaryNetworkID {
 		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
 	}
