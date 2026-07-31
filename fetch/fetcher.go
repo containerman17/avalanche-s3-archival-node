@@ -34,8 +34,7 @@ import (
 )
 
 const (
-	DefaultNodeURI  = "https://api.avax-test.network"
-	primarySubnetID = "11111111111111111111111111111111LpoYY"
+	DefaultNodeURI = "https://api.avax-test.network"
 
 	defaultConnectTimeout = 30 * time.Second
 	defaultPeerWarmup     = 5 * time.Second
@@ -69,6 +68,25 @@ type Config struct {
 	// back to NodeURI alone, with a warning: the recorded ruling wants
 	// multiple independent sources.
 	VdrSources []string
+	// Chain is the descriptor for an Avalanche L1. nil (or a descriptor whose
+	// SubnetID is the primary network) keeps the C-chain path exactly as it
+	// was: ids come from the bootstrap node's RPC, no tracked subnets, coreth.
+	Chain *chain.Chain
+}
+
+// vmKind is the libevm extras registration this config needs.
+func (c Config) vmKind() chain.VMKind {
+	if c.Chain != nil {
+		return c.Chain.VMKind
+	}
+	return chain.Coreth
+}
+
+// l1 reports whether this config names a non-primary subnet, which is the one
+// bit that changes the network wiring (tracked subnets, validator-driven IP
+// discovery, the subnet every Send is keyed on).
+func (c Config) l1() bool {
+	return c.Chain != nil && c.Chain.SubnetID != avaconstants.PrimaryNetworkID
 }
 
 // Fetcher owns a flat-file store of raw C-Chain containers and a P2P
@@ -85,9 +103,15 @@ type Fetcher struct {
 	creator   message.Creator
 	networkID uint32
 	chainID   ids.ID
+	// subnetID is the subnet EVERY outbound chain message is keyed on. The
+	// network drops a peer that does not track it, which is the correct
+	// filter: for the C-chain it is the primary network, for an L1 its own
+	// subnet.
+	subnetID ids.ID
 
 	// Genesis block of the C-Chain is not served over GetAncestors, so we
-	// short-circuit the walk when we hit its container ID.
+	// short-circuit the walk when we hit its container ID. Empty on an L1,
+	// where the walk terminates on height 1 instead (see walkSpan).
 	genesisID ids.ID
 
 	dispatchErrCh chan error
@@ -108,11 +132,11 @@ type Fetcher struct {
 	inFlight        atomic.Int64
 }
 
-// New opens the flat-file store, dials the Fuji primary network, and waits
-// for a peer to connect. It does NOT start syncing; call Sync for that.
+// New opens the flat-file store, dials the network named by cfg (the primary
+// network's C-chain by default, an L1 when cfg.Chain names one), and waits for
+// a peer to connect. It does NOT start syncing; call Sync for that.
 func New(cfg Config) (*Fetcher, error) {
-	// The fetcher still speaks the primary network only (subnet plumbing is M5).
-	RegisterExtras(chain.Coreth)
+	RegisterExtras(cfg.vmKind())
 
 	if cfg.NodeURI == "" {
 		cfg.NodeURI = DefaultNodeURI
@@ -139,12 +163,19 @@ func New(cfg Config) (*Fetcher, error) {
 // dial performs the network-only part of New: bootstrap RPC, P2P dial,
 // peer warmup, genesis ID computation. Used directly by the spike probe.
 func dial(cfg Config) (*Fetcher, error) {
-	RegisterExtras(chain.Coreth)
+	RegisterExtras(cfg.vmKind())
 	if cfg.NodeURI == "" {
 		cfg.NodeURI = DefaultNodeURI
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// An L1's validators are not in the bootstrap node's peer list at all; they
+	// arrive through ordinary PeerList gossip 10-15s after the primary peers
+	// connect (measured on FIFA), so the dial budget is wider there.
+	dialTimeout := 30 * time.Second
+	if cfg.l1() {
+		dialTimeout = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
 	infoClient := info.NewClient(cfg.NodeURI)
@@ -154,20 +185,26 @@ func dial(cfg Config) (*Fetcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("info.getNetworkID: %w", err)
 	}
-	chainID, err := infoClient.GetBlockchainID(ctx, "C")
-	if err != nil {
+	var (
+		chainID  ids.ID
+		subnetID = avaconstants.PrimaryNetworkID
+	)
+	if cfg.l1() {
+		if cfg.Chain.NetworkID != networkID {
+			return nil, fmt.Errorf("chain descriptor is network %d but %s is network %d",
+				cfg.Chain.NetworkID, cfg.NodeURI, networkID)
+		}
+		chainID, subnetID = cfg.Chain.BlockchainID, cfg.Chain.SubnetID
+	} else if chainID, err = infoClient.GetBlockchainID(ctx, "C"); err != nil {
 		return nil, fmt.Errorf("info.getBlockchainID(C): %w", err)
 	}
-	log.Printf("fetch: network_id=%d c_chain_id=%s", networkID, chainID)
+	log.Printf("fetch: network_id=%d chain_id=%s subnet_id=%s", networkID, chainID, subnetID)
 
-	subnetID, err := ids.FromString(primarySubnetID)
-	if err != nil {
-		return nil, fmt.Errorf("parse primary subnet: %w", err)
-	}
-	validatorIDs, err := loadValidatorIDs(ctx, pClient, subnetID)
+	vdrList, err := pClient.GetCurrentValidators(ctx, subnetID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get validators: %w", err)
 	}
+	validatorIDs := sortedNodeIDs(vdrList)
 	log.Printf("fetch: validator_set_size=%d", len(validatorIDs))
 
 	peerInfos, err := discoverPeers(ctx, infoClient, validatorIDs)
@@ -179,20 +216,35 @@ func dial(cfg Config) (*Fetcher, error) {
 	}
 	log.Printf("fetch: peer_candidates=%d", len(peerInfos))
 
+	// The pool holds the peers that can actually serve this chain. On the
+	// primary network that is everything the bootstrap node knows. On an L1 it
+	// is exactly the subnet's validators: no other peer tracks the subnet, and
+	// the network would drop every message we addressed to one.
 	peerIDs := set.NewSet[ids.NodeID](len(peerInfos))
 	for _, p := range peerInfos {
 		peerIDs.Add(p.ID)
 	}
+	if cfg.l1() {
+		peerIDs = set.Of(validatorIDs...)
+	}
 
 	pool := newPeerPool()
 	handler := newHandler(peerIDs, pool)
+
+	// Tracking the subnet is what makes the handshake advertise it and the
+	// network keep those peers. NEVER the primary ID: avalanchego rejects a
+	// tracked set containing it (errTrackingPrimaryNetwork).
+	tracked := set.Set[ids.ID]{}
+	if cfg.l1() {
+		tracked = set.Of(subnetID)
+	}
 
 	vdrs := &permissiveValidators{Manager: validators.NewManager()}
 	netCfg, err := network.NewTestNetworkConfig(
 		prometheus.NewRegistry(),
 		networkID,
 		vdrs,
-		set.Set[ids.ID]{},
+		tracked,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("NewTestNetworkConfig: %w", err)
@@ -228,6 +280,29 @@ func dial(cfg Config) (*Fetcher, error) {
 		dispatchErrCh <- net.Dispatch()
 	}()
 
+	// Loading the L1's validators into the manager AFTER the network exists is
+	// the whole mechanism: it fires ipTracker.OnValidatorAdded, so the network
+	// starts wanting those nodes' signed IPs and dials them the moment ordinary
+	// PeerList gossip carries one. Nothing else reaches an ACP-77 L1 validator,
+	// which need not be a primary-network validator and is absent from every
+	// public node's info.peers.
+	if cfg.l1() {
+		added := 0
+		for _, v := range vdrList {
+			validationID := v.TxID
+			if v.ValidationID != nil {
+				validationID = *v.ValidationID
+			}
+			if err := vdrs.AddStaker(subnetID, v.NodeID, nil, validationID, v.Weight); err == nil {
+				added++
+			}
+		}
+		log.Printf("fetch: registered %d/%d subnet validators for IP discovery", added, len(vdrList))
+	}
+
+	// The bootstrap node's peers are the gossip entry point either way: on an
+	// L1 none of them tracks the subnet, they just carry the PeerList messages
+	// that name the validators.
 	for _, p := range peerInfos {
 		net.ManuallyTrack(p.ID, peerAddr(p))
 	}
@@ -238,12 +313,18 @@ func dial(cfg Config) (*Fetcher, error) {
 	}
 	warmupPeers(ctx, dispatchErrCh, handler.connectedCh, peerIDs, defaultPeerWarmup)
 
-	genesisID, err := computeGenesisID(networkID)
-	if err != nil {
-		net.StartClose()
-		return nil, fmt.Errorf("compute genesis id: %w", err)
+	// The C-chain's genesis container ID is computable offline and is the walk
+	// terminator there. An L1's genesis is not needed for that: no chain serves
+	// genesis over GetAncestors, so the walk ends on the block at height 1
+	// whatever the chain (see walkSpan).
+	var genesisID ids.ID
+	if !cfg.l1() {
+		if genesisID, err = computeGenesisID(networkID); err != nil {
+			net.StartClose()
+			return nil, fmt.Errorf("compute genesis id: %w", err)
+		}
+		log.Printf("fetch: genesis_container_id=%s", genesisID)
 	}
-	log.Printf("fetch: genesis_container_id=%s", genesisID)
 
 	return &Fetcher{
 		net:           net,
@@ -252,6 +333,7 @@ func dial(cfg Config) (*Fetcher, error) {
 		creator:       creator,
 		networkID:     networkID,
 		chainID:       chainID,
+		subnetID:      subnetID,
 		genesisID:     genesisID,
 		dispatchErrCh: dispatchErrCh,
 	}, nil
@@ -482,7 +564,7 @@ func (f *Fetcher) request(ctx context.Context, peer ids.NodeID, tip ids.ID) (anc
 	f.requestsSent.Add(1)
 	f.inFlight.Add(1)
 	defer f.inFlight.Add(-1)
-	f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, avaconstants.PrimaryNetworkID, subnets.NoOpAllower)
+	f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, f.subnetID, subnets.NoOpAllower)
 
 	t := time.NewTimer(defaultRequestTimeout)
 	defer t.Stop()
@@ -643,7 +725,7 @@ func (f *Fetcher) acceptedFrontier(ctx context.Context) (ids.ID, error) {
 				results <- ids.Empty
 				return
 			}
-			f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, avaconstants.PrimaryNetworkID, subnets.NoOpAllower)
+			f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, f.subnetID, subnets.NoOpAllower)
 			t := time.NewTimer(defaultRequestTimeout)
 			defer t.Stop()
 			select {
@@ -727,11 +809,7 @@ func (f *Fetcher) FollowTip(ctx context.Context) error {
 
 // ---- small helpers ----
 
-func loadValidatorIDs(ctx context.Context, c *platformvm.Client, subnetID ids.ID) ([]ids.NodeID, error) {
-	list, err := c.GetCurrentValidators(ctx, subnetID, nil)
-	if err != nil {
-		return nil, err
-	}
+func sortedNodeIDs(list []platformvm.ClientPermissionlessValidator) []ids.NodeID {
 	seen := set.NewSet[ids.NodeID](len(list))
 	out := make([]ids.NodeID, 0, len(list))
 	for _, v := range list {
@@ -742,9 +820,14 @@ func loadValidatorIDs(ctx context.Context, c *platformvm.Client, subnetID ids.ID
 		out = append(out, v.NodeID)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-	return out, nil
+	return out
 }
 
+// discoverPeers returns the bootstrap node's peers, preferring the ones that
+// are validators of our subnet. Zero matches is NORMAL for an L1 (post-ACP-77
+// its validators need not validate the primary network and no public node's
+// info.peers lists them), so it falls back to the full peer list, which is only
+// ever the gossip entry point.
 func discoverPeers(ctx context.Context, c *info.Client, validatorIDs []ids.NodeID) ([]info.Peer, error) {
 	if len(validatorIDs) > 0 {
 		peers, err := c.Peers(ctx, validatorIDs)
@@ -752,6 +835,7 @@ func discoverPeers(ctx context.Context, c *info.Client, validatorIDs []ids.NodeI
 			sort.Slice(peers, func(i, j int) bool { return peers[i].ID.String() < peers[j].ID.String() })
 			return peers, nil
 		}
+		log.Printf("fetch: none of the %d subnet validators are in the bootstrap node's peer list, using it for gossip only", len(validatorIDs))
 	}
 	peers, err := c.Peers(ctx, nil)
 	if err != nil {

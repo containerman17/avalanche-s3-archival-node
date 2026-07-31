@@ -31,14 +31,14 @@ const vdrRefreshInterval = time.Hour
 // archival-pool walk.
 func (f *Fetcher) Follow(ctx context.Context) error {
 	vdrs := validators.NewManager()
-	weights, err := crossCheckedWeights(ctx, f.vdrSources())
+	weights, err := crossCheckedWeights(ctx, f.vdrSources(), f.subnetID)
 	if err != nil {
 		return fmt.Errorf("validator set: %w", err)
 	}
-	if err := reconcileValidators(vdrs, weights); err != nil {
+	if err := reconcileValidators(vdrs, weights, f.subnetID); err != nil {
 		return err
 	}
-	totalWeight, _ := vdrs.TotalWeight(avaconstants.PrimaryNetworkID)
+	totalWeight, _ := vdrs.TotalWeight(f.subnetID)
 	log.Printf("fetch: validator set loaded validators=%d total_weight=%d",
 		len(weights), totalWeight)
 	go f.refreshValidators(ctx, vdrs)
@@ -152,7 +152,7 @@ type consensusNet struct {
 func (n *consensusNet) NextRequestID() uint32 { return n.f.reqIDCounter.Add(1) }
 
 func (n *consensusNet) SampleValidators(k int) ([]ids.NodeID, error) {
-	return n.vdrs.Sample(avaconstants.PrimaryNetworkID, k)
+	return n.vdrs.Sample(n.f.subnetID, k)
 }
 
 func (n *consensusNet) IsConnected(nodeID ids.NodeID) bool {
@@ -172,7 +172,7 @@ func (n *consensusNet) SendGet(nodeID ids.NodeID, requestID uint32, containerID 
 	if err != nil {
 		return err
 	}
-	n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(nodeID)}, avaconstants.PrimaryNetworkID, subnets.NoOpAllower)
+	n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(nodeID)}, n.f.subnetID, subnets.NoOpAllower)
 	return nil
 }
 
@@ -181,14 +181,14 @@ func (n *consensusNet) SendPullQuery(nodeIDs set.Set[ids.NodeID], requestID uint
 	if err != nil {
 		return err
 	}
-	n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: nodeIDs}, avaconstants.PrimaryNetworkID, subnets.NoOpAllower)
+	n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: nodeIDs}, n.f.subnetID, subnets.NoOpAllower)
 	return nil
 }
 
 // --- validator set: multiple cross-checked RPC sources (recorded ruling:
 // no single external RPC decides tip trust; RPC stays off the latency path) ---
 
-func fetchWeights(ctx context.Context, uri string) (map[ids.NodeID]uint64, error) {
+func fetchWeights(ctx context.Context, uri string, subnetID ids.ID) (map[ids.NodeID]uint64, error) {
 	// A bare node URI gets the standard /ext/P path; a URI already naming an
 	// /ext/... path is used verbatim (some public providers only serve
 	// /ext/bc/P).
@@ -196,7 +196,7 @@ func fetchWeights(ctx context.Context, uri string) (map[ids.NodeID]uint64, error
 	if strings.Contains(uri, "/ext/") {
 		client = &platformvm.Client{Requester: rpc.NewEndpointRequester(uri)}
 	}
-	list, err := client.GetCurrentValidators(ctx, avaconstants.PrimaryNetworkID, nil)
+	list, err := client.GetCurrentValidators(ctx, subnetID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -207,18 +207,31 @@ func fetchWeights(ctx context.Context, uri string) (map[ids.NodeID]uint64, error
 	return weights, nil
 }
 
-// crossCheckedWeights fetches the validator set from every source and
-// requires all successful answers to agree on >=95% of stake (boundary churn
-// between two RPC calls legitimately moves a sliver of stake).
-func crossCheckedWeights(ctx context.Context, uris []string) (map[ids.NodeID]uint64, error) {
+// crossCheckedWeights fetches the validator set from every source and requires
+// all successful answers to agree.
+//
+// HOW MUCH THEY MUST AGREE DEPENDS ON THE SUBNET, and it is not a tuning knob:
+//   - Primary network: >=95% of stake. Delegations start and stop every block,
+//     so two RPC calls seconds apart legitimately differ by a sliver, and with
+//     ~600 validators no single one is anywhere near 5% of stake.
+//   - An L1 (ACP-77): EXACT. Its weights are the static registration weights
+//     from RegisterL1ValidatorTx, not a balance: the continuous fee drains the
+//     separate `balance` field and never moves `weight`. So there is no churn
+//     to absorb, and the 95% band is mis-calibrated anyway (FIFA has 25
+//     validators, one of them 38% of the total weight, so a single validator
+//     joining can blow past 5% while a large one leaving cannot be
+//     distinguished from a lying source). Exact agreement is the honest rule:
+//     any difference is a real registration event, and the caller retries.
+func crossCheckedWeights(ctx context.Context, uris []string, subnetID ids.ID) (map[ids.NodeID]uint64, error) {
 	var (
 		first    map[ids.NodeID]uint64
 		firstURI string
 		ok       int
 	)
+	exact := subnetID != avaconstants.PrimaryNetworkID
 	for _, uri := range uris {
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		w, err := fetchWeights(cctx, uri)
+		w, err := fetchWeights(cctx, uri, subnetID)
 		cancel()
 		if err != nil {
 			log.Printf("fetch: validator source %s failed: %v", uri, err)
@@ -229,7 +242,7 @@ func crossCheckedWeights(ctx context.Context, uris []string) (map[ids.NodeID]uin
 			first, firstURI = w, uri
 			continue
 		}
-		if err := weightsAgree(first, w); err != nil {
+		if err := weightsAgree(first, w, exact); err != nil {
 			return nil, fmt.Errorf("validator sets disagree between %s and %s: %w", firstURI, uri, err)
 		}
 	}
@@ -242,7 +255,7 @@ func crossCheckedWeights(ctx context.Context, uris []string) (map[ids.NodeID]uin
 	return first, nil
 }
 
-func weightsAgree(a, b map[ids.NodeID]uint64) error {
+func weightsAgree(a, b map[ids.NodeID]uint64, exact bool) error {
 	var totalA, totalB, agreed uint64
 	for id, w := range a {
 		totalA += w
@@ -257,18 +270,24 @@ func weightsAgree(a, b map[ids.NodeID]uint64) error {
 	if maxTotal == 0 {
 		return fmt.Errorf("empty validator sets")
 	}
+	if exact {
+		if len(a) != len(b) || agreed != maxTotal {
+			return fmt.Errorf("sets differ (%d vs %d validators, %d of %d weight agrees) and this subnet's weights are static, so a difference is a real registration or a bad source",
+				len(a), len(b), agreed, maxTotal)
+		}
+		return nil
+	}
 	if float64(agreed) < 0.95*float64(maxTotal) {
 		return fmt.Errorf("only %.1f%% of stake agrees", 100*float64(agreed)/float64(maxTotal))
 	}
 	return nil
 }
 
-// reconcileValidators diffs the manager's primary-network set against the
-// fetched weights: new validators are added, changed weights adjusted,
-// missing validators removed. Weights of zero are dropped. (Ported verbatim
-// from flatstate follower/net.)
-func reconcileValidators(m validators.Manager, weights map[ids.NodeID]uint64) error {
-	subnetID := avaconstants.PrimaryNetworkID
+// reconcileValidators diffs the manager's set for subnetID against the fetched
+// weights: new validators are added, changed weights adjusted, missing
+// validators removed. Weights of zero are dropped. (Ported verbatim from
+// flatstate follower/net.)
+func reconcileValidators(m validators.Manager, weights map[ids.NodeID]uint64, subnetID ids.ID) error {
 	for _, id := range m.GetValidatorIDs(subnetID) {
 		cur := m.GetWeight(subnetID, id)
 		want := weights[id]
@@ -305,12 +324,12 @@ func (f *Fetcher) refreshValidators(ctx context.Context, vdrs validators.Manager
 			return
 		case <-t.C:
 		}
-		weights, err := crossCheckedWeights(ctx, f.vdrSources())
+		weights, err := crossCheckedWeights(ctx, f.vdrSources(), f.subnetID)
 		if err != nil {
 			log.Printf("fetch: validator refresh failed (keeping last-good set): %v", err)
 			continue
 		}
-		if err := reconcileValidators(vdrs, weights); err != nil {
+		if err := reconcileValidators(vdrs, weights, f.subnetID); err != nil {
 			log.Printf("fetch: validator reconcile failed: %v", err)
 		}
 	}
