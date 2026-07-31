@@ -31,12 +31,21 @@ import (
 // tx-bearing blocks have no captured records is REFUSED, not backfilled
 // (corpora are disposable by ruling; see gatherEpoch).
 //
-// outDir is where sealed epoch files land (usually dir itself; a separate
-// dir cuts an alternate epoch size from the same raw captures without
-// touching existing epochs).
-func SealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte) error {
-	return sealEpochs(dir, out, epochTxs, chainRoot)
+// Epoch boundaries come from EpochTxsAt alone (no flag, no config): the epoch
+// index is how many epochs are already sealed, so a resumed seal cuts exactly
+// where an uninterrupted one would.
+//
+// outDir is where sealed epoch files land (usually dir itself; a separate dir
+// rebuilds the epochs from the same raw captures without touching the
+// existing ones).
+func SealEpochs(dir string, out *dist.Store, chainRoot [32]byte) error {
+	return sealEpochs(dir, out, chainRoot)
 }
+
+// epochTxsAt is the schedule the seal loop reads, indirected ONLY so package
+// tests can cut epochs of ten txs instead of a quarter million. The production
+// path has no knob.
+var epochTxsAt = EpochTxsAt
 
 // hashBytes decodes a hex sha256 artifact name into the footer's link field.
 func hashBytes(hash string) ([32]byte, error) {
@@ -60,7 +69,7 @@ func setLatestEpoch(st *dist.Store, hash string) error {
 	return st.SetLatest(l)
 }
 
-func sealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte) error {
+func sealEpochs(dir string, out *dist.Store, chainRoot [32]byte) error {
 	store, err := OpenReadOnly(dir)
 	if err != nil {
 		return err
@@ -84,6 +93,10 @@ func sealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte
 	// epoch's own hash, or the chain root for the very first epoch.
 	prev := chainRoot
 	next := uint64(1) // block 0 is genesis: no container, state in the alloc
+	// The index of the epoch about to be cut, which is what picks its size:
+	// sealing is strictly sequential from block 1, so it is simply how many
+	// epochs are already there.
+	idx := len(set.Epochs)
 	if head, ok := set.Head(); ok {
 		next = head.End() + 1
 		if prev, err = hashBytes(head.Hash); err != nil {
@@ -97,12 +110,13 @@ func sealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte
 	}
 
 	for {
+		epochTxs := epochTxsAt(idx)
 		in, rawBytes, err := gatherEpoch(store, reader, next, execHead, epochTxs)
 		if err != nil {
 			return err
 		}
 		if in == nil {
-			log.Printf("seal: tail %d..%d stays raw (below EpochTxs=%d)", next, execHead, epochTxs)
+			log.Printf("seal: tail %d..%d stays raw (below epoch %d's %d txs)", next, execHead, idx, epochTxs)
 			break
 		}
 		t0 := time.Now()
@@ -139,6 +153,7 @@ func sealEpochs(dir string, out *dist.Store, epochTxs uint64, chainRoot [32]byte
 			e.Close()
 		}
 		next = in.Start + uint64(len(in.Containers))
+		idx++
 	}
 
 	return deleteSealedRaw(dir, next-1)
@@ -153,7 +168,7 @@ func (r rawSizes) total() uint64 {
 }
 
 // gatherEpoch collects blocks from start until the cumulative tx count
-// reaches EpochTxs (that block included). nil input = not enough txs
+// reaches epochTxs (that block included). nil input = not enough txs
 // materialized yet (tail stays raw).
 func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uint64) (*EpochInput, rawSizes, error) {
 	in := &EpochInput{

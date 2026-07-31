@@ -86,12 +86,9 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 // All hardcoded parameters below are pre-freeze tunables (user directive:
 // constants in code, no config).
 const (
-	// EpochTxs is the epoch boundary: an epoch seals at the first block
-	// whose cumulative tx count reaches it. PRE-FREEZE TUNABLE; sized for
-	// the mainnet 0-100k measurement corpus (93,870 regular txs measured
-	// 2026-07-18) so it yields 3 sealed epochs plus a raw tail. The
-	// full-mainnet target per DESIGN.md is 10M.
-	EpochTxs = 25_000
+	// The epoch boundary schedule, see EpochTxsAt.
+	epochTxsBase = 250_000
+	epochTxsCap  = 6 // doublings before the size stops growing (250k << 6 = 16M)
 
 	framedGroup    = 16        // containers/headers per zstd frame (07-17: 2.24x, 34us access)
 	dictTargetSize = 512 << 10 // 07-17 experiment optimum
@@ -150,6 +147,22 @@ const (
 
 	logsDictTarget = 128 << 10 // dedicated logs dict (measured better than container dict)
 )
+
+// EpochTxsAt is the epoch boundary: epoch i seals at the first block whose
+// cumulative tx count reaches min(16M, 250k << i), i.e. 250k, 500k, 1M, 2M,
+// 4M, 8M, then 16M forever (cumulative boundaries 0.25M, 0.75M, 1.75M, 3.75M,
+// 7.75M, 15.75M, 31.75M, +16M each). A PURE FUNCTION OF THE EPOCH INDEX,
+// identical on every chain and every VM kind, with no flag and no config, so
+// two honest nodes cut byte-identical boundaries without talking to each
+// other. User ruling 2026-07-31; the rationale (small chains seal early
+// instead of hoarding an unevictable raw tail, giants converge to a ~65-80
+// epoch shape) is in DESIGN.md.
+func EpochTxsAt(i int) uint64 {
+	if i > epochTxsCap {
+		i = epochTxsCap
+	}
+	return epochTxsBase << i
+}
 
 // Section indexes into the footer table.
 const (

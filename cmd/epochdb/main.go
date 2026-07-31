@@ -197,7 +197,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120]")
-	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet | --chain <path.json>] [--epoch-txs <n>]")
+	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet | --chain <path.json>]")
 	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet | --chain <path.json>] [--frontier] [--verify]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet | --chain <path.json>] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
@@ -221,9 +221,8 @@ func cookMain(args []string) {
 func sealMain(args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	outDir := fs.String("out", "", "directory the sealed epochs are published into (default --data; a separate dir cuts an alternate epoch size from the same raws)")
+	outDir := fs.String("out", "", "directory the sealed epochs are published into (default --data; a separate dir rebuilds them from the same raws)")
 	_, resolveChain := chainFlags(fs)
-	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "epoch boundary tx count override")
 	fs.Parse(args)
 	if *outDir == "" {
 		*outDir = *dataDir
@@ -245,7 +244,7 @@ func sealMain(args []string) {
 	}
 	// Close marks the chunk cache clean, so the next process starts warm.
 	defer out.Close()
-	if err := state.SealEpochs(*dataDir, out, *epochTxs, chainRoot); err != nil {
+	if err := state.SealEpochs(*dataDir, out, chainRoot); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
 }

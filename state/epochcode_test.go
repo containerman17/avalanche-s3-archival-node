@@ -195,8 +195,9 @@ func TestSealCodeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 3 txs/block, boundary 10 => epochs 1-4 and 5-8.
+	fixedEpochTxs(t, 10)
 	cas := testStore(t, dir)
-	if err := sealEpochs(dir, cas, 10, [32]byte{}); err != nil {
+	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -21,6 +21,30 @@ func synthRcpt(nTxs int, n uint64) []byte {
 	return EncodeTailRcpt(nil, rr)
 }
 
+// fixedEpochTxs pins the seal schedule to a flat n for the duration of a
+// test. The real schedule starts at 250,000 txs, so a synthetic corpus of a
+// few dozen txs would seal nothing at all; this is the only override that
+// exists and it is test-only (see epochTxsAt).
+func fixedEpochTxs(t *testing.T, n uint64) {
+	prev := epochTxsAt
+	t.Cleanup(func() { epochTxsAt = prev })
+	epochTxsAt = func(int) uint64 { return n }
+}
+
+// TestEpochTxsSchedule pins the ruled boundary schedule: doubling from 250k,
+// flat at 16M from epoch 6 on, and never wrapping at a large index.
+func TestEpochTxsSchedule(t *testing.T) {
+	want := []uint64{250_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 16_000_000, 16_000_000}
+	for i, w := range want {
+		if got := EpochTxsAt(i); got != w {
+			t.Fatalf("EpochTxsAt(%d) = %d, want %d", i, got, w)
+		}
+	}
+	if got := EpochTxsAt(1000); got != 16_000_000 {
+		t.Fatalf("EpochTxsAt(1000) = %d, want 16000000", got)
+	}
+}
+
 // TestSealCutAndResume drives the sealer end-to-end on synthetic staging +
 // capture: fixed 3 txs/block, boundary at 10 txs => epochs of 4 blocks;
 // blocks beyond the exec head stay raw; re-running seals nothing new.
@@ -84,8 +108,9 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// 3 txs/block, boundary 10 => blocks 1-4 (12 txs), 5-8 (12 txs); 9,10
 	// beyond the exec head.
+	fixedEpochTxs(t, 10)
 	cas := testStore(t, dir)
-	if err := sealEpochs(dir, cas, 10, [32]byte{}); err != nil {
+	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	set, err := OpenEpochSet(cas)
@@ -143,7 +168,7 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// resume: nothing new to seal
 	before, _ := os.ReadDir(dir)
-	if err := sealEpochs(dir, cas, 10, [32]byte{}); err != nil {
+	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadDir(dir)

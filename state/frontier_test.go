@@ -72,8 +72,9 @@ func buildFrontierEpochs(t *testing.T, dir string) *EpochSet {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
+	fixedEpochTxs(t, 12)
 	cas := testStore(t, dir)
-	if err := sealEpochs(dir, cas, 12, [32]byte{}); err != nil {
+	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	set, err := OpenEpochSet(cas)
