@@ -267,10 +267,23 @@ func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params
 			chainCfg, chainCtx, blockCtx, &gasLeft, statedb,
 			header, tx, &usedGas, vm.Config{},
 		)
+		// A statedb read failure is RECORDED, not returned: geth's
+		// getDeleteStateObject calls setError and hands back an empty account,
+		// so a re-execution over a height the cook has not indexed yet reads
+		// every account as nonce 0 and either fails with a nonsense
+		// "nonce too high ... state: 0" or, worse, succeeds against zeroed
+		// state and returns wrong receipts. Surface the read error instead, so
+		// this path gives the same clean cook-lag refusal eth_call does.
+		if dbErr := statedb.Error(); dbErr != nil {
+			return nil, dbErr
+		}
 		if err != nil {
 			return nil, fmt.Errorf("tx %d: %w", i, err)
 		}
 		receipts = append(receipts, receipt)
+	}
+	if dbErr := statedb.Error(); dbErr != nil {
+		return nil, dbErr
 	}
 	if err := receipts.DeriveFields(chainCfg, blk.Hash(), n, header.Time, header.BaseFee, nil, blk.Transactions()); err != nil {
 		return nil, fmt.Errorf("derive receipt fields: %w", err)
