@@ -176,6 +176,8 @@ func main() {
 		rpcBenchMain(os.Args[2:])
 	case "seal":
 		sealMain(os.Args[2:])
+	case "publish":
+		publishMain(os.Args[2:])
 	case "bootstrap":
 		bootstrapMain(os.Args[2:])
 	case "verify":
@@ -201,6 +203,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120]")
 	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet | --chain <path.json>]")
+	fmt.Fprintln(os.Stderr, "       epochdb publish [--data <dir>]  (upload the spool to the bucket, then release the local copies; needs EPOCHDB_S3_*)")
 	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet | --chain <path.json>] [--frontier] [--verify]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet | --chain <path.json>] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")

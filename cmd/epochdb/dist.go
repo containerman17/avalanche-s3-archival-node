@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"log"
 
@@ -20,6 +21,32 @@ import (
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/state"
 )
+
+// publishMain uploads whatever the spool holds and unlinks the local copy once
+// the bucket confirms it: one shot of a serving node's syncLoop, for a producer
+// box that only seals and never serves. Idempotent (an artifact the bucket
+// already has costs one HEAD) and safe to repeat.
+func publishMain(args []string) {
+	fs := flag.NewFlagSet("publish", flag.ExitOnError)
+	dataDir := fs.String("data", "./data", "directory whose spool is uploaded")
+	fs.Parse(args)
+	st, err := dist.Open(*dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: publish: %v", err)
+	}
+	if !st.Remote() {
+		st.Close()
+		log.Fatalf("epochdb: publish: no EPOCHDB_S3_ENDPOINT configured, there is nowhere to publish to")
+	}
+	if err := st.Sync(); err != nil {
+		st.Close()
+		log.Fatalf("epochdb: publish: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		log.Fatalf("epochdb: publish: %v", err)
+	}
+	log.Printf("publish: spool uploaded and released")
+}
 
 // bootstrapChain walks the hash chain from the `latest` pointer and writes the
 // local index. Returns the number of epochs indexed. `latest` names ONE thing,

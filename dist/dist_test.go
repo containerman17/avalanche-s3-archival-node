@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -93,6 +95,24 @@ func TestStoreLocalRoundtrip(t *testing.T) {
 	}
 	if _, err := os.Stat(s.SpoolPath(hash)); err != nil {
 		t.Fatalf("spool file must survive Sync without credentials: %v", err)
+	}
+}
+
+// TestPointersOutsideChunkCache pins the one thing that made the credentialed
+// path eat its own metadata: casfs deletes everything in its cache directory
+// that is not one of its sharded artifact files, so no pointer may live there.
+func TestPointersOutsideChunkCache(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(rootFor(dir), cacheName)
+	for _, name := range []string{LatestPointer, ChunkPointer(hex.EncodeToString(bytes.Repeat([]byte{3}, 32)))} {
+		p := s.pointerPath(name)
+		if p == cache || strings.HasPrefix(p, cache+string(os.PathSeparator)) {
+			t.Fatalf("pointer %q lands at %s, inside the casfs chunk cache %s", name, p, cache)
+		}
 	}
 }
 

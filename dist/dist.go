@@ -47,8 +47,13 @@ const (
 	// exactly the ranges a downloader fetches.
 	ChunkSize = casfs.DefaultChunkSize
 
-	spoolName = "cas"    // <data>/cas/<hash>: durable until uploaded
-	cacheName = "chunks" // <data>/chunks: disposable
+	spoolName = "cas" // <data>/cas/<hash>: durable until uploaded
+	// cacheName is the casfs chunk cache, disposable. It must NOT collide with
+	// a pointer name: casfs owns its cache directory and deletes everything in
+	// it that is not one of its own sharded artifact files, so a cache dir
+	// named "chunks" silently ate the chunk-list pointers at
+	// <data>/chunks/<hash> the moment a credentialed store opened.
+	cacheName = "chunkcache"
 	// LatestPointer names the one mutable object in the bucket. It is a HINT,
 	// never an authority: every artifact self-verifies by hash and the epoch
 	// footers chain back to the chain root.
