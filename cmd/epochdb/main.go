@@ -530,7 +530,8 @@ func fetchMain(args []string) {
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "directory for the segment files")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (sets default node URI)")
-	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network)")
+	chainPath := fs.String("chain", "", "chain descriptor JSON for an Avalanche L1, instead of --network")
+	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network, or per the descriptor's networkID)")
 	walks := fs.Int("walks", 16, "concurrent backward walks")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
@@ -540,15 +541,34 @@ func fetchMain(args []string) {
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set (--follow); default: --node URI only, with a warning")
 	fs.Parse(args)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var l1 *chain.Chain
+	if *chainPath != "" {
+		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		var err error
+		l1, err = chain.Load(lctx, *chainPath)
+		cancel()
+		if err != nil {
+			log.Fatalf("epochdb: --chain: %v", err)
+		}
+		// The descriptor, not --network, names the network to dial.
+		*network = avaconstants.NetworkIDToNetworkName[l1.NetworkID]
+	}
 	_, defNode, rpcURL := netParams(*network)
 	if *nodeURI == "" {
 		*nodeURI = defNode
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	if l1 != nil && *tipOverride != "" {
+		// resolveTipOverride's whole job is finding the pre-ProposerVM
+		// ceiling, below which a container ID equals the eth block hash.
+		// An L1 has no such range: ProposerVM is active from block 1.
+		log.Fatalf("epochdb: --tip-override is C-chain only (an L1 is ProposerVM-wrapped from block 1); use --tip with a container ID")
+	}
 
-	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer}
+	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer, Chain: l1}
 	if *vdrSources != "" {
 		cfg.VdrSources = strings.Split(*vdrSources, ",")
 	}

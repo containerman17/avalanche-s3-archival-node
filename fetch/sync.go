@@ -9,6 +9,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/genesis"
 	"github.com/ava-labs/avalanchego/ids"
+	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -28,7 +29,15 @@ func (f *Fetcher) Sync(ctx context.Context, walks int) error {
 	}
 	cps := genesis.GetCheckpoints(f.networkID, f.chainID)
 	if cps.Len() == 0 {
-		return fmt.Errorf("no embedded checkpoints for network %d chain %s", f.networkID, f.chainID)
+		if f.subnetID == avaconstants.PrimaryNetworkID {
+			return fmt.Errorf("no embedded checkpoints for network %d chain %s", f.networkID, f.chainID)
+		}
+		// An L1 has no embedded checkpoints and never will: avalanchego only
+		// ships them for the primary network. The single anchor IS the sync,
+		// so fall through to the frontier-anchored walk, which covers all of
+		// history on its first pass and then tracks the tip.
+		log.Printf("fetch: no embedded checkpoints (subnet %s): syncing from the accepted frontier", f.subnetID)
+		return f.FollowTip(ctx)
 	}
 	log.Printf("fetch: checkpoints=%d walks=%d", cps.Len(), walks)
 
@@ -173,7 +182,12 @@ func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error
 	return nil
 }
 
-// walkSpan walks backward from tip until the span floor, genesis, or block 0.
+// walkSpan walks backward from tip until the span floor or the bottom of
+// history. No chain serves its genesis container over GetAncestors, so the
+// bottom is the block at height 1, whose parent IS genesis: stopping there is
+// exact on the C-chain (where the genesis container ID is also computable
+// offline and short-circuits the walk one step earlier) and is the only
+// terminator on an L1.
 func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -205,7 +219,7 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 			if err != nil {
 				return fmt.Errorf("parse stored container at height %d: %w", lo, err)
 			}
-			if parsed.blockNumber == 0 {
+			if parsed.blockNumber <= 1 {
 				return nil
 			}
 			id = parsed.parentID
@@ -215,7 +229,7 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 		if err != nil {
 			return err
 		}
-		if parsed.blockNumber == 0 {
+		if parsed.blockNumber <= 1 {
 			return nil
 		}
 		id = parsed.parentID
