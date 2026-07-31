@@ -27,6 +27,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/triedb"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -77,9 +78,9 @@ type Config struct {
 	// per-block bisect on a boundary mismatch). <= 1 means one proposal
 	// per block, the classic path.
 	CommitEvery int
-	// NetworkID selects the chain (constants.FujiID / MainnetID).
-	// 0 defaults to Fuji.
-	NetworkID uint32
+	// Chain is the chain descriptor (genesis bytes, ids, VM kind).
+	// nil defaults to the Fuji C-chain.
+	Chain *chain.Chain
 	// StopAt makes Run return cleanly after executing this height
 	// (fixed-corpus builds; staging above it is disposable). 0 = never.
 	StopAt uint64
@@ -254,18 +255,30 @@ func New(cfg Config) (*Executor, error) {
 		return nil, fmt.Errorf("config: commit-every %d puts the crash walk-back %d blocks back, past one raw bucket (%d): max is %d",
 			cfg.CommitEvery, budget, state.BucketBlocks, (state.BucketBlocks-1-walkBackBudget)/64)
 	}
-	fetch.RegisterExtras()
-
-	networkID := cfg.NetworkID
-	if networkID == 0 {
-		networkID = avaconstants.FujiID
+	c := cfg.Chain
+	if c == nil {
+		var err error
+		if c, err = chain.CChain(avaconstants.FujiID); err != nil {
+			return nil, err
+		}
+		cfg.Chain = c
 	}
-	snowCtx, err := snowContextFor(networkID)
+	fetch.RegisterExtras(c.VMKind)
+	if c.VMKind != chain.Coreth {
+		return nil, fmt.Errorf("exec: %s execution is not built yet (M3)", c.VMKind)
+	}
+	// A data directory is single-kind for life: the two header encodings are
+	// mutually exclusive, so a dir built by one is unreadable by the other and
+	// there is no migration (delete and resync).
+	if err := cfg.Store.BindVMKind(string(c.VMKind)); err != nil {
+		return nil, err
+	}
+	snowCtx, err := snowContextFor(c)
 	if err != nil {
 		return nil, err
 	}
 
-	g, err := loadCChainGenesis(networkID, snowCtx)
+	g, err := loadCorethGenesis(c, snowCtx)
 	if err != nil {
 		return nil, err
 	}

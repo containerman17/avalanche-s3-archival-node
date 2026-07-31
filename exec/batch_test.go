@@ -11,6 +11,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -19,7 +20,7 @@ import (
 // DISABLED so reads must flow through the pending-batch overlay.
 func newBatchExecutor(t *testing.T, commitEvery int, src fakeSource) *Executor {
 	t.Helper()
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
 	store, err := state.Open(dir)
 	if err != nil {
@@ -142,7 +143,7 @@ func emptyChain(t *testing.T, e *Executor, n int, badRootAt int) fakeSource {
 
 func loadGenesisHash(t *testing.T, e *Executor) common.Hash {
 	t.Helper()
-	g, err := loadCChainGenesis(e.snowCtx.NetworkID, e.snowCtx)
+	g, err := loadCorethGenesis(mustCChain(t, e.snowCtx.NetworkID), e.snowCtx)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
@@ -39,7 +40,7 @@ func rpcBenchMain(args []string) {
 	if *remote == "" {
 		_, _, *remote = netParams(*network)
 	}
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	rng := rand.New(rand.NewSource(*seed))
 
 	// ---- sample real inputs ----
@@ -48,7 +49,7 @@ func rpcBenchMain(args []string) {
 		log.Fatalf("rpc-bench: %v", err)
 	}
 	defer store.Close()
-	g, err := exec.NetworkGenesis(execNetID(*network))
+	g, err := exec.ChainGenesis(mustCChain(*network))
 	if err != nil {
 		log.Fatalf("rpc-bench: %v", err)
 	}

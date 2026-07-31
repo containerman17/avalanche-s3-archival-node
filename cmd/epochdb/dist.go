@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/state"
@@ -68,7 +69,7 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 // Runs as its own step, not inside serve: it is a full pass over the corpus
 // (hours at mainnet scale) and a node has no business starting an RPC port
 // while it happens.
-func buildFrontier(dataDir string, st *dist.Store, networkID uint32) {
+func buildFrontier(dataDir string, st *dist.Store, c *chain.Chain) {
 	set, err := state.OpenEpochSet(st)
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap --frontier: %v", err)
@@ -80,10 +81,10 @@ func buildFrontier(dataDir string, st *dist.Store, networkID uint32) {
 	}
 	defer store.Close()
 	e, err := exec.New(exec.Config{
-		DataDir:   dataDir,
-		Blocks:    set, // containers come from the epochs; nothing is staged yet
-		Store:     store,
-		NetworkID: networkID,
+		DataDir: dataDir,
+		Blocks:  set, // containers come from the epochs; nothing is staged yet
+		Store:   store,
+		Chain:   c,
 	})
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap --frontier: exec.New: %v", err)

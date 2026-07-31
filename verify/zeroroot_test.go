@@ -29,6 +29,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -121,7 +122,7 @@ func vbFirewoodRoot(t *testing.T, rows []state.StateRow) common.Hash {
 }
 
 func TestZeroStorageRootPremise(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	rows := vbRows(t)
 
 	// Path A: the preimage-keyed trie API the executor and the no-execution

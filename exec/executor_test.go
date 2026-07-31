@@ -13,6 +13,7 @@ import (
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/rlp"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -32,7 +33,7 @@ func (f fakeSource) GetByHeight(n uint64) ([]byte, bool, error) {
 // hash. A fresh-opened Firewood only knows the zero hash until
 // SetHashAndHeight registers the real one.
 func TestRestartAtGenesisExecutesFirstBlock(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
 
 	store, err := state.Open(dir)
@@ -89,7 +90,7 @@ func TestRestartAtGenesisExecutesFirstBlock(t *testing.T) {
 // (deforestationdb LOG.md, block 33405). The fast path must skip Firewood
 // entirely and the restart must reconcile onto the empty chain tip.
 func TestEmptyBlockFastPathAcrossRestart(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
 
 	store, err := state.Open(dir)
@@ -103,7 +104,7 @@ func TestEmptyBlockFastPathAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	g, err := loadCChainGenesis(e.snowCtx.NetworkID, e.snowCtx)
+	g, err := loadCorethGenesis(mustCChain(t, e.snowCtx.NetworkID), e.snowCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +176,7 @@ func TestEmptyBlockFastPathAcrossRestart(t *testing.T) {
 // timestamp rule, and mainnet, with no scheduled Helicon, must never take
 // the SAE path.
 func TestHeliconBoundaryRule(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
 
 	store, err := state.Open(dir)
@@ -242,11 +243,11 @@ func TestHeliconBoundaryRule(t *testing.T) {
 		}
 	}
 
-	mainCtx, err := snowContextFor(avaconstants.MainnetID)
+	mainCtx, err := snowContextFor(mustCChain(t, avaconstants.MainnetID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	mg, err := loadCChainGenesis(avaconstants.MainnetID, mainCtx)
+	mg, err := loadCorethGenesis(mustCChain(t, avaconstants.MainnetID), mainCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +268,7 @@ func TestHeliconBoundaryRule(t *testing.T) {
 // staging"), so New refuses it up front instead of leaving the safety margin
 // to a numeric coincidence.
 func TestCommitEveryWalkBackGuard(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	newAt := func(commitEvery int) error {
 		dir := t.TempDir()
 		store, err := state.Open(dir)

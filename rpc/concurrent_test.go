@@ -15,6 +15,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
@@ -53,7 +54,7 @@ func newCorpusServer(t *testing.T) (*httptest.Server, uint64, combinedBlocks) {
 	if os.Getenv("EPOCHDB_TEST_NETWORK") == "mainnet" {
 		netID = avaconstants.MainnetID
 	}
-	g, err := exec.NetworkGenesis(netID)
+	g, err := exec.ChainGenesis(mustCChain(t, netID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,4 +190,15 @@ func TestConcurrentRequests(t *testing.T) {
 	}
 	wg.Wait()
 	fmt.Printf("concurrent test: %d requests served\n", goroutines*iters)
+}
+
+// mustCChain is the primary-network C-chain descriptor, what these tests run
+// against.
+func mustCChain(t *testing.T, networkID uint32) *chain.Chain {
+	t.Helper()
+	c, err := chain.CChain(networkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

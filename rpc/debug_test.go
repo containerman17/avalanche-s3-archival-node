@@ -11,6 +11,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
@@ -36,7 +37,7 @@ func openCorpus(t *testing.T) *corpusEnv {
 	if _, err := os.Stat(corpusDir + "/exechead"); err != nil {
 		t.Skip("fixed corpus not present")
 	}
-	gm, err := exec.NetworkGenesis(1)
+	gm, err := exec.ChainGenesis(mustCChain(t, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,4 +296,15 @@ func TestRawGettersRoundTrip(t *testing.T) {
 	if err := tx.UnmarshalBinary(res.(hexutil.Bytes)); err != nil || tx.Hash() != logging {
 		t.Fatalf("raw tx round-trip: err=%v hash=%s want %s", err, tx.Hash(), logging)
 	}
+}
+
+// mustCChain is the primary-network C-chain descriptor, what every test here
+// runs against.
+func mustCChain(t *testing.T, networkID uint32) *chain.Chain {
+	t.Helper()
+	c, err := chain.CChain(networkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

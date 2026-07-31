@@ -46,6 +46,7 @@ import (
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
@@ -83,7 +84,11 @@ type DB struct {
 // networkID selects the chain config and genesis alloc (0 = Fuji), exactly as
 // for serve; it must match the network the dir holds.
 func Open(dir string, networkID uint32) (*DB, error) {
-	g, err := exec.NetworkGenesis(networkID)
+	c, err := chain.CChain(networkID)
+	if err != nil {
+		return nil, err
+	}
+	g, err := exec.ChainGenesis(c)
 	if err != nil {
 		return nil, fmt.Errorf("genesis: %w", err)
 	}

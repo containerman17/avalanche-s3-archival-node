@@ -59,7 +59,7 @@ func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	port := fs.Int("port", 9650, "HTTP listen port")
-	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	network, resolveChain := chainFlags(fs)
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: --node URI only, with a warning")
 	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network)")
 	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
@@ -113,7 +113,8 @@ func serveMain(args []string) {
 	}
 	defer store.Close()
 
-	g, err := exec.NetworkGenesis(networkID)
+	c := resolveChain()
+	g, err := exec.ChainGenesis(c)
 	if err != nil {
 		log.Fatalf("epochdb: genesis: %v", err)
 	}
@@ -143,7 +144,7 @@ func serveMain(args []string) {
 		// guard); 64 keeps the crash walk-back at 8k blocks, well inside one
 		// 100k raw bucket.
 		CommitEvery: 64,
-		NetworkID:   networkID,
+		Chain:       c,
 	})
 	if err != nil {
 		log.Fatalf("epochdb: exec.New: %v", err)

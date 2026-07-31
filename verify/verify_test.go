@@ -13,6 +13,7 @@ import (
 	"github.com/ava-labs/libevm/trie"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
@@ -74,7 +75,7 @@ func storageRow(blk uint64, addr common.Address, slot common.Hash, val []byte, s
 // per-block state roots the headers carry.
 func buildChain(t *testing.T) []tblock {
 	t.Helper()
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	tdb, fw, db, err := newThrowawayFirewood(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -296,7 +297,7 @@ func runVerify(t *testing.T, dir string) (*Verifier, error) {
 		t.Fatal(err)
 	}
 	defer set.Close()
-	v, err := New(t.TempDir(), 0, 2)
+	v, err := New(t.TempDir(), nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,6 +29,8 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/platformvm"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/containerman17/epochdb/chain"
 )
 
 const (
@@ -109,7 +111,8 @@ type Fetcher struct {
 // New opens the flat-file store, dials the Fuji primary network, and waits
 // for a peer to connect. It does NOT start syncing; call Sync for that.
 func New(cfg Config) (*Fetcher, error) {
-	registerExtras()
+	// The fetcher still speaks the primary network only (subnet plumbing is M5).
+	RegisterExtras(chain.Coreth)
 
 	if cfg.NodeURI == "" {
 		cfg.NodeURI = DefaultNodeURI
@@ -136,7 +139,7 @@ func New(cfg Config) (*Fetcher, error) {
 // dial performs the network-only part of New: bootstrap RPC, P2P dial,
 // peer warmup, genesis ID computation. Used directly by the spike probe.
 func dial(cfg Config) (*Fetcher, error) {
-	registerExtras()
+	RegisterExtras(chain.Coreth)
 	if cfg.NodeURI == "" {
 		cfg.NodeURI = DefaultNodeURI
 	}

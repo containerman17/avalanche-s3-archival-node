@@ -19,6 +19,7 @@ import (
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
@@ -50,8 +51,8 @@ type bfEnv struct {
 	end      uint64 // last height to derive (logs.start - 1)
 }
 
-func openBfEnv(dataDir string, networkID uint32) (*bfEnv, func()) {
-	g, err := exec.NetworkGenesis(networkID)
+func openBfEnv(dataDir string, c *chain.Chain) (*bfEnv, func()) {
+	g, err := exec.ChainGenesis(c)
 	if err != nil {
 		log.Fatalf("backfill-logs: genesis: %v", err)
 	}
@@ -121,7 +122,7 @@ func backfillLogsMain(args []string) {
 		go func() { log.Println(http.ListenAndServe(*pprofAddr, nil)) }()
 	}
 
-	env, cleanup := openBfEnv(*dataDir, execNetID(*network))
+	env, cleanup := openBfEnv(*dataDir, mustCChain(*network))
 	defer cleanup()
 	bf, err := state.OpenLogsBackfill(*dataDir)
 	if err != nil {
@@ -250,7 +251,7 @@ func verifyLogsMain(args []string) {
 		_, _, *remote = netParams(*network)
 	}
 
-	env, cleanup := openBfEnv(*dataDir, execNetID(*network))
+	env, cleanup := openBfEnv(*dataDir, mustCChain(*network))
 	defer cleanup()
 	// Read-only: safe while a backfill writer is running.
 	bf, err := state.OpenLogsBackfillRO(*dataDir)

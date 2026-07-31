@@ -19,6 +19,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -50,7 +51,7 @@ func benchMain(args []string) {
 		log.Fatalf("ab-bench: open state layer: %v", err)
 	}
 	defer store.Close()
-	g, err := exec.NetworkGenesis(execNetID(*network))
+	g, err := exec.ChainGenesis(mustCChain(*network))
 	if err != nil {
 		log.Fatalf("ab-bench: genesis: %v", err)
 	}
@@ -245,7 +246,7 @@ func benchTxMain(args []string) {
 		_, _, *remote = netParams(*network)
 	}
 
-	fetch.RegisterExtras() // ParseEthBlock needs the coreth/libevm extras
+	fetch.RegisterExtras(chain.Coreth) // ParseEthBlock needs the coreth/libevm extras
 	rng := rand.New(rand.NewSource(*seed))
 	fr, err := fetch.OpenReader(*dataDir)
 	if err != nil {

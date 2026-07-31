@@ -24,6 +24,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -42,6 +43,43 @@ func parseContainerID(s string) (ids.ID, error) {
 		return ids.ToID(b)
 	}
 	return ids.FromString(s)
+}
+
+// chainFlags registers --network and --chain on fs. --network names a primary
+// network, whose C-chain descriptor comes from avalanchego's embedded config;
+// --chain points at a descriptor JSON for an Avalanche L1 (see chain.Load) and
+// wins when both are given. Returns the --network value (some commands still
+// need it for the default node/archive URLs) and a resolver.
+func chainFlags(fs *flag.FlagSet) (*string, func() *chain.Chain) {
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the primary network's C-chain)")
+	path := fs.String("chain", "", "chain descriptor JSON for an Avalanche L1, instead of --network")
+	return network, func() *chain.Chain {
+		if *path == "" {
+			c, err := chain.CChain(execNetID(*network))
+			if err != nil {
+				log.Fatalf("epochdb: --network: %v", err)
+			}
+			return c
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c, err := chain.Load(ctx, *path)
+		if err != nil {
+			log.Fatalf("epochdb: --chain: %v", err)
+		}
+		return c
+	}
+}
+
+// mustCChain is the descriptor for --network's primary-network C-chain, for
+// the commands that are C-chain-only by nature (the A/B benches against a
+// public archive RPC, the event-log backfill).
+func mustCChain(network string) *chain.Chain {
+	c, err := chain.CChain(execNetID(network))
+	if err != nil {
+		log.Fatalf("epochdb: --network: %v", err)
+	}
+	return c
 }
 
 // netParams resolves --network into (networkID, node URI, archive RPC URL).
@@ -159,9 +197,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120]")
-	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet] [--epoch-txs <n>]")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--frontier] [--verify]")
-	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--workers N]")
+	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet | --chain <path.json>] [--epoch-txs <n>]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet | --chain <path.json>] [--frontier] [--verify]")
+	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet | --chain <path.json>] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
 	os.Exit(2)
@@ -184,7 +222,7 @@ func sealMain(args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	outDir := fs.String("out", "", "directory the sealed epochs are published into (default --data; a separate dir cuts an alternate epoch size from the same raws)")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (the hash chain roots at this network's chain root, sha256 of its CreateChainTx genesisData)")
+	_, resolveChain := chainFlags(fs)
 	epochTxs := fs.Uint64("epoch-txs", state.EpochTxs, "epoch boundary tx count override")
 	fs.Parse(args)
 	if *outDir == "" {
@@ -192,16 +230,15 @@ func sealMain(args []string) {
 	} else if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
 	}
-	fetch.RegisterExtras()
+	c := resolveChain()
+	fetch.RegisterExtras(c.VMKind)
 
 	// Still no overlay and no EVM: the stored-logs/receipt sections are a byte
 	// copy of the executor's live capture, so seal never re-executes (the
-	// --workers flag went with the DeriveStored stage, 2026-07-29). --network
-	// is back only for the chain root the first epoch's footer links to.
-	chainRoot, err := dist.ChainRoot(execNetID(*network))
-	if err != nil {
-		log.Fatalf("epochdb: seal: %v", err)
-	}
+	// --workers flag went with the DeriveStored stage, 2026-07-29). The chain
+	// descriptor is back only for the chain root the first epoch's footer
+	// links to.
+	chainRoot := c.Root()
 	out, err := dist.Open(*outDir)
 	if err != nil {
 		log.Fatalf("epochdb: seal: %v", err)
@@ -232,17 +269,15 @@ func cookTxMain(args []string) {
 func bootstrapMain(args []string) {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (the chain root the walk must land on)")
+	_, resolveChain := chainFlags(fs)
 	frontier := fs.Bool("frontier", false, "after the walk, MERGE the epochs into a Firewood state frontier at the last sealed block, so serve can start executing at H+1 (reads every epoch's SST section once)")
 	doVerify := fs.Bool("verify", false, "after the walk, run the no-execution verification over the whole indexed set (pulls every byte)")
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
-	fetch.RegisterExtras()
+	c := resolveChain()
+	fetch.RegisterExtras(c.VMKind)
 
-	chainRoot, err := dist.ChainRoot(execNetID(*network))
-	if err != nil {
-		log.Fatalf("epochdb: bootstrap: %v", err)
-	}
+	chainRoot := c.Root()
 	st, err := dist.Open(*dataDir)
 	if err != nil {
 		log.Fatalf("epochdb: bootstrap: %v", err)
@@ -254,7 +289,7 @@ func bootstrapMain(args []string) {
 	}
 	log.Printf("bootstrap: %d epochs indexed, chain rooted at %x", epochs, chainRoot[:8])
 	if *frontier {
-		buildFrontier(*dataDir, st, execNetID(*network))
+		buildFrontier(*dataDir, st, c)
 	}
 	if !*doVerify {
 		return
@@ -264,7 +299,7 @@ func bootstrapMain(args []string) {
 		log.Fatalf("epochdb: bootstrap: %v", err)
 	}
 	defer os.RemoveAll(tmp)
-	blocks, wall, err := verify.VerifySet(st, tmp, execNetID(*network), *workers)
+	blocks, wall, err := verify.VerifySet(st, tmp, c, *workers)
 	if err != nil {
 		os.RemoveAll(tmp)
 		log.Fatalf("epochdb: bootstrap: verify FAIL after %d blocks in %s: %v", blocks, wall.Round(time.Second), err)
@@ -278,9 +313,10 @@ func bootstrapMain(args []string) {
 func verifyMain(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "directory with the sealed epochs")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (genesis anchor)")
+	_, resolveChain := chainFlags(fs)
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
+	c := resolveChain()
 
 	tmp, err := os.MkdirTemp(*dataDir, ".verify-")
 	if err != nil {
@@ -292,7 +328,7 @@ func verifyMain(args []string) {
 		log.Fatalf("epochdb: verify: %v", err)
 	}
 	defer st.Close()
-	blocks, wall, err := verify.VerifySet(st, tmp, execNetID(*network), *workers)
+	blocks, wall, err := verify.VerifySet(st, tmp, c, *workers)
 	if err != nil {
 		os.RemoveAll(tmp)
 		log.Fatalf("epochdb: verify: FAIL after %d blocks in %s: %v", blocks, wall.Round(time.Second), err)
@@ -306,7 +342,7 @@ func execMain(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory (staging segments + state layer)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address (e.g. localhost:6060)")
-	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	_, resolveChain := chainFlags(fs)
 	stateCacheGiB := fs.Int("state-cache", 6, "Go-side EVM read cache size in GiB (0 disables)")
 	verifyCache := fs.Bool("verify-cache", false, "re-read every cache hit through Firewood and panic on mismatch (slow, validation only)")
 	commitEvery := fs.Int("commit-every", 1000, "blocks per Firewood proposal (root verification at batch boundaries, per-block bisect on mismatch; 1 = classic per-block)")
@@ -339,7 +375,7 @@ func execMain(args []string) {
 		StateCacheBytes: uint64(*stateCacheGiB) << 30,
 		VerifyCache:     *verifyCache,
 		CommitEvery:     *commitEvery,
-		NetworkID:       execNetID(*network),
+		Chain:           resolveChain(),
 		StopAt:          *stopAt,
 	})
 	if err != nil {

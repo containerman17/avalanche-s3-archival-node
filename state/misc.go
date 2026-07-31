@@ -104,6 +104,9 @@ func (s *miscStore) Get(key []byte) ([]byte, bool) {
 func (s *miscStore) Put(key, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.f == nil { // read-only open with no misc.log present
+		return fmt.Errorf("misc.log: read-only store")
+	}
 	if cur, ok := s.m[string(key)]; ok && bytes.Equal(cur, value) {
 		return nil
 	}

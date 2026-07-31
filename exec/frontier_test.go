@@ -13,6 +13,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
@@ -211,7 +212,7 @@ func sealCorpus(t *testing.T, dir string, roots map[uint64]common.Hash, rows map
 // into its own Firewood. The merged frontier must hash to the same root, and
 // the node must then restart at H+1 as if it had replayed.
 func TestBuildFrontierMatchesReplayRoot(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	roots, rows := replayCorpus(t, t.TempDir())
 
 	dir := t.TempDir()
@@ -271,7 +272,7 @@ func TestBuildFrontierMatchesReplayRoot(t *testing.T) {
 // SETTLED block's root, so there is nothing to check the merge against. The
 // build must say so instead of reporting a root mismatch.
 func TestBuildFrontierRefusesSAE(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	roots, rows := replayCorpus(t, t.TempDir())
 	dir := t.TempDir()
 	set := sealCorpus(t, dir, roots, rows)

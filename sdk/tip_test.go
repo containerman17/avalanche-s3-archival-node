@@ -12,6 +12,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -27,7 +28,7 @@ import (
 // tip returns the block-2 value; drop the RescanRO call and the head never
 // moves at all.
 func TestTipLiveness(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
 
 	addr := common.HexToAddress("0xaaaa000000000000000000000000000000000001")

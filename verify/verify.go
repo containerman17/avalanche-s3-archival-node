@@ -26,6 +26,7 @@ import (
 	"github.com/ava-labs/libevm/trie"
 	"github.com/ava-labs/libevm/triedb"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -49,11 +50,14 @@ type Verifier struct {
 	blocks     uint64 // total verified
 }
 
-// New opens a fresh throwaway Firewood under tmpDir and anchors it at the
-// C-chain genesis of networkID. networkID 0 = anchorless test mode: start
-// from an empty trie and adopt the first header's ParentHash as anchor.
-func New(tmpDir string, networkID uint32, workers int) (*Verifier, error) {
-	fetch.RegisterExtras()
+// New opens a fresh throwaway Firewood under tmpDir and anchors it at c's
+// genesis. c == nil = anchorless test mode: start from an empty trie and adopt
+// the first header's ParentHash as anchor.
+func New(tmpDir string, c *chain.Chain, workers int) (*Verifier, error) {
+	if c != nil && c.VMKind != chain.Coreth {
+		return nil, fmt.Errorf("verify: %s verification is not built yet (M3)", c.VMKind)
+	}
+	fetch.RegisterExtras(chain.Coreth)
 	tdb, fw, db, err := newThrowawayFirewood(tmpDir)
 	if err != nil {
 		return nil, err
@@ -63,8 +67,8 @@ func New(tmpDir string, networkID uint32, workers int) (*Verifier, error) {
 	}
 	v := &Verifier{tmp: tmpDir, tdb: tdb, fw: fw, db: db, workers: workers, next: 1,
 		parentRoot: types.EmptyRootHash}
-	if networkID != 0 {
-		g, err := exec.NetworkGenesis(networkID)
+	if c != nil {
+		g, err := exec.ChainGenesis(c)
 		if err != nil {
 			tdb.Close()
 			return nil, err
@@ -409,7 +413,7 @@ func reconstructReceipts(e *state.Epoch, n uint64, txs types.Transactions) (type
 // it once the hash chain has been walked). Reads pull whatever bytes they need
 // through dist, so a node with S3 credentials verifies history it does not
 // hold locally. Returns total blocks and wall time for the runbook numbers.
-func VerifySet(st *dist.Store, tmpDir string, networkID uint32, workers int) (blocks uint64, wall time.Duration, err error) {
+func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (blocks uint64, wall time.Duration, err error) {
 	set, err := state.OpenEpochSet(st)
 	if err != nil {
 		return 0, 0, err
@@ -418,7 +422,7 @@ func VerifySet(st *dist.Store, tmpDir string, networkID uint32, workers int) (bl
 	if len(set.Epochs) == 0 {
 		return 0, 0, fmt.Errorf("no sealed epochs indexed in %s", st.Dir())
 	}
-	v, err := New(tmpDir, networkID, workers)
+	v, err := New(tmpDir, c, workers)
 	if err != nil {
 		return 0, 0, err
 	}

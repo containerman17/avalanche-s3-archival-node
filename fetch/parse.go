@@ -12,6 +12,9 @@ import (
 	proposerblock "github.com/ava-labs/avalanchego/vms/proposervm/block"
 	ethtypes "github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
+
+	"github.com/containerman17/epochdb/chain"
+	"github.com/containerman17/epochdb/fetch/sevm"
 )
 
 // C-Chain blocks and state use four libevm extras:
@@ -24,18 +27,50 @@ import (
 //     and writes match coreth's multi-coin slot layout. This one matters for
 //     state root verification even if we don't use coreth's VM directly.
 //
-// RegisterExtras installs the avalanchego graft submodule extras that
-// all C-Chain state-touching code paths depend on. Safe to call from
-// packages that don't open a Fetcher (e.g. debug/bench commands);
-// idempotent after the first call.
-var RegisterExtras = registerExtras
+// A subnet-evm chain uses its own set instead (see fetch/sevm). The two are
+// MUTUALLY EXCLUSIVE: libevm's extras registry is process-global and panics on
+// re-registration, and the header encodings disagree anyway (coreth has a
+// mandatory ExtDataHash field where subnet-evm goes straight to the optional
+// BaseFee). So a process registers exactly one kind, at start, and every later
+// call must name the same kind.
+var (
+	regMu   sync.Mutex
+	regKind chain.VMKind
+)
 
-var registerExtras = sync.OnceFunc(func() {
-	corethcore.RegisterExtras()
-	ccustomtypes.Register()
-	cparams.RegisterExtras()
-	extstate.RegisterExtras()
-})
+// RegisterExtras installs the libevm extras for one VM kind. Safe to call from
+// packages that don't open a Fetcher (e.g. debug/bench commands); idempotent
+// for the kind already registered, and a hard panic for the other one, since
+// mixing them would silently misdecode every header in the process.
+func RegisterExtras(kind chain.VMKind) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	if regKind != "" {
+		if regKind != kind {
+			panic(fmt.Sprintf("fetch: libevm extras already registered as %q, cannot also register %q in this process", regKind, kind))
+		}
+		return
+	}
+	switch kind {
+	case chain.Coreth:
+		corethcore.RegisterExtras()
+		ccustomtypes.Register()
+		cparams.RegisterExtras()
+		extstate.RegisterExtras()
+	case chain.SubnetEVM:
+		sevm.Register()
+	default:
+		panic(fmt.Sprintf("fetch: unknown VM kind %q", kind))
+	}
+	regKind = kind
+}
+
+// RegisteredKind reports the kind registered in this process, "" if none.
+func RegisteredKind() chain.VMKind {
+	regMu.Lock()
+	defer regMu.Unlock()
+	return regKind
+}
 
 // parsedContainer holds everything we need to store and continue walking,
 // plus what the consensus follower needs (parent hash, timestamp).

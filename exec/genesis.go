@@ -4,73 +4,73 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/ava-labs/avalanchego/genesis"
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
 	"github.com/ava-labs/avalanchego/graft/coreth/params/extras"
 	warpcontract "github.com/ava-labs/avalanchego/graft/coreth/precompile/contracts/warp"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/upgrade"
-	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/triedb"
+
+	"github.com/containerman17/epochdb/chain"
 )
 
-// snowContextFor builds the snow.Context the EVM sees. Both fields are
-// EXECUTION INPUTS, not bookkeeping, so both are derived from avalanchego's
-// embedded genesis rather than guessed:
+// snowContextFor builds the snow.Context the EVM sees. EVERY field is an
+// EXECUTION INPUT, not bookkeeping, so none of them may be left zero:
 //
-//   - AVAXAssetID: the atomic-tx state transfer credits imported AVAX by it.
-//   - ChainID: the C-Chain's blockchain ID, which the Warp precompile's
+//   - ChainID: the chain's own blockchain ID, which the Warp precompile's
 //     getBlockchainID() returns straight into EVM output. Leaving it zero
 //     diverged the state root at Fuji 29,955,803, the first block after
 //     Durango whose transaction called Warp: a TeleporterRegistry deploy
 //     baked the returned value into an immutable, so the deployed code (and
 //     the account's code hash) differed from the chain's.
-func snowContextFor(networkID uint32) (*snow.Context, error) {
-	cfg := genesis.GetConfig(networkID)
-	if cfg == nil {
-		return nil, fmt.Errorf("no embedded genesis config for network %d", networkID)
+//   - SubnetID: the primary network for the C-chain, the L1's own subnet
+//     otherwise. Warp signature verification reads it.
+//   - AVAXAssetID: the atomic-tx state transfer credits imported AVAX by it.
+//     C-CHAIN ONLY: atomic txs do not exist on subnet-evm, and an L1 on a
+//     network with no embedded config has no way to learn it.
+//   - CChainID: the primary network's C-chain, filled for any chain on a
+//     network whose config is embedded.
+func snowContextFor(c *chain.Chain) (*snow.Context, error) {
+	ctx := &snow.Context{
+		NetworkID: c.NetworkID,
+		SubnetID:  c.SubnetID,
+		ChainID:   c.BlockchainID,
 	}
-	genesisBytes, avaxAssetID, err := genesis.FromConfig(cfg)
+	cChainID, avaxAssetID, err := chain.PrimaryC(c.NetworkID)
 	if err != nil {
-		return nil, fmt.Errorf("build genesis for network %d: %w", networkID, err)
+		if c.VMKind == chain.Coreth {
+			return nil, err
+		}
+		// A subnet-evm chain on a network avalanchego does not embed (a local
+		// network): neither field is reachable and neither is an input for it.
+		return ctx, nil
 	}
-	cChain, err := genesis.VMGenesis(genesisBytes, avaconstants.EVMID)
-	if err != nil {
-		return nil, fmt.Errorf("locate C-Chain in genesis for network %d: %w", networkID, err)
+	ctx.CChainID = cChainID
+	if c.VMKind == chain.Coreth {
+		ctx.AVAXAssetID = avaxAssetID
 	}
-	return &snow.Context{
-		NetworkID:   networkID,
-		SubnetID:    avaconstants.PrimaryNetworkID,
-		ChainID:     cChain.ID(),
-		CChainID:    cChain.ID(),
-		AVAXAssetID: avaxAssetID,
-	}, nil
+	return ctx, nil
 }
 
-// loadCChainGenesis parses the C-Chain genesis for networkID from
-// avalanchego's embedded config and wires the Avalanche network upgrades
-// BEFORE SetEthUpgrades: without configExtra.NetworkUpgrades the
-// Avalanche phases never activate, state roots diverge at the first AP1
-// block, and SetEthUpgrades cannot place Berlin or London (Fuji
-// 184985/805078, mainnet 1640340/3308552). Mirrors
+// loadCorethGenesis parses the C-Chain genesis out of the descriptor and
+// wires the Avalanche network upgrades BEFORE SetEthUpgrades: without
+// configExtra.NetworkUpgrades the Avalanche phases never activate, state
+// roots diverge at the first AP1 block, and SetEthUpgrades cannot place
+// Berlin or London (Fuji 184985/805078, mainnet 1640340/3308552). Mirrors
 // coreth/plugin/evm/vm.go parseGenesis.
-func loadCChainGenesis(networkID uint32, snowCtx *snow.Context) (*corethcore.Genesis, error) {
-	cfg := genesis.GetConfig(networkID)
-	if cfg == nil {
-		return nil, fmt.Errorf("no embedded genesis config for network %d", networkID)
-	}
+func loadCorethGenesis(c *chain.Chain, snowCtx *snow.Context) (*corethcore.Genesis, error) {
 	var g corethcore.Genesis
-	if err := json.Unmarshal([]byte(cfg.CChainGenesis), &g); err != nil {
+	if err := json.Unmarshal(c.GenesisJSON, &g); err != nil {
 		return nil, fmt.Errorf("unmarshal C-Chain genesis: %w", err)
 	}
 
 	configExtra := cparams.GetExtra(g.Config)
 	configExtra.AvalancheContext = extras.AvalancheContext{SnowCtx: snowCtx}
-	configExtra.NetworkUpgrades = extras.GetNetworkUpgrades(upgrade.GetConfig(networkID))
+	configExtra.NetworkUpgrades = extras.GetNetworkUpgrades(upgrade.GetConfig(c.NetworkID))
 
 	// If Durango is scheduled, schedule the Warp precompile at the same
 	// time (its activation writes to state, so roots would diverge at the

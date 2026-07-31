@@ -19,6 +19,7 @@ import (
 
 	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -129,7 +130,7 @@ func settledMarkers(height uint64, c *gastime.Time) hook.Settled {
 // checks, the restart path that rebuilds the SAE parent from the ring, and
 // the hard stop on a bad settled root.
 func TestSAEChainAcrossBoundary(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
 
 	store, err := state.Open(dir)
@@ -142,7 +143,7 @@ func TestSAEChainAcrossBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	g, err := loadCChainGenesis(e.snowCtx.NetworkID, e.snowCtx)
+	g, err := loadCorethGenesis(mustCChain(t, e.snowCtx.NetworkID), e.snowCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,12 +241,12 @@ func TestSAEChainAcrossBoundary(t *testing.T) {
 // RulesHooks.MinimumGasConsumption), which is why saexec.Execute charges it
 // without any wiring of ours, and it must be inert below the boundary.
 func TestSAEGasFloor(t *testing.T) {
-	fetch.RegisterExtras()
-	snowCtx, err := snowContextFor(avaconstants.FujiID)
+	fetch.RegisterExtras(chain.Coreth)
+	snowCtx, err := snowContextFor(mustCChain(t, avaconstants.FujiID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := loadCChainGenesis(avaconstants.FujiID, snowCtx)
+	g, err := loadCorethGenesis(mustCChain(t, avaconstants.FujiID), snowCtx)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -235,3 +235,39 @@ func TestLiveStoreConcurrentReadWrite(t *testing.T) {
 		st.CodeCount()
 	}
 }
+
+// TestBindVMKind pins the no-migration rule: a data dir belongs to the VM kind
+// that built it, forever, and reopening it as the other kind is an error rather
+// than a silent misdecode of every header in it.
+func TestBindVMKind(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BindVMKind("coreth"); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	if err := st.BindVMKind("coreth"); err != nil {
+		t.Fatalf("rebind same kind: %v", err)
+	}
+	if err := st.BindVMKind("subnetevm"); err == nil {
+		t.Fatal("rebinding the other kind was accepted")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stamp survives a reopen: it is in misc.log, not in RAM.
+	st, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.BindVMKind("subnetevm"); err == nil {
+		t.Fatal("a reopened dir accepted the other kind")
+	}
+	if err := st.BindVMKind("coreth"); err != nil {
+		t.Fatalf("reopened dir rejected its own kind: %v", err)
+	}
+}

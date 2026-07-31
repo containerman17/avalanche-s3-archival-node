@@ -1,28 +1,39 @@
 package exec
 
 import (
+	"fmt"
+
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
 
-// NetworkGenesis returns the fully wired C-chain genesis (chain config
-// with Avalanche upgrades + alloc) for networkID, for read-side
-// consumers: the historical overlay needs the alloc as its
-// below-first-capture floor, the RPC server needs the chain config for
-// eth_call. networkID 0 defaults to Fuji.
-func NetworkGenesis(networkID uint32) (*corethcore.Genesis, error) {
-	fetch.RegisterExtras()
-	if networkID == 0 {
-		networkID = avaconstants.FujiID
+// ChainGenesis returns the fully wired genesis (chain config with Avalanche
+// upgrades + alloc) for a chain descriptor, for read-side consumers: the
+// historical overlay needs the alloc as its below-first-capture floor, the RPC
+// server needs the chain config for eth_call. nil means the Fuji C-chain.
+//
+// It also performs this process's one-and-only extras registration, for the
+// descriptor's VM kind.
+func ChainGenesis(c *chain.Chain) (*corethcore.Genesis, error) {
+	if c == nil {
+		var err error
+		if c, err = chain.CChain(avaconstants.FujiID); err != nil {
+			return nil, err
+		}
 	}
-	snowCtx, err := snowContextFor(networkID)
+	fetch.RegisterExtras(c.VMKind)
+	if c.VMKind != chain.Coreth {
+		return nil, fmt.Errorf("exec: %s genesis is not wired yet (subnet-evm execution is M3)", c.VMKind)
+	}
+	snowCtx, err := snowContextFor(c)
 	if err != nil {
 		return nil, err
 	}
-	return loadCChainGenesis(networkID, snowCtx)
+	return loadCorethGenesis(c, snowCtx)
 }
 
 // ParseEthBlock decodes a raw staging container (ProposerVM-wrapped or

@@ -13,6 +13,8 @@ import (
 	proposerblock "github.com/ava-labs/avalanchego/vms/proposervm/block"
 	ethtypes "github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
+
+	"github.com/containerman17/epochdb/chain"
 )
 
 // TestBitIdentity: decode real stored containers, re-encode the inner eth
@@ -23,7 +25,7 @@ func TestBitIdentity(t *testing.T) {
 	if dir == "" {
 		t.Skip("BITID_DIR unset")
 	}
-	RegisterExtras()
+	RegisterExtras(chain.Coreth)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)

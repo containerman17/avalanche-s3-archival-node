@@ -35,11 +35,12 @@ import (
 	"github.com/ava-labs/libevm/trie"
 	"github.com/holiman/uint256"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 )
 
 func TestFirewoodFrontierFromHashedKeys(t *testing.T) {
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 
 	type kv struct{ key, val []byte }
 	var (

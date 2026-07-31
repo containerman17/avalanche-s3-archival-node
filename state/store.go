@@ -248,6 +248,24 @@ func (s *Store) SetLogsStart(h uint64) error {
 	return nil
 }
 
+// vmKindKey stamps the data dir with the VM kind that built it, inside misc.
+// Namespaced so it cannot collide with a rawdb key.
+const vmKindKey = "epochdb.vmkind"
+
+// BindVMKind claims the data dir for one VM kind, or refuses it for the other.
+// coreth and subnet-evm header RLP are mutually exclusive and libevm's extras
+// registry is process-global, so a dir built by one is unreadable by the other
+// and there is NO migration: delete the corpus and resync.
+func (s *Store) BindVMKind(kind string) error {
+	if cur, ok := s.misc.Get([]byte(vmKindKey)); ok {
+		if string(cur) != kind {
+			return fmt.Errorf("state: data dir was built by %s, refusing to open it as %s: delete the corpus and resync", cur, kind)
+		}
+		return nil
+	}
+	return s.misc.Put([]byte(vmKindKey), []byte(kind))
+}
+
 // PutCode stores a contract code blob by hash (dedup by hash).
 func (s *Store) PutCode(hash common.Hash, blob []byte) error { return s.code.Put(hash, blob) }
 

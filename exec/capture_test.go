@@ -9,6 +9,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/state"
 )
@@ -17,7 +18,7 @@ import (
 // enabled and returns an open account trie at the genesis root.
 func cacheHarness(t *testing.T, cacheBytes uint64) *wrappingTrie {
 	t.Helper()
-	fetch.RegisterExtras()
+	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
 	store, err := state.Open(dir)
 	if err != nil {

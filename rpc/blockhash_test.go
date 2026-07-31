@@ -77,7 +77,7 @@ type bhEnv struct {
 func newBlockHashEnv(t *testing.T) *bhEnv {
 	t.Helper()
 	dir := t.TempDir()
-	gm, err := exec.NetworkGenesis(1)
+	gm, err := exec.ChainGenesis(mustCChain(t, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
