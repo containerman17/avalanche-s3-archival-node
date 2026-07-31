@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 
 	"github.com/containerman17/epochdb/dist"
@@ -71,6 +72,14 @@ func serveMain(args []string) {
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
 
+	// The descriptor comes FIRST: on `--chain` it, not `--network`, names the
+	// network to dial, and it is what the fetcher, the executor and the genesis
+	// all key on. An L1 on mainnet with the default `--network fuji` would
+	// otherwise dial the wrong network's bootstrap node.
+	c := resolveChain()
+	if c.SubnetID != avaconstants.PrimaryNetworkID {
+		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
+	}
 	networkID, defNode, rpcURL := netParams(*network)
 	if *nodeURI == "" {
 		*nodeURI = defNode
@@ -84,7 +93,10 @@ func serveMain(args []string) {
 	fatal := make(chan error, 4)
 
 	// --- staging: the follower writes it, the executor reads it ---------------
-	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer}
+	// Chain is what makes the follower track the L1's subnet and register the
+	// subnet-evm extras (M5); nil-equivalent for the C-chain, whose descriptor
+	// carries the primary subnet.
+	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer, Chain: c}
 	if *vdrSources != "" {
 		cfg.VdrSources = strings.Split(*vdrSources, ",")
 	} else if *tipOverride == "" {
@@ -100,6 +112,12 @@ func serveMain(args []string) {
 		// Same process, same staging store, different source of blocks: a
 		// bounded backfill instead of the consensus tip (fixed-corpus builds
 		// and integration runs). Everything below is identical.
+		if c.SubnetID != avaconstants.PrimaryNetworkID {
+			// resolveTipOverride's whole job is finding the pre-ProposerVM
+			// ceiling, below which a container ID equals the eth block hash.
+			// An L1 is ProposerVM-wrapped from block 1, so there is none.
+			log.Fatalf("epochdb: serve: --tip-override is C-chain only (an L1 is ProposerVM-wrapped from block 1); serve an L1 by following its tip")
+		}
 		anchors := resolveTipOverride(ctx, fetcher, rpcURL, *tipOverride, networkID)
 		go func() { report(fatal, "backfill", fetcher.SyncTo(ctx, anchors, *walks)) }()
 	} else {
@@ -113,7 +131,6 @@ func serveMain(args []string) {
 	}
 	defer store.Close()
 
-	c := resolveChain()
 	g, err := exec.ChainGenesis(c)
 	if err != nil {
 		log.Fatalf("epochdb: genesis: %v", err)
