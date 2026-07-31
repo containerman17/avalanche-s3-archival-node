@@ -14,9 +14,6 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
-	"github.com/ava-labs/avalanchego/graft/coreth/consensus/dummy"
-	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	ethstate "github.com/ava-labs/libevm/core/state"
@@ -37,7 +34,7 @@ const GasCap = 50_000_000
 // DecodeAll is concurrent-safe.
 type Server struct {
 	hist     *state.History
-	chainCtx corethcore.ChainContext
+	chainCtx ChainContext
 	chainCfg *params.ChainConfig
 
 	// tx APIs, wired by EnableTxAPIs (nil = methods unavailable).
@@ -129,14 +126,14 @@ func (h *recentHashes) add(k common.Hash, n uint64) {
 }
 
 // HistoryChainContext serves BLOCKHASH headers through the epochs-aware
-// History (raw store first, sealed epochs once the raws are gone).
-func HistoryChainContext(hist *state.History) corethcore.ChainContext {
+// History (raw store first, sealed epochs once the raws are gone). It is
+// VM-neutral: the consensus engine the two VMs disagree about is added by
+// whichever backend the seam picks (rpc/vm.go).
+func HistoryChainContext(hist *state.History) ChainContext {
 	return histChainCtx{hist}
 }
 
 type histChainCtx struct{ hist *state.History }
-
-func (c histChainCtx) Engine() consensus.Engine { return dummy.NewFullFaker() }
 
 func (c histChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
 	raw, ok, err := c.hist.HeaderRLP(n)
@@ -150,7 +147,7 @@ func (c histChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
 	return &h
 }
 
-func NewServer(hist *state.History, chainCtx corethcore.ChainContext, chainCfg *params.ChainConfig) *Server {
+func NewServer(hist *state.History, chainCtx ChainContext, chainCfg *params.ChainConfig) *Server {
 	return &Server{hist: hist, chainCtx: chainCtx, chainCfg: chainCfg, recent: newRecentHashes(recentBlockHashes)}
 }
 
@@ -283,8 +280,12 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 	case "eth_accounts":
 		return []common.Address{}, nil
 	case "eth_coinbase", "eth_etherbase":
-		// Coreth's fixed blackhole coinbase, matching the public API
-		// (eth_etherbase is its coreth-served alias).
+		// The fixed blackhole coinbase, matching the public API
+		// (eth_etherbase is its coreth-served alias). It is the SAME address on
+		// both VM kinds: graft/evm's constants.BlackholeAddr, which subnet-evm
+		// also uses unless the chain sets allowFeeRecipients, in which case the
+		// real recipient is per block and lives in each header's Coinbase (this
+		// method has no block, so it cannot report it).
 		return common.HexToAddress("0x0100000000000000000000000000000000000000"), nil
 	case "eth_getUncleCountByBlockNumber", "eth_getUncleCountByBlockHash":
 		return hexutil.Uint(0), nil // no uncles on Avalanche
@@ -550,15 +551,13 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 	if args.Gas != nil && uint64(*args.Gas) < gas {
 		gas = uint64(*args.Gas)
 	}
-	msg := &corethcore.Message{
-		From:              common.Address{},
-		To:                args.To,
-		Value:             new(big.Int),
-		GasLimit:          gas,
-		GasPrice:          new(big.Int),
-		GasFeeCap:         new(big.Int),
-		GasTipCap:         new(big.Int),
-		SkipAccountChecks: true,
+	msg := &callMsg{
+		To:        args.To,
+		Value:     new(big.Int),
+		GasLimit:  gas,
+		GasPrice:  new(big.Int),
+		GasFeeCap: new(big.Int),
+		GasTipCap: new(big.Int),
 	}
 	if args.From != nil {
 		msg.From = *args.From
@@ -575,11 +574,9 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 		msg.Data = *args.Data
 	}
 
-	blockCtx := corethcore.NewEVMBlockContext(&header, s.chainCtx, nil)
-	txCtx := corethcore.NewEVMTxContext(msg)
-	evm := vm.NewEVM(blockCtx, txCtx, st, s.chainCfg, vm.Config{NoBaseFee: true})
-	gp := new(corethcore.GasPool).AddGas(gas)
-	res, err := corethcore.ApplyMessage(evm, msg, gp)
+	backend := registeredVM()
+	res, err := backend.applyMsg(s.chainCfg, backend.blockContext(&header, s.chainCtx), st,
+		msg, vm.Config{NoBaseFee: true})
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
@@ -587,15 +584,22 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if res.Err != nil {
-		rerr := &rpcError{Code: 3, Message: "execution reverted"}
-		if len(res.Revert()) > 0 {
-			rerr.Data = hexutil.Encode(res.Revert())
-		} else {
-			rerr.Message = res.Err.Error()
-		}
-		return nil, rerr
+		return nil, revertError(res)
 	}
 	return hexutil.Encode(res.ReturnData), nil
+}
+
+// revertError is the geth-shaped failure for a call that executed and failed:
+// code 3 with the revert payload when there is one, the raw EVM error
+// otherwise.
+func revertError(res *callResult) *rpcError {
+	out := &rpcError{Code: 3, Message: "execution reverted"}
+	if len(res.Revert) > 0 {
+		out.Data = hexutil.Encode(res.Revert)
+	} else {
+		out.Message = res.Err.Error()
+	}
+	return out
 }
 
 // ListenAndServe runs the server on addr until the listener fails.

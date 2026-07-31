@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/big"
 
-	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	ethstate "github.com/ava-labs/libevm/core/state"
@@ -238,7 +237,7 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 // execute after regular txs, emit no EVM logs, and cannot affect these
 // receipts, so they are skipped entirely (matching the live capture's log
 // collection). chainCtx must be safe for the caller's concurrency.
-func ReExecuteBlock(hist *state.History, chainCtx corethcore.ChainContext, chainCfg *params.ChainConfig, blk *types.Block) (types.Receipts, error) {
+func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params.ChainConfig, blk *types.Block) (types.Receipts, error) {
 	header := blk.Header()
 	n := blk.NumberU64()
 	statedb, err := ethstate.New(common.Hash{}, hist.StateAt(n-1), nil)
@@ -252,19 +251,20 @@ func ReExecuteBlock(hist *state.History, chainCtx corethcore.ChainContext, chain
 	if parent == nil {
 		return nil, fmt.Errorf("parent header %d missing", n-1)
 	}
-	if err := corethcore.ApplyUpgrades(chainCfg, &parent.Time, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
+	backend := registeredVM()
+	if err := backend.applyUpgrades(chainCfg, parent.Time, header, statedb); err != nil {
 		return nil, fmt.Errorf("apply upgrades: %w", err)
 	}
-	blockCtx := corethcore.NewEVMBlockContext(header, chainCtx, nil)
-	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
+	blockCtx := backend.blockContext(header, chainCtx)
+	gasLeft := header.GasLimit
 	var (
 		usedGas  uint64
 		receipts types.Receipts
 	)
 	for i, tx := range blk.Transactions() {
 		statedb.SetTxContext(tx.Hash(), i)
-		receipt, err := corethcore.ApplyTransaction(
-			chainCfg, chainCtx, blockCtx, gp, statedb,
+		receipt, err := backend.applyTx(
+			chainCfg, chainCtx, blockCtx, &gasLeft, statedb,
 			header, tx, &usedGas, vm.Config{},
 		)
 		if err != nil {

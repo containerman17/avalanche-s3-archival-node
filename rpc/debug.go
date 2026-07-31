@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"math/big"
 
-	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
-	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	ethstate "github.com/ava-labs/libevm/core/state"
@@ -71,11 +69,12 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 	if parent == nil {
 		return nil, errInvalid("parent header %d missing", n-1)
 	}
-	if err := corethcore.ApplyUpgrades(s.chainCfg, &parent.Time, corethcore.NewBlockContext(header.Number, header.Time), statedb); err != nil {
+	backend := registeredVM()
+	if err := backend.applyUpgrades(s.chainCfg, parent.Time, header, statedb); err != nil {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("apply upgrades: %v", err)}
 	}
-	blockCtx := corethcore.NewEVMBlockContext(header, s.chainCtx, nil)
-	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
+	blockCtx := backend.blockContext(header, s.chainCtx)
+	gasLeft := header.GasLimit
 	var (
 		usedGas uint64
 		out     []json.RawMessage
@@ -99,8 +98,8 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 			}
 			vmCfg.Tracer = tracer
 		}
-		if _, err := corethcore.ApplyTransaction(
-			s.chainCfg, s.chainCtx, blockCtx, gp, statedb,
+		if _, err := backend.applyTx(
+			s.chainCfg, s.chainCtx, blockCtx, &gasLeft, statedb,
 			header, tx, &usedGas, vmCfg,
 		); err != nil {
 			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("tx %d: %v", i, err)}
@@ -427,7 +426,10 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 		}
 		to = crypto.CreateAddress(from, nonce)
 	}
-	rules := s.chainCfg.Rules(header.Number, cparams.IsMergeTODO, header.Time)
+	// The active precompile set is what the tracer must NOT list as accessed.
+	// Rules is libevm's, and its VM-specific half comes out of the config's
+	// registered extras payload, so this is one call on both kinds.
+	rules := s.chainCfg.Rules(header.Number, isMergeTODO, header.Time)
 	precompiles := vm.ActivePrecompiles(rules)
 
 	gas := uint64(GasCap)
@@ -443,6 +445,7 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 
 	// Geth's fixed-point loop: run with the previous round's list until
 	// the traced list stops changing (AccessListTracer.Equal).
+	backend := registeredVM()
 	prevTracer := logger.NewAccessListTracer(nil, from, to, precompiles)
 	if args.AccessList != nil {
 		prevTracer = logger.NewAccessListTracer(*args.AccessList, from, to, precompiles)
@@ -454,25 +457,22 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 			return nil, rerr
 		}
 		tracer := logger.NewAccessListTracer(al, from, to, precompiles)
-		msg := &corethcore.Message{
-			From:              from,
-			To:                args.To,
-			Value:             new(big.Int),
-			GasLimit:          gas,
-			GasPrice:          new(big.Int),
-			GasFeeCap:         new(big.Int),
-			GasTipCap:         new(big.Int),
-			Data:              data,
-			AccessList:        al,
-			SkipAccountChecks: true,
+		msg := &callMsg{
+			From:       from,
+			To:         args.To,
+			Value:      new(big.Int),
+			GasLimit:   gas,
+			GasPrice:   new(big.Int),
+			GasFeeCap:  new(big.Int),
+			GasTipCap:  new(big.Int),
+			Data:       data,
+			AccessList: al,
 		}
 		if args.Value != nil {
 			msg.Value = (*big.Int)(args.Value)
 		}
-		blockCtx := corethcore.NewEVMBlockContext(header, s.chainCtx, nil)
-		evm := vm.NewEVM(blockCtx, corethcore.NewEVMTxContext(msg), st, s.chainCfg, vm.Config{Tracer: tracer, NoBaseFee: true})
-		gp := new(corethcore.GasPool).AddGas(gas)
-		res, err := corethcore.ApplyMessage(evm, msg, gp)
+		res, err := backend.applyMsg(s.chainCfg, backend.blockContext(header, s.chainCtx), st,
+			msg, vm.Config{Tracer: tracer, NoBaseFee: true})
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}

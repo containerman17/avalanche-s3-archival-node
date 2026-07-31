@@ -6,8 +6,6 @@ import (
 	"math/big"
 	"sort"
 
-	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
-	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/core/vm"
@@ -18,10 +16,6 @@ import (
 
 // ClientVersion is returned by web3_clientVersion.
 const ClientVersion = "epochdb/v0.1.0"
-
-// fallbackGasPrice is the C-chain phase-0 minimum gas price (470 gwei),
-// returned when the recent corpus blocks carry no transactions to sample.
-var fallbackGasPrice = new(big.Int).Mul(big.NewInt(470), big.NewInt(ethparams.GWei))
 
 func (s *Server) headerAt(n uint64) (*types.Header, *rpcError) {
 	raw, ok, err := s.hist.HeaderRLP(n)
@@ -38,7 +32,7 @@ func (s *Server) headerAt(n uint64) (*types.Header, *rpcError) {
 // runCall executes args as a message at height n with the given gas limit,
 // optionally under a tracer (debug_traceCall). Kept separate from
 // server.go's ethCall (file discipline); same semantics.
-func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (*corethcore.ExecutionResult, *rpcError) {
+func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (*callResult, *rpcError) {
 	header, rerr := s.headerAt(n)
 	if rerr != nil {
 		return nil, rerr
@@ -47,15 +41,13 @@ func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (
 	if rerr != nil {
 		return nil, rerr
 	}
-	msg := &corethcore.Message{
-		From:              common.Address{},
-		To:                args.To,
-		Value:             new(big.Int),
-		GasLimit:          gas,
-		GasPrice:          new(big.Int),
-		GasFeeCap:         new(big.Int),
-		GasTipCap:         new(big.Int),
-		SkipAccountChecks: true,
+	msg := &callMsg{
+		To:        args.To,
+		Value:     new(big.Int),
+		GasLimit:  gas,
+		GasPrice:  new(big.Int),
+		GasFeeCap: new(big.Int),
+		GasTipCap: new(big.Int),
 	}
 	if args.From != nil {
 		msg.From = *args.From
@@ -68,14 +60,12 @@ func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (
 	} else if args.Data != nil {
 		msg.Data = *args.Data
 	}
-	blockCtx := corethcore.NewEVMBlockContext(header, s.chainCtx, nil)
 	vmCfg := vm.Config{NoBaseFee: true}
 	if tracer != nil {
 		vmCfg.Tracer = tracer
 	}
-	evm := vm.NewEVM(blockCtx, corethcore.NewEVMTxContext(msg), st, s.chainCfg, vmCfg)
-	gp := new(corethcore.GasPool).AddGas(gas)
-	res, err := corethcore.ApplyMessage(evm, msg, gp)
+	backend := registeredVM()
+	res, err := backend.applyMsg(s.chainCfg, backend.blockContext(header, s.chainCtx), st, msg, vmCfg)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
@@ -119,13 +109,7 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 		return nil, rerr
 	}
 	if res.Err != nil {
-		out := &rpcError{Code: 3, Message: "execution reverted"}
-		if len(res.Revert()) > 0 {
-			out.Data = hexutil.Encode(res.Revert())
-		} else {
-			out.Message = res.Err.Error()
-		}
-		return nil, out
+		return nil, revertError(res)
 	}
 
 	return hexutil.EncodeUint64(searchGas(ethparams.TxGas-1, hi, func(gas uint64) bool {
@@ -149,8 +133,10 @@ func searchGas(lo, hi uint64, executable func(uint64) bool) uint64 {
 }
 
 // gasOracle samples the gas prices of transactions in recent corpus blocks
-// (pre-London: legacy gasPrice semantics) and returns the 60th percentile;
-// fallbackGasPrice when nothing is sampled.
+// (pre-London: legacy gasPrice semantics) and returns the 60th percentile.
+// With nothing to sample it falls back to the VM's own floor: a protocol
+// constant on the C-chain, the chain's configured minBaseFee on an L1 (see
+// rpcVM.minGasPrice).
 func (s *Server) gasOracle() *big.Int {
 	var prices []*big.Int
 	n := s.hist.Head()
@@ -168,7 +154,7 @@ func (s *Server) gasOracle() *big.Int {
 		}
 	}
 	if len(prices) == 0 {
-		return new(big.Int).Set(fallbackGasPrice)
+		return registeredVM().minGasPrice(s.chainCfg)
 	}
 	sort.Slice(prices, func(i, j int) bool { return prices[i].Cmp(prices[j]) < 0 })
 	return prices[len(prices)*60/100]
@@ -240,7 +226,19 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 			rewards = append(rewards, row)
 		}
 	}
-	baseFees = append(baseFees, zero) // next block's base fee: pre-London zero
+	// geth's shape wants blockCount+1 entries, the last being the NEXT block's
+	// projected base fee. We do not project one on either VM kind.
+	//
+	// ponytail: the trailing entry is 0. Per-block base fees above are exact
+	// on both kinds (header.BaseFee, which coreth fills from AP3 on and
+	// subnet-evm fills from its SubnetEVM timestamp on), so only this one
+	// forward-looking slot is unanswered. Projecting it means running the fee
+	// algorithm: coreth's dynamic fee over the parent window, or subnet-evm's
+	// fee window out of header.Extra, both of which also need a timestamp for
+	// a block nobody has built. Emit the real projection if a fee-estimating
+	// client ever needs it; nothing on the execution path reads a base fee at
+	// all (DESIGN, subnet-evm scoping).
+	baseFees = append(baseFees, zero)
 	out := map[string]any{
 		"oldestBlock":   hexutil.EncodeUint64(oldest),
 		"baseFeePerGas": baseFees,
