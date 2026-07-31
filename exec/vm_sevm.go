@@ -14,6 +14,15 @@ import (
 	sevmextstate "github.com/ava-labs/avalanchego/graft/subnet-evm/core/extstate"
 	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
 	sevmextras "github.com/ava-labs/avalanchego/graft/subnet-evm/params/extras"
+
+	// GENESIS PRECOMPILES DO NOT PARSE WITHOUT THIS, AND THEY FAIL SILENTLY.
+	// extras.Precompiles.UnmarshalJSON walks modules.RegisteredModules() and
+	// keeps only the keys it finds there; with an empty registry a genesis
+	// carrying "nativeMinterConfig" (which FIFA does, at time 0) unmarshals to
+	// ZERO precompiles, no error, and every state root from genesis onward is
+	// wrong. The registry is init-registration only, so importing it is the
+	// whole fix.
+	_ "github.com/ava-labs/avalanchego/graft/subnet-evm/precompile/registry"
 	"github.com/ava-labs/avalanchego/snow"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
