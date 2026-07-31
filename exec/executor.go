@@ -9,13 +9,6 @@ import (
 	goatomic "sync/atomic"
 	"time"
 
-	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
-	"github.com/ava-labs/avalanchego/graft/coreth/consensus/dummy"
-	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
-	"github.com/ava-labs/avalanchego/graft/coreth/core/extstate"
-	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
-	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/atomic"
-	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/avalanchego/graft/evm/firewood"
 	"github.com/ava-labs/avalanchego/snow"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
@@ -23,7 +16,6 @@ import (
 	"github.com/ava-labs/libevm/core/rawdb"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/core/vm"
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
@@ -97,7 +89,9 @@ type Config struct {
 // state, verifies every computed state root against the header root, and
 // captures post-image write frames, headers, and code into the state layer.
 type Executor struct {
-	cfg       Config
+	cfg Config
+	// vm is the execution backend seam (vm.go): coreth or subnet-evm.
+	vm        vmBackend
 	chainCfg  *params.ChainConfig
 	wrapDB    *wrappedDatabase
 	triedb    *triedb.Database
@@ -191,7 +185,8 @@ type chainContext struct {
 	store *state.Store // headers log
 }
 
-func (c chainContext) Engine() consensus.Engine { return dummy.NewFullFaker() }
+// Engine lives in vm_coreth.go / sevmChainContext: the consensus engine type
+// is one of the few things the two VMs do not share.
 
 func (c chainContext) GetHeader(_ common.Hash, num uint64) *types.Header {
 	var (
@@ -283,9 +278,7 @@ func New(cfg Config) (*Executor, error) {
 		cfg.Chain = c
 	}
 	fetch.RegisterExtras(c.VMKind)
-	if c.VMKind != chain.Coreth {
-		return nil, fmt.Errorf("exec: %s execution is not built yet (M3)", c.VMKind)
-	}
+	backend := vmFor(c.VMKind)
 	// A data directory is single-kind for life: the two header encodings are
 	// mutually exclusive, so a dir built by one is unreadable by the other and
 	// there is no migration (delete and resync).
@@ -297,7 +290,7 @@ func New(cfg Config) (*Executor, error) {
 		return nil, err
 	}
 
-	g, err := loadCorethGenesis(c, snowCtx)
+	g, err := backend.genesis(c, snowCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +341,7 @@ func New(cfg Config) (*Executor, error) {
 		return nil, err
 	}
 
-	inner := extstate.NewDatabaseWithNodeDB(memdb, tdb)
+	inner := backend.newStateDatabase(memdb, tdb)
 	wrapDB := wrapDatabase(inner, cfg.Store, cfg.StateCacheBytes, cfg.VerifyCache)
 
 	fwBackend, ok := tdb.Backend().(*firewood.TrieDB)
@@ -365,6 +358,7 @@ func New(cfg Config) (*Executor, error) {
 
 	e := &Executor{
 		cfg:         cfg,
+		vm:          backend,
 		chainCfg:    g.Config,
 		ring:        ring,
 		wrapDB:      wrapDB,
@@ -373,11 +367,11 @@ func New(cfg Config) (*Executor, error) {
 		snowCtx:     snowCtx,
 		chainCtx:    chainContext{},
 		genesisRoot: genesisRoot,
-		genesisHash: g.ToBlock().Hash(),
+		genesisHash: g.Hash,
 		headRoot:    genesisRoot,
 		headNum:     0,
 		headTime:    g.Timestamp,
-		lastFwHash:  g.ToBlock().Hash(),
+		lastFwHash:  g.Hash,
 		alloc:       g.Alloc,
 	}
 
@@ -761,7 +755,7 @@ func (e *Executor) Run(ctx context.Context) error {
 // SETTLES, so the value comes from the root ring. ok=false means an SAE
 // height that has aged out of the ring.
 func (e *Executor) ownRootAt(hdr *types.Header, n uint64) (common.Hash, bool) {
-	if !hasSettledMarkers(hdr) {
+	if !e.vm.hasSettledMarkers(hdr) {
 		return hdr.Root, true
 	}
 	root, _, ok := e.ring.get(n)
@@ -958,69 +952,15 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	return newRoot, nil
 }
 
-// runEVM applies upgrades, all transactions, and the atomic ExtData
-// transfers of blk onto statedb, returning every receipt produced (they
-// already exist in memory: capture is free). Shared by the per-block and
-// batched paths.
+// runEVM applies the block's upgrades and every transaction onto statedb,
+// returning every receipt produced (they already exist in memory: capture is
+// free). Shared by the per-block and batched paths; the VM-specific half
+// (and, on coreth, the atomic ExtData transfers) lives behind the seam.
+//
+// e.headTime IS the parent's timestamp here: executeRaw advances it only
+// after the block returns, and bisect rewinds it with batchStartTime.
 func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) (types.Receipts, error) {
-	header := blk.Header()
-
-	// The PARENT timestamp is what makes a precompile activate exactly once:
-	// IsForkTransition treats a nil parent as "never forked", so nil
-	// re-activates every already-active precompile on EVERY block
-	// (SetNonce 1 + SetCode {0x01} + Configure). Idempotent for Warp, but it
-	// writes two junk rows per post-Durango block into the write frame,
-	// which breaks epoch byte-determinism against a correct builder, and it
-	// is a live correctness bug for any precompile whose Configure is not
-	// idempotent. Mirrors coreth core/state_processor.go Process.
-	//
-	// e.headTime IS the parent's timestamp here: executeRaw advances it only
-	// after the block returns, and bisect rewinds it with batchStartTime.
-	parentTime := e.headTime
-	upgradeBlockCtx := corethcore.NewBlockContext(header.Number, header.Time)
-	if err := corethcore.ApplyUpgrades(e.chainCfg, &parentTime, upgradeBlockCtx, statedb); err != nil {
-		return nil, fmt.Errorf("apply upgrades: %w", err)
-	}
-
-	blockCtx := corethcore.NewEVMBlockContext(header, e.chainCtx, nil)
-	gp := new(corethcore.GasPool).AddGas(header.GasLimit)
-	var (
-		usedGas  uint64
-		receipts types.Receipts
-	)
-
-	for txIndex, tx := range blk.Transactions() {
-		statedb.SetTxContext(tx.Hash(), txIndex)
-		receipt, err := corethcore.ApplyTransaction(
-			e.chainCfg, e.chainCtx, blockCtx, gp, statedb,
-			header, tx, &usedGas, vm.Config{},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("tx %d: %w", txIndex, err)
-		}
-		receipts = append(receipts, receipt)
-	}
-
-	// Atomic txs ride in the block's ExtData; Fuji has real imports and
-	// exports, so this path is mandatory for root correctness.
-	if extData := ccustomtypes.BlockExtData(blk); len(extData) > 0 {
-		rules := e.chainCfg.Rules(header.Number, cparams.IsMergeTODO, header.Time)
-		isAP5 := false
-		if rulesExtra := cparams.GetRulesExtra(rules); rulesExtra != nil {
-			isAP5 = rulesExtra.AvalancheRules.IsApricotPhase5
-		}
-		atomicTxs, err := atomic.ExtractAtomicTxs(extData, isAP5, atomic.Codec)
-		if err != nil {
-			return nil, fmt.Errorf("extract atomic txs: %w", err)
-		}
-		wrapped := extstate.New(statedb)
-		for i, atx := range atomicTxs {
-			if err := atx.UnsignedAtomicTx.EVMStateTransfer(e.snowCtx, wrapped); err != nil {
-				return nil, fmt.Errorf("atomic tx %d: %w", i, err)
-			}
-		}
-	}
-	return receipts, nil
+	return e.vm.runEVM(e.chainCtx, e.chainCfg, e.snowCtx, blk, e.headTime, statedb)
 }
 
 // executeBatched accumulates blk into the open batch (opening one if

@@ -253,7 +253,7 @@ func TestHeliconBoundaryRule(t *testing.T) {
 	}
 	// Mainnet is "unscheduled" as a year-9999 activation time rather than a
 	// nil one, so the guard is inert instead of absent.
-	me := &Executor{chainCfg: mg.Config, ring: e.ring}
+	me := &Executor{vm: corethVM{}, chainCfg: mg.Config, ring: e.ring}
 	blk := saeTestBlock(t, e, 2, common.Hash{}, helicon, false)
 	if sae, err := me.saeExecuted(blk, helicon); err != nil || sae {
 		t.Fatalf("mainnet at Fuji's Helicon time: sae=%v err=%v, want false/nil", sae, err)

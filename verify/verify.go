@@ -55,7 +55,7 @@ type Verifier struct {
 // the first header's ParentHash as anchor.
 func New(tmpDir string, c *chain.Chain, workers int) (*Verifier, error) {
 	if c != nil && c.VMKind != chain.Coreth {
-		return nil, fmt.Errorf("verify: %s verification is not built yet (M3)", c.VMKind)
+		return nil, fmt.Errorf("verify: %s verification is not built yet (exec can replay one, this engine still cannot)", c.VMKind)
 	}
 	fetch.RegisterExtras(chain.Coreth)
 	tdb, fw, db, err := newThrowawayFirewood(tmpDir)
@@ -73,15 +73,14 @@ func New(tmpDir string, c *chain.Chain, workers int) (*Verifier, error) {
 			tdb.Close()
 			return nil, err
 		}
-		gBlk := g.ToBlock()
-		if !tdb.Initialized(gBlk.Root()) {
-			if _, err := g.Commit(rawdb.NewMemoryDatabase(), tdb); err != nil {
+		if !tdb.Initialized(g.Root) {
+			if err := g.Commit(rawdb.NewMemoryDatabase(), tdb); err != nil {
 				tdb.Close()
 				return nil, fmt.Errorf("commit genesis: %w", err)
 			}
 		}
-		v.parentRoot = gBlk.Root()
-		v.parentHash = gBlk.Hash()
+		v.parentRoot = g.Root
+		v.parentHash = g.Hash
 		v.anchored = true
 		fw.SetHashAndHeight(v.parentHash, 0)
 	}

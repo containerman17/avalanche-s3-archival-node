@@ -1,10 +1,9 @@
 package exec
 
 import (
-	"fmt"
-
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/libevm/core/types"
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
@@ -18,7 +17,7 @@ import (
 //
 // It also performs this process's one-and-only extras registration, for the
 // descriptor's VM kind.
-func ChainGenesis(c *chain.Chain) (*corethcore.Genesis, error) {
+func ChainGenesis(c *chain.Chain) (*Genesis, error) {
 	if c == nil {
 		var err error
 		if c, err = chain.CChain(avaconstants.FujiID); err != nil {
@@ -26,14 +25,11 @@ func ChainGenesis(c *chain.Chain) (*corethcore.Genesis, error) {
 		}
 	}
 	fetch.RegisterExtras(c.VMKind)
-	if c.VMKind != chain.Coreth {
-		return nil, fmt.Errorf("exec: %s genesis is not wired yet (subnet-evm execution is M3)", c.VMKind)
-	}
 	snowCtx, err := snowContextFor(c)
 	if err != nil {
 		return nil, err
 	}
-	return loadCorethGenesis(c, snowCtx)
+	return vmFor(c.VMKind).genesis(c, snowCtx)
 }
 
 // ParseEthBlock decodes a raw staging container (ProposerVM-wrapped or
@@ -49,7 +45,11 @@ var EncodeLogsFrame = encodeLogsFrame
 // consumers need it because every per-block header invariant changes above
 // the boundary (header.Root belongs to the settled block, receiptsRoot
 // covers the whole settled range).
-var HasSettledMarkers = hasSettledMarkers
+//
+// These callers hold no descriptor, so the answer comes from the kind THIS
+// PROCESS registered with libevm, which is the only kind whose header extras
+// can be read at all (see registeredVM). On subnet-evm it is always false.
+var HasSettledMarkers = func(h *types.Header) bool { return registeredVM().hasSettledMarkers(h) }
 
 // NewChainContext exposes the executor's headers-log-backed ChainContext so
 // BLOCKHASH inside historical eth_call resolves real hashes. Not

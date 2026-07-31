@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/database"
-	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/vms/components/gas"
 	"github.com/ava-labs/avalanchego/vms/saevm/blocks"
@@ -21,43 +20,18 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/libevm/stateconf"
-	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/containerman17/epochdb/state"
 
-	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
 	saetypes "github.com/ava-labs/avalanchego/vms/saevm/types"
 )
 
-// heliconTransitionLead is transitionvm's switch offset: the C-Chain
-// registers TransitionTime = HeliconTime - 10s.
-const heliconTransitionLead = 10
-
-// transitionTimestamp returns the transitionvm switch time for cfg and
-// whether Helicon is scheduled at all (mainnet is not, in this dep set).
-func transitionTimestamp(cfg *params.ChainConfig) (uint64, bool) {
-	ts := cparams.GetExtra(cfg).HeliconTimestamp
-	if ts == nil {
-		return 0, false
-	}
-	if *ts < heliconTransitionLead {
-		return 0, true
-	}
-	return *ts - heliconTransitionLead, true
-}
-
-// hasSettledMarkers reports whether a header carries the four ACP-194
-// settlement markers, which is exactly the set of blocks the SAE VM built:
-// coreth's own customheader.VerifySettled REJECTS a coreth block carrying
-// any of them, so their presence is a second, independent read on which
-// side of the boundary a block sits.
-func hasSettledMarkers(h *types.Header) bool {
-	he := ccustomtypes.GetHeaderExtra(h)
-	return he.SettledHeight != nil && he.SettledGasUnix != nil &&
-		he.SettledGasNumerator != nil && he.SettledExcess != nil
-}
-
 // saeExecuted reports whether blk must be executed by the SAE engine.
+//
+// SAE IS CORETH-ONLY, and it is neutralized structurally rather than with a
+// kind check: the subnet-evm backend reports "transition never scheduled" and
+// "no settlement markers", so sae is always false there and nothing below this
+// line (executeSAEBlock, initSAE, saehooks.go, saering.go) is ever reached.
 //
 // THE RULE, from vms/transitionvm: the transition block is the first block
 // whose timestamp is at or past TransitionTime; the pre-transition VM
@@ -72,8 +46,8 @@ func hasSettledMarkers(h *types.Header) bool {
 // The settlement markers must agree with the timestamp rule; a
 // disagreement means our idea of the boundary is wrong and replay stops.
 func (e *Executor) saeExecuted(blk *types.Block, parentTime uint64) (bool, error) {
-	markers := hasSettledMarkers(blk.Header())
-	ts, scheduled := transitionTimestamp(e.chainCfg)
+	markers := e.vm.hasSettledMarkers(blk.Header())
+	ts, scheduled := e.vm.transitionTimestamp(e.chainCfg)
 	sae := scheduled && parentTime >= ts
 	if sae != markers {
 		return false, fmt.Errorf(
@@ -185,7 +159,7 @@ func (e *Executor) postExecutionAt(n uint64, hdr *types.Header, h *saeHooks) (co
 		}
 		return root, clock, nil
 	}
-	if hasSettledMarkers(hdr) {
+	if e.vm.hasSettledMarkers(hdr) {
 		return common.Hash{}, nil, fmt.Errorf(
 			"sae: block %d was executed by SAE but is not in the root ring (window %d blocks): its post-execution root cannot be established without re-executing it",
 			n, saeRingSlots)

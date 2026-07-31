@@ -47,7 +47,7 @@ type bfEnv struct {
 	hist     *state.History
 	reader   *fetch.Reader
 	chainCtx corethcore.ChainContext
-	cfg      *corethcore.Genesis
+	cfg      *exec.Genesis
 	end      uint64 // last height to derive (logs.start - 1)
 }
 
