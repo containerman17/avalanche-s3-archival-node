@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
@@ -56,7 +55,6 @@ func (s *Server) heightByHash(raw json.RawMessage) (uint64, bool, *rpcError) {
 // (that package is not importable) so responses byte-match the public API.
 func (s *Server) marshalBlock(blk *types.Block, fullTx bool) map[string]any {
 	head := blk.Header()
-	headExtra := ccustomtypes.GetHeaderExtra(head)
 	fields := map[string]any{
 		"number":           (*hexutil.Big)(head.Number),
 		"hash":             head.Hash(),
@@ -74,22 +72,15 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) map[string]any {
 		"timestamp":        hexutil.Uint64(head.Time),
 		"transactionsRoot": head.TxHash,
 		"receiptsRoot":     head.ReceiptHash,
-		"extDataHash":      headExtra.ExtDataHash,
 		"size":             hexutil.Uint64(blk.Size()),
-		"blockExtraData":   hexutil.Bytes(ccustomtypes.BlockExtData(blk)),
-		// Coreth difficulty is always 1: totalDifficulty == height.
+		// Avalanche difficulty is always 1: totalDifficulty == height.
 		"totalDifficulty": (*hexutil.Big)(head.Number),
 		"uncles":          []common.Hash{},
 	}
 	if head.BaseFee != nil {
 		fields["baseFeePerGas"] = (*hexutil.Big)(head.BaseFee)
 	}
-	if headExtra.ExtDataGasUsed != nil {
-		fields["extDataGasUsed"] = (*hexutil.Big)(headExtra.ExtDataGasUsed)
-	}
-	if headExtra.BlockGasCost != nil {
-		fields["blockGasCost"] = (*hexutil.Big)(headExtra.BlockGasCost)
-	}
+	addHeaderExtraFields(fields, blk)
 	txs := blk.Transactions()
 	transactions := make([]any, len(txs))
 	for i, tx := range txs {
