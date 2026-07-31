@@ -137,8 +137,11 @@ func serveMain(args []string) {
 		log.Printf("epochdb: shutting down, flushing")
 	case err := <-fatal:
 		// Close the writers before dying so the restart is a clean resume
-		// rather than a crash walk-back.
+		// rather than a crash walk-back. stop() cancels ctx first, because
+		// closeAll waits for the executor goroutine to return before it
+		// releases the executor's writers.
 		log.Printf("epochdb: FATAL: %v", err)
+		stop()
 		n.closeAll()
 		os.Exit(1)
 	}
@@ -186,6 +189,11 @@ type chainNode struct {
 	accepted func() uint64
 	chainID  fmt.Stringer // eth chainId, for the startup line
 	stopOnce sync.Once
+	// execDone closes when the executor goroutine has RETURNED. Closing the
+	// executor while Run is still in a block would corrupt exactly the writers
+	// the flush exists to protect, so stop waits on this. Cancel the node's
+	// context first or the wait never ends.
+	execDone chan struct{}
 }
 
 // startNode wires one chain's goroutines onto ctx and returns with it running.
@@ -280,6 +288,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	n = &chainNode{
 		cfg: cfg, fetcher: fetcher, e: e, store: store, hist: hist,
 		txidx: &txIndexHolder{}, accepted: accepted, chainID: g.Config.ChainID,
+		execDone: make(chan struct{}),
 	}
 
 	// --- the one read path: uncooked tail overlay, then the descent ----------
@@ -319,7 +328,11 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	} else {
 		go func() { report("follower", fetcher.Follow(ctx)) }()
 	}
-	go func() { report("executor", e.Run(ctx)) }()
+	go func() {
+		err := e.Run(ctx)
+		close(n.execDone) // BEFORE report: report may flush, and flushing waits
+		report("executor", err)
+	}()
 	go n.cookLoop(ctx)
 	go n.statusLoop(ctx)
 	return n, nil
@@ -334,6 +347,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 // chain keeps answering frozen data until the process restarts.
 func (n *chainNode) stop() {
 	n.stopOnce.Do(func() {
+		<-n.execDone
 		if err := n.e.Close(); err != nil {
 			n.cfg.logf("executor close: %v", err)
 		}

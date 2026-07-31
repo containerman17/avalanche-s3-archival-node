@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -203,13 +204,26 @@ func (f *fleet) add(ctx context.Context, id string, cfg nodeConfig) (*fleetChain
 	// The per-chain context is the isolation mechanism: cancelling it stops
 	// this chain's follower, executor and cook loop and reaches nothing else.
 	cctx, cancel := context.WithCancel(ctx)
-	fc := &fleetChain{id: id, cancel: cancel}
+	// stop reaches the node through a pointer because a component can fail
+	// between startNode launching its goroutines and returning, and report
+	// must never call a nil hook. A failure that lands in that window flushes
+	// at the recheck below instead.
+	var node atomic.Pointer[chainNode]
+	fc := &fleetChain{id: id, cancel: cancel, stop: func() {
+		if n := node.Load(); n != nil {
+			n.stop()
+		}
+	}}
 	n, err := startNode(cctx, cfg, fc.report)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	fc.node, fc.stop = n, n.stop
+	node.Store(n)
+	fc.node = n
+	if fc.stopped() != nil {
+		fc.once.Do(fc.stop)
+	}
 	f.mu.Lock()
 	f.chains = append(f.chains, fc)
 	f.mu.Unlock()
