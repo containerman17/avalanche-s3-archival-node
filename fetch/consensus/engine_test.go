@@ -12,8 +12,11 @@ import (
 
 // fakeNet records outbound traffic.
 type fakeNet struct {
-	reqID       uint32
-	vdrs        []ids.NodeID
+	reqID uint32
+	vdrs  []ids.NodeID
+	// sample, when set, is returned verbatim by SampleValidators (duplicates
+	// included), modelling weighted sampling with replacement.
+	sample      []ids.NodeID
 	pullQueries []pullQuery
 	gets        []ids.ID
 }
@@ -26,6 +29,9 @@ type pullQuery struct {
 
 func (f *fakeNet) NextRequestID() uint32 { f.reqID++; return f.reqID }
 func (f *fakeNet) SampleValidators(k int) ([]ids.NodeID, error) {
+	if f.sample != nil {
+		return f.sample, nil
+	}
 	out := make([]ids.NodeID, k)
 	for i := range out {
 		out[i] = f.vdrs[i%len(f.vdrs)]
@@ -114,6 +120,52 @@ func bootstrapped(t *testing.T, net *fakeNet, p snowball.Parameters, cs []*Conta
 		t.Fatal("engine not live after anchor container")
 	}
 	return e
+}
+
+// TestBootstrapAnchorOnSkewedValidatorSet: the K=20 sample of a stake-skewed
+// L1 collapses onto a few nodes (FIFA: 25 validators, 5 holding 78.5% of the
+// weight, mean 8.7 distinct per sample). The anchor tally must weigh each
+// chit by that node's draws, or AlphaPreference is unreachable and the engine
+// never goes live.
+func TestBootstrapAnchorOnSkewedValidatorSet(t *testing.T) {
+	heavy, light := ids.BuildTestNodeID([]byte{1}), ids.BuildTestNodeID([]byte{2})
+	sample := make([]ids.NodeID, 20)
+	for i := range sample {
+		sample[i] = heavy // 16 draws
+		if i >= 16 {
+			sample[i] = light // 4 draws
+		}
+	}
+	net := &fakeNet{vdrs: []ids.NodeID{heavy, light}, sample: sample}
+	cs, parse := chain(0)
+	anchor := cs[0]
+
+	e, err := New(Config{
+		Net: net, Parse: parse,
+		OnAccept: func(*Container) error { return nil },
+		Params:   params(20, 15, 20),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Tick()
+	bsReq := net.pullQueries[0].reqID
+
+	// The light node alone is 4 of 20 draws: nowhere near alpha.
+	e.OnChits(light, bsReq, anchor.ID, anchor.ID, anchor.ID, anchor.Height)
+	if len(net.gets) != 0 {
+		t.Fatalf("anchored on 4 of 20 draws: %v", net.gets)
+	}
+	// The heavy node's 16 draws clear alpha=15 on their own, even though only
+	// two distinct nodes ever answered.
+	e.OnChits(heavy, bsReq, anchor.ID, anchor.ID, anchor.ID, anchor.Height)
+	if len(net.gets) != 1 || net.gets[0] != anchor.ID {
+		t.Fatalf("expected anchor Get for %s after 20 of 20 draws agreed, got %v", anchor.ID, net.gets)
+	}
+	e.OnContainer(heavy, anchor.Bytes)
+	if !e.Stats().Live {
+		t.Fatal("engine not live after the anchor container arrived")
+	}
 }
 
 // TestAcceptanceThreshold: a block is accepted only once alphaConfidence

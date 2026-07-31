@@ -80,6 +80,19 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) map[string]any {
 	if head.BaseFee != nil {
 		fields["baseFeePerGas"] = (*hexutil.Big)(head.BaseFee)
 	}
+	// The optional Cancun header fields, emitted exactly as libevm's
+	// RPCMarshalHeader does (present iff non-nil). Both Avalanche VMs set them
+	// on modern headers; omitting them made every eth_getBlockBy* answer differ
+	// from the reference RPC above the activation height.
+	if head.BlobGasUsed != nil {
+		fields["blobGasUsed"] = hexutil.Uint64(*head.BlobGasUsed)
+	}
+	if head.ExcessBlobGas != nil {
+		fields["excessBlobGas"] = hexutil.Uint64(*head.ExcessBlobGas)
+	}
+	if head.ParentBeaconRoot != nil {
+		fields["parentBeaconBlockRoot"] = head.ParentBeaconRoot
+	}
 	addHeaderExtraFields(fields, blk)
 	txs := blk.Transactions()
 	transactions := make([]any, len(txs))

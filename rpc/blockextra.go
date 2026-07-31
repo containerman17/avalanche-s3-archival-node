@@ -28,22 +28,19 @@ import (
 //     NOOPBlockBodyHooks and has no ExtData at all, so those keys are OMITTED
 //     rather than emitted empty (an empty extDataHash would read as a real
 //     zero hash to a client).
-//   - blockGasCost exists on both.
+//   - blockGasCost, timestampMilliseconds and minDelayExcess exist on both.
+//
+// Each VM's own PostRPCMarshal is what produces those keys inside the real
+// node, so we call it rather than hand-copying a subset: a hand-copied subset
+// is how timestampMilliseconds and minDelayExcess went missing from every
+// block above the Granite activation. blockExtraData stays here because it
+// comes from the block BODY, not the header extras.
 func addHeaderExtraFields(fields map[string]any, blk *types.Block) {
 	head := blk.Header()
 	if fetch.RegisteredKind() == chain.SubnetEVM {
-		if bgc := sevmcustomtypes.GetHeaderExtra(head).BlockGasCost; bgc != nil {
-			fields["blockGasCost"] = (*hexutil.Big)(bgc)
-		}
+		sevmcustomtypes.GetHeaderExtra(head).PostRPCMarshal(head, fields)
 		return
 	}
-	headExtra := ccustomtypes.GetHeaderExtra(head)
-	fields["extDataHash"] = headExtra.ExtDataHash
+	ccustomtypes.GetHeaderExtra(head).PostRPCMarshal(head, fields)
 	fields["blockExtraData"] = hexutil.Bytes(ccustomtypes.BlockExtData(blk))
-	if headExtra.ExtDataGasUsed != nil {
-		fields["extDataGasUsed"] = (*hexutil.Big)(headExtra.ExtDataGasUsed)
-	}
-	if headExtra.BlockGasCost != nil {
-		fields["blockGasCost"] = (*hexutil.Big)(headExtra.BlockGasCost)
-	}
 }

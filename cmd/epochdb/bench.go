@@ -19,7 +19,6 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 
-	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -39,7 +38,7 @@ func benchMain(args []string) {
 	remote := fs.String("remote", "", "reference archive RPC (default per --network)")
 	n := fs.Int("n", 1000, "total probes")
 	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
-	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	network, resolveChain := chainFlags(fs)
 	workers := fs.Int("workers", 8, "concurrent probe workers")
 	fs.Parse(args)
 	if *remote == "" {
@@ -51,7 +50,9 @@ func benchMain(args []string) {
 		log.Fatalf("ab-bench: open state layer: %v", err)
 	}
 	defer store.Close()
-	g, err := exec.ChainGenesis(mustCChain(*network))
+	// ChainGenesis registers the descriptor's libevm extras, so an L1 dir is
+	// read with the same registration its writer used.
+	g, err := exec.ChainGenesis(resolveChain())
 	if err != nil {
 		log.Fatalf("ab-bench: genesis: %v", err)
 	}
@@ -238,7 +239,7 @@ func benchTxMain(args []string) {
 	local := fs.String("local", "http://127.0.0.1:9650", "local epochdb serve URL")
 	remote := fs.String("remote", "", "reference archive RPC (default per --network)")
 	n := fs.Int("n", 600, "sampled txs (each probes both methods where state allows)")
-	network := fs.String("network", "fuji", "network: fuji|mainnet")
+	network, resolveChain := chainFlags(fs)
 	seed := fs.Int64("seed", time.Now().UnixNano(), "probe RNG seed")
 	workers := fs.Int("workers", 8, "concurrent probe workers")
 	fs.Parse(args)
@@ -246,7 +247,7 @@ func benchTxMain(args []string) {
 		_, _, *remote = netParams(*network)
 	}
 
-	fetch.RegisterExtras(chain.Coreth) // ParseEthBlock needs the coreth/libevm extras
+	fetch.RegisterExtras(resolveChain().VMKind) // ParseEthBlock needs this chain's libevm extras
 	rng := rand.New(rand.NewSource(*seed))
 	fr, err := fetch.OpenReader(*dataDir)
 	if err != nil {

@@ -186,8 +186,12 @@ type Engine struct {
 	fatal chan error
 
 	// bootstrap (phasePollAnchor)
-	bsReqID  uint32
-	bsVotes  map[ids.ID]int
+	bsReqID uint32
+	bsVotes map[ids.ID]int
+	// bsSample is this poll's K draws per node. Sampling is weighted WITH
+	// replacement, so a node drawn n times casts n votes, exactly as
+	// poll.Vote credits bag multiplicity in the live path.
+	bsSample map[ids.NodeID]int
 	bsVoters set.Set[ids.NodeID]
 	bsHeight map[ids.ID]uint64
 	lastBSAt time.Time
@@ -241,6 +245,7 @@ func New(cfg Config) (*Engine, error) {
 		phase:       phasePollAnchor,
 		fatal:       make(chan error, 1),
 		bsVotes:     make(map[ids.ID]int),
+		bsSample:    make(map[ids.NodeID]int),
 		bsHeight:    make(map[ids.ID]uint64),
 		pollVdrs:    make(map[uint32]*pollState),
 		recs:        make(map[ids.ID]*rec),
@@ -423,9 +428,11 @@ func (e *Engine) sendBootstrapPoll() {
 	e.bsReqID = e.cfg.Net.NextRequestID()
 	clear(e.bsVotes)
 	clear(e.bsHeight)
+	clear(e.bsSample)
 	e.bsVoters.Clear()
 	targets := set.NewSet[ids.NodeID](len(vdrs))
 	for _, v := range vdrs {
+		e.bsSample[v]++
 		if e.cfg.Net.IsConnected(v) {
 			targets.Add(v)
 		}
@@ -440,12 +447,23 @@ func (e *Engine) sendBootstrapPoll() {
 	}
 }
 
+// bootstrapChit counts a chit toward the anchor with the WEIGHT OF ITS DRAWS
+// in the sample, not one vote per node. K is a number of weighted draws with
+// replacement, not a number of distinct nodes: on a small, stake-skewed
+// validator set a K=20 sample collapses onto a handful of nodes (measured on
+// FIFA mainnet: 25 validators, 5 of them holding 78.5% of the weight, mean
+// 8.7 distinct nodes per sample), so a one-vote-per-node tally can never
+// reach AlphaPreference=15 and the engine never leaves phasePollAnchor. This
+// is exactly what poll.Vote does for every live poll (bag multiplicity), and
+// on the primary network the two rules coincide because ~600 near-uniform
+// validators make 20 draws ~20 distinct nodes.
 func (e *Engine) bootstrapChit(nodeID ids.NodeID, requestID uint32, accepted ids.ID, acceptedHeight uint64) {
-	if requestID != e.bsReqID || e.bsVoters.Contains(nodeID) {
+	draws := e.bsSample[nodeID]
+	if requestID != e.bsReqID || draws == 0 || e.bsVoters.Contains(nodeID) {
 		return
 	}
 	e.bsVoters.Add(nodeID)
-	e.bsVotes[accepted]++
+	e.bsVotes[accepted] += draws
 	e.bsHeight[accepted] = acceptedHeight
 	if e.bsVotes[accepted] < e.cfg.Params.AlphaPreference {
 		return
