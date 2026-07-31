@@ -162,6 +162,8 @@ func main() {
 		cookTxMain(os.Args[2:])
 	case "serve":
 		serveMain(os.Args[2:])
+	case "fleet":
+		fleetMain(os.Args[2:])
 	case "ab-bench":
 		benchMain(os.Args[2:])
 	case "ab-bench-tx":
@@ -193,6 +195,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override N]")
+	fmt.Fprintln(os.Stderr, "       epochdb fleet [--chains a.json,b.json] [--data <root>] [--port 9650]  (all subnet-evm chains in one process; /ext/bc/<blockchainID>/rpc)")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")

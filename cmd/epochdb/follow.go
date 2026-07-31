@@ -18,6 +18,7 @@ import (
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
@@ -92,63 +93,165 @@ func serveMain(args []string) {
 	defer stop()
 	fatal := make(chan error, 4)
 
-	// --- staging: the follower writes it, the executor reads it ---------------
-	// Chain is what makes the follower track the L1's subnet and register the
-	// subnet-evm extras (M5); nil-equivalent for the C-chain, whose descriptor
-	// carries the primary subnet.
-	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer, Chain: c}
+	cfg := nodeConfig{
+		DataDir:       *dataDir,
+		Chain:         c,
+		NodeURI:       *nodeURI,
+		StateCacheGiB: *stateCacheGiB,
+		PerPeer:       *perPeer,
+		CookEvery:     *cookEvery,
+	}
 	if *vdrSources != "" {
 		cfg.VdrSources = strings.Split(*vdrSources, ",")
 	} else if *tipOverride == "" {
 		log.Printf("epochdb: serve: no --vdr-sources, validator set cross-checked against the --node URI only")
 	}
-	fetcher, err := fetch.New(cfg)
-	if err != nil {
-		log.Fatalf("epochdb: serve: fetch: %v", err)
-	}
-	var blocks rpc.BlockSource = fetcher.Store()
-	accepted := func() uint64 { n, _ := fetcher.Store().Head(); return n }
 	if *tipOverride != "" {
 		// Same process, same staging store, different source of blocks: a
 		// bounded backfill instead of the consensus tip (fixed-corpus builds
-		// and integration runs). Everything below is identical.
+		// and integration runs). Everything else is identical.
 		if c.SubnetID != avaconstants.PrimaryNetworkID {
 			// resolveTipOverride's whole job is finding the pre-ProposerVM
 			// ceiling, below which a container ID equals the eth block hash.
 			// An L1 is ProposerVM-wrapped from block 1, so there is none.
 			log.Fatalf("epochdb: serve: --tip-override is C-chain only (an L1 is ProposerVM-wrapped from block 1); serve an L1 by following its tip")
 		}
-		anchors := resolveTipOverride(ctx, fetcher, rpcURL, *tipOverride, networkID)
-		go func() { report(fatal, "backfill", fetcher.SyncTo(ctx, anchors, *walks)) }()
-	} else {
-		go func() { report(fatal, "follower", fetcher.Follow(ctx)) }()
+		cfg.Backfill = func(ctx context.Context, f *fetch.Fetcher) error {
+			return f.SyncTo(ctx, resolveTipOverride(ctx, f, rpcURL, *tipOverride, networkID), *walks)
+		}
 	}
+
+	n, err := startNode(ctx, cfg, func(what string, err error) { report(fatal, what, err) })
+	if err != nil {
+		log.Fatalf("epochdb: serve: %v", err)
+	}
+
+	go func() { report(fatal, "rpc server", n.srv.ListenAndServe(fmt.Sprintf(":%d", *port))) }()
+	go syncLoop(ctx, n.store.Cas(), *syncEvery)
+
+	log.Printf("epochdb: serve on :%d, executed=%d cooked=%d chainId=%s (cook every %s)",
+		*port, n.e.LiveHead(), n.hist.StateHead(), n.chainID, *cookEvery)
+
+	select {
+	case <-ctx.Done():
+		log.Printf("epochdb: shutting down, flushing")
+	case err := <-fatal:
+		// Close the writers before dying so the restart is a clean resume
+		// rather than a crash walk-back.
+		log.Printf("epochdb: FATAL: %v", err)
+		n.closeAll()
+		os.Exit(1)
+	}
+	n.closeAll()
+	log.Printf("epochdb: stopped at executed=%d", n.e.LiveHead())
+}
+
+// nodeConfig is everything one chain's node needs. `serve` fills one from its
+// flags; `fleet` fills one per descriptor (fleet.go).
+type nodeConfig struct {
+	DataDir       string
+	Chain         *chain.Chain
+	NodeURI       string
+	VdrSources    []string
+	StateCacheGiB int
+	PerPeer       int
+	CookEvery     time.Duration
+	// Label prefixes this node's log lines so a fleet's chains are
+	// distinguishable. Empty keeps single-chain serve's log format verbatim.
+	Label string
+	// Backfill replaces the consensus follower with a bounded walk
+	// (serve --tip-override). nil follows the live tip.
+	Backfill func(context.Context, *fetch.Fetcher) error
+}
+
+func (c nodeConfig) logf(format string, args ...any) {
+	if c.Label != "" {
+		format = c.Label + ": " + format
+	}
+	log.Printf("epochdb: "+format, args...)
+}
+
+// chainNode is ONE chain's running stack: follower, executor, state layer,
+// history and RPC handler, all on the caller's context. `serve` runs one;
+// `fleet` runs N of them side by side in one process, which is the entire
+// difference between the two commands.
+type chainNode struct {
+	cfg      nodeConfig
+	fetcher  *fetch.Fetcher
+	e        *exec.Executor
+	store    *state.Store
+	hist     *state.History
+	srv      *rpc.Server
+	txidx    *txIndexHolder
+	accepted func() uint64
+	chainID  fmt.Stringer // eth chainId, for the startup line
+	stopOnce sync.Once
+}
+
+// startNode wires one chain's goroutines onto ctx and returns with it running.
+// Every component goroutine's exit goes to report, which decides what a
+// failure means: fatal for `serve` (one chain IS the process), per-chain in the
+// fleet. Nothing here calls log.Fatal, because a fleet must survive one chain's
+// bad data directory.
+func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err error)) (n *chainNode, err error) {
+	// Unwind whatever is already open if a later step fails: in the fleet this
+	// runs while sibling chains are serving, so leaking fds is not an option.
+	var closers []func()
+	defer func() {
+		if err == nil {
+			return
+		}
+		for i := len(closers) - 1; i >= 0; i-- {
+			closers[i]()
+		}
+	}()
+
+	// --- staging: the follower writes it, the executor reads it ---------------
+	// Chain is what makes the follower track the L1's subnet and register the
+	// subnet-evm extras (M5); nil-equivalent for the C-chain, whose descriptor
+	// carries the primary subnet.
+	fetcher, err := fetch.New(fetch.Config{
+		DataDir:    cfg.DataDir,
+		NodeURI:    cfg.NodeURI,
+		PerPeer:    cfg.PerPeer,
+		Chain:      cfg.Chain,
+		VdrSources: cfg.VdrSources,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch: %w", err)
+	}
+	closers = append(closers, func() { fetcher.Close() })
+	var blocks rpc.BlockSource = fetcher.Store()
+	accepted := func() uint64 { h, _ := fetcher.Store().Head(); return h }
 
 	// --- state layer: the executor owns the writer, the RPC shares it ---------
-	store, err := state.Open(*dataDir)
+	store, err := state.Open(cfg.DataDir)
 	if err != nil {
-		log.Fatalf("epochdb: open state layer: %v", err)
+		return nil, fmt.Errorf("open state layer: %w", err)
 	}
-	defer store.Close()
+	closers = append(closers, func() { store.Close() })
 
-	g, err := exec.ChainGenesis(c)
+	g, err := exec.ChainGenesis(cfg.Chain)
 	if err != nil {
-		log.Fatalf("epochdb: genesis: %v", err)
+		return nil, fmt.Errorf("genesis: %w", err)
 	}
 
 	// onBlock is late-bound: the executor is built before the RPC server, and
 	// exec.New's reconcile must not publish into a nil server.
 	var onBlock atomic.Pointer[func(uint64, common.Hash)]
+	// exec.New stamps the data dir with the VM kind and refuses a dir built by
+	// the other one (state.Store.BindVMKind): that check is what keeps a
+	// subnet-evm fleet from opening a coreth corpus.
 	e, err := exec.New(exec.Config{
-		DataDir: *dataDir,
+		DataDir: cfg.DataDir,
 		Blocks:  blocks,
 		Store:   store,
-		OnBlock: func(n uint64, h common.Hash) {
+		OnBlock: func(h uint64, hash common.Hash) {
 			if f := onBlock.Load(); f != nil {
-				(*f)(n, h)
+				(*f)(h, hash)
 			}
 		},
-		StateCacheBytes: uint64(*stateCacheGiB) << 30,
+		StateCacheBytes: uint64(cfg.StateCacheGiB) << 30,
 		// UNPINNED 2026-07-29: this was 1 only so the served frontier was a
 		// committed Firewood revision. Nothing reads Firewood any more, so
 		// batching costs nothing in freshness: head, block-hash index and the
@@ -161,77 +264,92 @@ func serveMain(args []string) {
 		// guard); 64 keeps the crash walk-back at 8k blocks, well inside one
 		// 100k raw bucket.
 		CommitEvery: 64,
-		Chain:       c,
+		Chain:       cfg.Chain,
 	})
 	if err != nil {
-		log.Fatalf("epochdb: exec.New: %v", err)
+		return nil, fmt.Errorf("exec.New: %w", err)
 	}
-	defer e.Close()
+	closers = append(closers, func() { e.Close() })
 
-	hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
+	hist, err := state.OpenHistory(cfg.DataDir, store, g.Alloc)
 	if err != nil {
-		log.Fatalf("epochdb: open history: %v", err)
+		return nil, fmt.Errorf("open history: %w", err)
 	}
-	defer hist.Close()
+	closers = append(closers, func() { hist.Close() })
+
+	n = &chainNode{
+		cfg: cfg, fetcher: fetcher, e: e, store: store, hist: hist,
+		txidx: &txIndexHolder{}, accepted: accepted, chainID: g.Config.ChainID,
+	}
 
 	// --- the one read path: uncooked tail overlay, then the descent ----------
 	// Cook once before serving so the descent reaches as high as it can, then
 	// hand the residue (executed but not indexed, and therefore answerable
 	// only from the raw writelog) to the overlay. Both must happen before the
 	// executor and the RPC goroutines start.
-	txidx := &txIndexHolder{}
-	cookOnce(*dataDir, hist, txidx)
+	n.cookOnce()
 	tailBlocks, tailEntries, tailBytes, err := hist.EnableTail(e.LiveHead())
 	if err != nil {
-		log.Fatalf("epochdb: tail overlay: %v", err)
+		return nil, fmt.Errorf("tail overlay: %w", err)
 	}
-	log.Printf("epochdb: tail overlay: cooked=%d executed=%d, backfilled %d uncooked blocks (%d entries, %.1fMB)",
+	cfg.logf("tail overlay: cooked=%d executed=%d, backfilled %d uncooked blocks (%d entries, %.1fMB)",
 		hist.StateHead(), e.LiveHead(), tailBlocks, tailEntries, float64(tailBytes)/1e6)
 
 	// --- RPC -----------------------------------------------------------------
-	srv := rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
-	srv.EnableLive(liveNode{Executor: e, accepted: accepted})
+	n.srv = rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
+	n.srv.EnableLive(liveNode{Executor: e, accepted: accepted})
 
-	txidx.reopen(*dataDir, hist.Epochs())
-	srv.EnableTxAPIs(txidx, rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: blocks}, exec.ParseEthBlock)
+	n.txidx.reopen(cfg.DataDir, hist.Epochs())
+	n.srv.EnableTxAPIs(n.txidx, rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: blocks}, exec.ParseEthBlock)
 
 	// NO floor-to-head block-hash map (deleted 2026-07-31, DESIGN.md ruling
 	// 2): block hashes live in the same fp48 index as tx hashes, sealed and
 	// raw alike, so eth_getBlockByHash resolves through WalkCandidates. Only
 	// the blocks accepted since the last cook need in-process tracking, and
 	// those arrive through OnBlock into a bounded ring.
-	advance := func(n uint64, h common.Hash) {
-		srv.AddBlockHash(h, n)
-		hist.SetHead(n)
+	advance := func(h uint64, hash common.Hash) {
+		n.srv.AddBlockHash(hash, h)
+		hist.SetHead(h)
 	}
 	onBlock.Store(&advance)
 	hist.SetHead(e.LiveHead())
 
-	go func() { report(fatal, "rpc server", srv.ListenAndServe(fmt.Sprintf(":%d", *port))) }()
-	go func() { report(fatal, "executor", e.Run(ctx)) }()
-	go cookLoop(ctx, *dataDir, hist, txidx, *cookEvery)
-	go syncLoop(ctx, store.Cas(), *syncEvery)
-	go statusLoop(ctx, e, hist, accepted)
-
-	log.Printf("epochdb: serve on :%d, executed=%d cooked=%d chainId=%s (cook every %s)",
-		*port, e.LiveHead(), hist.StateHead(), g.Config.ChainID, *cookEvery)
-
-	select {
-	case <-ctx.Done():
-		log.Printf("epochdb: shutting down, flushing")
-	case err := <-fatal:
-		// Close the writers before dying so the restart is a clean resume
-		// rather than a crash walk-back (the deferred Closes run on return).
-		log.Printf("epochdb: FATAL: %v", err)
-		fetcher.Close()
-		e.Close()
-		store.Close()
-		os.Exit(1)
+	if cfg.Backfill != nil {
+		go func() { report("backfill", cfg.Backfill(ctx, fetcher)) }()
+	} else {
+		go func() { report("follower", fetcher.Follow(ctx)) }()
 	}
-	if err := fetcher.Close(); err != nil {
-		log.Printf("epochdb: fetch close: %v", err)
+	go func() { report("executor", e.Run(ctx)) }()
+	go n.cookLoop(ctx)
+	go n.statusLoop(ctx)
+	return n, nil
+}
+
+// stop flushes and releases what a STOPPED chain must not leave dirty: the
+// executor's open batch, the state watermark and the Firewood handle, all of
+// which the executor alone touches. It deliberately does NOT close the state
+// layer, the history or the staging store: the RPC goroutines read their
+// mmaps, and a use-after-close there is a segfault, i.e. exactly the
+// process-wide failure the per-chain boundary exists to prevent. A stopped
+// chain keeps answering frozen data until the process restarts.
+func (n *chainNode) stop() {
+	n.stopOnce.Do(func() {
+		if err := n.e.Close(); err != nil {
+			n.cfg.logf("executor close: %v", err)
+		}
+	})
+}
+
+// closeAll is the clean process-shutdown path: every writer flushed and
+// released, executor first (it is the only writer of the state layer). Safe
+// only once the RPC listener is done with this node.
+func (n *chainNode) closeAll() {
+	n.stop()
+	if err := n.fetcher.Close(); err != nil {
+		n.cfg.logf("fetch close: %v", err)
 	}
-	log.Printf("epochdb: stopped at executed=%d", e.LiveHead())
+	n.hist.Close()
+	n.store.Close()
 }
 
 // report routes a component goroutine's exit. Only a REAL error is fatal: a
@@ -272,8 +390,8 @@ func (l liveNode) AcceptedHead() uint64 { return max(l.accepted(), l.Executor.Li
 // another cook. The documented shape stays: run seal as the external sibling
 // on its own cadence. With EPOCH_TXS at 10M an epoch boundary is ~10 days
 // away, so nothing is lost by leaving it out of the tip loop.
-func cookLoop(ctx context.Context, dir string, hist *state.History, txidx *txIndexHolder, every time.Duration) {
-	t := time.NewTicker(every)
+func (n *chainNode) cookLoop(ctx context.Context) {
+	t := time.NewTicker(n.cfg.CookEvery)
 	defer t.Stop()
 	for {
 		select {
@@ -281,7 +399,7 @@ func cookLoop(ctx context.Context, dir string, hist *state.History, txidx *txInd
 			return
 		case <-t.C:
 		}
-		cookOnce(dir, hist, txidx)
+		n.cookOnce()
 	}
 }
 
@@ -315,26 +433,27 @@ func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
 // everything dropped here is already answerable by the descent, and a latest
 // read that misses the overlay picks up its descent target afterwards. See
 // state/tail.go prune for the full race argument.
-func cookOnce(dir string, hist *state.History, txidx *txIndexHolder) {
+func (n *chainNode) cookOnce() {
 	start := time.Now()
+	dir, hist := n.cfg.DataDir, n.hist
 	if err := state.CookIndex(dir); err != nil {
-		log.Printf("epochdb: COOK FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
+		n.cfg.logf("COOK FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
 		return
 	}
 	if err := state.CookTxIndex(dir); err != nil {
-		log.Printf("epochdb: COOK-TXINDEX FAILED (tail tx lookups frozen, chain unaffected): %v", err)
+		n.cfg.logf("COOK-TXINDEX FAILED (tail tx lookups frozen, chain unaffected): %v", err)
 	}
 	if err := hist.Refresh(); err != nil {
-		log.Printf("epochdb: HISTORY REFRESH FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
+		n.cfg.logf("HISTORY REFRESH FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
 		return
 	}
-	txidx.reopen(dir, hist.Epochs())
+	n.txidx.reopen(dir, hist.Epochs())
 	entries, size := hist.PruneTail()
-	log.Printf("epochdb: cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
+	n.cfg.logf("cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
 		hist.StateHead(), time.Since(start).Round(time.Millisecond), entries, float64(size)/1e6)
 }
 
-func statusLoop(ctx context.Context, e *exec.Executor, hist *state.History, accepted func() uint64) {
+func (n *chainNode) statusLoop(ctx context.Context) {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
 	for {
@@ -343,11 +462,17 @@ func statusLoop(ctx context.Context, e *exec.Executor, hist *state.History, acce
 			return
 		case <-t.C:
 		}
-		acc, ex := accepted(), e.LiveHead()
-		entries, size := hist.TailStats()
-		log.Printf("epochdb: serve: accepted=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%d tail=%d/%.1fMB",
-			acc, ex, hist.Head(), hist.StateHead(), e.SettledHeight(), int64(acc)-int64(ex), entries, float64(size)/1e6)
+		n.cfg.logf("serve: %s", n.status())
 	}
+}
+
+// status is the one-line health of this chain, shared by the log loop and the
+// fleet's /status endpoint.
+func (n *chainNode) status() string {
+	acc, ex := n.accepted(), n.e.LiveHead()
+	entries, size := n.hist.TailStats()
+	return fmt.Sprintf("accepted=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%d tail=%d/%.1fMB",
+		acc, ex, n.hist.Head(), n.hist.StateHead(), n.e.SettledHeight(), int64(acc)-int64(ex), entries, float64(size)/1e6)
 }
 
 // txIndexHolder swaps the raw tx index under the RPC server as cook rebuilds

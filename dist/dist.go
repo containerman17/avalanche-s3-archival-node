@@ -116,6 +116,26 @@ func (s *sharedCas) close() error {
 	return s.Store.Close()
 }
 
+// casRoot, when set, moves the spool and the chunk cache OUT of each data
+// directory into ONE shared place. That is the fleet's rule (DESIGN.md "THE
+// FLEET"): N chains in one process share one casfs, so the SSD-tier LRU is
+// global across chains, a dead chain drains to zero and a hot one takes what it
+// needs. Cross-chain collisions are impossible because artifacts are named by
+// their content hash, and the only per-chain state (the epoch markers, the
+// local `latest`) still lives in each chain's own data dir. Set it once at
+// startup before any Open; empty keeps every store self-contained.
+var casRoot string
+
+// SetRoot points every later Open/Local at a shared spool and chunk cache.
+func SetRoot(dir string) { casRoot = dir }
+
+func rootFor(dataDir string) string {
+	if casRoot != "" {
+		return casRoot
+	}
+	return dataDir
+}
+
 // Open builds the store for a data directory from the environment.
 func Open(dataDir string) (*Store, error) {
 	s, err := Local(dataDir)
@@ -134,7 +154,7 @@ func Open(dataDir string) (*Store, error) {
 		}
 		cacheBytes = n
 	}
-	cacheDir := filepath.Join(dataDir, cacheName)
+	cacheDir := filepath.Join(rootFor(dataDir), cacheName)
 	cas, err := openCas(cacheDir, casfs.Config{
 		Endpoint:   endpoint,
 		Region:     os.Getenv("EPOCHDB_S3_REGION"),
@@ -156,7 +176,7 @@ func Open(dataDir string) (*Store, error) {
 // Local builds a store that never talks to S3 whatever the environment says
 // (tests, tools, and any node run without credentials).
 func Local(dataDir string) (*Store, error) {
-	s := &Store{dir: dataDir, spool: filepath.Join(dataDir, spoolName)}
+	s := &Store{dir: dataDir, spool: filepath.Join(rootFor(dataDir), spoolName)}
 	if err := os.MkdirAll(s.spool, 0o755); err != nil {
 		return nil, err
 	}
