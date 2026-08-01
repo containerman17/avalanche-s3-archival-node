@@ -242,6 +242,16 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	}
 	closers = append(closers, func() { store.Close() })
 
+	// Never serve an epoch set with a hole in it: walk the hash chain from
+	// `latest` back to the chain root before anything opens it.
+	epochs, err := validateChain(store.Cas(), cfg.Chain.Root())
+	if err != nil {
+		return nil, fmt.Errorf("epoch chain: %w", err)
+	}
+	if epochs > 0 {
+		cfg.logf("epoch chain: %d epochs linked from `latest` to the chain root", epochs)
+	}
+
 	g, err := exec.ChainGenesis(cfg.Chain)
 	if err != nil {
 		return nil, fmt.Errorf("genesis: %w", err)
@@ -287,6 +297,12 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		return nil, fmt.Errorf("open history: %w", err)
 	}
 	closers = append(closers, func() { hist.Close() })
+
+	// The sealed history IS history: the follower must not walk below it,
+	// whatever the raw staging store still happens to hold. sealOnce raises
+	// this again on every epoch cut, including the one the startup cook below
+	// may do.
+	fetcher.SetFloor(hist.Epochs().CoveredEnd())
 
 	n = &chainNode{
 		cfg: cfg, fetcher: fetcher, e: e, store: store, hist: hist,
@@ -497,7 +513,10 @@ func (n *chainNode) sealOnce() {
 	}
 	// The staging segments are the fetcher's, not the state layer's, so their
 	// handles are released here: an unlinked arrival log this process still
-	// holds open frees no disk.
+	// holds open frees no disk. The same call raises the follower's backfill
+	// floor, so a walk started after this seal never asks for what it just
+	// deleted.
+	n.fetcher.SetFloor(sealedEnd)
 	if err := n.fetcher.Store().Retire(sealedEnd); err != nil {
 		n.cfg.logf("seal: retiring staging segments: %v", err)
 	}

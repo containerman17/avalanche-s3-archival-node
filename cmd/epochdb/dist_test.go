@@ -78,3 +78,37 @@ func TestBootstrapChainWalk(t *testing.T) {
 		t.Fatalf("walk with the wrong chain root: %v", err)
 	}
 }
+
+// TestValidateChainAtStartup: the startup walk passes on an intact chain, is a
+// no-op on a dir that never sealed, and refuses to start once a linked
+// artifact is gone.
+func TestValidateChainAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	st, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := [32]byte{7, 7, 7}
+
+	// Nothing sealed yet: no `latest`, nothing to walk, and that is fine.
+	if n, err := validateChain(st, root); n != 0 || err != nil {
+		t.Fatalf("empty dir: %d epochs, err %v", n, err)
+	}
+
+	h1, h2 := buildLinkedEpochs(t, st, root)
+	if err := st.SetLatest(dist.Latest{Epoch: h2}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := validateChain(st, root); n != 2 || err != nil {
+		t.Fatalf("intact chain: %d epochs, err %v", n, err)
+	}
+
+	// Existence is half the check: lose the artifact the chain links to and
+	// the node must refuse to serve.
+	if err := os.Remove(st.SpoolPath(h1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateChain(st, root); err == nil {
+		t.Fatalf("missing epoch %s accepted", h1)
+	}
+}

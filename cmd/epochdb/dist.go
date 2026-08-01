@@ -12,8 +12,10 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 
 	"github.com/containerman17/epochdb/chain"
@@ -84,6 +86,21 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 		hash = hex.EncodeToString(prev[:])
 	}
 	return epochs, nil
+}
+
+// validateChain is the SAME walk, run at every node start (ruling 2026-08-01):
+// existence and linkage of every epoch from `latest` back to the chain root,
+// and NOTHING else. No content is rehashed: that is `epochdb verify`, a full
+// pass over the corpus, and this must stay O(epochs) metadata reads. Serving a
+// corrupt epoch set silently is the one unforgivable failure, so a break here
+// refuses to start.
+//
+// A missing `latest` is not a break: it is a data dir that has never sealed.
+func validateChain(st *dist.Store, chainRoot [32]byte) (int, error) {
+	if _, err := st.Latest(); errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	return bootstrapChain(st, chainRoot)
 }
 
 // buildFrontier is `bootstrap --frontier`: the state half of bootstrapping.
