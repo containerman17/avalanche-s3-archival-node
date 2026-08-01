@@ -678,8 +678,3 @@ func revertError(res *callResult) *rpcError {
 	}
 	return out
 }
-
-// ListenAndServe runs the server on addr until the listener fails.
-func (s *Server) ListenAndServe(addr string) error {
-	return http.ListenAndServe(addr, s)
-}

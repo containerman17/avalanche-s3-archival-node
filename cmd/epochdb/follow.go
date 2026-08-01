@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -122,12 +123,12 @@ func serveMain(args []string) {
 		}
 	}
 
-	n, err := startNode(ctx, cfg, func(what string, err error) { report(fatal, what, err) })
+	n, ln, err := serveOn(ctx, cfg, *port, func(what string, err error) { report(fatal, what, err) })
 	if err != nil {
 		log.Fatalf("epochdb: serve: %v", err)
 	}
 
-	go func() { report(fatal, "rpc server", n.srv.ListenAndServe(fmt.Sprintf(":%d", *port))) }()
+	go func() { report(fatal, "rpc server", http.Serve(ln, n.srv)) }()
 	go syncLoop(ctx, n.store.Cas(), *syncEvery)
 
 	log.Printf("epochdb: serve on :%d, executed=%d cooked=%d chainId=%s (cook every %s)",
@@ -148,6 +149,29 @@ func serveMain(args []string) {
 	}
 	n.closeAll()
 	log.Printf("epochdb: stopped at executed=%d", n.e.LiveHead())
+}
+
+// serveOn binds the RPC port and ONLY THEN starts the node on it. The order is
+// the whole point: startNode is an hour of work on a big corpus (the epoch
+// chain walk, the exec open, the startup cook and the tail overlay), and while
+// it ran nothing had touched the port, so a collision surfaced as FATAL 68
+// minutes in (Fuji, 2026-08-01, twice in one night). A bad port now fails in
+// milliseconds.
+//
+// Connections that arrive before the node is up wait in the kernel's accept
+// backlog until http.Serve starts reading it: zero code, and unlike a 503
+// nothing a client has to learn to retry.
+func serveOn(ctx context.Context, cfg nodeConfig, port int, report func(string, error)) (*chainNode, net.Listener, error) {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return nil, nil, err
+	}
+	n, err := startNode(ctx, cfg, report)
+	if err != nil {
+		ln.Close()
+		return nil, nil, err
+	}
+	return n, ln, nil
 }
 
 // nodeConfig is everything one chain's node needs. `serve` fills one from its

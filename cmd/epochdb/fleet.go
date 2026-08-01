@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -84,11 +85,30 @@ func fleetMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	descs := loadFleetChains(ctx, specs, execNetID(*network), *root)
-
+	// The listener FIRST, before chain resolution and the per-chain startup work
+	// below, which on a big corpus is over an hour: a bad port must be a dead
+	// process in milliseconds, not a FATAL after the whole boot (Fuji,
+	// 2026-08-01, twice on serve). /status answers from this moment too, so an
+	// operator can watch the chains come up instead of guessing; a chain's own
+	// path 404s until it registers, and registering into a live ServeMux is
+	// safe (Handle and ServeHTTP share its lock).
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	if err != nil {
+		log.Fatalf("epochdb: fleet: %v", err)
+	}
 	f := &fleet{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", f.statusHandler)
+	srv := &http.Server{Handler: mux}
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("epochdb: fleet: FATAL rpc listener: %v", err)
+			stop()
+		}
+	}()
+
+	descs := loadFleetChains(ctx, specs, execNetID(*network), *root)
+
 	for i, c := range descs {
 		id := c.BlockchainID.String()
 		cfg := nodeConfig{
@@ -141,13 +161,6 @@ func fleetMain(args []string) {
 	// One syncLoop for the shared spool; any chain's store reaches the same
 	// casfs.
 	go syncLoop(ctx, f.chains[0].node.store.Cas(), *syncEvery)
-	srv := &http.Server{Addr: fmt.Sprintf(":%d", *port), Handler: mux}
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("epochdb: fleet: FATAL rpc listener: %v", err)
-			stop()
-		}
-	}()
 	log.Printf("epochdb: fleet on :%d with %d chains (cook every %s)", *port, len(f.chains), *cookEvery)
 
 	<-ctx.Done()
