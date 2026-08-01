@@ -16,10 +16,12 @@
 //
 //	EPOCHDB_S3_ENDPOINT    scheme://host[:port]; empty = fully local, no S3
 //	EPOCHDB_S3_BUCKET      required when the endpoint is set
-//	EPOCHDB_S3_ACCESS_KEY  }
-//	EPOCHDB_S3_SECRET_KEY  } required when the endpoint is set
+//	EPOCHDB_S3_ACCESS_KEY  } static keys, the R2 and MinIO path. UNSET means the
+//	EPOCHDB_S3_SECRET_KEY  } AWS default chain: env, shared config, SSO, instance
+//	                       } role, refresh and session tokens included.
 //	EPOCHDB_S3_PREFIX      optional key prefix, used verbatim
-//	EPOCHDB_S3_REGION      optional, default "auto" (R2; MinIO ignores it)
+//	EPOCHDB_S3_REGION      optional; default the chain's region, else "auto"
+//	                       (R2 wants "auto"; MinIO ignores it)
 //	EPOCHDB_CACHE_BYTES    chunk cache cap, default 8GiB
 package dist
 
@@ -160,6 +162,9 @@ func Open(dataDir string) (*Store, error) {
 		cacheBytes = n
 	}
 	cacheDir := filepath.Join(rootFor(dataDir), cacheName)
+	// Empty keys are not an error: casfs falls back to the AWS default chain,
+	// which is what makes an SSO session or an instance role work with nothing
+	// but an endpoint and a bucket set.
 	cas, err := openCas(cacheDir, casfs.Config{
 		Endpoint:   endpoint,
 		Region:     os.Getenv("EPOCHDB_S3_REGION"),

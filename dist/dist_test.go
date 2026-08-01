@@ -116,6 +116,30 @@ func TestPointersOutsideChunkCache(t *testing.T) {
 	}
 }
 
+// TestOpenWithoutStaticKeys pins the credential contract: an endpoint with no
+// EPOCHDB_S3_ACCESS_KEY/SECRET_KEY is the AWS default chain, not an error. The
+// stub is env credentials, which is the first link of that chain, so the test
+// resolves nothing over the network and never touches a real account.
+func TestOpenWithoutStaticKeys(t *testing.T) {
+	t.Setenv("EPOCHDB_S3_ENDPOINT", "https://s3.example.invalid")
+	t.Setenv("EPOCHDB_S3_BUCKET", "epochs")
+	t.Setenv("EPOCHDB_S3_ACCESS_KEY", "")
+	t.Setenv("EPOCHDB_S3_SECRET_KEY", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDSTUB")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "stub")
+	t.Setenv("AWS_SESSION_TOKEN", "stubtoken")
+	t.Setenv("AWS_REGION", "ap-northeast-1")
+
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open with no static keys: %v", err)
+	}
+	defer s.Close()
+	if !s.Remote() {
+		t.Fatal("store is local, want a credentialed store from the default chain")
+	}
+}
+
 func TestLatestPointer(t *testing.T) {
 	s, err := Local(t.TempDir())
 	if err != nil {

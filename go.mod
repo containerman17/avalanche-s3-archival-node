@@ -6,10 +6,11 @@ require (
 	github.com/ava-labs/avalanchego v1.15.0-fuji
 	github.com/ava-labs/avalanchego/graft/coreth v1.15.0-fuji
 	github.com/ava-labs/avalanchego/graft/evm v1.15.0-fuji
+	github.com/ava-labs/avalanchego/graft/subnet-evm v1.15.0-fuji
 	github.com/ava-labs/firewood-go-ethhash/ffi v0.8.0
 	github.com/ava-labs/libevm v1.13.15-0.20260721184559-5557c68d296b
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/containerman17/casfs v0.0.0-20260730162613-777915bcf3f2
+	github.com/containerman17/casfs v0.0.0-20260801065700-a1c0aa22d6e1
 	github.com/gorilla/websocket v1.5.0
 	github.com/holiman/uint256 v1.2.4
 	github.com/klauspost/compress v1.18.0
@@ -24,7 +25,20 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/StephenButtolph/canoto v0.18.0 // indirect
 	github.com/VictoriaMetrics/fastcache v1.12.1 // indirect
-	github.com/ava-labs/avalanchego/graft/subnet-evm v1.15.0-fuji // indirect
+	github.com/aws/aws-sdk-go-v2 v1.43.3 // indirect
+	github.com/aws/aws-sdk-go-v2/config v1.32.34 // indirect
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.33 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.34 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.34 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.34 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.35 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.15 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.34 // indirect
+	github.com/aws/aws-sdk-go-v2/service/signin v1.5.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.33.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.45.3 // indirect
+	github.com/aws/smithy-go v1.27.6 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.3.5 // indirect
