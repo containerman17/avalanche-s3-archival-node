@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ava-labs/avalanchego/graft/coreth/core/extstate"
 	"github.com/ava-labs/avalanchego/graft/evm/firewood"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
@@ -53,11 +52,20 @@ type Verifier struct {
 // New opens a fresh throwaway Firewood under tmpDir and anchors it at c's
 // genesis. c == nil = anchorless test mode: start from an empty trie and adopt
 // the first header's ParentHash as anchor.
+//
+// The VM kind comes off the descriptor and picks BOTH the libevm extras (which
+// decide how a header decodes and hashes) and the throwaway's state database,
+// exactly as exec does. Anchorless mode has no descriptor, so it takes whatever
+// kind the process already registered, and coreth when nothing has.
 func New(tmpDir string, c *chain.Chain, workers int) (*Verifier, error) {
-	if c != nil && c.VMKind != chain.Coreth {
-		return nil, fmt.Errorf("verify: %s verification is not built yet (exec can replay one, this engine still cannot)", c.VMKind)
+	kind := fetch.RegisteredKind()
+	if c != nil {
+		kind = c.VMKind
 	}
-	fetch.RegisterExtras(chain.Coreth)
+	if kind == "" {
+		kind = chain.Coreth
+	}
+	fetch.RegisterExtras(kind)
 	tdb, fw, db, err := newThrowawayFirewood(tmpDir)
 	if err != nil {
 		return nil, err
@@ -98,7 +106,7 @@ func newThrowawayFirewood(tmpDir string) (*triedb.Database, *firewood.TrieDB, et
 		tdb.Close()
 		return nil, nil, nil, fmt.Errorf("triedb backend is %T, want *firewood.TrieDB", tdb.Backend())
 	}
-	return tdb, fw, extstate.NewDatabaseWithNodeDB(memdb, tdb), nil
+	return tdb, fw, exec.NewStateDatabase(memdb, tdb), nil
 }
 
 // Close releases the throwaway Firewood (the caller removes tmpDir).
@@ -418,8 +426,20 @@ func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (bloc
 		return 0, 0, err
 	}
 	defer set.Close()
-	if len(set.All()) == 0 {
+	eps := set.All()
+	if len(eps) == 0 {
 		return 0, 0, fmt.Errorf("no sealed epochs indexed in %s", st.Dir())
+	}
+	// The chain root is sha256(genesisData || upgradeBytes), so a chain that
+	// ships an upgrade.json cannot be verified without it: parsing the genesis
+	// with default upgrades would replay a DIFFERENT chain and only surface as
+	// a root mismatch somewhere in the middle, if at all. Epoch 1's prev-hash
+	// IS that root, so one comparison says it up front and by name.
+	if c != nil && eps[0].Start == 1 {
+		if root := c.Root(); eps[0].Prev != root {
+			return 0, 0, fmt.Errorf("epoch_%d_%d anchors at chain root %x, but %s resolves to %x: wrong chain, or a missing/edited upgrade.json (the chain root is sha256(genesisData || upgradeBytes))",
+				eps[0].Start, eps[0].Count, eps[0].Prev, st.Dir(), root)
+		}
 	}
 	v, err := New(tmpDir, c, workers)
 	if err != nil {
@@ -427,7 +447,7 @@ func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (bloc
 	}
 	defer v.Close()
 	t0 := time.Now()
-	for _, e := range set.All() {
+	for _, e := range eps {
 		if err := v.VerifyEpoch(e); err != nil {
 			return v.blocks, time.Since(t0), fmt.Errorf("epoch_%d_%d: %w", e.Start, e.Count, err)
 		}

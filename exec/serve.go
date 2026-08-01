@@ -3,7 +3,10 @@ package exec
 import (
 	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
+	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/ethdb"
+	"github.com/ava-labs/libevm/triedb"
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
@@ -50,6 +53,20 @@ var EncodeLogsFrame = encodeLogsFrame
 // PROCESS registered with libevm, which is the only kind whose header extras
 // can be read at all (see registeredVM). On subnet-evm it is always false.
 var HasSettledMarkers = func(h *types.Header) bool { return registeredVM().hasSettledMarkers(h) }
+
+// NewStateDatabase is the registered VM's extstate database over a triedb, for
+// the no-execution verifier's throwaway Firewood. Like HasSettledMarkers it
+// holds no descriptor, so the kind is the one THIS PROCESS registered.
+//
+// HONEST NOTE: at v1.15.0-fuji the two VMs' NewDatabaseWithNodeDB are the SAME
+// three lines in two packages (libevm's state.NewDatabaseWithNodeDB wrapped by
+// graft/evm/firewood.NewStateAccessor), so today this routes to identical code
+// and no test can tell them apart. It goes through the seam anyway because
+// naming coreth's package from a subnet-evm path is precisely the class of bug
+// M8 found in rpc, and it is where a divergence would land.
+func NewStateDatabase(db ethdb.Database, tdb *triedb.Database) ethstate.Database {
+	return registeredVM().newStateDatabase(db, tdb)
+}
 
 // NewChainContext exposes the executor's headers-log-backed ChainContext so
 // BLOCKHASH inside historical eth_call resolves real hashes. Not
