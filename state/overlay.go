@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -132,7 +133,10 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 		stateHead = end
 	}
 	if len(h.buckets) == 0 && len(h.epochs.All()) == 0 {
-		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets or epochs in %s (run epochdb cook-index or seal)", dir)
+		// A never-cooked dir is a valid empty window, not an error: the node
+		// cooks at startup and Refresh picks the buckets up. Refusing here
+		// would make first start on a raw corpus impossible.
+		log.Printf("state: nothing cooked or sealed in %s yet, historical window empty until the first cook", dir)
 	}
 	h.deletes = make(map[string][]uint64)
 	addEpochDeletes(h.deletes, h.epochs.All())
