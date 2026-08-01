@@ -187,8 +187,14 @@ func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error
 // bottom is the block at height 1, whose parent IS genesis: stopping there is
 // exact on the C-chain (where the genesis container ID is also computable
 // offline and short-circuits the walk one step earlier) and is the only
-// terminator on an L1.
+// terminator on an L1. That is the floor=0 case of the one rule below: stop
+// when the NEXT block down is at or below the floor.
+//
+// The sealed end (SetFloor) is a floor for every walk, whatever its caller
+// passed: those blocks are durable in the epochs and their raw is gone, so a
+// walk that descended past it would re-download history this node already has.
 func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
+	floor = max(floor, f.floor.Load())
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -208,7 +214,7 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 			// Short-circuit: skip past the contiguous stored run in RAM,
 			// re-parse only the bottom container to find its parent.
 			lo := f.store.LowestContiguous(h, floor)
-			if lo == 0 || (floor > 0 && lo <= floor+1) {
+			if lo <= floor+1 {
 				return nil // run connects to the floor checkpoint (or block 0)
 			}
 			raw, ok, err := f.store.GetByHeight(lo)
@@ -219,7 +225,7 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 			if err != nil {
 				return fmt.Errorf("parse stored container at height %d: %w", lo, err)
 			}
-			if parsed.blockNumber <= 1 {
+			if parsed.blockNumber <= floor+1 {
 				return nil
 			}
 			id = parsed.parentID
@@ -229,7 +235,7 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 		if err != nil {
 			return err
 		}
-		if parsed.blockNumber <= 1 {
+		if parsed.blockNumber <= floor+1 {
 			return nil
 		}
 		id = parsed.parentID

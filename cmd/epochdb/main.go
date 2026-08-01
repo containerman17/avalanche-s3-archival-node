@@ -529,6 +529,24 @@ func execNetID(network string) uint32 {
 	return id
 }
 
+// sealedFloor is the last block of the contiguous sealed prefix in a data dir,
+// 0 when nothing is sealed. It is the fetcher's backfill floor: seal deleted
+// the raw below it, so a walk that went there would re-download durable
+// history.
+func sealedFloor(dataDir string) uint64 {
+	st, err := dist.Open(dataDir)
+	if err != nil {
+		log.Fatalf("epochdb: open artifact store: %v", err)
+	}
+	defer st.Close()
+	set, err := state.OpenEpochSet(st)
+	if err != nil {
+		log.Fatalf("epochdb: open sealed epochs: %v", err)
+	}
+	defer set.Close()
+	return set.CoveredEnd()
+}
+
 func fetchMain(args []string) {
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "directory for the segment files")
@@ -572,6 +590,12 @@ func fetchMain(args []string) {
 	f, err := fetch.New(cfg)
 	if err != nil {
 		log.Fatalf("epochdb: %v", err)
+	}
+	if floor := sealedFloor(*dataDir); floor > 0 {
+		// Nothing seals in this process, so the startup value is the whole
+		// story here: below it the raw is gone and the epochs answer.
+		f.SetFloor(floor)
+		log.Printf("epochdb: sealed through %d, backfilling only above it", floor)
 	}
 
 	done := make(chan error, 1)

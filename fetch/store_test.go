@@ -193,3 +193,40 @@ func TestSubscribeAscending(t *testing.T) {
 	for range ch { // drain until close
 	}
 }
+
+// TestWalkSpanStopsAtSealedFloor: the raw below the sealed end is gone (seal
+// deleted it), so a walk from the tip must stop at the bottom of the RETAINED
+// run instead of dropping off it and re-fetching durable history.
+func TestWalkSpanStopsAtSealedFloor(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	const sealedEnd = 500
+	for h := uint64(sealedEnd + 1); h <= sealedEnd+10; h++ {
+		p, raw := fakeContainer(h, 0xb0, 64)
+		if err := s.Append(p, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tip, _ := fakeContainer(sealedEnd+10, 0xb0, 64)
+	f := &Fetcher{store: s, dispatchErrCh: make(chan error, 1)}
+
+	// Unfloored, the walk falls off the bottom of the run and goes looking for
+	// the parent of the lowest retained block (here it chokes on the synthetic
+	// container, which is exactly one step further than it should ever get).
+	if err := f.walkSpan(context.Background(), tip.containerID, 0); err == nil {
+		t.Fatal("unfloored walk stopped at the retained run; the floor test proves nothing")
+	}
+	f.SetFloor(sealedEnd)
+	if err := f.walkSpan(context.Background(), tip.containerID, 0); err != nil {
+		t.Fatalf("floored walk: %v", err)
+	}
+	// The floor only ever rises.
+	f.SetFloor(1)
+	if got := f.floor.Load(); got != sealedEnd {
+		t.Fatalf("floor=%d after a lower SetFloor, want %d", got, sealedEnd)
+	}
+}

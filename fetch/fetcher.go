@@ -124,6 +124,10 @@ type Fetcher struct {
 	// prober reuses it instead of fabricating ranges.
 	lastTip atomic.Value // ids.ID
 
+	// floor is the sealed end: no walk descends to it and no block at or
+	// below it is ever requested. See SetFloor.
+	floor atomic.Uint64
+
 	// Stats for progress logging.
 	requestsSent    atomic.Uint64
 	answersTotal    atomic.Uint64
@@ -370,6 +374,20 @@ func (f *Fetcher) Close() error {
 
 // Store exposes the underlying flat-file store for readers.
 func (f *Fetcher) Store() *Store { return f.store }
+
+// SetFloor raises the backfill floor to the SEALED END. Every walk treats it
+// as its floor, so no block at or below it is ever walked or requested.
+//
+// It is what stops a restarted follower re-downloading all of sealed history:
+// walks short-circuit on the STAGING store alone, and seal legitimately
+// deleted the raw buckets those blocks used to live in, so without the floor
+// the walk drops off the bottom of the retained tail and re-fetches to height
+// 1 (DESIGN.md, was OPEN 2026-07-31).
+//
+// The floor RISES while the node runs, because sealing is in-process: the
+// caller sets it at startup from the sealed epoch set and again after every
+// seal. Monotonic, and written by one goroutine (the cook loop).
+func (f *Fetcher) SetFloor(sealedEnd uint64) { f.floor.Store(max(sealedEnd, f.floor.Load())) }
 
 // WalkFrom walks backward from an arbitrary container ID down to block 0
 // (short-circuiting over already-stored contiguous runs), storing every
