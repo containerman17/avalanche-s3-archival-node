@@ -70,7 +70,7 @@ func serveMain(args []string) {
 	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
 	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook (index + txindex) that drags the historical window up to the head")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
-	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL to this height instead of a consensus follower (fixed-corpus builds and integration runs: the executor still chases staging live)")
+	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks; fixed-corpus builds and integration runs: the executor still chases staging live)")
 	walks := fs.Int("walks", 16, "concurrent backward walks (--tip-override)")
 	syncEvery := fs.Duration("sync-every", 5*time.Minute, "cadence for uploading spooled artifacts to the bucket and releasing the local copies (no-op without S3 credentials)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
@@ -84,7 +84,7 @@ func serveMain(args []string) {
 	if c.SubnetID != avaconstants.PrimaryNetworkID {
 		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
 	}
-	networkID, defNode, rpcURL := netParams(*network)
+	_, defNode, _ := netParams(*network)
 	if *nodeURI == "" {
 		*nodeURI = defNode
 	}
@@ -113,14 +113,12 @@ func serveMain(args []string) {
 		// Same process, same staging store, different source of blocks: a
 		// bounded backfill instead of the consensus tip (fixed-corpus builds
 		// and integration runs). Everything else is identical.
-		if c.SubnetID != avaconstants.PrimaryNetworkID {
-			// resolveTipOverride's whole job is finding the pre-ProposerVM
-			// ceiling, below which a container ID equals the eth block hash.
-			// An L1 is ProposerVM-wrapped from block 1, so there is none.
-			log.Fatalf("epochdb: serve: --tip-override is C-chain only (an L1 is ProposerVM-wrapped from block 1); serve an L1 by following its tip")
+		id, err := parseTipOverride(*tipOverride)
+		if err != nil {
+			log.Fatalf("epochdb: serve: --tip-override: %v", err)
 		}
 		cfg.Backfill = func(ctx context.Context, f *fetch.Fetcher) error {
-			return f.SyncTo(ctx, resolveTipOverride(ctx, f, rpcURL, *tipOverride, networkID), *walks)
+			return f.SyncTo(ctx, resolveTipOverride(ctx, f, id), *walks)
 		}
 	}
 

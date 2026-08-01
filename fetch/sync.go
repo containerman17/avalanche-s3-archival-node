@@ -129,6 +129,18 @@ func (f *Fetcher) ResolveCheckpoints(ctx context.Context) ([]Anchor, error) {
 	return anchors, nil
 }
 
+// ResolveAnchor fetches one container (over p2p, or straight out of the store
+// if it is already there) and returns it with its parsed height. That parse is
+// the ONLY height source for a --tip-override container ID: the CLI names a
+// physical block, and the chain itself says where it sits.
+func (f *Fetcher) ResolveAnchor(ctx context.Context, id ids.ID) (Anchor, error) {
+	parsed, err := f.getContainer(ctx, id)
+	if err != nil {
+		return Anchor{}, fmt.Errorf("resolve container %s: %w", id, err)
+	}
+	return Anchor{ID: id, Height: parsed.blockNumber}, nil
+}
+
 // SyncTo backfills blocks [0..max(anchors)] with NO frontier following:
 // the anchors (a fixed tip override plus any checkpoints at or below it)
 // are sorted descending and each walk covers one span down to the next

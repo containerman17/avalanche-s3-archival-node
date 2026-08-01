@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,10 +18,7 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/upgrade"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
-	"github.com/ava-labs/libevm/common"
-	"github.com/ava-labs/libevm/common/hexutil"
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
@@ -93,57 +89,26 @@ func netParams(network string) (uint32, string, string) {
 	}
 }
 
-// rpcBlockHash resolves a block number to its hash via the archive RPC.
-func rpcBlockHash(rpcURL string, height uint64) (common.Hash, error) {
-	res, err := rpcHeaderCall(rpcURL, "eth_getBlockByNumber", fmt.Sprintf("%q", hexutil.EncodeUint64(height)))
+// parseTipOverride turns a --tip-override value into a container ID. The
+// override is a PHYSICAL container ID and never a height (RULING 2026-08-01):
+// resolving a height needed the ProposerVM activation constant plus the
+// embedded checkpoint table, and an operator must not depend on that magic.
+func parseTipOverride(v string) (ids.ID, error) {
+	if _, err := strconv.ParseUint(v, 10, 64); err == nil {
+		return ids.Empty, fmt.Errorf("%q is a block height; --tip-override takes a container ID: %s", v, tipOverrideHowTo)
+	}
+	id, err := parseContainerID(v)
 	if err != nil {
-		return common.Hash{}, err
+		return ids.Empty, fmt.Errorf("%q is not a container ID (%v): %s", v, err, tipOverrideHowTo)
 	}
-	if res == nil || res.Hash == "" {
-		return common.Hash{}, fmt.Errorf("block %d not found via %s", height, rpcURL)
-	}
-	return common.HexToHash(res.Hash), nil
+	return id, nil
 }
 
-// rpcBlockNumberByHash resolves a block hash to its height via the archive
-// RPC. ok=false when the chain does not know the hash (e.g. the hash is a
-// post-ProposerVM container ID, not an eth block hash).
-func rpcBlockNumberByHash(rpcURL string, h common.Hash) (uint64, bool, error) {
-	res, err := rpcHeaderCall(rpcURL, "eth_getBlockByHash", fmt.Sprintf("%q", h.Hex()))
-	if err != nil {
-		return 0, false, err
-	}
-	if res == nil || res.Number == "" {
-		return 0, false, nil
-	}
-	n, err := hexutil.DecodeUint64(res.Number)
-	return n, err == nil, err
-}
-
-type rpcBlockHeader struct {
-	Hash      string `json:"hash"`
-	Number    string `json:"number"`
-	Timestamp string `json:"timestamp"`
-}
-
-func rpcHeaderCall(rpcURL, method, param string) (*rpcBlockHeader, error) {
-	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"%s","params":[%s,false]}`, method, param)
-	resp, err := http.Post(rpcURL, "application/json", strings.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Result *rpcBlockHeader `json:"result"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	if out.Result == nil {
-		return nil, nil
-	}
-	return out.Result, nil
-}
+// tipOverrideHowTo is the only thing an operator needs to hear after getting
+// the value wrong: where the IDs are printed.
+const tipOverrideHowTo = "cb58, or a 0x-hex eth block hash for pre-ProposerVM blocks. " +
+	"The fetch log prints one per accepted block, 'consensus: accepted height=N container=<ID>', " +
+	"and any checkpoint anchor line ('fetch: tip-override <ID> at height N') carries one too"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -194,8 +159,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>] [--network mainnet] [--chain C|<blockchainID>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
 	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
-	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override N]")
-	fmt.Fprintln(os.Stderr, "       epochdb fleet [--chains <blockchainID>,<blockchainID>] [--data <root>] [--port 9650]  (all subnet-evm chains in one process; /ext/bc/<blockchainID>/rpc)")
+	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override <containerID>]")
+	fmt.Fprintln(os.Stderr, "       epochdb fleet [--chains <blockchainID>,<blockchainID>] [--data <root>] [--port 9650] [--tip-override <chain>=<containerID>,...]  (all subnet-evm chains in one process; /ext/bc/<blockchainID>/rpc)")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
@@ -392,135 +357,31 @@ func execMain(args []string) {
 	log.Printf("epochdb: exec stopped at height=%d, state flushed", e.Head())
 }
 
-// resolveTipOverride turns a --tip-override value (block height or
-// container ID) into SyncTo anchors: the tip itself plus every embedded
-// checkpoint at or below its height. Heights resolve via the archive RPC;
-// pre-ProposerVM container IDs equal the eth block hash, so checkpoint
-// heights resolve the same way (post-ProposerVM checkpoints don't resolve
-// and are skipped, they sit above any pre-fork override by construction).
-func resolveTipOverride(ctx context.Context, f *fetch.Fetcher, rpcURL, v string, networkID uint32) []fetch.Anchor {
-	ceiling := preForkCeiling(rpcURL, networkID)
-
-	var (
-		tipID     ids.ID
-		tipHeight uint64
-		anchors   []fetch.Anchor
-		seen      = map[uint64]bool{}
-	)
-	if height, herr := strconv.ParseUint(v, 10, 64); herr == nil && height >= ceiling {
-		// Post-ProposerVM target: heights don't RPC-resolve to container
-		// IDs. Anchor at the nearest embedded checkpoint at/above the
-		// target (blocks between target and checkpoint stage as
-		// disposable extra; exec --stop caps the corpus).
+// resolveTipOverride turns a --tip-override container ID into SyncTo anchors:
+// the container itself, plus every embedded checkpoint below its height as a
+// parallel walk seed (an L1 has no checkpoints and gets the one anchor). Both
+// heights come from the fetched container over p2p, so nothing here depends on
+// an archive RPC, on the ProposerVM activation constant, or on a checkpoint
+// happening to sit at the right height (RULING 2026-08-01).
+func resolveTipOverride(ctx context.Context, f *fetch.Fetcher, id ids.ID) []fetch.Anchor {
+	tip, err := f.ResolveAnchor(ctx, id)
+	if err != nil {
+		log.Fatalf("epochdb: --tip-override: %v", err)
+	}
+	anchors := []fetch.Anchor{tip}
+	if len(f.Checkpoints()) > 0 {
 		cps, err := f.ResolveCheckpoints(ctx)
 		if err != nil {
 			log.Fatalf("epochdb: --tip-override: %v", err)
 		}
 		for _, cp := range cps {
-			switch {
-			case cp.Height >= height && tipHeight == 0:
-				tipID, tipHeight = cp.ID, cp.Height
+			if cp.Height > 0 && cp.Height < tip.Height {
 				anchors = append(anchors, cp)
-				seen[cp.Height] = true
-			case cp.Height < height && cp.Height > 0 && !seen[cp.Height]:
-				anchors = append(anchors, cp)
-				seen[cp.Height] = true
 			}
-		}
-		if tipHeight == 0 {
-			log.Fatalf("epochdb: --tip-override: no embedded checkpoint at/above %d", height)
-		}
-		log.Printf("fetch: tip-override %d is post-ProposerVM (ceiling %d): anchored at checkpoint %s height %d",
-			height, ceiling, tipID, tipHeight)
-	} else {
-		if herr == nil {
-			h, err := rpcBlockHash(rpcURL, height)
-			if err != nil {
-				log.Fatalf("epochdb: --tip-override: resolve height %d: %v", height, err)
-			}
-			tipID = ids.ID(h)
-			log.Printf("fetch: tip-override height %d -> container %s", height, tipID)
-		} else {
-			var err error
-			if tipID, err = parseContainerID(v); err != nil {
-				log.Fatalf("epochdb: --tip-override: %v", err)
-			}
-		}
-		var ok bool
-		var err error
-		tipHeight, ok, err = rpcBlockNumberByHash(rpcURL, common.Hash(tipID))
-		if err != nil || !ok {
-			log.Fatalf("epochdb: --tip-override: cannot determine height of %s via %s (post-ProposerVM container? use --tip): ok=%v err=%v", tipID, rpcURL, ok, err)
-		}
-		anchors = append(anchors, fetch.Anchor{ID: tipID, Height: tipHeight})
-		seen[tipHeight] = true
-		for _, cp := range f.Checkpoints() {
-			h, ok, err := rpcBlockNumberByHash(rpcURL, common.Hash(cp))
-			if err != nil || !ok || h > tipHeight || h == 0 || seen[h] {
-				continue // post-ProposerVM, above the override, or genesis
-			}
-			seen[h] = true
-			anchors = append(anchors, fetch.Anchor{ID: cp, Height: h})
 		}
 	}
-
-	// The walks are round-trip-latency-bound, so synthesize evenly spaced
-	// pre-fork anchors (below the ProposerVM ceiling every height
-	// RPC-resolves to a container ID for free).
-	const wantAnchors = 24
-	if fillTop := min(tipHeight, ceiling); len(anchors) < wantAnchors {
-		step := fillTop / wantAnchors
-		for h := step; h < fillTop && step > 0; h += step {
-			if seen[h] {
-				continue
-			}
-			bh, err := rpcBlockHash(rpcURL, h)
-			if err != nil {
-				log.Fatalf("epochdb: --tip-override: resolve filler anchor %d: %v", h, err)
-			}
-			seen[h] = true
-			anchors = append(anchors, fetch.Anchor{ID: ids.ID(bh), Height: h})
-		}
-	}
-	log.Printf("fetch: tip-override %s at height %d, %d seeds below", tipID, tipHeight, len(anchors)-1)
+	log.Printf("fetch: tip-override %s at height %d, %d seeds below", tip.ID, tip.Height, len(anchors)-1)
 	return anchors
-}
-
-// preForkCeiling binary-searches the archive for the first block at/after
-// the network's ApricotPhase4 activation (ProposerVM starts there):
-// below it, container ID == eth block hash.
-func preForkCeiling(rpcURL string, networkID uint32) uint64 {
-	ap4 := uint64(upgrade.GetConfig(networkID).ApricotPhase4Time.Unix())
-	// Find an upper bound: double until the block is missing (beyond
-	// head) or its timestamp reaches AP4.
-	lo, hi := uint64(1), uint64(0)
-	for probe := uint64(1 << 20); ; probe <<= 1 {
-		ts, ok := rpcBlockTime(rpcURL, probe)
-		if !ok || ts >= ap4 {
-			hi = probe
-			break
-		}
-		lo = probe
-	}
-	for lo < hi {
-		mid := (lo + hi) / 2
-		ts, ok := rpcBlockTime(rpcURL, mid)
-		if ok && ts >= ap4 {
-			hi = mid
-		} else {
-			lo = mid + 1
-		}
-	}
-	return lo
-}
-
-func rpcBlockTime(rpcURL string, height uint64) (uint64, bool) {
-	res, err := rpcHeaderCall(rpcURL, "eth_getBlockByNumber", fmt.Sprintf("%q", hexutil.EncodeUint64(height)))
-	if err != nil || res == nil || res.Timestamp == "" {
-		return 0, false
-	}
-	ts, err := hexutil.DecodeUint64(res.Timestamp)
-	return ts, err == nil
 }
 
 // execNetID maps --network to a network ID.
@@ -556,7 +417,7 @@ func fetchMain(args []string) {
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
 	fromTip := fs.Bool("from-tip", false, "anchor at the network's accepted frontier, backfill down to stored history, then keep following the live tip")
-	tipOverride := fs.String("tip-override", "", "fixed corpus ceiling replacing frontier following: a block HEIGHT (RPC-resolved; pre-ProposerVM only) or a container ID; backfills [0..height] using checkpoints at or below it as parallel seeds, then exits")
+	tipOverride := fs.String("tip-override", "", "fixed corpus ceiling replacing frontier following: a CONTAINER ID (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks); backfills [0..that block] using the embedded checkpoints below it as parallel seeds, then exits")
 	follow := fs.Bool("follow", false, "consensus-verified tip following: real snowman polls against the weighted validator set (replaces --from-tip's frontier voting)")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set (--follow); default: --node URI only, with a warning")
 	fs.Parse(args)
@@ -564,23 +425,24 @@ func fetchMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Bad flag values die before anything dials.
+	var overrideID ids.ID
+	if *tipOverride != "" {
+		var err error
+		if overrideID, err = parseTipOverride(*tipOverride); err != nil {
+			log.Fatalf("epochdb: --tip-override: %v", err)
+		}
+	}
+
 	// The descriptor comes FIRST, and for a cached L1 it, not --network, names
 	// the network to dial: the cache is what the data dir was built with.
 	c := resolveChain(*dataDir)
-	l1 := c.SubnetID != avaconstants.PrimaryNetworkID
-	if l1 {
+	if c.SubnetID != avaconstants.PrimaryNetworkID {
 		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
 	}
-	_, defNode, rpcURL := netParams(*network)
+	_, defNode, _ := netParams(*network)
 	if *nodeURI == "" {
 		*nodeURI = defNode
-	}
-
-	if l1 && *tipOverride != "" {
-		// resolveTipOverride's whole job is finding the pre-ProposerVM
-		// ceiling, below which a container ID equals the eth block hash.
-		// An L1 has no such range: ProposerVM is active from block 1.
-		log.Fatalf("epochdb: --tip-override is C-chain only (an L1 is ProposerVM-wrapped from block 1); use --tip with a container ID")
 	}
 
 	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer, Chain: c}
@@ -603,7 +465,7 @@ func fetchMain(args []string) {
 	case *follow:
 		go func() { done <- f.Follow(ctx) }()
 	case *tipOverride != "":
-		anchors := resolveTipOverride(ctx, f, rpcURL, *tipOverride, execNetID(*network))
+		anchors := resolveTipOverride(ctx, f, overrideID)
 		go func() { done <- f.SyncTo(ctx, anchors, *walks) }()
 	case *fromTip:
 		go func() { done <- f.FollowTip(ctx) }()

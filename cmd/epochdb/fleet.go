@@ -17,10 +17,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/epochdb/fetch"
 )
 
 // fleetMain is THE FLEET (DESIGN.md "THE FLEET"): ONE process hosting every
@@ -55,11 +57,18 @@ func fleetMain(args []string) {
 	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook that drags each chain's historical window up to its head")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	syncEvery := fs.Duration("sync-every", 5*time.Minute, "cadence for uploading spooled artifacts to the bucket (no-op without S3 credentials)")
+	tipOverride := fs.String("tip-override", "", "per-chain fixed corpus ceiling: <chain>=<containerID>[,<chain>=<containerID>...], where <chain> is a key from --chains (C or a blockchainID); a chain without an entry keeps following the live tip")
+	walks := fs.Int("walks", 16, "concurrent backward walks per overridden chain (--tip-override)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
 
-	if *chains == "" {
+	specs := splitChains(*chains)
+	if len(specs) == 0 {
 		log.Fatalf("epochdb: fleet: --chains is empty (comma-separated chain IDs, or C)")
+	}
+	overrides, err := parseFleetTipOverrides(*tipOverride, specs)
+	if err != nil {
+		log.Fatalf("epochdb: fleet: --tip-override: %v", err)
 	}
 	if err := os.MkdirAll(*root, 0o755); err != nil {
 		log.Fatalf("epochdb: fleet: %v", err)
@@ -75,12 +84,12 @@ func fleetMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	descs := loadFleetChains(ctx, strings.Split(*chains, ","), execNetID(*network), *root)
+	descs := loadFleetChains(ctx, specs, execNetID(*network), *root)
 
 	f := &fleet{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", f.statusHandler)
-	for _, c := range descs {
+	for i, c := range descs {
 		id := c.BlockchainID.String()
 		cfg := nodeConfig{
 			DataDir:       filepath.Join(*root, id),
@@ -96,6 +105,14 @@ func fleetMain(args []string) {
 		}
 		if *vdrSources != "" {
 			cfg.VdrSources = strings.Split(*vdrSources, ",")
+		}
+		// descs is one-for-one with specs, so the override key the operator
+		// typed (C or a blockchainID) names this chain.
+		if tip, ok := overrides[specs[i]]; ok {
+			log.Printf("epochdb: fleet: %s backfills to container %s instead of following", id, tip)
+			cfg.Backfill = func(ctx context.Context, fe *fetch.Fetcher) error {
+				return fe.SyncTo(ctx, resolveTipOverride(ctx, fe, tip), *walks)
+			}
 		}
 		if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 			log.Printf("epochdb: fleet: %s: %v (chain not started, siblings unaffected)", id, err)
@@ -141,6 +158,63 @@ func fleetMain(args []string) {
 	srv.Shutdown(sctx)
 	cancel()
 	f.closeAll()
+}
+
+// splitChains is --chains, trimmed, with empty entries dropped.
+func splitChains(v string) []string {
+	var out []string
+	for _, spec := range strings.Split(v, ",") {
+		if spec = strings.TrimSpace(spec); spec != "" {
+			out = append(out, spec)
+		}
+	}
+	return out
+}
+
+// parseFleetTipOverrides parses fleet's --tip-override, which is PER CHAIN
+// (RULING 2026-08-01): a fleet hosts N chains, so one bare value cannot say
+// which one it caps. Syntax: <chain>=<containerID>[,...], keyed exactly as in
+// --chains (C for the primary C-chain). A chain with no entry keeps following.
+func parseFleetTipOverrides(v string, specs []string) (map[string]ids.ID, error) {
+	if v == "" {
+		return nil, nil
+	}
+	// A blockchainID is cb58, which IS case-sensitive, so only the C alias
+	// folds.
+	canon := func(k string) (string, bool) {
+		for _, s := range specs {
+			if k == s || (strings.EqualFold(s, "C") && strings.EqualFold(k, "C")) {
+				return s, true
+			}
+		}
+		return "", false
+	}
+	out := map[string]ids.ID{}
+	for _, kv := range strings.Split(v, ",") {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			return nil, fmt.Errorf("%q is not <chain>=<containerID>: a fleet hosts several chains, so the override names one of --chains (%s)", kv, strings.Join(specs, ","))
+		}
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		spec, ok := canon(key)
+		if !ok {
+			return nil, fmt.Errorf("%q is not in --chains (%s)", key, strings.Join(specs, ","))
+		}
+		key = spec
+		if _, dup := out[key]; dup {
+			return nil, fmt.Errorf("%q listed twice", key)
+		}
+		id, err := parseTipOverride(val)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		out[key] = id
+	}
+	return out, nil
 }
 
 // loadFleetChains resolves every chain ID against its own data dir under the
