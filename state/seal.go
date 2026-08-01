@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -21,9 +22,10 @@ import (
 // files, strictly behind the durable exec head. Idempotent and resumable:
 // the next epoch always starts right after the last sealed one, files land
 // via tmp+rename. Raw bucket files whose WHOLE range is sealed are removed
-// afterwards, unconditionally (user ruling 2026-07-29: --delete-raw was the
-// only sane setting, so the flag is gone). NEVER run seal next to a running
-// fetch/exec: they own those files.
+// AFTER EACH EPOCH, unconditionally (user ruling 2026-07-29: --delete-raw was
+// the only sane setting, so the flag is gone), so a long backfill crunch frees
+// disk as it goes instead of holding raw and sealed side by side until the last
+// epoch. NEVER run seal next to a running fetch/exec: they own those files.
 //
 // The stored-logs/receipt sections come from the executor's LIVE CAPTURE (the
 // rcpt tail family, same encoding), never from re-execution: the DeriveStored
@@ -43,11 +45,10 @@ import (
 // A live serve/fleet process seals through History.SealTail, which splits the
 // same work so the new epochs reach its readers before the raw goes.
 func SealEpochs(dir string, out *dist.Store, chainRoot [32]byte) error {
-	run, err := sealEpochs(dir, out, chainRoot)
-	if err != nil {
-		return err
-	}
-	return DeleteSealedRaw(dir, run.SealedEnd)
+	_, err := sealEpochs(context.Background(), dir, out, chainRoot, func(sealedEnd uint64) error {
+		return DeleteSealedRaw(dir, sealedEnd)
+	})
+	return err
 }
 
 // sealRun is what one seal pass did.
@@ -63,42 +64,61 @@ type sealRun struct {
 	RetryAt uint64
 }
 
-// SealTail is the LIVE process's seal, and the ORDER is the whole point:
+// SealTail is the LIVE process's seal, and the ORDER is the whole point,
+// PER EPOCH:
 //
-//  1. cut whatever whole epochs the durable exec head allows,
-//  2. publish them to this History's readers (refreshEpochs),
-//  3. only then delete the raw buckets they replace, and drop this process's
-//     own handles on those files so the space is actually freed.
+//  1. cut ONE whole epoch, if the durable exec head allows one,
+//  2. publish it to this History's readers (refreshEpochs),
+//  3. only then delete the raw buckets it replaces, and drop this process's
+//     own handles on those files so the space is actually freed,
+//  4. onEpoch (may be nil), for whatever the caller owns outside `state`: the
+//     serve node raises the fetcher's floor and retires its staging segments
+//     there. Then back to 1 for the next epoch.
 //
 // Between 1 and 2 the raw is still there and answers everything; after 2 the
 // epoch answers everything; so no read of a sealed height is ever without a
-// source. Cheap when there is nothing to do: below RetryAt it opens nothing.
+// source. Per epoch rather than per pass because a backlog crunch that cuts 14
+// epochs before it deletes anything holds the whole raw corpus AND its sealed
+// replacement at once (Fuji, 2026-08-01: ~100G sealed on top of 411G raw).
+//
+// ctx is observed BETWEEN epochs: a canceled pass returns what it has already
+// cut, published and retired, and the next call resumes at the next unsealed
+// block. Cheap when there is nothing to do: below RetryAt it opens nothing.
 //
 // Single-caller by contract (the cook loop), like AdvanceTail/PruneTail.
-func (h *History) SealTail(chainRoot [32]byte) (epochs int, sealedEnd uint64, err error) {
+func (h *History) SealTail(ctx context.Context, chainRoot [32]byte, onEpoch func(sealedEnd uint64)) (epochs int, sealedEnd uint64, err error) {
 	execHead, ok := h.store.ExecHead()
 	if !ok || execHead < h.sealRetryAt {
 		return 0, 0, nil
 	}
-	run, err := sealEpochs(h.dir, h.store.Cas(), chainRoot)
+	run, err := sealEpochs(ctx, h.dir, h.store.Cas(), chainRoot, func(end uint64) error {
+		if _, err := h.refreshEpochs(); err != nil {
+			return fmt.Errorf("publish sealed epochs: %w", err)
+		}
+		if err := DeleteSealedRaw(h.dir, end); err != nil {
+			return err
+		}
+		h.dropSealedBuckets(end)
+		if err := h.store.RetireBuckets(end); err != nil {
+			return err
+		}
+		if onEpoch != nil {
+			onEpoch(end)
+		}
+		return nil
+	})
 	if err != nil {
 		// A corpus seal cannot read (no capture, a staging gap) must not
 		// re-scan every cook tick: log once per bucket of new blocks.
 		h.sealRetryAt = execHead + BucketBlocks
-		return 0, 0, err
-	}
-	h.sealRetryAt = run.RetryAt
-	if run.Cut == 0 {
-		return 0, run.SealedEnd, nil
-	}
-	if _, err := h.refreshEpochs(); err != nil {
-		return run.Cut, run.SealedEnd, fmt.Errorf("publish sealed epochs: %w", err)
-	}
-	if err := DeleteSealedRaw(h.dir, run.SealedEnd); err != nil {
 		return run.Cut, run.SealedEnd, err
 	}
-	h.dropSealedBuckets(run.SealedEnd)
-	return run.Cut, run.SealedEnd, h.store.RetireBuckets(run.SealedEnd)
+	// A canceled pass measured no boundary, so it dates nothing: keep the
+	// existing gate rather than lowering it to zero.
+	if ctx.Err() == nil {
+		h.sealRetryAt = run.RetryAt
+	}
+	return run.Cut, run.SealedEnd, nil
 }
 
 // epochTxsAt is the schedule the seal loop reads, indirected ONLY so package
@@ -110,7 +130,10 @@ var epochTxsAt = EpochTxsAt
 // reason and nothing else: a package test retires a bucket of a few blocks
 // instead of 100,000. Everything that decides whether a bucket is fully sealed
 // reads it (the unlink, this process's handles, the mapped sorted buckets), so
-// the three stay in step.
+// the three stay in step. WHERE a raw record lives is still BucketBlocks, so a
+// test that shrinks this retires buckets whose files hold blocks above the
+// sealed end too; only the seal's own open handles keep those readable, which
+// is fine for one pass and is why no test resumes across a shrunk bucket.
 var bucketBlocks uint64 = BucketBlocks
 
 // hashBytes decodes a hex sha256 artifact name into the footer's link field.
@@ -136,13 +159,18 @@ func setLatestEpoch(st *dist.Store, hash string) error {
 }
 
 // sealEpochs cuts every whole epoch the durable exec head allows and writes
-// them to out. It NEVER deletes anything: the caller does that, after
-// whatever it must do to make the new epochs readable.
+// them to out, calling onEpoch after each one is durable. It NEVER deletes
+// anything itself: onEpoch does that, after whatever it must do to make the
+// new epoch readable (the live process publishes it first, History.SealTail).
 //
 // It reads the corpus through OpenReadOnly + fetch.OpenReader, which never
 // truncate and never create, so it is safe beside the live writer that owns
 // those files.
-func sealEpochs(dir string, out *dist.Store, chainRoot [32]byte) (sealRun, error) {
+//
+// ctx is checked BETWEEN epochs only: a gather is one indivisible unit of
+// several minutes, and dropping a nearly finished one buys nothing (the next
+// pass would gather it again from the same block).
+func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]byte, onEpoch func(sealedEnd uint64) error) (sealRun, error) {
 	var run sealRun
 	store, err := OpenReadOnly(dir)
 	if err != nil {
@@ -185,6 +213,14 @@ func sealEpochs(dir string, out *dist.Store, chainRoot [32]byte) (sealRun, error
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			// Cancellation lands between epochs, on purpose: everything cut so
+			// far is durable, published and its raw retired, and seal resumes
+			// at the next unsealed block by construction, so the next call
+			// finishes the backlog exactly where this one left it.
+			log.Printf("seal: stopping after %d epoch(s), sealed through %d: %v", run.Cut, run.SealedEnd, err)
+			return run, nil
+		}
 		epochTxs := epochTxsAt(idx)
 		in, full, rawBytes, err := gatherEpoch(store, reader, next, execHead, epochTxs)
 		if err != nil {
@@ -232,6 +268,14 @@ func sealEpochs(dir string, out *dist.Store, chainRoot [32]byte) (sealRun, error
 		idx++
 		run.Cut++
 		run.SealedEnd = next - 1
+		// Publish and retire this epoch before gathering the next one. The
+		// unlink onEpoch does frees the disk even though this pass is still
+		// reading the same dir: both readers it holds are LRU-capped (4 bucket
+		// pairs per raw family, 4 staging segments) and it walks heights
+		// ascending, so a retired bucket's handle goes on its own.
+		if err := onEpoch(run.SealedEnd); err != nil {
+			return run, err
+		}
 	}
 
 	return run, nil
@@ -443,6 +487,9 @@ func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
 // the live process's own readers: a retired bucket reads as "not here", so
 // every descent falls through to the epoch that replaced it. In a live
 // process it must run AFTER those epochs are published (History.SealTail).
+//
+// Idempotent, and called once per sealed epoch, so it rescans buckets it has
+// already emptied: only a bucket that actually lost a file is logged.
 func DeleteSealedRaw(dir string, sealedEnd uint64) error {
 	patterns := []string{
 		"arrival_%05d.log", "index_%05d.log",
@@ -454,13 +501,20 @@ func DeleteSealedRaw(dir string, sealedEnd uint64) error {
 		"sorted_%05d.idx", "txidx_%05d.idx",
 	}
 	for b := uint64(0); (b+1)*bucketBlocks-1 <= sealedEnd; b++ {
+		removed := 0
 		for _, p := range patterns {
 			path := filepath.Join(dir, fmt.Sprintf(p, b))
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return err
+			if err := os.Remove(path); err != nil {
+				if !os.IsNotExist(err) {
+					return err
+				}
+				continue
 			}
+			removed++
 		}
-		log.Printf("seal: raw bucket %05d removed (sealed through %d)", b, sealedEnd)
+		if removed > 0 {
+			log.Printf("seal: raw bucket %05d removed (%d files, sealed through %d)", b, removed, sealedEnd)
+		}
 	}
 	return nil
 }

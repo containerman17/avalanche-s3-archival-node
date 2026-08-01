@@ -323,7 +323,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	// hand the residue (executed but not indexed, and therefore answerable
 	// only from the raw writelog) to the overlay. Both must happen before the
 	// executor and the RPC goroutines start.
-	n.cookOnce()
+	n.cookOnce(ctx)
 	tailBlocks, tailEntries, tailBytes, err := hist.EnableTail(e.LiveHead())
 	if err != nil {
 		return nil, fmt.Errorf("tail overlay: %w", err)
@@ -427,13 +427,15 @@ func (l liveNode) AcceptedHead() uint64 { return max(l.accepted(), l.Executor.Li
 // whose objection was the DELETE of raw buckets this process reads: an
 // external sibling unlinked files while our fds, mmaps and in-RAM bucket index
 // still pointed at them, and there was no way to tell the reader first. In
-// process there is, and the ordering IS the safety (state.History.SealTail):
+// process there is, and the ordering IS the safety (state.History.SealTail),
+// per epoch rather than per pass, so a backlog crunch frees disk as it goes:
 //
-//	seal    write the epochs, delete nothing. Both sources exist.
-//	refresh publish them into the live EpochSet every reader already holds,
+//	seal    write ONE epoch, delete nothing. Both sources exist.
+//	refresh publish it into the live EpochSet every reader already holds,
 //	        so a sealed height now has a sealed answer.
-//	delete  only then unlink the raw buckets, and drop our own handles on them
-//	        so the space is actually returned.
+//	delete  only then unlink the raw buckets it replaced, and drop our own
+//	        handles on them so the space is actually returned. Then the next
+//	        epoch, until the exec head has no whole epoch left or ctx is done.
 //
 // Nothing races a sibling because there is no sibling: one process owns the
 // dir, and cook and seal are the same goroutine, so cook's tmp+rename cannot
@@ -448,7 +450,7 @@ func (n *chainNode) cookLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		n.cookOnce()
+		n.cookOnce(ctx)
 	}
 }
 
@@ -482,7 +484,7 @@ func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
 // everything dropped here is already answerable by the descent, and a latest
 // read that misses the overlay picks up its descent target afterwards. See
 // state/tail.go prune for the full race argument.
-func (n *chainNode) cookOnce() {
+func (n *chainNode) cookOnce(ctx context.Context) {
 	start := time.Now()
 	dir, hist := n.cfg.DataDir, n.hist
 	if err := state.CookIndex(dir); err != nil {
@@ -500,33 +502,40 @@ func (n *chainNode) cookOnce() {
 	entries, size := hist.PruneTail()
 	n.cfg.logf("cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
 		hist.StateHead(), time.Since(start).Round(time.Millisecond), entries, float64(size)/1e6)
-	n.sealOnce()
+	n.sealOnce(ctx)
 }
 
 // sealOnce is the cook pass's seal step: cut whatever epochs the durable exec
-// head has made whole, publish them, drop the raw they replace. Same
-// fail-loud-but-keep-serving contract as cook, and for the same reason: the
-// chain does not stop because history could not be compacted. The sealed
-// artifacts land in the same spool the syncLoop uploads from, so they reach
-// the bucket on the next sync tick with no extra wiring.
-func (n *chainNode) sealOnce() {
+// head has made whole, publish them, drop the raw they replace, ONE EPOCH AT A
+// TIME. Same fail-loud-but-keep-serving contract as cook, and for the same
+// reason: the chain does not stop because history could not be compacted. The
+// sealed artifacts land in the same spool the syncLoop uploads from, so they
+// reach the bucket on the next sync tick with no extra wiring.
+//
+// ctx is the node's: a shutdown mid-crunch stops the pass at the next epoch
+// boundary instead of after all of them (Fuji, 2026-08-01: a SIGINT during a
+// 14-epoch backlog left the node sealing for hours), and the next start resumes
+// where it stopped.
+func (n *chainNode) sealOnce(ctx context.Context) {
 	start := time.Now()
-	epochs, sealedEnd, err := n.hist.SealTail(n.cfg.Chain.Root())
+	// Per epoch, right after state published it and deleted its raw: the
+	// staging segments are the fetcher's, not the state layer's, so their
+	// handles are released here (an unlinked arrival log this process still
+	// holds open frees no disk), and the same call raises the follower's
+	// backfill floor, so a walk started after this epoch never asks for what it
+	// just deleted.
+	epochs, sealedEnd, err := n.hist.SealTail(ctx, n.cfg.Chain.Root(), func(end uint64) {
+		n.fetcher.SetFloor(end)
+		if err := n.fetcher.Store().Retire(end); err != nil {
+			n.cfg.logf("seal: retiring staging segments: %v", err)
+		}
+	})
 	if err != nil {
 		n.cfg.logf("SEAL FAILED (history stays raw, chain unaffected): %v", err)
 		return
 	}
 	if epochs == 0 {
 		return
-	}
-	// The staging segments are the fetcher's, not the state layer's, so their
-	// handles are released here: an unlinked arrival log this process still
-	// holds open frees no disk. The same call raises the follower's backfill
-	// floor, so a walk started after this seal never asks for what it just
-	// deleted.
-	n.fetcher.SetFloor(sealedEnd)
-	if err := n.fetcher.Store().Retire(sealedEnd); err != nil {
-		n.cfg.logf("seal: retiring staging segments: %v", err)
 	}
 	n.cfg.logf("seal: %d epoch(s) cut, sealed through %d, raw retired (in %s)",
 		epochs, sealedEnd, time.Since(start).Round(time.Millisecond))
