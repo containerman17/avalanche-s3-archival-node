@@ -302,7 +302,17 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	// whatever the raw staging store still happens to hold. sealOnce raises
 	// this again on every epoch cut, including the one the startup cook below
 	// may do.
-	fetcher.SetFloor(hist.Epochs().CoveredEnd())
+	//
+	// Never above the exec head, though: an SAE bootstrap parks the frontier
+	// at the settled height a header attests, up to a settlement lag BELOW the
+	// sealed end (exec.BuildFrontier), and those few blocks have to come back
+	// down the wire to be re-executed. A dir with no exec head at all keeps the
+	// sealed floor: it has not been frontier-built and cannot serve anyway.
+	floor := hist.Epochs().CoveredEnd()
+	if head := e.LiveHead(); head > 0 && head < floor {
+		floor = head
+	}
+	fetcher.SetFloor(floor)
 
 	n = &chainNode{
 		cfg: cfg, fetcher: fetcher, e: e, store: store, hist: hist,

@@ -280,6 +280,31 @@ func (s *Store) BindVMKind(kind string) error {
 	return s.misc.Put([]byte(vmKindKey), []byte(kind))
 }
 
+// frontierFloorKey records the height a bootstrap frontier merge parked this
+// data dir at, inside misc. Namespaced so it cannot collide with a rawdb key.
+const frontierFloorKey = "epochdb.frontierfloor"
+
+// FrontierFloor is the height `bootstrap --frontier` merged and verified this
+// dir's state at, ok=false for a dir that executed its way up from genesis.
+// NOTHING BELOW IT WAS EVER EXECUTED HERE, which is what the ACP-194 settled
+// -root check needs to know: a header settling a height below the floor names
+// a block this node has no post-execution root for (the floor itself was
+// verified, against the header that settles it).
+func (s *Store) FrontierFloor() (uint64, bool) {
+	v, ok := s.misc.Get([]byte(frontierFloorKey))
+	if !ok || len(v) != 8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(v), true
+}
+
+// SetFrontierFloor stamps the height a frontier merge parked at.
+func (s *Store) SetFrontierFloor(h uint64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], h)
+	return s.misc.Put([]byte(frontierFloorKey), buf[:])
+}
+
 // PutCode stores a contract code blob by hash (dedup by hash).
 func (s *Store) PutCode(hash common.Hash, blob []byte) error { return s.code.Put(hash, blob) }
 

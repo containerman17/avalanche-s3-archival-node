@@ -4,9 +4,25 @@ package exec
 // that only downloaded epochs has no state at all: it never executed a block
 // and there is no snapshot artifact to load any more. Its frontier is merged
 // out of the epochs themselves (state.MergeFrontier), streamed into the
-// Firewood this Executor already opened, and checked against header(H).Root.
-// After that the node is indistinguishable from one that replayed to H: exec
-// starts at H+1 and follows.
+// Firewood this Executor already opened, and checked against a header that
+// COMMITS to the merged root. After that the node is indistinguishable from
+// one that replayed to that height: exec starts at the next block and follows.
+//
+// WHICH HEADER COMMITS TO WHAT (RULING 2026-08-01). Below the Helicon
+// boundary a header commits to its own post-execution root, so the merge
+// targets H (the last sealed block) and is checked against header(H).Root:
+// unchanged, byte for byte. Above it (ACP-194) header.Root is the root of the
+// block the header SETTLES, so the merge targets S = settledHeight(header(H))
+// and header(H).Root is the cryptographic commitment to it. Same strength as
+// the pre-SAE check, one header hop away.
+//
+// The pairing is FORCED, not chosen. The settled height is the only height
+// above the boundary whose post-execution root AND gas clock consensus ever
+// publishes (the roots of every other height live nowhere but the executor's
+// own sae.ring), and the gas clock is not optional decoration: executing S+1
+// needs its parent's clock, so a frontier parked anywhere but a settlement
+// point could not take a single step. The lag costs the frontier 1..10 blocks
+// (measured on live Fuji), which the follower re-executes on the way up.
 
 import (
 	"bytes"
@@ -14,6 +30,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/ava-labs/avalanchego/vms/saevm/hook"
 	ffi "github.com/ava-labs/firewood-go-ethhash/ffi"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
@@ -38,8 +55,10 @@ const frontierBatch = 200_000
 const frontierHeaderWindow = 256
 
 // BuildFrontier merges every epoch's SST section into this Executor's
-// Firewood, parking the head at H = the last block of the contiguous sealed
-// prefix. Idempotent: a store already executed to H or beyond is left alone.
+// Firewood, parking the head at the highest height a header of the contiguous
+// sealed prefix commits to: H itself below the Helicon boundary, the height H
+// settles above it. Idempotent: a store already at or past that height is left
+// alone.
 //
 // The merge is linear per epoch and the working set is one active SST block
 // per epoch cursor, so this streams a full corpus without ever holding more
@@ -56,28 +75,35 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		log.Printf("exec: frontier already at %d (sealed set ends at %d), nothing to build", n, h)
 		return nil
 	}
+	// Idempotent above the boundary too, where the frontier legitimately parks
+	// a settlement lag below the sealed end.
+	if floor, ok := e.cfg.Store.FrontierFloor(); ok {
+		if n, _ := e.cfg.Store.ExecHead(); n >= floor {
+			log.Printf("exec: frontier already built at %d (exec head %d, sealed set ends at %d), nothing to build", floor, n, h)
+			return nil
+		}
+	}
 	if n, ok := e.cfg.Store.ExecHead(); ok && n > 0 {
 		return fmt.Errorf("build frontier: this data dir already executed to %d; the merge only ever builds a FRESH frontier (delete the dir to rebuild)", n)
 	}
 
-	top, ok := epochs.At(h)
-	if !ok {
-		return fmt.Errorf("build frontier: no epoch covers block %d", h)
-	}
-	hdrRLP, err := top.HeaderRLP(h)
+	// attest is the header whose Root the merge must reproduce; target is the
+	// height it is the root OF (see the settled-root rule at the top).
+	attest, err := epochHeader(epochs, h)
 	if err != nil {
-		return fmt.Errorf("build frontier: header %d: %w", h, err)
+		return err
 	}
-	var hdr types.Header
-	if err := rlp.DecodeBytes(hdrRLP, &hdr); err != nil {
-		return fmt.Errorf("build frontier: decode header %d: %w", h, err)
-	}
-	if HasSettledMarkers(&hdr) {
-		// Post-Helicon (ACP-194) header.Root is the root of the block this one
-		// SETTLES, so it is not the frontier's root and there is nothing here
-		// to check the merge against. The settled-root plumbing belongs to the
-		// verification engine; until it lands, refuse loudly.
-		return fmt.Errorf("build frontier: block %d is post-Helicon (SAE): header.Root is the SETTLED block's root, not the state at %d, so the merged frontier cannot be checked against it; SAE bootstrap needs the settled-root ring (not built)", h, h)
+	target, targetHdr := h, attest
+	if HasSettledMarkers(attest) {
+		s := settledBy(attest).Height
+		if s == 0 || s >= h {
+			return fmt.Errorf("build frontier: block %d is post-Helicon but settles height %d: a block cannot settle itself, the future, or genesis", h, s)
+		}
+		if targetHdr, err = epochHeader(epochs, s); err != nil {
+			return err
+		}
+		target = s
+		log.Printf("exec: frontier is post-Helicon (SAE): merging to the settled height %d, attested by header(%d).Root (lag %d)", target, h, h-target)
 	}
 
 	t0 := time.Now()
@@ -110,7 +136,7 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		return nil
 	}
 
-	err = state.MergeFrontier(epochs.All(), h, func(r state.FrontierRow) error {
+	err = state.MergeFrontier(epochs.All(), target, func(r state.FrontierRow) error {
 		nRows++
 		addr := common.Address(r.Key[1:21])
 		switch r.Key[0] {
@@ -168,19 +194,22 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	if err := flush(); err != nil {
 		return err
 	}
-	if got := common.Hash(root); got != hdr.Root {
-		return fmt.Errorf("build frontier: merged root %x != header(%d).Root %x (%d accounts, %d slots, %d deletes over %d rows)",
-			got, h, hdr.Root, nAcct, nSlot, nDel, nRows)
+	if got := common.Hash(root); got != attest.Root {
+		return fmt.Errorf("build frontier: merged root at %d is %x, but header(%d).Root commits to %x (%d accounts, %d slots, %d deletes over %d rows)",
+			target, got, h, attest.Root, nAcct, nSlot, nDel, nRows)
 	}
 
-	// The headers just below H come out of the epochs into the state layer:
-	// BLOCKHASH in [H+1, H+256) reads them, and so does the crash walk-back,
-	// which has no other way to learn that Firewood's root belongs to H.
+	// The headers just below the frontier come out of the epochs into the
+	// state layer: BLOCKHASH above it reads them, and so does the crash
+	// walk-back, which has no other way to learn what height Firewood's root
+	// belongs to. Nothing ABOVE the frontier is copied down: the walk-back
+	// starts at the highest header on disk and would then demand containers
+	// for a gap this node has not fetched.
 	from := uint64(1)
-	if h > frontierHeaderWindow {
-		from = h - frontierHeaderWindow
+	if target > frontierHeaderWindow {
+		from = target - frontierHeaderWindow
 	}
-	for n := from; n <= h; n++ {
+	for n := from; n <= target; n++ {
 		ep, ok := epochs.At(n)
 		if !ok {
 			continue
@@ -194,15 +223,63 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		}
 	}
 
-	e.fwBackend.SetHashAndHeight(hdr.Hash(), h)
-	e.fwHeight, e.lastFwHash = h, hdr.Hash()
-	e.headNum, e.headRoot, e.headTime = h, hdr.Root, hdr.Time
+	// Above the boundary the frontier height's gas clock is published by the
+	// SAME markers that just attested its root, and hook.SettledGasTime is
+	// upstream's own reconstruction of it, so the ring entry the executor
+	// needs to execute target+1 comes straight out of the attesting header.
+	// Below the boundary the block's own header carries root and clock and
+	// postExecutionAt reads them from there, so there is nothing to seed.
+	if target != h && e.vm.hasSettledMarkers(targetHdr) {
+		hooks := &saeHooks{chainCfg: e.chainCfg, avaxAssetID: e.snowCtx.AVAXAssetID}
+		clock, err := hook.SettledGasTime(hooks, targetHdr, attest)
+		if err != nil {
+			return fmt.Errorf("build frontier: settled gas clock at %d: %w", target, err)
+		}
+		if err := hooks.takeErr(); err != nil {
+			return fmt.Errorf("build frontier: settled gas clock at %d: %w", target, err)
+		}
+		if err := e.ring.put(target, common.Hash(root), clock.MarshalCanoto()); err != nil {
+			return err
+		}
+	}
+	// Nothing below the frontier was ever executed here, so no header settling
+	// such a height can be checked against a root of ours (checkSettled).
+	if err := e.cfg.Store.SetFrontierFloor(target); err != nil {
+		return fmt.Errorf("build frontier: stamp frontier floor: %w", err)
+	}
+
+	e.fwBackend.SetHashAndHeight(targetHdr.Hash(), target)
+	e.fwHeight, e.lastFwHash = target, targetHdr.Hash()
+	e.headNum, e.headRoot, e.headTime = target, common.Hash(root), targetHdr.Time
 	e.publishLive()
-	if err := e.cfg.Store.FlushAndSetExecHead(h); err != nil {
+	// Same order as maybeFlush: the ring must be on disk before exechead
+	// claims a height whose root only the ring records.
+	if err := e.ring.sync(); err != nil {
+		return err
+	}
+	if err := e.cfg.Store.FlushAndSetExecHead(target); err != nil {
 		return fmt.Errorf("build frontier: seed exechead: %w", err)
 	}
 	dt := time.Since(t0)
 	log.Printf("exec: frontier built at %d root=%x from %d epochs: %d rows -> %d accounts, %d slots, %d deletes, %d skipped, %d batches in %s (%.0f rows/s)",
-		h, hdr.Root, len(epochs.All()), nRows, nAcct, nSlot, nDel, nSkip, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
+		target, common.Hash(root), len(epochs.All()), nRows, nAcct, nSlot, nDel, nSkip, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
 	return nil
+}
+
+// epochHeader decodes the stored header of block n out of the epoch that
+// covers it.
+func epochHeader(epochs *state.EpochSet, n uint64) (*types.Header, error) {
+	ep, ok := epochs.At(n)
+	if !ok {
+		return nil, fmt.Errorf("build frontier: no epoch covers block %d", n)
+	}
+	raw, err := ep.HeaderRLP(n)
+	if err != nil {
+		return nil, fmt.Errorf("build frontier: header %d: %w", n, err)
+	}
+	hdr := new(types.Header)
+	if err := rlp.DecodeBytes(raw, hdr); err != nil {
+		return nil, fmt.Errorf("build frontier: decode header %d: %w", n, err)
+	}
+	return hdr, nil
 }

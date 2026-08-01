@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
@@ -158,10 +159,35 @@ func replayCorpus(t *testing.T, dir string) (roots map[uint64]common.Hash, rows 
 	return roots, rows
 }
 
+// saeMarkers turns header n into an SAE header settling height s: the four
+// ACP-194 markers, with header.Root the SETTLED block's post-execution root
+// instead of its own. The gas-clock markers are arbitrary but self-consistent
+// (nothing here executes; the build only reconstructs the clock from them).
+//
+// This is what a post-Helicon header the node fetched actually looks like on
+// the wire: the fields are RLP-optional tail fields on the coreth header, so
+// they survive the epoch's header section byte for byte.
+func saeMarkers(hdr *types.Header, s uint64, settledRoot common.Hash) *types.Header {
+	unix, num, excess := uint64(1785250800+s), uint64(0), uint64(1_000_000)
+	hdr.Root = settledRoot
+	// The settlement markers are RLP-OPTIONAL TAIL fields: setting them forces
+	// every optional field before them to be encoded too, and a nil
+	// ParentBeaconRoot round-trips as an empty string that will not decode
+	// into a common.Hash. Every real post-Helicon header carries one.
+	hdr.ParentBeaconRoot = new(common.Hash)
+	return ccustomtypes.WithHeaderExtra(hdr, &ccustomtypes.HeaderExtra{
+		SettledHeight:       &s,
+		SettledGasUnix:      &unix,
+		SettledGasNumerator: &num,
+		SettledExcess:       &excess,
+	})
+}
+
 // sealCorpus publishes the replayed rows as two epochs (blocks 1..4 and
 // 5..8) into a FRESH data dir that holds nothing else: exactly what a
-// downloaded node has.
-func sealCorpus(t *testing.T, dir string, roots map[uint64]common.Hash, rows map[uint64][]state.StateRow) *state.EpochSet {
+// downloaded node has. mark, if set, rewrites a header before it is encoded,
+// which is how the SAE cases get real settlement markers into the epochs.
+func sealCorpus(t *testing.T, dir string, roots map[uint64]common.Hash, rows map[uint64][]state.StateRow, mark ...func(n uint64, hdr *types.Header)) *state.EpochSet {
 	t.Helper()
 	st, err := dist.Local(dir)
 	if err != nil {
@@ -179,11 +205,15 @@ func sealCorpus(t *testing.T, dir string, roots map[uint64]common.Hash, rows map
 		}
 		for n := start; n < start+4; n++ {
 			in.Containers = append(in.Containers, []byte(strings.Repeat("container", 20)))
-			hdr, err := rlp.EncodeToBytes(&types.Header{
+			h := &types.Header{
 				Number:     new(big.Int).SetUint64(n),
 				Difficulty: big.NewInt(1),
 				Root:       roots[n],
-			})
+			}
+			for _, m := range mark {
+				m(n, h)
+			}
+			hdr, err := rlp.EncodeToBytes(h)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -268,32 +298,135 @@ func TestBuildFrontierMatchesReplayRoot(t *testing.T) {
 	}
 }
 
-// TestBuildFrontierRefusesSAE: above the Helicon boundary header.Root is the
-// SETTLED block's root, so there is nothing to check the merge against. The
-// build must say so instead of reporting a root mismatch.
-func TestBuildFrontierRefusesSAE(t *testing.T) {
+// buildOn runs a frontier build over a corpus sealed with mark applied to
+// every header, and returns the executor (still open) for inspection.
+func buildOn(t *testing.T, mark func(roots map[uint64]common.Hash, n uint64, hdr *types.Header)) (*Executor, *state.Store, *state.EpochSet, map[uint64]common.Hash, error) {
+	t.Helper()
 	fetch.RegisterExtras(chain.Coreth)
 	roots, rows := replayCorpus(t, t.TempDir())
 	dir := t.TempDir()
-	set := sealCorpus(t, dir, roots, rows)
-	defer set.Close()
-
-	prev := HasSettledMarkers
-	HasSettledMarkers = func(*types.Header) bool { return true }
-	defer func() { HasSettledMarkers = prev }()
+	set := sealCorpus(t, dir, roots, rows, func(n uint64, hdr *types.Header) { mark(roots, n, hdr) })
+	t.Cleanup(set.Close)
 
 	store, err := state.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	e, err := New(Config{DataDir: dir, Blocks: set, Store: store})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Close()
-	err = e.BuildFrontier(set)
-	if err == nil || !strings.Contains(err.Error(), "post-Helicon") {
-		t.Fatalf("SAE corpus: %v, want a post-Helicon refusal", err)
+	t.Cleanup(func() { e.Close() })
+	return e, store, set, roots, e.BuildFrontier(set)
+}
+
+// TestBuildFrontierSAESettledRoot is the post-Helicon half of the root check
+// (RULING 2026-08-01). header(8) is an SAE header: its Root is NOT the state
+// at 8, it is the post-execution root of the height it settles. So the merge
+// must land on that settled height and reproduce exactly that root, and the
+// node must park there, a settlement lag below the sealed end.
+//
+// lag 1 (settles 7, itself an SAE height, so the frontier's gas clock has to
+// be seeded into the ring out of the attesting header's markers) and lag 3
+// (settles 5) are the same rule at both distances.
+func TestBuildFrontierSAESettledRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		settled uint64
+	}{{"lag1", 7}, {"lag3", 5}} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, store, _, roots, err := buildOn(t, func(roots map[uint64]common.Hash, n uint64, hdr *types.Header) {
+				// Blocks 5..8 are SAE, each settling as far back as the case
+				// wants and never further: monotonic, and 8 (the sealed end)
+				// is the header that attests the frontier.
+				if n < 5 {
+					return
+				}
+				s := min(n-1, tc.settled)
+				saeMarkers(hdr, s, roots[s])
+			})
+			if err != nil {
+				t.Fatalf("build frontier: %v", err)
+			}
+			if got := common.Hash(e.fwBackend.Firewood.Root()); got != roots[tc.settled] {
+				t.Fatalf("merged frontier root %x, want the root at the settled height %d (%x)", got, tc.settled, roots[tc.settled])
+			}
+			if e.Head() != tc.settled || e.headRoot != roots[tc.settled] {
+				t.Fatalf("head after build: %d root %x, want %d", e.Head(), e.headRoot, tc.settled)
+			}
+			if n, ok := store.ExecHead(); !ok || n != tc.settled {
+				t.Fatalf("exechead after build: %d %v, want %d", n, ok, tc.settled)
+			}
+			if f, ok := store.FrontierFloor(); !ok || f != tc.settled {
+				t.Fatalf("frontier floor: %d %v, want %d", f, ok, tc.settled)
+			}
+			// The frontier height is post-Helicon here, so its root and gas
+			// clock must be in the ring: without them the executor cannot
+			// take a single step at settled+1, and the restart walk-back
+			// cannot identify Firewood's root at all.
+			root, clock, ok := e.ring.get(tc.settled)
+			if !ok || root != roots[tc.settled] || len(clock) == 0 {
+				t.Fatalf("ring at %d: root %x clock %d bytes ok=%v", tc.settled, root, len(clock), ok)
+			}
+			// Nothing above the frontier reaches the state layer: the
+			// walk-back would demand containers this node never fetched.
+			if n, ok := store.HeadersMax(); !ok || n != tc.settled {
+				t.Fatalf("headers max %d %v, want %d", n, ok, tc.settled)
+			}
+		})
+	}
+}
+
+// TestBuildFrontierSAEAtBoundary: the sealed end is the FIRST SAE block, so
+// the height it settles is the transition block, which is synchronous. The
+// frontier lands on a pre-Helicon height whose own header carries its root and
+// seeds its gas clock, so nothing goes into the ring.
+func TestBuildFrontierSAEAtBoundary(t *testing.T) {
+	e, store, _, roots, err := buildOn(t, func(roots map[uint64]common.Hash, n uint64, hdr *types.Header) {
+		if n == 8 {
+			saeMarkers(hdr, 7, roots[7])
+		}
+	})
+	if err != nil {
+		t.Fatalf("build frontier: %v", err)
+	}
+	if got := common.Hash(e.fwBackend.Firewood.Root()); got != roots[7] || e.Head() != 7 {
+		t.Fatalf("frontier at %d root %x, want 7 %x", e.Head(), got, roots[7])
+	}
+	if _, _, ok := e.ring.get(7); ok {
+		t.Fatal("ring seeded at a synchronous height: its own header carries root and clock")
+	}
+	if f, ok := store.FrontierFloor(); !ok || f != 7 {
+		t.Fatalf("frontier floor: %d %v, want 7", f, ok)
+	}
+}
+
+// TestBuildFrontierSAERefusesWrongRoot: the whole point is that the check is
+// cryptographic, so a corpus whose rows do not hash to what the attesting
+// header settles must be refused, exactly like a pre-SAE mismatch.
+func TestBuildFrontierSAERefusesWrongRoot(t *testing.T) {
+	_, _, _, _, err := buildOn(t, func(roots map[uint64]common.Hash, n uint64, hdr *types.Header) {
+		if n == 8 {
+			// Settles 5, but presents the root of 6: the merge at 5 cannot
+			// produce it.
+			saeMarkers(hdr, 5, roots[6])
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "commits to") {
+		t.Fatalf("corrupted settled root: %v, want a merged-root refusal", err)
+	}
+}
+
+// TestBuildFrontierSAERefusesSelfSettle: a header that settles itself or the
+// future is not a commitment to anything this node can merge to.
+func TestBuildFrontierSAERefusesSelfSettle(t *testing.T) {
+	_, _, _, _, err := buildOn(t, func(roots map[uint64]common.Hash, n uint64, hdr *types.Header) {
+		if n == 8 {
+			saeMarkers(hdr, 8, roots[8])
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot settle itself") {
+		t.Fatalf("self-settling header: %v, want a refusal", err)
 	}
 }

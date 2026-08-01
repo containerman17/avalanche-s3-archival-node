@@ -358,6 +358,16 @@ func (e *Executor) checkSettled(n uint64, header *types.Header) error {
 		return fmt.Errorf("block %d settles height %d, below the previously settled %d: settlement is monotonic",
 			n, s.Height, e.sae.settledHeight)
 	}
+	if floor, ok := e.cfg.Store.FrontierFloor(); ok && s.Height < floor {
+		// A bootstrapped node's state came from a frontier merge at floor,
+		// verified against the header that settles it (exec/frontier.go), and
+		// it never executed anything below that: there is no root of ours to
+		// present here, and the settlement lag means the first few headers
+		// after the frontier all name heights inside that gap. Everything from
+		// the floor up is attested normally.
+		e.sae.settledHeight, e.sae.settledSeen = s.Height, true
+		return nil
+	}
 
 	hdr, err := e.loadHeader(s.Height)
 	if err != nil {
