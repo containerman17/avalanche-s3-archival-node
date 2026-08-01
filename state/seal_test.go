@@ -110,7 +110,7 @@ func TestSealCutAndResume(t *testing.T) {
 	// beyond the exec head.
 	fixedEpochTxs(t, 10)
 	cas := testStore(t, dir)
-	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
+	if err := SealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	set, err := OpenEpochSet(cas)
@@ -118,10 +118,10 @@ func TestSealCutAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer set.Close()
-	if len(set.Epochs) != 2 {
-		t.Fatalf("epochs: %d", len(set.Epochs))
+	if len(set.All()) != 2 {
+		t.Fatalf("epochs: %d", len(set.All()))
 	}
-	e1, e2 := set.Epochs[0], set.Epochs[1]
+	e1, e2 := set.All()[0], set.All()[1]
 	if e1.Start != 1 || e1.Count != 4 || e1.TxCount != 12 {
 		t.Fatalf("epoch1: %+v", e1)
 	}
@@ -168,7 +168,7 @@ func TestSealCutAndResume(t *testing.T) {
 
 	// resume: nothing new to seal
 	before, _ := os.ReadDir(dir)
-	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
+	if err := SealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadDir(dir)

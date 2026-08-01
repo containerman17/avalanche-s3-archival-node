@@ -768,125 +768,187 @@ func ReadMarker(dir, name string) (string, error) {
 // contiguous epoch range from genesis. Epochs above the first gap stay open
 // (their data is epoch-local and valid for body/tx-by-hash reads), but
 // full-descent reads (state, receipts, logs) must call RequireCovered.
+//
+// THE SET IS LIVE (2026-08-01, when sealing moved into the serve process):
+// Reload publishes epochs cut since open into the SAME *EpochSet every reader
+// already holds, so nothing is rewired when an epoch is cut and no reader ever
+// sees a half-swapped set. Readers get an immutable snapshot: All() returns a
+// slice that is replaced, never mutated, and the *Epoch values in it are
+// shared with the next snapshot (Reload opens only the markers it does not
+// already have, so nothing an in-flight read holds is ever closed).
 type EpochSet struct {
-	Epochs []*Epoch // ascending by Start
+	cur atomic.Pointer[epochSnapshot]
+}
+
+// epochSnapshot is one immutable published view of the set.
+type epochSnapshot struct {
+	epochs []*Epoch // ascending by Start
 
 	covered  uint64 // last block of the contiguous prefix from genesis
 	gapStart uint64 // expected Start of the first missing epoch (covered+1)
 	gapped   bool   // true when at least one epoch above the prefix exists
 }
 
+func (s *EpochSet) snap() *epochSnapshot {
+	if v := s.cur.Load(); v != nil {
+		return v
+	}
+	return &epochSnapshot{}
+}
+
+// All returns the current epochs, ascending. The slice is immutable: callers
+// read it, never write it.
+func (s *EpochSet) All() []*Epoch { return s.snap().epochs }
+
 // OpenEpochSet opens every epoch the store's data directory indexes. An empty
 // set is valid.
 func OpenEpochSet(st *dist.Store) (*EpochSet, error) {
+	s := &EpochSet{}
+	eps, err := openEpochMarkers(st, nil)
+	if err != nil {
+		return nil, err
+	}
+	s.publish(eps)
+	return s, nil
+}
+
+// Reload opens every epoch marker in the store's directory this set does not
+// hold yet and publishes the enlarged set in one atomic swap. Returns the
+// epochs it added. This is the in-process seal's publish step: it must run
+// BEFORE the raw buckets those epochs replace are deleted, so no read of a
+// sealed height can fall between the two sources.
+func (s *EpochSet) Reload(st *dist.Store) ([]*Epoch, error) {
+	cur := s.snap()
+	have := make(map[string]bool, len(cur.epochs))
+	for _, e := range cur.epochs {
+		have[EpochMarkerName(e.Start, e.Count)] = true
+	}
+	fresh, err := openEpochMarkers(st, have)
+	if err != nil || len(fresh) == 0 {
+		return nil, err
+	}
+	s.publish(append(append(make([]*Epoch, 0, len(cur.epochs)+len(fresh)), cur.epochs...), fresh...))
+	return fresh, nil
+}
+
+// openEpochMarkers opens the epochs named by the local index, skipping the
+// marker names in have. On any error every epoch it opened is closed.
+func openEpochMarkers(st *dist.Store, have map[string]bool) ([]*Epoch, error) {
 	dir := st.Dir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	s := &EpochSet{}
+	var out []*Epoch
+	fail := func(format string, args ...any) ([]*Epoch, error) {
+		for _, e := range out {
+			e.Close()
+		}
+		return nil, fmt.Errorf(format, args...)
+	}
 	for _, en := range entries {
 		// A pre-casfs corpus (whole epoch files sitting in the data dir) is
 		// refused by name: there is no migration, only delete and resync.
 		if strings.HasPrefix(en.Name(), "epoch_") && strings.HasSuffix(en.Name(), ".epoch") {
-			s.Close()
-			return nil, fmt.Errorf("%s: %s is a pre-casfs epoch file; epochs are now content-addressed artifacts in %s/cas (no migration: delete the corpus and resync)", dir, en.Name(), dir)
+			return fail("%s: %s is a pre-casfs epoch file; epochs are now content-addressed artifacts in %s/cas (no migration: delete the corpus and resync)", dir, en.Name(), dir)
 		}
 		start, count, ok := ParseEpochMarkerName(en.Name())
-		if !ok {
+		if !ok || have[en.Name()] {
 			continue
 		}
 		hash, err := ReadMarker(dir, en.Name())
 		if err != nil {
-			s.Close()
-			return nil, err
+			return fail("%w", err)
 		}
 		e, err := OpenEpoch(st, hash)
 		if err != nil {
-			s.Close()
-			return nil, fmt.Errorf("%s: %w", en.Name(), err)
+			return fail("%s: %w", en.Name(), err)
 		}
 		if e.Start != start || e.Count != count {
 			e.Close()
-			s.Close()
-			return nil, fmt.Errorf("%s names blocks %d..%d but %s covers %d..%d", en.Name(), start, start+count-1, hash, e.Start, e.End())
+			return fail("%s names blocks %d..%d but %s covers %d..%d", en.Name(), start, start+count-1, hash, e.Start, e.End())
 		}
-		s.Epochs = append(s.Epochs, e)
+		out = append(out, e)
 	}
-	sort.Slice(s.Epochs, func(i, j int) bool { return s.Epochs[i].Start < s.Epochs[j].Start })
-	s.computeCoverage()
-	return s, nil
+	return out, nil
 }
 
-// computeCoverage walks the epochs upward from genesis. Anything after the
-// first gap stays open for epoch-local reads but is outside coverage.
-func (s *EpochSet) computeCoverage() {
-	s.covered, s.gapped, s.gapStart = 0, false, 0
-	for _, e := range s.Epochs {
-		if e.End() <= s.covered {
+// publish sorts, walks coverage upward from genesis, and swaps the snapshot in.
+// Anything after the first gap stays open for epoch-local reads but is outside
+// coverage.
+func (s *EpochSet) publish(eps []*Epoch) {
+	sort.Slice(eps, func(i, j int) bool { return eps[i].Start < eps[j].Start })
+	snap := &epochSnapshot{epochs: eps}
+	for _, e := range eps {
+		if e.End() <= snap.covered {
 			continue
 		}
-		want := s.covered + 1
-		if s.covered == 0 && e.Start <= 1 { // block 0 is genesis (no container); sealing starts at 1
+		want := snap.covered + 1
+		if snap.covered == 0 && e.Start <= 1 { // block 0 is genesis (no container); sealing starts at 1
 			want = e.Start
 		}
 		if e.Start > want {
-			s.gapped, s.gapStart = true, want
+			snap.gapped, snap.gapStart = true, want
 			break
 		}
-		s.covered = e.End()
+		snap.covered = e.End()
 	}
-	if !s.gapped {
-		s.gapStart = s.covered + 1
+	if !snap.gapped {
+		snap.gapStart = snap.covered + 1
 	}
+	s.cur.Store(snap)
 }
 
 // CoveredEnd returns the last block of the contiguous sealed prefix from
 // genesis (0 when nothing is covered).
-func (s *EpochSet) CoveredEnd() uint64 { return s.covered }
+func (s *EpochSet) CoveredEnd() uint64 { return s.snap().covered }
 
 // RequireCovered errors when block n is beyond the contiguous prefix while
 // later epochs exist (a hole): state, receipt, and log reads at n would
 // silently skip missing history. Bodies/tx-by-hash are epoch-local and may
 // still be served above the gap without this check.
 func (s *EpochSet) RequireCovered(n uint64) error {
-	if s.gapped && n > s.covered {
-		return fmt.Errorf("missing epoch epoch_%d: sealed coverage is contiguous only through block %d", s.gapStart, s.covered)
+	snap := s.snap()
+	if snap.gapped && n > snap.covered {
+		return fmt.Errorf("missing epoch epoch_%d: sealed coverage is contiguous only through block %d", snap.gapStart, snap.covered)
 	}
 	return nil
 }
 
 func (s *EpochSet) Close() {
-	for _, e := range s.Epochs {
+	for _, e := range s.All() {
 		e.Close()
 	}
-	s.Epochs = nil
+	s.cur.Store(&epochSnapshot{})
 }
 
 // SealedEnd returns the last sealed block, ok=false for an empty set.
 func (s *EpochSet) SealedEnd() (uint64, bool) {
-	if len(s.Epochs) == 0 {
+	eps := s.All()
+	if len(eps) == 0 {
 		return 0, false
 	}
-	return s.Epochs[len(s.Epochs)-1].End(), true
+	return eps[len(eps)-1].End(), true
 }
 
 // Head returns the newest epoch, ok=false for an empty set. Seal chains the
 // next epoch's footer onto its hash.
 func (s *EpochSet) Head() (*Epoch, bool) {
-	if len(s.Epochs) == 0 {
+	eps := s.All()
+	if len(eps) == 0 {
 		return nil, false
 	}
-	return s.Epochs[len(s.Epochs)-1], true
+	return eps[len(eps)-1], true
 }
 
 // At returns the epoch containing block n.
 func (s *EpochSet) At(n uint64) (*Epoch, bool) {
-	i := sort.Search(len(s.Epochs), func(i int) bool { return s.Epochs[i].End() >= n })
-	if i == len(s.Epochs) || s.Epochs[i].Start > n {
+	eps := s.All()
+	i := sort.Search(len(eps), func(i int) bool { return eps[i].End() >= n })
+	if i == len(eps) || eps[i].Start > n {
 		return nil, false
 	}
-	return s.Epochs[i], true
+	return eps[i], true
 }
 
 // GetByHeight serves raw containers from sealed epochs (rpc.BlockSource
@@ -943,8 +1005,9 @@ func (c CombinedTxIndex) WalkCandidates(hash common.Hash, fn func(blk uint64) (b
 	if c.Epochs == nil {
 		return nil
 	}
-	for i := len(c.Epochs.Epochs) - 1; i >= 0; i-- {
-		e := c.Epochs.Epochs[i]
+	eps := c.Epochs.All()
+	for i := len(eps) - 1; i >= 0; i-- {
+		e := eps[i]
 		if !e.MayContainTx(fp) {
 			continue
 		}

@@ -197,7 +197,7 @@ func TestSealCodeEndToEnd(t *testing.T) {
 	// 3 txs/block, boundary 10 => epochs 1-4 and 5-8.
 	fixedEpochTxs(t, 10)
 	cas := testStore(t, dir)
-	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
+	if err := SealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -205,10 +205,10 @@ func TestSealCodeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(set.Epochs) != 2 {
-		t.Fatalf("epochs: %d", len(set.Epochs))
+	if len(set.All()) != 2 {
+		t.Fatalf("epochs: %d", len(set.All()))
 	}
-	e1, e2 := set.Epochs[0], set.Epochs[1]
+	e1, e2 := set.All()[0], set.All()[1]
 	// each epoch carries the code of the accounts IT wrote, and only those
 	if got, ok, _ := e1.Code(hashA); !ok || !bytes.Equal(got, blobA) {
 		t.Fatalf("epoch1 code A: %x ok=%v", got, ok)

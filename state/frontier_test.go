@@ -74,15 +74,15 @@ func buildFrontierEpochs(t *testing.T, dir string) *EpochSet {
 	}
 	fixedEpochTxs(t, 12)
 	cas := testStore(t, dir)
-	if err := sealEpochs(dir, cas, [32]byte{}); err != nil {
+	if err := SealEpochs(dir, cas, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	set, err := OpenEpochSet(cas)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(set.Epochs) != 2 {
-		t.Fatalf("want 2 epochs, got %d", len(set.Epochs))
+	if len(set.All()) != 2 {
+		t.Fatalf("want 2 epochs, got %d", len(set.All()))
 	}
 	return set
 }
@@ -113,7 +113,7 @@ func TestMergeFrontierEqualsDescent(t *testing.T) {
 
 	const h = 8
 	got := map[string][]byte{}
-	if err := MergeFrontier(set.Epochs, h, func(r FrontierRow) error {
+	if err := MergeFrontier(set.All(), h, func(r FrontierRow) error {
 		if len(r.Value) == 0 {
 			return nil // not part of the frontier
 		}
@@ -183,7 +183,7 @@ func TestMergeFrontierBelowHead(t *testing.T) {
 	defer set.Close()
 
 	got := map[string][]byte{}
-	if err := MergeFrontier(set.Epochs, 5, func(r FrontierRow) error {
+	if err := MergeFrontier(set.All(), 5, func(r FrontierRow) error {
 		if len(r.Value) > 0 {
 			got[string(r.Key)] = bytes.Clone(r.Value)
 		}

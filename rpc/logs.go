@@ -216,7 +216,7 @@ func (s *Server) logCandidates(from, to uint64, addrs []common.Address, topics [
 	}
 
 	// sealed portion via posting lists
-	for _, e := range epochs.Epochs {
+	for _, e := range epochs.All() {
 		lo, hi := max(from, e.Start), min(to, e.End())
 		if lo > hi {
 			continue

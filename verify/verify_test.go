@@ -302,7 +302,7 @@ func runVerify(t *testing.T, dir string) (*Verifier, error) {
 		t.Fatal(err)
 	}
 	t.Cleanup(v.Close)
-	for _, e := range set.Epochs {
+	for _, e := range set.All() {
 		if err := v.VerifyEpoch(e); err != nil {
 			return v, err
 		}

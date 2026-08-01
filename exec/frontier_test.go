@@ -200,8 +200,8 @@ func sealCorpus(t *testing.T, dir string, roots map[uint64]common.Hash, rows map
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(set.Epochs) != 2 {
-		t.Fatalf("want 2 epochs, got %d", len(set.Epochs))
+	if len(set.All()) != 2 {
+		t.Fatalf("want 2 epochs, got %d", len(set.All()))
 	}
 	return set
 }

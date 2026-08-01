@@ -22,15 +22,15 @@ func synthSet(t *testing.T, n int) (*dist.Store, *EpochSet, []*EpochInput) {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
-	if len(s.Epochs) != n {
-		t.Fatalf("opened %d epochs, want %d", len(s.Epochs), n)
+	if len(s.All()) != n {
+		t.Fatalf("opened %d epochs, want %d", len(s.All()), n)
 	}
 	return st, s, ins
 }
 
 func txLoadCounts(s *EpochSet) []uint64 {
-	out := make([]uint64, len(s.Epochs))
-	for i, e := range s.Epochs {
+	out := make([]uint64, len(s.All()))
+	for i, e := range s.All() {
 		out[i] = e.txLoads.Load()
 	}
 	return out
@@ -67,14 +67,14 @@ func TestUnknownTxHashLoadsNoIndex(t *testing.T) {
 	for i := 0; i < probes; i++ {
 		var h common.Hash
 		binary.BigEndian.PutUint64(h[:8], 0x9e3779b97f4a7c15*uint64(i+1))
-		for _, e := range s.Epochs {
+		for _, e := range s.All() {
 			if e.MayContainTx(txFingerprint(h)) {
 				fps++
 			}
 		}
 	}
-	if fps > probes*len(s.Epochs)/100 { // 16 bits/tx targets 0.045%
-		t.Fatalf("tx bloom false-positive rate too high: %d of %d probes", fps, probes*len(s.Epochs))
+	if fps > probes*len(s.All())/100 { // 16 bits/tx targets 0.045%
+		t.Fatalf("tx bloom false-positive rate too high: %d of %d probes", fps, probes*len(s.All()))
 	}
 }
 

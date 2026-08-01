@@ -418,7 +418,7 @@ func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (bloc
 		return 0, 0, err
 	}
 	defer set.Close()
-	if len(set.Epochs) == 0 {
+	if len(set.All()) == 0 {
 		return 0, 0, fmt.Errorf("no sealed epochs indexed in %s", st.Dir())
 	}
 	v, err := New(tmpDir, c, workers)
@@ -427,7 +427,7 @@ func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (bloc
 	}
 	defer v.Close()
 	t0 := time.Now()
-	for _, e := range set.Epochs {
+	for _, e := range set.All() {
 		if err := v.VerifyEpoch(e); err != nil {
 			return v.blocks, time.Since(t0), fmt.Errorf("epoch_%d_%d: %w", e.Start, e.Count, err)
 		}

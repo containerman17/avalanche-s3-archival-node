@@ -71,6 +71,11 @@ type History struct {
 	// a prune (which drops cooked entries) never makes work reappear.
 	tailApplied uint64
 
+	// sealRetryAt is the exec head below which SealTail cannot possibly cut an
+	// epoch, so it does not even open the corpus. Owned by the same single
+	// goroutine that calls SealTail (the cook loop).
+	sealRetryAt uint64
+
 	// mu guards buckets and deletes, which Refresh swaps when cook lands new
 	// sorted files. Everything else here is immutable after open.
 	mu      sync.RWMutex
@@ -126,16 +131,12 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 	if end, ok := h.epochs.SealedEnd(); ok && end > stateHead {
 		stateHead = end
 	}
-	if len(h.buckets) == 0 && len(h.epochs.Epochs) == 0 {
+	if len(h.buckets) == 0 && len(h.epochs.All()) == 0 {
 		return nil, fmt.Errorf("no sorted_NNNNN.idx buckets or epochs in %s (run epochdb cook-index or seal)", dir)
 	}
 	h.deletes = make(map[string][]uint64)
-	for _, e := range h.epochs.Epochs {
-		e.AccountDeletes(func(key []byte, blk uint64) {
-			h.deletes[string(key)] = append(h.deletes[string(key)], blk)
-		})
-	}
-	h.addBucketDeletes(h.deletes, h.buckets)
+	addEpochDeletes(h.deletes, h.epochs.All())
+	addBucketDeletes(h.deletes, h.buckets)
 	h.stateHead.Store(stateHead)
 	h.head.Store(stateHead)
 	return h, nil
@@ -170,35 +171,38 @@ func openSortedBuckets(dir string, floorHead uint64) ([]*sortedBucket, uint64, e
 	return out, floorHead, nil
 }
 
-// addBucketDeletes folds every account-delete row of the given buckets into
-// dst, keeping each key's block list sorted and deduped. Raw buckets STILL
-// overlap sealed epochs even though seal always deletes fully-sealed raws
-// (buckets are 100k blocks, epochs cut on tx count), and a re-cooked tip
-// bucket is a superset of its previous cook, so dedupe is load-bearing both
-// at open and on Refresh.
-func (h *History) addBucketDeletes(dst map[string][]uint64, buckets []*sortedBucket) {
-	touched := make(map[string]bool)
-	for _, b := range buckets {
-		for i := 0; i < b.n; i++ {
-			r := b.rec(i)
-			blk := binary.BigEndian.Uint64(r[53:61])
-			if r[0] == recKindAccount && binary.BigEndian.Uint32(r[69:73]) == 0 {
-				k := string(r[:sortedKeySize])
-				if !touched[k] {
-					// Refresh works on a shallow copy of the map, so the first
-					// touch must clone: append + the dedupe below rewrite the
-					// backing array, which a reader may still be holding from
-					// the previous map.
-					dst[k] = append(append([]uint64(nil), dst[k]...), blk)
-					touched[k] = true
-					continue
-				}
-				dst[k] = append(dst[k], blk)
-			}
-		}
+// deleteAdder folds account-delete rows into dst, keeping each key's block
+// list sorted and deduped. Raw buckets STILL overlap sealed epochs even though
+// seal always deletes fully-sealed raws (buckets are 100k blocks, epochs cut
+// on tx count), a re-cooked tip bucket is a superset of its previous cook, and
+// an epoch published by the in-process seal repeats rows the cooked buckets
+// already contributed, so dedupe is load-bearing at open, on Refresh and on
+// RefreshEpochs alike.
+type deleteAdder struct {
+	dst     map[string][]uint64
+	touched map[string]bool
+}
+
+func newDeleteAdder(dst map[string][]uint64) *deleteAdder {
+	return &deleteAdder{dst: dst, touched: make(map[string]bool)}
+}
+
+func (a *deleteAdder) add(key []byte, blk uint64) {
+	k := string(key)
+	if !a.touched[k] {
+		// Refresh works on a shallow copy of the map, so the first touch must
+		// clone: append + the dedupe in done rewrite the backing array, which
+		// a reader may still be holding from the previous map.
+		a.dst[k] = append(append([]uint64(nil), a.dst[k]...), blk)
+		a.touched[k] = true
+		return
 	}
-	for k := range touched {
-		ds := dst[k]
+	a.dst[k] = append(a.dst[k], blk)
+}
+
+func (a *deleteAdder) done() {
+	for k := range a.touched {
+		ds := a.dst[k]
 		sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
 		out := ds[:0]
 		for i, d := range ds {
@@ -206,8 +210,29 @@ func (h *History) addBucketDeletes(dst map[string][]uint64, buckets []*sortedBuc
 				out = append(out, d)
 			}
 		}
-		dst[k] = out
+		a.dst[k] = out
 	}
+}
+
+func addBucketDeletes(dst map[string][]uint64, buckets []*sortedBucket) {
+	a := newDeleteAdder(dst)
+	for _, b := range buckets {
+		for i := 0; i < b.n; i++ {
+			r := b.rec(i)
+			if r[0] == recKindAccount && binary.BigEndian.Uint32(r[69:73]) == 0 {
+				a.add(r[:sortedKeySize], binary.BigEndian.Uint64(r[53:61]))
+			}
+		}
+	}
+	a.done()
+}
+
+func addEpochDeletes(dst map[string][]uint64, epochs []*Epoch) {
+	a := newDeleteAdder(dst)
+	for _, e := range epochs {
+		e.AccountDeletes(a.add)
+	}
+	a.done()
 }
 
 // Refresh re-opens the sorted buckets whose cook advanced (and any new one),
@@ -286,7 +311,7 @@ func (h *History) Refresh() error {
 	for k, v := range h.deletes {
 		deletes[k] = v
 	}
-	h.addBucketDeletes(deletes, fresh)
+	addBucketDeletes(deletes, fresh)
 	h.buckets, h.deletes = list, deletes
 	h.mu.Unlock()
 
@@ -308,6 +333,65 @@ func (h *History) Refresh() error {
 // Epochs exposes the sealed epoch set (shared with the serve wiring for
 // bodies and tx lookups).
 func (h *History) Epochs() *EpochSet { return h.epochs }
+
+// refreshEpochs publishes epochs sealed since open to the live read path: the
+// set is reloaded IN PLACE, so every reader that captured it (the RPC body
+// source, the combined tx index) starts answering from them without being
+// rewired, and their account deletes join the descent's delete index. Returns
+// how many epochs it added.
+//
+// This is step two of the in-process seal, and it must complete before the raw
+// buckets those epochs replace are deleted: after it, every read of a sealed
+// height has a sealed answer, so losing the raw one costs nothing.
+func (h *History) refreshEpochs() (int, error) {
+	fresh, err := h.epochs.Reload(h.store.Cas())
+	if err != nil || len(fresh) == 0 {
+		return 0, err
+	}
+	h.mu.Lock()
+	deletes := make(map[string][]uint64, len(h.deletes))
+	for k, v := range h.deletes {
+		deletes[k] = v
+	}
+	addEpochDeletes(deletes, fresh)
+	h.deletes = deletes
+	h.mu.Unlock()
+	if end, ok := h.epochs.SealedEnd(); ok && end > h.stateHead.Load() {
+		h.stateHead.Store(end)
+		if h.head.Load() < end {
+			h.head.Store(end)
+		}
+	}
+	return len(fresh), nil
+}
+
+// dropSealedBuckets releases the raw buckets whose whole range is at or below
+// sealedEnd, LAST step of the in-process seal. It is what makes the deletion
+// actually free disk: an unlinked file that this process still mmaps (the
+// sorted index) or still holds open (its writelog) keeps its blocks allocated
+// until the handle goes. Every dropped block is inside a published epoch, so
+// the descent answers it from there.
+func (h *History) dropSealedBuckets(sealedEnd uint64) int {
+	h.mu.Lock()
+	var keep, drop []*sortedBucket
+	for _, b := range h.buckets {
+		if (b.bucket+1)*bucketBlocks-1 <= sealedEnd {
+			drop = append(drop, b)
+			continue
+		}
+		keep = append(keep, b)
+	}
+	if len(drop) > 0 {
+		h.buckets = keep
+	}
+	h.mu.Unlock()
+	// Same drain rule as Refresh: readers hold the read lock for the whole
+	// descent, so the write lock above already got them out of these mmaps.
+	for _, b := range drop {
+		b.close()
+	}
+	return len(drop)
+}
 
 // LogTuples returns block n's captured log tuple record from the raw logs
 // bucketLog (unsealed-tail getLogs candidates). ok=false = no logs.
@@ -542,8 +626,9 @@ func (h *History) search(key []byte, n uint64) (val []byte, blk uint64, found bo
 			return val, blk, found, err
 		}
 	}
-	for i := len(h.epochs.Epochs) - 1; i >= 0; i-- {
-		e := h.epochs.Epochs[i]
+	eps := h.epochs.All()
+	for i := len(eps) - 1; i >= 0; i-- {
+		e := eps[i]
 		if e.Start > n || !e.MayContainKey(key) {
 			continue
 		}
@@ -664,8 +749,9 @@ func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := len(h.epochs.Epochs) - 1; !ok && i >= 0; i-- {
-		if blob, ok, err = h.epochs.Epochs[i].Code(codeHash); err != nil {
+	eps := h.epochs.All()
+	for i := len(eps) - 1; !ok && i >= 0; i-- {
+		if blob, ok, err = eps[i].Code(codeHash); err != nil {
 			return nil, err
 		}
 	}
@@ -722,7 +808,7 @@ func (h *History) SampleRecord(r *rand.Rand) (kind byte, addr common.Address, sl
 // sampleEpochRecord picks a random sparse-index entry from a random epoch
 // SST and a random row inside its block.
 func (h *History) sampleEpochRecord(r *rand.Rand) (kind byte, addr common.Address, slot common.Hash, block uint64, ok bool) {
-	eps := h.epochs.Epochs
+	eps := h.epochs.All()
 	if len(eps) == 0 {
 		return 0, addr, slot, 0, false
 	}

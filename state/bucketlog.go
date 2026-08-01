@@ -317,6 +317,32 @@ func (l *bucketLog) Get(block uint64) ([]byte, bool, error) {
 	return buf, true, nil
 }
 
+// retire forgets everything at or below sealedEnd whose whole bucket is
+// retired: the open handles first (an unlinked file this process still holds
+// open keeps its blocks allocated, so without this the seal's delete frees no
+// disk at all until the process exits) and then the RAM index entries, which
+// would otherwise pin one map entry per retired block forever.
+func (l *bucketLog) retire(sealedEnd uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var firstErr error
+	for b := range l.pairs {
+		if (b+1)*bucketBlocks-1 > sealedEnd {
+			continue
+		}
+		if err := l.closePair(b); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for block, loc := range l.idx {
+		if (block/bucketBlocks+1)*bucketBlocks-1 <= sealedEnd {
+			delete(l.idx, block)
+			l.bytes -= uint64(loc.ln)
+		}
+	}
+	return firstErr
+}
+
 // Max returns the highest indexed block, ok=false if empty.
 func (l *bucketLog) Max() (uint64, bool) {
 	l.mu.Lock()

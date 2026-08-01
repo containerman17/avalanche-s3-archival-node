@@ -53,10 +53,13 @@ import (
 //	                eth_blockNumber and the frontier can never disagree by more
 //	                than the microseconds between two stores.
 //	cook loop       cook-index + cook-txindex + History.Refresh on a cadence,
-//	                so the historical window chases the head. Async and
-//	                fail-loud: a cook failure is logged, never stalls the chain.
+//	                so the historical window chases the head, then seal: whole
+//	                epochs are cut, published and their raw retired on the same
+//	                tick. Async and fail-loud: a cook or seal failure is
+//	                logged, never stalls the chain.
 //
-// Seal deliberately stays OUT of this process; see the comment on cookLoop.
+// Sealing is automatic and in-process (ruling 2026-08-01); see cookLoop for
+// the ordering that makes deleting raw safe under a live reader.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
@@ -395,15 +398,23 @@ func (l liveNode) AcceptedHead() uint64 { return max(l.accepted(), l.Executor.Li
 // state at newly executed heights answerable by the descent, cook-txindex
 // makes their txs findable by hash, and History.Refresh publishes both.
 //
-// Deliberately NOT in this loop: seal. It DELETES raw buckets, and this
-// process is the live writer of exactly those files. Seal drops a bucket only
-// once every block in it is sealed (so it can only ever target buckets far
-// below the writer's tip bucket) and is SAFE in principle beside this writer;
-// what is NOT safe is the state.Open handle: our bucketLog holds open fds and
-// an in-RAM index of files a sibling would unlink, and cook's tmp+rename races
-// another cook. The documented shape stays: run seal as the external sibling
-// on its own cadence. With EPOCH_TXS at 10M an epoch boundary is ~10 days
-// away, so nothing is lost by leaving it out of the tip loop.
+// SEAL RIDES THIS LOOP TOO (ruling 2026-08-01: sealing is automatic, there is
+// no seal process and no cron). It supersedes "seal stays out of the process",
+// whose objection was the DELETE of raw buckets this process reads: an
+// external sibling unlinked files while our fds, mmaps and in-RAM bucket index
+// still pointed at them, and there was no way to tell the reader first. In
+// process there is, and the ordering IS the safety (state.History.SealTail):
+//
+//	seal    write the epochs, delete nothing. Both sources exist.
+//	refresh publish them into the live EpochSet every reader already holds,
+//	        so a sealed height now has a sealed answer.
+//	delete  only then unlink the raw buckets, and drop our own handles on them
+//	        so the space is actually returned.
+//
+// Nothing races a sibling because there is no sibling: one process owns the
+// dir, and cook and seal are the same goroutine, so cook's tmp+rename cannot
+// overlap a seal. Cost is gated by the exec head (SealTail opens nothing below
+// the extrapolated boundary), so riding the cook cadence is free.
 func (n *chainNode) cookLoop(ctx context.Context) {
 	t := time.NewTicker(n.cfg.CookEvery)
 	defer t.Stop()
@@ -465,6 +476,33 @@ func (n *chainNode) cookOnce() {
 	entries, size := hist.PruneTail()
 	n.cfg.logf("cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
 		hist.StateHead(), time.Since(start).Round(time.Millisecond), entries, float64(size)/1e6)
+	n.sealOnce()
+}
+
+// sealOnce is the cook pass's seal step: cut whatever epochs the durable exec
+// head has made whole, publish them, drop the raw they replace. Same
+// fail-loud-but-keep-serving contract as cook, and for the same reason: the
+// chain does not stop because history could not be compacted. The sealed
+// artifacts land in the same spool the syncLoop uploads from, so they reach
+// the bucket on the next sync tick with no extra wiring.
+func (n *chainNode) sealOnce() {
+	start := time.Now()
+	epochs, sealedEnd, err := n.hist.SealTail(n.cfg.Chain.Root())
+	if err != nil {
+		n.cfg.logf("SEAL FAILED (history stays raw, chain unaffected): %v", err)
+		return
+	}
+	if epochs == 0 {
+		return
+	}
+	// The staging segments are the fetcher's, not the state layer's, so their
+	// handles are released here: an unlinked arrival log this process still
+	// holds open frees no disk.
+	if err := n.fetcher.Store().Retire(sealedEnd); err != nil {
+		n.cfg.logf("seal: retiring staging segments: %v", err)
+	}
+	n.cfg.logf("seal: %d epoch(s) cut, sealed through %d, raw retired (in %s)",
+		epochs, sealedEnd, time.Since(start).Round(time.Millisecond))
 }
 
 func (n *chainNode) statusLoop(ctx context.Context) {

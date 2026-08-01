@@ -191,7 +191,14 @@ func (s *Store) rebuildSegment(bucket uint64) error {
 
 // seg returns the open segment pair for bucket, opening it (and LRU-closing
 // the least recently used one over the cap) if needed. Caller holds s.mu.
-func (s *Store) seg(bucket uint64) (*segment, error) {
+//
+// create=false never brings a segment BACK: a segment the seal retired is
+// gone, and
+// recreating it here would put an empty arrival file where history used to be
+// and turn every read of that range into an EOF instead of an epoch fallback
+// (the bug state/bucketlog.go's pair() already carries this rule for).
+// nil, nil means the segment is not here.
+func (s *Store) seg(bucket uint64, create bool) (*segment, error) {
 	s.useCounter++
 	if sg, ok := s.segs[bucket]; ok {
 		sg.lastUse = s.useCounter
@@ -211,11 +218,24 @@ func (s *Store) seg(bucket uint64) (*segment, error) {
 			return nil, err
 		}
 	}
-	arrival, err := os.OpenFile(filepath.Join(s.dir, arrivalName(bucket)), os.O_RDWR|os.O_CREATE, 0o644)
+	flags := os.O_RDWR
+	idxFlags := os.O_WRONLY | os.O_APPEND
+	if create {
+		flags |= os.O_CREATE
+		idxFlags |= os.O_CREATE
+	}
+	arrival, err := os.OpenFile(filepath.Join(s.dir, arrivalName(bucket)), flags, 0o644)
+	if os.IsNotExist(err) {
+		return nil, nil // retired segment: not an error, just not here
+	}
 	if err != nil {
 		return nil, err
 	}
-	index, err := os.OpenFile(filepath.Join(s.dir, indexName(bucket)), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	index, err := os.OpenFile(filepath.Join(s.dir, indexName(bucket)), idxFlags, 0o644)
+	if os.IsNotExist(err) {
+		arrival.Close()
+		return nil, nil
+	}
 	if err != nil {
 		arrival.Close()
 		return nil, err
@@ -268,7 +288,7 @@ func (s *Store) Append(p parsedContainer, raw []byte) error {
 	if _, dup := s.byID[p.containerID]; dup {
 		return nil
 	}
-	sg, err := s.seg(p.blockNumber / SegmentBlocks)
+	sg, err := s.seg(p.blockNumber/SegmentBlocks, true)
 	if err != nil {
 		return err
 	}
@@ -366,9 +386,16 @@ func (s *Store) readAt(n uint64) ([]byte, ids.ID, bool, error) {
 	if !ok {
 		return nil, ids.Empty, false, nil
 	}
-	sg, err := s.seg(n / SegmentBlocks)
+	sg, err := s.seg(n/SegmentBlocks, false)
 	if err != nil {
 		return nil, ids.Empty, false, err
+	}
+	if sg == nil {
+		// Segment retired under us by the in-process seal: the sealed epoch
+		// answers this height now, so drop the stale index entry and say
+		// "not here" rather than resurrecting an empty file.
+		delete(s.byHeight, n)
+		return nil, ids.Empty, false, nil
 	}
 	frame := make([]byte, rec.ln)
 	if _, err := sg.arrival.ReadAt(frame, int64(rec.off)); err != nil {
@@ -379,6 +406,25 @@ func (s *Store) readAt(n uint64) ([]byte, ids.ID, bool, error) {
 		return nil, ids.Empty, false, fmt.Errorf("decompress container at height %d: %w", n, err)
 	}
 	return raw, rec.id, true, nil
+}
+
+// Retire drops this store's handles on the staging segments a seal has just
+// deleted. Same reason as state.Store.RetireBuckets: the arrival log is the
+// biggest raw family there is, and an unlinked file this process still holds
+// open frees no disk at all.
+func (s *Store) Retire(sealedEnd uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var firstErr error
+	for b := range s.segs {
+		if (b+1)*SegmentBlocks-1 > sealedEnd {
+			continue
+		}
+		if err := s.closeSegment(b); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Head returns the highest stored block height, ok=false if empty.

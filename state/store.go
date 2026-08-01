@@ -143,6 +143,20 @@ func (s *Store) Close() error {
 // ExecHead returns the durable executor head. ok=false on a fresh store.
 func (s *Store) ExecHead() (uint64, bool) { return s.execHead, s.execHeadOK }
 
+// RetireBuckets drops this store's handles and index entries for the raw
+// buckets a seal has just deleted (History.SealTail's last step). Without it
+// the delete frees nothing: the writer keeps the unlinked files open, so their
+// blocks stay allocated for the life of the process.
+func (s *Store) RetireBuckets(sealedEnd uint64) error {
+	var firstErr error
+	for _, l := range []*bucketLog{s.wl, s.hd, s.lg, s.rc} {
+		if err := l.retire(sealedEnd); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // FlushAndSetExecHead fsyncs every dirty file (writelog, headers, code,
 // misc) and only then persists executorHead = n via tmp+rename.
 func (s *Store) FlushAndSetExecHead(n uint64) error {

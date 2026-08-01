@@ -110,7 +110,7 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		return nil
 	}
 
-	err = state.MergeFrontier(epochs.Epochs, h, func(r state.FrontierRow) error {
+	err = state.MergeFrontier(epochs.All(), h, func(r state.FrontierRow) error {
 		nRows++
 		addr := common.Address(r.Key[1:21])
 		switch r.Key[0] {
@@ -203,6 +203,6 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	}
 	dt := time.Since(t0)
 	log.Printf("exec: frontier built at %d root=%x from %d epochs: %d rows -> %d accounts, %d slots, %d deletes, %d skipped, %d batches in %s (%.0f rows/s)",
-		h, hdr.Root, len(epochs.Epochs), nRows, nAcct, nSlot, nDel, nSkip, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
+		h, hdr.Root, len(epochs.All()), nRows, nAcct, nSlot, nDel, nSkip, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
 	return nil
 }
