@@ -108,6 +108,16 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) map[string]any {
 	return fields
 }
 
+// marshalHeader is marshalBlock's header-only shape, shared by
+// eth_getHeaderBy* and the newHeads subscription.
+func (s *Server) marshalHeader(blk *types.Block) map[string]any {
+	m := s.marshalBlock(blk, false)
+	delete(m, "transactions")
+	delete(m, "uncles")
+	delete(m, "size")
+	return m
+}
+
 func fullTxFlag(params []json.RawMessage, idx int) bool {
 	if len(params) <= idx {
 		return false

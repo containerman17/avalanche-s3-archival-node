@@ -826,6 +826,9 @@ func TestMethodTableNoPanics(t *testing.T) {
 		"debug_storageRangeAt": true, "eth_sendRawTransaction": true,
 		"eth_sendTransaction": true, "eth_fillTransaction": true, "eth_resend": true,
 		"eth_subscribe": true, "eth_unsubscribe": true,
+		"debug_intermediateRoots": true, "debug_preimage": true,
+		"debug_traceBadBlock": true, "debug_traceChain": true,
+		"eth_sign": true, "eth_signTransaction": true,
 	}
 
 	for _, tc := range []struct {
@@ -903,6 +906,18 @@ func TestMethodTableNoPanics(t *testing.T) {
 		{"eth_resend", []any{map[string]any{}}},
 		{"eth_subscribe", []any{"newHeads"}},
 		{"eth_unsubscribe", []any{"0x1"}},
+		{"eth_callDetailed", []any{callArgs, tag}},
+		{"eth_suggestPriceOptions", nil},
+		{"eth_getChainConfig", nil},
+		{"debug_chainConfig", nil},
+		{"debug_printBlock", []any{blkCall}},
+		{"debug_getAccessibleState", []any{1, headBlock}},
+		{"debug_intermediateRoots", []any{blkHash}},
+		{"debug_preimage", []any{common.Hash{}}},
+		{"debug_traceBadBlock", []any{blkHash}},
+		{"debug_traceChain", []any{"0x1", "0x2"}},
+		{"eth_sign", []any{fundedAddr(), "0x00"}},
+		{"eth_signTransaction", []any{map[string]any{}}},
 	} {
 		res, rerr := e.call(t, tc.method, tc.params...)
 		switch {

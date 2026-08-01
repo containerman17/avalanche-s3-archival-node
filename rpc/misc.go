@@ -30,9 +30,10 @@ func (s *Server) headerAt(n uint64) (*types.Header, *rpcError) {
 }
 
 // runCall executes args as a message at height n with the given gas limit,
-// optionally under a tracer (debug_traceCall). Kept separate from
-// server.go's ethCall (file discipline); same semantics.
-func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (*callResult, *rpcError) {
+// optionally under a tracer (debug_traceCall) and optionally with eth_call's
+// state/block overrides. Kept separate from server.go's ethCall (file
+// discipline); same semantics.
+func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer, ov *overrides) (*callResult, *rpcError) {
 	header, rerr := s.headerAt(n)
 	if rerr != nil {
 		return nil, rerr
@@ -40,6 +41,9 @@ func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (
 	st, rerr := s.stateAt(n)
 	if rerr != nil {
 		return nil, rerr
+	}
+	if err := ov.stateDiff().apply(st); err != nil {
+		return nil, errInvalid("%v", err)
 	}
 	msg := &callMsg{
 		To:        args.To,
@@ -65,7 +69,9 @@ func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer) (
 		vmCfg.Tracer = tracer
 	}
 	backend := registeredVM()
-	res, err := backend.applyMsg(s.chainCfg, backend.blockContext(header, s.chainCtx), st, msg, vmCfg)
+	blockCtx := backend.blockContext(header, s.chainCtx)
+	ov.blockDiff().apply(&blockCtx)
+	res, err := backend.applyMsg(s.chainCfg, blockCtx, st, msg, vmCfg)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
@@ -95,6 +101,10 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 	if n == 0 {
 		return nil, errInvalid("eth_estimateGas needs an executed block (>=1)")
 	}
+	ov, rerr := parseOverrides(reqParams, 2, -1)
+	if rerr != nil {
+		return nil, rerr
+	}
 
 	hi := uint64(GasCap)
 	if args.Gas != nil && uint64(*args.Gas) >= ethparams.TxGas {
@@ -104,7 +114,7 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 	}
 
 	// The ceiling must execute at all, or the call fails regardless of gas.
-	res, rerr := s.runCall(&args, n, hi, nil)
+	res, rerr := s.runCall(&args, n, hi, nil, ov)
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -113,7 +123,7 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 	}
 
 	return hexutil.EncodeUint64(searchGas(ethparams.TxGas-1, hi, func(gas uint64) bool {
-		res, rerr := s.runCall(&args, n, gas, nil)
+		res, rerr := s.runCall(&args, n, gas, nil, ov)
 		return rerr == nil && res.Err == nil
 	})), nil
 }

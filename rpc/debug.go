@@ -20,11 +20,14 @@ import (
 )
 
 // traceConfig mirrors geth's TraceConfig: struct-logger options inline,
-// or a named tracer from the default directory.
+// or a named tracer from the default directory. StateOverrides/BlockOverrides
+// are geth's TraceCallConfig extension, only read by debug_traceCall.
 type traceConfig struct {
 	logger.Config
-	Tracer       *string         `json:"tracer"`
-	TracerConfig json.RawMessage `json:"tracerConfig"`
+	Tracer         *string         `json:"tracer"`
+	TracerConfig   json.RawMessage `json:"tracerConfig"`
+	StateOverrides *stateOverride  `json:"stateOverrides"`
+	BlockOverrides *blockOverrides `json:"blockOverrides"`
 }
 
 func newTracer(cfg *traceConfig, tctx *tracers.Context) (tracers.Tracer, error) {
@@ -278,7 +281,11 @@ func (s *Server) debugTraceCall(params []json.RawMessage) (any, *rpcError) {
 	if args.Gas != nil && uint64(*args.Gas) < gas {
 		gas = uint64(*args.Gas)
 	}
-	if _, rerr := s.runCall(&args, n, gas, tracer); rerr != nil {
+	var ov *overrides
+	if cfg != nil && (cfg.StateOverrides != nil || cfg.BlockOverrides != nil) {
+		ov = &overrides{state: cfg.StateOverrides, block: cfg.BlockOverrides}
+	}
+	if _, rerr := s.runCall(&args, n, gas, tracer, ov); rerr != nil {
 		return nil, rerr
 	}
 	res, err := tracer.GetResult()

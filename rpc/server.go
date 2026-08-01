@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -293,6 +294,12 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return nil, nil
 	case "eth_getProof":
 		return nil, &rpcError{Code: -32000, Message: "eth_getProof unsupported by design: epochdb stores no tries"}
+	case "eth_callDetailed":
+		return s.callDetailed(req.Params)
+	case "eth_suggestPriceOptions":
+		return s.suggestPriceOptions()
+	case "eth_getChainConfig", "debug_chainConfig":
+		return s.chainConfig()
 	// debug/trace namespace (debug.go).
 	case "debug_traceTransaction":
 		return s.debugTraceTransaction(req.Params)
@@ -318,8 +325,31 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.debugGetModifiedAccounts(req.Params, true)
 	case "debug_getBadBlocks":
 		return []any{}, nil // root-verified replay retains no bad blocks
-	case "debug_dumpBlock", "debug_accountRange", "debug_storageRangeAt":
+	case "debug_printBlock":
+		return s.printBlock(req.Params)
+	case "debug_getAccessibleState":
+		return s.getAccessibleState(req.Params)
+	case "debug_dumpBlock", "debug_accountRange", "debug_storageRangeAt", "debug_intermediateRoots":
+		// intermediateRoots is the same refusal as getProof for the same
+		// reason: a per-tx state root only exists if the node hashes a trie
+		// per transaction, and epochdb stores no tries at all.
 		return nil, &rpcError{Code: -32000, Message: req.Method + " unsupported by design: epochdb stores no tries"}
+	case "debug_preimage":
+		// The state key space is ALREADY hashed (wiki: firewood key space is
+		// already hashed, no preimages needed), so there is no preimage table
+		// to look a hash up in.
+		return nil, &rpcError{Code: -32000, Message: "debug_preimage unsupported by design: epochdb keeps no preimage table"}
+	case "debug_traceBadBlock":
+		// Consistent with debug_getBadBlocks returning []: replay is
+		// root-verified block by block, so a bad block halts the executor
+		// instead of being retained for later inspection.
+		return nil, &rpcError{Code: -32000, Message: "debug_traceBadBlock: no bad blocks are retained (replay is root-verified and halts instead)"}
+	case "debug_traceChain":
+		// geth streams this one over a notification channel, unbounded, for a
+		// whole range. Refused rather than half-implemented with a different
+		// wire shape: debug_traceBlockByNumber is the same work, per block,
+		// with a shape clients already parse.
+		return nil, &rpcError{Code: -32000, Message: "debug_traceChain unsupported: trace a range with debug_traceBlockByNumber per block"}
 	// filters, subscriptions bookkeeping, and audit trivia (filters.go).
 	case "eth_newFilter":
 		return s.newFilter(req.Params)
@@ -355,9 +385,17 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.rawTxByBlockAndIndex(req.Params, true)
 	case "eth_sendRawTransaction", "eth_sendTransaction", "eth_fillTransaction", "eth_resend":
 		return nil, errTxSubmission(req.Method)
+	case "eth_sign", "eth_signTransaction":
+		return nil, errNoKeystore(req.Method)
 	case "eth_subscribe", "eth_unsubscribe":
 		return nil, &rpcError{Code: -32000, Message: req.Method + " requires the WebSocket transport"}
 	default:
+		if ns, _, ok := strings.Cut(req.Method, "_"); ok {
+			switch ns {
+			case "personal", "miner", "admin", "les", "clique", "ethash":
+				return nil, errNotArchivable(req.Method)
+			}
+		}
 		return nil, &rpcError{Code: -32601, Message: "method not found: " + req.Method}
 	}
 }
@@ -376,8 +414,38 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 // itself is served by getBlockByNumber, which handles the tag before this.
 func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 	head := s.hist.Head()
-	if raw == nil {
+	if len(raw) == 0 {
 		return head, nil
+	}
+	// geth's BlockNumberOrHash object form, accepted at EVERY position whose
+	// geth signature is a blockNrOrHash (getBalance, getCode, getStorageAt,
+	// getTransactionCount, call, estimateGas, createAccessList, traceCall,
+	// the filter criteria). Resolved here, once, so no method can forget it.
+	if raw[0] == '{' {
+		var o struct {
+			BlockNumber      json.RawMessage `json:"blockNumber"`
+			BlockHash        *common.Hash    `json:"blockHash"`
+			RequireCanonical bool            `json:"requireCanonical"`
+		}
+		if err := json.Unmarshal(raw, &o); err != nil {
+			return 0, errInvalid("bad block tag: %v", err)
+		}
+		switch {
+		case o.BlockHash != nil:
+			// Every height this node serves is canonical (there is no side
+			// chain to confuse it with), so requireCanonical is a no-op.
+			n, ok, err := s.HeightByHash(*o.BlockHash)
+			if err != nil {
+				return 0, &rpcError{Code: -32000, Message: err.Error()}
+			}
+			if !ok {
+				return 0, &rpcError{Code: -32000, Message: "header for hash not found"}
+			}
+			return n, nil
+		case len(o.BlockNumber) > 0:
+			return s.blockNumber(o.BlockNumber)
+		}
+		return 0, errInvalid("block tag object needs blockNumber or blockHash")
 	}
 	var tag string
 	if err := json.Unmarshal(raw, &tag); err != nil {
@@ -533,6 +601,11 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 	if n == 0 {
 		return nil, errInvalid("eth_call needs an executed block (>=1)")
 	}
+	// geth's signature is [args, blockNrOrHash, stateOverride, blockOverrides].
+	ov, rerr := parseOverrides(params, 2, 3)
+	if rerr != nil {
+		return nil, rerr
+	}
 	raw, ok, err := s.hist.HeaderRLP(n)
 	if err != nil || !ok {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d unavailable: ok=%v err=%v", n, ok, err)}
@@ -545,6 +618,9 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 	st, rerr := s.stateAt(n)
 	if rerr != nil {
 		return nil, rerr
+	}
+	if err := ov.stateDiff().apply(st); err != nil {
+		return nil, errInvalid("%v", err)
 	}
 
 	gas := uint64(GasCap)
@@ -575,8 +651,9 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 	}
 
 	backend := registeredVM()
-	res, err := backend.applyMsg(s.chainCfg, backend.blockContext(&header, s.chainCtx), st,
-		msg, vm.Config{NoBaseFee: true})
+	blockCtx := backend.blockContext(&header, s.chainCtx)
+	ov.blockDiff().apply(&blockCtx)
+	res, err := backend.applyMsg(s.chainCfg, blockCtx, st, msg, vm.Config{NoBaseFee: true})
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}

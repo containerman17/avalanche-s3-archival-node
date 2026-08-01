@@ -65,6 +65,7 @@ func (c countingCandidates) WalkCandidates(h common.Hash, fn func(uint64) (bool,
 
 type bhEnv struct {
 	srv    *Server
+	hist   *state.History // the ws test drives the serving head through this
 	hashes map[uint64]common.Hash
 	poison common.Hash // a TX hash sharing block bhSealedEnd-1's fp48
 	visits int
@@ -138,6 +139,7 @@ func newBlockHashEnv(t *testing.T) *bhEnv {
 	}
 	t.Cleanup(hist.Close)
 	hist.SetHead(bhTailEnd)
+	env.hist = hist
 
 	env.srv = NewServer(hist, HistoryChainContext(hist), gm.Config)
 	env.srv.EnableTxAPIs(

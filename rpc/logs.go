@@ -64,13 +64,23 @@ func (s *Server) parseFilterCriteria(f *logsFilter) (from, to uint64, addrs []co
 	if to-from+1 > GetLogsMaxRange {
 		return 0, 0, nil, nil, errInvalid("block range %d exceeds %d", to-from+1, GetLogsMaxRange)
 	}
+	addrs, topics, rerr = parseLogMatchers(f)
+	if rerr != nil {
+		return 0, 0, nil, nil, rerr
+	}
+	return from, to, addrs, topics, nil
+}
 
+// parseLogMatchers is the address/topic half of a logs filter, without any
+// block range. A logs SUBSCRIPTION has no range to validate (it streams
+// forward from now), so it needs this half alone.
+func parseLogMatchers(f *logsFilter) (addrs []common.Address, topics [][]common.Hash, _ *rpcError) {
 	if len(f.Address) > 0 {
 		var one common.Address
 		if err := json.Unmarshal(f.Address, &one); err == nil {
 			addrs = []common.Address{one}
 		} else if err := json.Unmarshal(f.Address, &addrs); err != nil {
-			return 0, 0, nil, nil, errInvalid("bad address: %v", err)
+			return nil, nil, errInvalid("bad address: %v", err)
 		}
 	}
 	// topics[i] = nil (wildcard) | hash | [hash...]
@@ -86,14 +96,14 @@ func (s *Server) parseFilterCriteria(f *logsFilter) (from, to uint64, addrs []co
 		}
 		var many []common.Hash
 		if err := json.Unmarshal(raw, &many); err != nil {
-			return 0, 0, nil, nil, errInvalid("bad topics entry: %v", err)
+			return nil, nil, errInvalid("bad topics entry: %v", err)
 		}
 		topics = append(topics, many)
 	}
 	for len(topics) > 0 && topics[len(topics)-1] == nil {
 		topics = topics[:len(topics)-1] // trailing wildcards are no-ops
 	}
-	return from, to, addrs, topics, nil
+	return addrs, topics, nil
 }
 
 // runGetLogs is the parsed-filter execution path, shared with the filter

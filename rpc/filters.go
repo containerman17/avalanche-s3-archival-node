@@ -207,11 +207,7 @@ func (s *Server) getHeaderBy(params []json.RawMessage, byHash bool) (any, *rpcEr
 	if !ok {
 		return nil, nil
 	}
-	m := s.marshalBlock(blk, false)
-	delete(m, "transactions")
-	delete(m, "uncles")
-	delete(m, "size")
-	return m, nil
+	return s.marshalHeader(blk), nil
 }
 
 func (s *Server) rawTxByHash(params []json.RawMessage) (any, *rpcError) {
@@ -266,4 +262,21 @@ func (s *Server) rawTxByBlockAndIndex(params []json.RawMessage, byHash bool) (an
 func errTxSubmission(method string) *rpcError {
 	return &rpcError{Code: -32000, Message: fmt.Sprintf(
 		"%s: transaction submission not supported: read-only archive node (mempool relay planned)", method)}
+}
+
+// errNoKeystore refuses the signing methods. They are not a gap to close
+// later: epochdb holds no keys and never will, so a request to sign has no
+// answer that is not a lie.
+func errNoKeystore(method string) *rpcError {
+	return &rpcError{Code: -32000, Message: fmt.Sprintf(
+		"%s: no keystore on a read-only archive node: sign the transaction client-side", method)}
+}
+
+// errNotArchivable names the whole class of methods that need a component an
+// archival read server does not have (a keystore, a miner, a p2p/node-ops
+// surface). -32601 keeps geth's code for "this node does not serve that",
+// with a message that says WHY instead of leaving the caller to guess.
+func errNotArchivable(method string) *rpcError {
+	return &rpcError{Code: -32601, Message: fmt.Sprintf(
+		"%s: unsupported namespace on a read-only archive node (no keystore, no mempool, no miner, no node-ops surface)", method)}
 }
