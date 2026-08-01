@@ -430,6 +430,7 @@ Ranked epochdb work: (1) small and urgent, do not crash at the boundary (park fe
 - `du` lies on WSL2 and page-cache-heavy dirs; footers and artifact hashes are truth.
 - `epochdb serve` is the node: follower + executor + RPC in one process, no restarts, following by default (`--vdr-sources <2+ P-chain RPCs>` cross-checks the validator set, otherwise the --node URI with a warning); `--tip-override <containerID>` runs a bounded backfill in the same slot instead. It OWNS the data dir (state writer + Firewood), so nothing else may write there, and seal/cook/`bootstrap --frontier` must not run beside it.
 - ALWAYS pass `--network mainnet`: the default is fuji and the chain-id mismatch fails late.
+- PACKAGING: per-commit images ARE the release channel (ruling 2026-08-01, tagged releases never get cut). Every push to main runs `go vet` + `go test ./...` then builds the root Dockerfile and pushes `ghcr.io/containerman17/epochdb` as `latest` and `sha-<shortsha>`; there are no tagged releases and no Docker Hub. cgo is mandatory (firewood ships a prebuilt glibc `libfirewood_ffi.a`), so the runtime layer is `distroless/cc-debian13`, matching the golang:1.26 builder's Debian 13: `distroless/static` cannot link it and `distroless/base` is missing `libgcc_s.so.1`.
 
 ## Debt and rulings
 - MUST-FIX, DONE: tip finality via real snowman consensus called from avalanchego source (no reinvention, no external-RPC trust for tip choice).
