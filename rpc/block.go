@@ -73,9 +73,10 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) map[string]any {
 		"transactionsRoot": head.TxHash,
 		"receiptsRoot":     head.ReceiptHash,
 		"size":             hexutil.Uint64(blk.Size()),
-		// Avalanche difficulty is always 1: totalDifficulty == height.
-		"totalDifficulty": (*hexutil.Big)(head.Number),
-		"uncles":          []common.Hash{},
+		// totalDifficulty is VM-kind dependent and set in
+		// addHeaderExtraFields: subnet-evm reports the height (difficulty is
+		// always 1), coreth reports 0.
+		"uncles": []common.Hash{},
 	}
 	if head.BaseFee != nil {
 		fields["baseFeePerGas"] = (*hexutil.Big)(head.BaseFee)

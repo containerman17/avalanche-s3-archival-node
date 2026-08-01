@@ -13,6 +13,7 @@ package rpc
 import (
 	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	sevmcustomtypes "github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/customtypes"
+	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 
@@ -38,9 +39,16 @@ import (
 func addHeaderExtraFields(fields map[string]any, blk *types.Block) {
 	head := blk.Header()
 	if fetch.RegisteredKind() == chain.SubnetEVM {
+		// subnet-evm reports totalDifficulty as the height (difficulty is
+		// always 1); coreth reports 0. Measured against the live reference
+		// RPCs 2026-08-01: FIFA returns the height, Fuji C returns 0x0, and
+		// emitting the height for both failed all 54 eth_getBlockByNumber
+		// probes of the C-chain gate.
+		fields["totalDifficulty"] = (*hexutil.Big)(head.Number)
 		sevmcustomtypes.GetHeaderExtra(head).PostRPCMarshal(head, fields)
 		return
 	}
+	fields["totalDifficulty"] = (*hexutil.Big)(common.Big0)
 	ccustomtypes.GetHeaderExtra(head).PostRPCMarshal(head, fields)
 	fields["blockExtraData"] = hexutil.Bytes(ccustomtypes.BlockExtData(blk))
 }
