@@ -48,7 +48,7 @@ func TestBootstrapChainWalk(t *testing.T) {
 	}
 	root := [32]byte{7, 7, 7}
 	h1, h2 := buildLinkedEpochs(t, st, root)
-	if err := st.SetLatest(dist.Latest{Epoch: h2}); err != nil {
+	if err := st.SetLatest(root, dist.Latest{Epoch: h2}); err != nil {
 		t.Fatal(err)
 	}
 	for _, n := range []string{state.EpochMarkerName(1, 4), state.EpochMarkerName(5, 4)} {
@@ -73,8 +73,14 @@ func TestBootstrapChainWalk(t *testing.T) {
 		t.Fatalf("rebuilt set covers through %d (ok=%v), want 8", end, ok)
 	}
 
-	// The chain root is the trust anchor: another network's root is refused.
-	if _, err := bootstrapChain(st, [32]byte{9}); err == nil || !strings.Contains(err.Error(), "wrong chain") {
+	// The chain root is the trust anchor, and the pointer NAME carrying it is
+	// not the check: publish the same tip under another root's pointer name and
+	// the footers still refuse it.
+	bad := [32]byte{9}
+	if err := st.SetLatest(bad, dist.Latest{Epoch: h2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bootstrapChain(st, bad); err == nil || !strings.Contains(err.Error(), "wrong chain") {
 		t.Fatalf("walk with the wrong chain root: %v", err)
 	}
 }
@@ -96,7 +102,7 @@ func TestValidateChainAtStartup(t *testing.T) {
 	}
 
 	h1, h2 := buildLinkedEpochs(t, st, root)
-	if err := st.SetLatest(dist.Latest{Epoch: h2}); err != nil {
+	if err := st.SetLatest(root, dist.Latest{Epoch: h2}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := validateChain(st, root); n != 2 || err != nil {

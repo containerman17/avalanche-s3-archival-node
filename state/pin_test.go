@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,6 +122,87 @@ func credStore(t *testing.T, dir string, cacheBytes int64) (*dist.Store, *fakeS3
 	}
 	t.Cleanup(func() { st.Close() })
 	return st, s3
+}
+
+// TestSharedSpoolKeepsOneLatestPerChain is the fleet's pointer namespace: N
+// chains through ONE casfs (dist.SetRoot, so one spool and one bucket prefix)
+// each publish a tip, and neither the shared spool nor the bucket may let one
+// overwrite the other's. A consumer that has only the bucket then resolves each
+// chain's tip from its chain root alone, which is the single-chain bootstrap
+// path (`epochdb bootstrap`) reading a fleet's output.
+func TestSharedSpoolKeepsOneLatestPerChain(t *testing.T) {
+	s3 := newFakeS3(t)
+	t.Setenv("EPOCHDB_S3_ENDPOINT", s3.URL)
+	t.Setenv("EPOCHDB_S3_BUCKET", "epochs")
+	t.Setenv("EPOCHDB_S3_ACCESS_KEY", "ak")
+	t.Setenv("EPOCHDB_S3_SECRET_KEY", "sk")
+
+	fleetRoot := t.TempDir()
+	dist.SetRoot(fleetRoot)
+	t.Cleanup(func() { dist.SetRoot("") })
+
+	rootA, rootB := [32]byte{0xaa, 1}, [32]byte{0xbb, 2}
+	open := func(name string) *dist.Store {
+		dir := filepath.Join(fleetRoot, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		st, err := dist.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return st
+	}
+	a, b := open("chain-a"), open("chain-b")
+
+	_, ha := synthEpoch(t, a, 1)
+	_, hb := synthEpoch(t, b, 1000)
+	if ha == hb {
+		t.Fatal("the two chains published the same artifact; the test cannot tell them apart")
+	}
+	if err := a.SetLatest(rootA, dist.Latest{Epoch: ha}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetLatest(rootB, dist.Latest{Epoch: hb}); err != nil {
+		t.Fatal(err)
+	}
+	// One Sync for the whole fleet: the stores share the casfs, so a sibling's
+	// would upload the same spool again (see fleetMain's single syncLoop).
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The consumer is a fresh box: its own spool and cache, nothing local, the
+	// same bucket.
+	dist.SetRoot("")
+	c, err := dist.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, tc := range []struct {
+		name  string
+		root  [32]byte
+		epoch string
+		start uint64
+	}{{"chain-a", rootA, ha, 1}, {"chain-b", rootB, hb, 1000}} {
+		l, err := c.Latest(tc.root)
+		if err != nil {
+			t.Fatalf("%s: latest from the bucket: %v", tc.name, err)
+		}
+		if l.Epoch != tc.epoch {
+			t.Fatalf("%s: latest names epoch %s, want %s (a sibling chain overwrote the pointer)", tc.name, l.Epoch, tc.epoch)
+		}
+		e, err := OpenEpoch(c, l.Epoch)
+		if err != nil {
+			t.Fatalf("%s: open the epoch the pointer names: %v", tc.name, err)
+		}
+		if e.Start != tc.start {
+			t.Fatalf("%s: pointer resolves to an epoch at %d, want %d", tc.name, e.Start, tc.start)
+		}
+		e.Close()
+	}
 }
 
 // chunkyEpoch is a synthetic epoch several casfs chunks wide, so that a cache

@@ -2,8 +2,9 @@ package main
 
 // Bootstrap over the content-addressed store (DESIGN.md "Distribution").
 //
-// There is no manifest. The bucket carries exactly one mutable object, the
-// `latest` pointer, and it is a HINT: boot reads it, then walks the epoch
+// There is no manifest. The bucket carries exactly one mutable object per
+// chain, its `latest-<chain root>` pointer (dist.LatestPointer), and it is a
+// HINT: boot reads it, then walks the epoch
 // footers BACKWARD by their embedded prev-hash, which roots at this chain's
 // CHAIN ROOT (dist.ChainRoot). Everything the walk learns is written to the local
 // index (one marker per epoch), and nothing is downloaded eagerly: with S3
@@ -56,9 +57,9 @@ func publishMain(args []string) {
 // a bootstrapped node builds its state frontier out of the epochs themselves
 // (epochdb bootstrap --frontier).
 func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) {
-	l, err := st.Latest()
+	l, err := st.Latest(chainRoot)
 	if err != nil {
-		return 0, fmt.Errorf("read the `latest` pointer: %w", err)
+		return 0, fmt.Errorf("read the `%s` pointer: %w", dist.LatestPointer(chainRoot), err)
 	}
 	hash := l.Epoch
 	var below uint64 // Start of the epoch already indexed, for the contiguity check
@@ -97,7 +98,7 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 //
 // A missing `latest` is not a break: it is a data dir that has never sealed.
 func validateChain(st *dist.Store, chainRoot [32]byte) (int, error) {
-	if _, err := st.Latest(); errors.Is(err, fs.ErrNotExist) {
+	if _, err := st.Latest(chainRoot); errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
 	return bootstrapChain(st, chainRoot)

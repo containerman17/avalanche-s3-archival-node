@@ -56,13 +56,23 @@ const (
 	// named "chunks" silently ate the chunk-list pointers at
 	// <data>/chunks/<hash> the moment a credentialed store opened.
 	cacheName = "chunkcache"
-	// LatestPointer names the one mutable object in the bucket. It is a HINT,
-	// never an authority: every artifact self-verifies by hash and the epoch
-	// footers chain back to the chain root.
-	LatestPointer = "latest"
 
 	defaultCacheBytes = 8 << 30
 )
+
+// LatestPointer names a chain's one mutable object. It is a HINT, never an
+// authority: every artifact self-verifies by hash and the epoch footers chain
+// back to the chain root.
+//
+// THE NAME CARRIES THE CHAIN ROOT, and that is not cosmetic: a fleet shares one
+// spool and one bucket prefix across N chains (dist.SetRoot, DESIGN.md "THE
+// FLEET"), so an unqualified `latest` meant every chain published its tip over
+// its siblings'. Content is safe there because artifacts are named by their
+// hash; the pointer is the only mutable name, so it is the only one that needs
+// the qualifier. The chain root is the right qualifier because every side
+// already holds it: the producer to link epoch 1's footer, the consumer to
+// refuse the wrong chain.
+func LatestPointer(chainRoot [32]byte) string { return "latest-" + hex.EncodeToString(chainRoot[:]) }
 
 // Store is the node's artifact store. cas nil means no credentials were
 // configured: everything stays in the spool and nothing is ever uploaded.
@@ -458,18 +468,20 @@ func decodeLatest(s string) (Latest, error) {
 	return l, nil
 }
 
-// Latest reads the pointer. A missing pointer wraps fs.ErrNotExist.
-func (s *Store) Latest() (Latest, error) {
-	v, err := s.GetPointer(LatestPointer)
+// Latest reads chainRoot's pointer. A missing pointer wraps fs.ErrNotExist.
+func (s *Store) Latest(chainRoot [32]byte) (Latest, error) {
+	v, err := s.GetPointer(LatestPointer(chainRoot))
 	if err != nil {
 		return Latest{}, err
 	}
 	return decodeLatest(v)
 }
 
-// SetLatest publishes the pointer. Call it only after the artifacts it names
-// are durable (uploaded when there is a bucket).
-func (s *Store) SetLatest(l Latest) error { return s.SetPointer(LatestPointer, l.encode()) }
+// SetLatest publishes chainRoot's pointer. Call it only after the artifacts it
+// names are durable (uploaded when there is a bucket).
+func (s *Store) SetLatest(chainRoot [32]byte, l Latest) error {
+	return s.SetPointer(LatestPointer(chainRoot), l.encode())
+}
 
 // SetPointer writes a small mutable value locally and hands it to casfs, which
 // is also local and also synchronous (it lands under the spool) and which

@@ -318,7 +318,7 @@ func TestSealTailNeedsNoBucket(t *testing.T) {
 	if cut != 1 || end != 8 {
 		t.Fatalf("seal with an unreachable bucket cut %d through %d, want 1 through 8", cut, end)
 	}
-	if l, err := st.Cas().Latest(); err != nil || l.Epoch == "" {
+	if l, err := st.Cas().Latest([32]byte{}); err != nil || l.Epoch == "" {
 		t.Fatalf("local latest after sealing without a bucket: %+v %v", l, err)
 	}
 	// Only the upload stalls, and it says so.

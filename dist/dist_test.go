@@ -108,7 +108,7 @@ func TestPointersOutsideChunkCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache := filepath.Join(rootFor(dir), cacheName)
-	for _, name := range []string{LatestPointer, ChunkPointer(hex.EncodeToString(bytes.Repeat([]byte{3}, 32)))} {
+	for _, name := range []string{LatestPointer([32]byte{5}), ChunkPointer(hex.EncodeToString(bytes.Repeat([]byte{3}, 32)))} {
 		p := s.pointerPath(name)
 		if p == cache || strings.HasPrefix(p, cache+string(os.PathSeparator)) {
 			t.Fatalf("pointer %q lands at %s, inside the casfs chunk cache %s", name, p, cache)
@@ -145,22 +145,28 @@ func TestLatestPointer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Latest(); !errors.Is(err, fs.ErrNotExist) {
+	root := [32]byte{7}
+	if _, err := s.Latest(root); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("missing pointer: %v, want fs.ErrNotExist", err)
 	}
 	want := Latest{Epoch: hex.EncodeToString(bytes.Repeat([]byte{1}, 32))}
-	if err := s.SetLatest(want); err != nil {
+	if err := s.SetLatest(root, want); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Latest()
+	got, err := s.Latest(root)
 	if err != nil || got != want {
 		t.Fatalf("latest: %+v %v", got, err)
 	}
 	want.Epoch = hex.EncodeToString(bytes.Repeat([]byte{2}, 32))
-	if err := s.SetLatest(want); err != nil {
+	if err := s.SetLatest(root, want); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := s.Latest(); err != nil || got != want {
+	if got, err := s.Latest(root); err != nil || got != want {
 		t.Fatalf("latest after advance: %+v %v", got, err)
+	}
+	// Another chain's tip is another pointer, in the same dir and the same
+	// bucket: nothing about one chain's `latest` is visible to a sibling.
+	if _, err := s.Latest([32]byte{8}); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a sibling chain's pointer: %v, want fs.ErrNotExist", err)
 	}
 }

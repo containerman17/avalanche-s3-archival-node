@@ -162,7 +162,7 @@ func TestSealCutAndResume(t *testing.T) {
 	if want, _ := hashBytes(e1.Hash); e2.Prev != want {
 		t.Fatalf("epoch2 prev %x, want epoch1 %x", e2.Prev, want)
 	}
-	if l, err := cas.Latest(); err != nil || l.Epoch != e2.Hash {
+	if l, err := cas.Latest([32]byte{}); err != nil || l.Epoch != e2.Hash {
 		t.Fatalf("latest pointer: %+v %v, want epoch %s", l, err, e2.Hash)
 	}
 

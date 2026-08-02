@@ -159,8 +159,8 @@ func hashBytes(hash string) ([32]byte, error) {
 // was the seal's last reachable network call (a fresh producer has no local
 // copy, so it fell through to the bucket), and it was pointless: the pointer
 // carries one field and this overwrites it.
-func setLatestEpoch(st *dist.Store, hash string) error {
-	return st.SetLatest(dist.Latest{Epoch: hash})
+func setLatestEpoch(st *dist.Store, chainRoot [32]byte, hash string) error {
+	return st.SetLatest(chainRoot, dist.Latest{Epoch: hash})
 }
 
 // sealedHead reads the LOCAL INDEX ALONE and answers what the next epoch needs
@@ -288,7 +288,7 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 		if prev, err = hashBytes(hash); err != nil {
 			return run, err
 		}
-		if err := setLatestEpoch(out, hash); err != nil {
+		if err := setLatestEpoch(out, chainRoot, hash); err != nil {
 			return run, err
 		}
 		st, _ := os.Stat(out.SpoolPath(hash))
