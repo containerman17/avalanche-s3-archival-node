@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ava-labs/libevm/common"
@@ -108,9 +107,17 @@ func (h *History) SealTail(ctx context.Context, chainRoot [32]byte, onEpoch func
 		return nil
 	})
 	if err != nil {
-		// A corpus seal cannot read (no capture, a staging gap) must not
-		// re-scan every cook tick: log once per bucket of new blocks.
-		h.sealRetryAt = execHead + BucketBlocks
+		// A FAILED PASS LEAVES THE GATE OPEN: the next cook tick tries again
+		// (user ruling 2026-08-02). This used to push the gate a whole bucket
+		// of blocks ahead, which on Fuji meant three failures and then
+		// silence, because a node at the tip needs a day and a half to make
+		// 100,000 more blocks. Nothing here can tell a permanent corpus defect
+		// from a transient one, and a stall that lasts until someone reads the
+		// log is the worse failure of the two.
+		//
+		// ponytail: a permanently unsealable corpus therefore pays a full
+		// gather per cook tick. Add a backoff only if a real node is ever seen
+		// doing that, and never one that outlives the condition.
 		return run.Cut, run.SealedEnd, err
 	}
 	// A canceled pass measured no boundary, so it dates nothing: keep the
@@ -147,15 +154,50 @@ func hashBytes(hash string) ([32]byte, error) {
 	return out, nil
 }
 
-// setLatestEpoch advances the `latest` pointer: it names the newest epoch
-// and nothing else.
+// setLatestEpoch advances the `latest` pointer: it names the newest epoch and
+// nothing else, which is why it does not read the old value first. That read
+// was the seal's last reachable network call (a fresh producer has no local
+// copy, so it fell through to the bucket), and it was pointless: the pointer
+// carries one field and this overwrites it.
 func setLatestEpoch(st *dist.Store, hash string) error {
-	l, err := st.Latest()
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
+	return st.SetLatest(dist.Latest{Epoch: hash})
+}
+
+// sealedHead reads the LOCAL INDEX ALONE and answers what the next epoch needs
+// to know: how many epochs are already sealed, the last block of the newest
+// one, and its hash. No artifact is opened, so this costs one ReadDir and one
+// small file read whether the epochs are spooled here or long since released
+// to a bucket.
+//
+// Newest is by Start, matching EpochSet.Head over the same markers.
+func sealedHead(dir string) (count int, end uint64, hash string, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0, "", err
 	}
-	l.Epoch = hash
-	return st.SetLatest(l)
+	var headName string
+	var headStart uint64
+	for _, en := range entries {
+		// A pre-casfs corpus (whole epoch files in the data dir) is refused by
+		// name here as it is on the read path: there is no migration, and
+		// sealing over one would silently re-cut epochs it cannot see.
+		if strings.HasPrefix(en.Name(), "epoch_") && strings.HasSuffix(en.Name(), ".epoch") {
+			return 0, 0, "", fmt.Errorf("%s: %s is a pre-casfs epoch file; epochs are now content-addressed artifacts in %s/cas (no migration: delete the corpus and resync)", dir, en.Name(), dir)
+		}
+		start, n, ok := ParseEpochMarkerName(en.Name())
+		if !ok {
+			continue
+		}
+		count++
+		if headName == "" || start >= headStart {
+			headName, headStart, end = en.Name(), start, start+n-1
+		}
+	}
+	if headName == "" {
+		return 0, 0, "", nil
+	}
+	hash, err = ReadMarker(dir, headName)
+	return count, end, hash, err
 }
 
 // sealEpochs cuts every whole epoch the durable exec head allows and writes
@@ -187,25 +229,31 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 	}
 	defer reader.Close()
 
-	set, err := OpenEpochSet(out)
+	// THE MARKERS, NOT THE EPOCHS. Everything this needs is in the local index
+	// (how many epochs exist, where the last one ends, what it hashes to), and
+	// opening the epochs to learn it would read their footers, which on a node
+	// whose artifacts have been uploaded and released means a HEAD and ranged
+	// GETs per epoch per pass. That is how a seal could still fail on expired
+	// credentials with nothing left to upload. It also stops re-opening every
+	// epoch on every tick of a crunch.
+	//
+	// idx is the index of the epoch about to be cut, which is what picks its
+	// size: sealing is strictly sequential from block 1, so it is simply how
+	// many epochs are already there. prev is the hash-chain link the next
+	// epoch's footer carries: the head epoch's own hash, or the chain root for
+	// the very first epoch.
+	idx, end, headHash, err := sealedHead(out.Dir())
 	if err != nil {
 		return run, err
 	}
-	// prev is the hash-chain link the next epoch's footer carries: the head
-	// epoch's own hash, or the chain root for the very first epoch.
 	prev := chainRoot
 	next := uint64(1) // block 0 is genesis: no container, state in the alloc
-	// The index of the epoch about to be cut, which is what picks its size:
-	// sealing is strictly sequential from block 1, so it is simply how many
-	// epochs are already there.
-	idx := len(set.All())
-	if head, ok := set.Head(); ok {
-		next = head.End() + 1
-		if prev, err = hashBytes(head.Hash); err != nil {
+	if idx > 0 {
+		next = end + 1
+		if prev, err = hashBytes(headHash); err != nil {
 			return run, err
 		}
 	}
-	set.Close()
 	run.SealedEnd = next - 1
 
 	if ls, ok := store.LogsStart(); !ok || ls > next {

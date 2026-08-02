@@ -260,6 +260,120 @@ func TestSealTailCancelBetweenEpochs(t *testing.T) {
 	}
 }
 
+// TestSealTailNeedsNoBucket is the ruling of 2026-08-02: SEALING DOES NOT KNOW
+// S3 EXISTS. The store here is fully credentialed and its endpoint is a closed
+// port, so any byte the seal sends is a connection refused; if the seal path
+// still reached for the bucket anywhere (the `latest` pointer, the chunk
+// lists, opening the sealed head to chain onto it) this could not pass.
+//
+// That is also the offline/expired-credentials equivalence: a node with no
+// EPOCHDB_S3_* at all runs the same code with cas nil, and this one cannot
+// reach its bucket. Both seal, repeatedly, and only uploads stall.
+func TestSealTailNeedsNoBucket(t *testing.T) {
+	fixedEpochTxs(t, 10) // epochs of 4 blocks: 1-4 and 5-8
+	fixedBucketBlocks(t, 8)
+	s3 := newFakeS3(t)
+	t.Setenv("EPOCHDB_S3_ENDPOINT", s3.URL)
+	t.Setenv("EPOCHDB_S3_BUCKET", "epochs")
+	t.Setenv("EPOCHDB_S3_ACCESS_KEY", "ak")
+	t.Setenv("EPOCHDB_S3_SECRET_KEY", "sk")
+
+	dir := t.TempDir()
+	st, _ := sealCorpus(t, dir, 8)
+	defer st.Close()
+	if !st.Cas().Remote() {
+		t.Fatal("the test store has no bucket configured, it would prove nothing")
+	}
+	hist, err := OpenHistory(dir, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hist.Close()
+
+	// Epoch 1, uploaded and RELEASED: its bytes now exist only in the bucket,
+	// which is the state a producer box is in for everything but its newest
+	// epoch.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if cut, _, err := hist.SealTail(ctx, [32]byte{}, func(uint64) { cancel() }); err != nil || cut != 1 {
+		t.Fatalf("first seal cut %d epochs: %v", cut, err)
+	}
+	if err := st.Cas().Sync(); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := ReadMarker(dir, EpochMarkerName(1, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(st.Cas().SpoolPath(hash)); !os.IsNotExist(err) {
+		t.Fatalf("epoch 1 is still spooled, so this proves nothing: %v", err)
+	}
+
+	// The token dies. Sealing must not notice.
+	s3.Server.Close()
+	cut, end, err := hist.SealTail(context.Background(), [32]byte{}, nil)
+	if err != nil {
+		t.Fatalf("seal with an unreachable bucket: %v", err)
+	}
+	if cut != 1 || end != 8 {
+		t.Fatalf("seal with an unreachable bucket cut %d through %d, want 1 through 8", cut, end)
+	}
+	if l, err := st.Cas().Latest(); err != nil || l.Epoch == "" {
+		t.Fatalf("local latest after sealing without a bucket: %+v %v", l, err)
+	}
+	// Only the upload stalls, and it says so.
+	if err := st.Cas().Sync(); err == nil {
+		t.Fatal("Sync to an unreachable bucket reported success")
+	}
+}
+
+// TestSealTailRetriesAfterFailure is the overnight stall of 2026-08-01, in
+// miniature: three seals failed on an expired SSO token and the node then
+// never tried again, because a failed pass pushed the retry gate a whole
+// bucket of blocks ahead and a node at the tip needs a day and a half to make
+// that many. A FAILED PASS MUST LEAVE THE GATE OPEN.
+//
+// The failure is injected where the seal actually writes, by taking write
+// permission off the artifact spool for one pass: BuildEpoch cannot land its
+// file, exactly as a store that errors once.
+func TestSealTailRetriesAfterFailure(t *testing.T) {
+	fixedEpochTxs(t, 10)    // epochs of 4 blocks: 1-4 and 5-8
+	fixedBucketBlocks(t, 8) // exec head 8, so a bucket-wide gate would be 100008
+
+	dir := t.TempDir()
+	st, _ := sealCorpus(t, dir, 8)
+	defer st.Close()
+	hist, err := OpenHistory(dir, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hist.Close()
+
+	spool := filepath.Join(dir, "cas")
+	if err := os.Chmod(spool, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	cut, _, err := hist.SealTail(context.Background(), [32]byte{}, nil)
+	if err == nil {
+		t.Fatal("seal onto a read-only spool reported success")
+	}
+	if cut != 0 {
+		t.Fatalf("failed pass cut %d epochs", cut)
+	}
+	if err := os.Chmod(spool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The very next tick, with no new blocks and no new exec head.
+	cut, end, err := hist.SealTail(context.Background(), [32]byte{}, nil)
+	if err != nil {
+		t.Fatalf("seal after a failed pass: %v", err)
+	}
+	if cut != 2 || end != 8 {
+		t.Fatalf("retry cut %d epochs through %d, want 2 through 8", cut, end)
+	}
+}
+
 // TestSealTailRetiresRawPerEpoch pins the disk contract (Fuji, 2026-08-01: a
 // 14-epoch crunch held ~100G of sealed output on top of all 411G of raw until
 // the last epoch was cut). Raw whose whole bucket is behind epoch 1 is unlinked

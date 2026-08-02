@@ -471,9 +471,11 @@ func (s *Store) Latest() (Latest, error) {
 // are durable (uploaded when there is a bucket).
 func (s *Store) SetLatest(l Latest) error { return s.SetPointer(LatestPointer, l.encode()) }
 
-// SetPointer writes a small mutable value locally and, when there is a bucket,
-// to the bucket too. The local copy is what makes a producer restart without
-// asking S3 anything.
+// SetPointer writes a small mutable value locally and hands it to casfs, which
+// is also local and also synchronous (it lands under the spool) and which
+// uploads it on a later Sync, after that pass's content. NOTHING HERE TOUCHES
+// THE NETWORK, which is what lets a seal publish an epoch on a node whose
+// credentials expired hours ago.
 func (s *Store) SetPointer(name, value string) error {
 	p := s.pointerPath(name)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
