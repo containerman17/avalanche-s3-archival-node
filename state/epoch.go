@@ -1,9 +1,11 @@
 package state
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"math/bits"
 	"os"
@@ -294,296 +296,552 @@ func (in *EpochInput) HasStoredLogInputs() bool { return in.FullLogs != nil && i
 
 // codeCursor emits the v3 code rows in key order as an SST write walks past
 // them ('c' sorts between the 'a' and 's' rows, so they form one contiguous
-// run). Kept separate from the state rows because a production epoch holds
-// ~100M of those in RAM and merging into that slice would reallocate it.
-// The row's block number is the epoch start: a blob has no meaningful write
-// height (the same bytes can be deployed by many blocks) and the code lookup
-// ignores it, so the epoch's own first block is the deterministic choice.
+// run). It holds the HASHES and a getter, never the blobs: an epoch's code is
+// hundreds of MB (80,291 blobs on Fuji's epoch 11) and one blob at a time is
+// all a sorted write needs. The row's block number is the epoch start: a blob
+// has no meaningful write height (the same bytes can be deployed by many
+// blocks) and the code lookup ignores it, so the epoch's own first block is
+// the deterministic choice.
 type codeCursor struct {
 	hashes []common.Hash // ascending
-	code   map[common.Hash][]byte
+	get    func(common.Hash) ([]byte, error)
 	block  uint64
 	i      int
 }
 
-func newCodeCursor(code map[common.Hash][]byte, block uint64) *codeCursor {
-	hashes := make([]common.Hash, 0, len(code))
-	for h := range code {
-		hashes = append(hashes, h)
-	}
+func newCodeCursor(hashes []common.Hash, get func(common.Hash) ([]byte, error), block uint64) *codeCursor {
 	sort.Slice(hashes, func(i, j int) bool { return bytes.Compare(hashes[i][:], hashes[j][:]) < 0 })
-	return &codeCursor{hashes: hashes, code: code, block: block}
+	return &codeCursor{hashes: hashes, get: get, block: block}
 }
 
 // upTo writes every remaining code row that sorts before key (nil = all).
-func (c *codeCursor) upTo(w *sstWriter, key []byte) {
+func (c *codeCursor) upTo(w *sstWriter, key []byte) error {
 	for c.i < len(c.hashes) {
 		k := epochCodeKey(c.hashes[c.i])
 		if key != nil && bytes.Compare(k[:], key) >= 0 {
-			return
+			return nil
 		}
-		w.add(k[:], c.block, c.code[c.hashes[c.i]])
+		blob, err := c.get(c.hashes[c.i])
+		if err != nil {
+			return err
+		}
+		if err := w.add(k[:], c.block, blob); err != nil {
+			return err
+		}
 		c.i++
 	}
+	return nil
 }
 
 // ---------- builder ----------
+
+// epochSrc is what the builder PULLS, and it is the whole of the seal's
+// memory rule: nothing here hands over an epoch's worth of anything. The
+// sections are written in file order, so every walk must be re-runnable (the
+// sealer re-reads the raw corpus per family; an EpochInput re-walks its
+// slices). Cheaper than it sounds: a raw family is read sequentially and the
+// alternative is holding tens of GB, which is what OOM-killed three seals.
+type epochSrc struct {
+	Start, Count, TxCount uint64
+	Prev                  [32]byte
+
+	// Container is random access by epoch-relative index: the dict trains on
+	// evenly spaced samples, which needs the block count first.
+	Container func(i uint64) ([]byte, error)
+	// Containers and Headers walk the epoch ascending.
+	Containers func(yield func(b []byte) error) error
+	Headers    func(yield func(b []byte) error) error
+	// Rows yields every post-image write row, in any order (the builder sorts
+	// them externally).
+	Rows func(yield func(StateRow) error) error
+	// Code is called AFTER Rows: only then does a sealer know which blobs this
+	// epoch's account rows reference. Returns the hashes (any order) and a
+	// getter for one blob at a time.
+	Code func() ([]common.Hash, func(common.Hash) ([]byte, error), error)
+	// Logs yields the per-block log tuple records (logidx input).
+	Logs func(yield func(LogRec) error) error
+	// Stored yields (block, stored-logs record, receipt-fields record)
+	// ascending, either half possibly empty. nil = seal without the v2
+	// sections (unit tests only). Walked three times: the logs dict is trained
+	// on those records before either section can be compressed.
+	Stored func(yield func(block uint64, logs, rcpt []byte) error) error
+	// TxPairs yields (fingerprint, epoch-relative block) for every tx hash and
+	// every block hash (v6).
+	TxPairs func(yield func(fp, blk uint64) error) error
+}
+
+// src adapts the in-RAM input to the streaming builder: tests and small
+// callers keep handing over slices, the sealer hands over walks over the raw
+// corpus (state/seal.go). ONE builder either way, which is what makes the
+// streaming path byte-identical to the slice path by construction.
+func (in *EpochInput) src() *epochSrc {
+	blobs := func(bs [][]byte) func(func([]byte) error) error {
+		return func(yield func([]byte) error) error {
+			for _, b := range bs {
+				if err := yield(b); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	s := &epochSrc{
+		Start:      in.Start,
+		Count:      uint64(len(in.Containers)),
+		TxCount:    in.TxCount,
+		Prev:       in.Prev,
+		Container:  func(i uint64) ([]byte, error) { return in.Containers[i], nil },
+		Containers: blobs(in.Containers),
+		Headers:    blobs(in.Headers),
+		Rows: func(yield func(StateRow) error) error {
+			for _, r := range in.StateRows {
+				if err := yield(r); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Code: func() ([]common.Hash, func(common.Hash) ([]byte, error), error) {
+			hashes := make([]common.Hash, 0, len(in.Code))
+			for h := range in.Code {
+				hashes = append(hashes, h)
+			}
+			return hashes, func(h common.Hash) ([]byte, error) { return in.Code[h], nil }, nil
+		},
+		Logs: func(yield func(LogRec) error) error {
+			for _, lr := range in.Logs {
+				if err := yield(lr); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		TxPairs: func(yield func(fp, blk uint64) error) error {
+			for i, hdr := range in.Headers {
+				if err := yield(txFingerprint(BlockHashFromHeaderRLP(hdr)), uint64(i)); err != nil {
+					return err
+				}
+			}
+			for blk, hashes := range in.TxHashes {
+				for _, h := range hashes {
+					if err := yield(binary.BigEndian.Uint64(h[:8])>>16, blk-in.Start); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		},
+	}
+	if in.HasStoredLogInputs() {
+		s.Stored = func(yield func(uint64, []byte, []byte) error) error {
+			blocks := make([]uint64, 0, len(in.FullLogs)+len(in.RcptRecs))
+			for b := range in.FullLogs {
+				blocks = append(blocks, b)
+			}
+			for b := range in.RcptRecs {
+				if _, dup := in.FullLogs[b]; !dup {
+					blocks = append(blocks, b)
+				}
+			}
+			sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
+			for _, b := range blocks {
+				if err := yield(b, in.FullLogs[b], in.RcptRecs[b]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	return s
+}
+
+// sealTmpPrefix names the seal's scratch directories. They live in the DATA
+// DIR (same filesystem, never /tmp), one per build, removed when the build
+// returns; sealEpochs sweeps whatever a killed build left behind.
+const sealTmpPrefix = "sealtmp-"
+
+// newEpochEncoder is the ONE place a seal-time zstd encoder is made, and
+// WithEncoderConcurrency(1) is not tuning: EncodeAll compresses in the calling
+// goroutine and takes one state from the pool, so the other GOMAXPROCS-1
+// states are pure resident cost. Measured 2026-08-02 on a 16-core box, three
+// dict-primed SpeedBestCompression encoders: 3.37 GB at the default
+// concurrency, 0.10 GB at 1, byte-identical output either way.
+func newEpochEncoder(dict []byte) (*zstd.Encoder, error) {
+	opts := []zstd.EOption{
+		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+		zstd.WithEncoderConcurrency(1),
+	}
+	if len(dict) > 0 {
+		opts = append(opts, zstd.WithEncoderDict(dict))
+	}
+	return zstd.NewWriter(nil, opts...)
+}
 
 // BuildEpoch assembles one epoch and publishes it as a content-addressed
 // artifact: the bytes land in the store's spool under their own sha256 and the
 // data directory gets the local index marker naming it. Returns the hash.
 func BuildEpoch(st *dist.Store, in *EpochInput) (string, error) {
-	count := uint64(len(in.Containers))
-	if count == 0 || len(in.Headers) != len(in.Containers) {
+	if len(in.Containers) == 0 || len(in.Headers) != len(in.Containers) {
 		return "", fmt.Errorf("epoch build: %d containers, %d headers", len(in.Containers), len(in.Headers))
 	}
+	return buildEpoch(st, in.src())
+}
+
+// buildEpoch writes the sections in file order STRAIGHT INTO THE ARTIFACT
+// FILE, hashing as it goes, pulling each one from src when its turn comes.
+// Nothing here is proportional to the epoch: the multi-GB sections stream, the
+// index and bloom sections are megabytes, and the two orderings that cannot be
+// streamed (post-image rows, logs-dict samples) go through extSort. Scratch
+// lives in a directory under the data dir, removed however this returns.
+func buildEpoch(st *dist.Store, src *epochSrc) (string, error) {
+	if src.Count == 0 {
+		return "", fmt.Errorf("epoch build: no blocks")
+	}
+	tmp, err := os.MkdirTemp(st.Dir(), sealTmpPrefix)
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
 
 	// Deterministic dictionary: sample containers evenly, fixed dict ID,
 	// zstd CLI trainer (pinned v1.5.7). klauspost's dict.BuildZstdDict is
 	// internally map-iteration nondeterministic (verified 2026-07-18) and
 	// would break bit-identical epoch files.
-	samples := in.Containers
-	if len(samples) > dictMaxSamples {
-		step := len(samples) / dictMaxSamples
-		sub := make([][]byte, 0, dictMaxSamples)
-		for i := 0; i < len(samples); i += step {
-			sub = append(sub, samples[i])
-		}
-		samples = sub
+	samples, err := sampleContainers(src)
+	if err != nil {
+		return "", err
 	}
-	epochDict := trainDictCLI(samples, uint32(in.Start%0xfffffffe)+1, dictTargetSize)
+	epochDict := trainDictCLI(samples, uint32(src.Start%0xfffffffe)+1, dictTargetSize)
 
-	encOpts := []zstd.EOption{zstd.WithEncoderLevel(zstd.SpeedBestCompression)}
-	if len(epochDict) > 0 {
-		encOpts = append(encOpts, zstd.WithEncoderDict(epochDict))
-	}
-	enc, err := zstd.NewWriter(nil, encOpts...)
+	enc, err := newEpochEncoder(epochDict)
 	if err != nil {
 		return "", err
 	}
 	defer enc.Close()
 
-	var (
-		buf     bytes.Buffer
-		offsets [epochNumSections][2]uint64 // off, len per section
-	)
-	section := func(id int, b []byte) {
-		offsets[id][0] = uint64(buf.Len())
-		offsets[id][1] = uint64(len(b))
-		buf.Write(b)
-	}
-
-	section(secDict, epochDict)
-
-	bodies, bodiesIdx := buildFramed(enc, in.Containers)
-	section(secBodies, bodies)
-	section(secBodiesIdx, bodiesIdx)
-
-	headers, headersIdx := buildFramed(enc, in.Headers)
-	section(secHeaders, headers)
-	section(secHeadersIdx, headersIdx)
-
-	sst, sstIdx, deletes, keys := buildSST(enc, in.StateRows, newCodeCursor(in.Code, in.Start))
-	section(secSST, sst)
-	section(secSSTIdx, sstIdx)
-	section(secDeletes, deletes)
-
-	txidx, txbloom := buildEpochTxidx(in, count)
-	section(secTxidx, txidx)
-	section(secTxBloom, txbloom)
-	section(secLogidx, buildLogidx(in.Logs, in.Start, count))
-	section(secKeybloom, buildBloom(keys))
-
-	// Stored-logs sections. Present (nonempty index headers) whenever the
-	// inputs were supplied, even for epochs with zero logs. Without them
-	// (unit tests only) the five sections are empty but still get their
-	// offsets, so the section layout never varies.
-	var stored [5][]byte
-	if in.HasStoredLogInputs() {
-		if stored, err = buildStoredSections(in, epochDict); err != nil {
-			return "", err
-		}
-	}
-	section(secLogsDict, stored[0])
-	section(secFullLogs, stored[1])
-	section(secFullLogsIdx, stored[2])
-	section(secRcpt, stored[3])
-	section(secRcptIdx, stored[4])
-
-	// Footer.
-	var ft [epochFooterSize]byte
-	copy(ft[0:4], epochMagic[:])
-	binary.LittleEndian.PutUint32(ft[4:8], epochVersion)
-	binary.LittleEndian.PutUint64(ft[8:16], in.Start)
-	binary.LittleEndian.PutUint64(ft[16:24], count)
-	binary.LittleEndian.PutUint64(ft[24:32], in.TxCount)
-	copy(ft[32:64], in.Prev[:])
-	for i := 0; i < epochNumSections; i++ {
-		binary.LittleEndian.PutUint64(ft[epochTableOff+i*16:], offsets[i][0])
-		binary.LittleEndian.PutUint64(ft[epochTableOff+8+i*16:], offsets[i][1])
-	}
-	copy(ft[epochFooterSize-4:], epochMagic[:])
-	buf.Write(ft[:])
-
-	hash, err := st.Put(buf.Bytes())
+	o, err := newEpochOut(st)
 	if err != nil {
 		return "", err
 	}
-	return hash, WriteMarker(st.Dir(), EpochMarkerName(in.Start, count), hash)
+	defer o.discard()
+
+	if err := o.section(secDict, epochDict); err != nil {
+		return "", err
+	}
+	bodiesIdx, err := o.framed(secBodies, enc, src.Containers)
+	if err != nil {
+		return "", err
+	}
+	if err := o.section(secBodiesIdx, bodiesIdx); err != nil {
+		return "", err
+	}
+	headersIdx, err := o.framed(secHeaders, enc, src.Headers)
+	if err != nil {
+		return "", err
+	}
+	if err := o.section(secHeadersIdx, headersIdx); err != nil {
+		return "", err
+	}
+
+	keys, nKeys, err := writeSST(o, tmp, enc, src)
+	if err != nil {
+		return "", err
+	}
+	if err := writeTxidx(o, src); err != nil {
+		return "", err
+	}
+	logidx, err := buildLogidx(src.Logs, src.Start, src.Count)
+	if err != nil {
+		return "", err
+	}
+	if err := o.section(secLogidx, logidx); err != nil {
+		return "", err
+	}
+	keybloom, err := buildBloomFile(keys, nKeys)
+	if err != nil {
+		return "", err
+	}
+	if err := o.section(secKeybloom, keybloom); err != nil {
+		return "", err
+	}
+	if err := writeStored(o, tmp, enc, src); err != nil {
+		return "", err
+	}
+
+	hash, err := o.finish(src)
+	if err != nil {
+		return "", err
+	}
+	return hash, WriteMarker(st.Dir(), EpochMarkerName(src.Start, src.Count), hash)
 }
 
-// buildStoredSections derives the five v2 sections from filled stored-log
-// inputs. containerDict compresses the receipt frames (measured fine);
-// the logs get their own freshly trained dict.
-func buildStoredSections(in *EpochInput, containerDict []byte) (secs [5][]byte, err error) {
-	var recSamples [][]byte
-	for _, r := range in.FullLogs {
-		recSamples = append(recSamples, r)
+// sampleContainers picks the dict training set: every step-th container, step
+// chosen so at most dictMaxSamples land in it (all of them below that cap).
+func sampleContainers(src *epochSrc) ([][]byte, error) {
+	step := uint64(1)
+	if src.Count > dictMaxSamples {
+		step = src.Count / dictMaxSamples
 	}
-	sort.Slice(recSamples, func(i, j int) bool { return bytes.Compare(recSamples[i], recSamples[j]) < 0 })
-	if len(recSamples) > dictMaxSamples {
-		step := len(recSamples) / dictMaxSamples
-		sub := make([][]byte, 0, dictMaxSamples)
-		for i := 0; i < len(recSamples); i += step {
-			sub = append(sub, recSamples[i])
+	out := make([][]byte, 0, min(src.Count, dictMaxSamples+1))
+	for i := uint64(0); i < src.Count; i += step {
+		c, err := src.Container(i)
+		if err != nil {
+			return nil, err
 		}
-		recSamples = sub
+		out = append(out, c)
 	}
-	var logsDict []byte
-	if len(recSamples) > 0 {
-		logsDict = trainDictCLI(recSamples, uint32(in.Start%0xfffffffe)+2, logsDictTarget)
-	}
-	newEnc := func(dict []byte) (*zstd.Encoder, error) {
-		opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.SpeedBestCompression)}
-		if len(dict) > 0 {
-			opts = append(opts, zstd.WithEncoderDict(dict))
-		}
-		return zstd.NewWriter(nil, opts...)
-	}
-	encL, err := newEnc(logsDict)
-	if err != nil {
-		return secs, err
-	}
-	defer encL.Close()
-	encC, err := newEnc(containerDict)
-	if err != nil {
-		return secs, err
-	}
-	defer encC.Close()
-	secs[0] = logsDict
-	secs[1], secs[2] = buildStoredFrames(encL, in.Start, in.FullLogs)
-	secs[3], secs[4] = buildStoredFrames(encC, in.Start, in.RcptRecs)
-	return secs, nil
+	return out, nil
 }
 
-// buildStoredFrames packs sparse per-block records (stored logs / receipt
-// fields) into zstd frames of framedGroup records. Index layout:
+// ---------- the artifact file ----------
+
+// epochOut is the artifact under construction: a file in the spool, its
+// running sha256 + chunk list, and the section table. It replaces a
+// bytes.Buffer that held the WHOLE epoch (7.2 GB on Fuji's epoch 11, plus a
+// doubling copy whenever it grew) and is why the sealed size no longer shows
+// up in the sealer's resident set at all.
+type epochOut struct {
+	st   *dist.Store
+	path string
+	f    *os.File
+	w    *bufio.Writer
+	d    *dist.Digest
+	off  uint64
+	tab  [epochNumSections][2]uint64 // off, len per section
+}
+
+func newEpochOut(st *dist.Store) (*epochOut, error) {
+	f, err := os.CreateTemp(st.SpoolDir(), "epoch-*.tmp")
+	if err != nil {
+		return nil, err
+	}
+	return &epochOut{
+		st: st, path: f.Name(), f: f,
+		w: bufio.NewWriterSize(f, 1<<20), d: dist.NewDigest(),
+	}, nil
+}
+
+func (o *epochOut) write(b []byte) error {
+	if _, err := o.w.Write(b); err != nil {
+		return err
+	}
+	o.d.Write(b)
+	o.off += uint64(len(b))
+	return nil
+}
+
+// begin/end bracket a section written in pieces; section writes a whole one.
+// An empty section still gets its offset, so the layout never varies.
+func (o *epochOut) begin(id int) { o.tab[id][0] = o.off }
+func (o *epochOut) end(id int)   { o.tab[id][1] = o.off - o.tab[id][0] }
+
+func (o *epochOut) section(id int, b []byte) error {
+	o.begin(id)
+	if err := o.write(b); err != nil {
+		return err
+	}
+	o.end(id)
+	return nil
+}
+
+// framed packs a walk's blobs into zstd frames of framedGroup entries each
+// (frame payload = per-blob uvarint length + bytes), writes them as section
+// id, and returns the frame offset index (u64 LE, nFrames+1 with an end
+// sentinel). One frame of RAM, whatever the epoch's block count.
+func (o *epochOut) framed(id int, enc *zstd.Encoder, walk func(func([]byte) error) error) ([]byte, error) {
+	o.begin(id)
+	base := o.off
+	var payload, frame []byte
+	offs := binary.LittleEndian.AppendUint64(nil, 0)
+	n := 0
+	flush := func() error {
+		frame = enc.EncodeAll(payload, frame[:0])
+		if err := o.write(frame); err != nil {
+			return err
+		}
+		offs = binary.LittleEndian.AppendUint64(offs, o.off-base)
+		payload, n = payload[:0], 0
+		return nil
+	}
+	if err := walk(func(b []byte) error {
+		payload = binary.AppendUvarint(payload, uint64(len(b)))
+		payload = append(payload, b...)
+		if n++; n == framedGroup {
+			return flush()
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		if err := flush(); err != nil {
+			return nil, err
+		}
+	}
+	o.end(id)
+	return offs, nil
+}
+
+// storedFrames is framed for the sparse per-block records (stored logs /
+// receipt fields), which carry a member table on top. Index layout:
 //
 //	u32 nMembers | members (12B: relBlock u32, frame u32, slot u32) |
 //	frame offsets u64 x (nFrames+1)
 //
-// Members sorted by relBlock; the index header is always written, so a
-// present-but-empty section (epoch without logs) stays distinguishable
-// from a v2 epoch sealed without the sections (unit tests only).
-func buildStoredFrames(enc *zstd.Encoder, start uint64, recs map[uint64][]byte) (data, index []byte) {
-	blocks := make([]uint64, 0, len(recs))
-	for b := range recs {
-		blocks = append(blocks, b)
-	}
-	sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
-
+// Members are in walk order, which is ascending by block.
+func (o *epochOut) storedFrames(id int, enc *zstd.Encoder, start uint64, walk func(func(uint64, []byte) error) error) ([]byte, error) {
+	o.begin(id)
+	base := o.off
 	var (
-		members []byte
-		offs    []byte
-		payload []byte
-		inFrame int
-		frame   uint32
+		members, payload, frame []byte
+		inFrame                 int
+		frameNo, n              uint32
 	)
-	offs = binary.LittleEndian.AppendUint64(offs, 0)
-	for _, b := range blocks {
-		members = binary.LittleEndian.AppendUint32(members, uint32(b-start))
-		members = binary.LittleEndian.AppendUint32(members, frame)
-		members = binary.LittleEndian.AppendUint32(members, uint32(inFrame))
-		payload = binary.AppendUvarint(payload, uint64(len(recs[b])))
-		payload = append(payload, recs[b]...)
-		if inFrame++; inFrame == framedGroup {
-			data = enc.EncodeAll(payload, data)
-			offs = binary.LittleEndian.AppendUint64(offs, uint64(len(data)))
-			payload, inFrame = payload[:0], 0
-			frame++
+	offs := binary.LittleEndian.AppendUint64(nil, 0)
+	flush := func() error {
+		frame = enc.EncodeAll(payload, frame[:0])
+		if err := o.write(frame); err != nil {
+			return err
 		}
+		offs = binary.LittleEndian.AppendUint64(offs, o.off-base)
+		payload, inFrame = payload[:0], 0
+		frameNo++
+		return nil
+	}
+	if err := walk(func(b uint64, rec []byte) error {
+		members = binary.LittleEndian.AppendUint32(members, uint32(b-start))
+		members = binary.LittleEndian.AppendUint32(members, frameNo)
+		members = binary.LittleEndian.AppendUint32(members, uint32(inFrame))
+		payload = binary.AppendUvarint(payload, uint64(len(rec)))
+		payload = append(payload, rec...)
+		n++
+		if inFrame++; inFrame == framedGroup {
+			return flush()
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if len(payload) > 0 {
-		data = enc.EncodeAll(payload, data)
-		offs = binary.LittleEndian.AppendUint64(offs, uint64(len(data)))
+		if err := flush(); err != nil {
+			return nil, err
+		}
 	}
-	index = binary.LittleEndian.AppendUint32(nil, uint32(len(blocks)))
+	o.end(id)
+	index := binary.LittleEndian.AppendUint32(nil, n)
 	index = append(index, members...)
-	index = append(index, offs...)
-	return data, index
+	return append(index, offs...), nil
 }
 
-// buildFramed packs blobs into zstd frames of framedGroup entries each:
-// frame payload = per-blob uvarint length + bytes. Index = u64 LE offsets,
-// nFrames+1 (end sentinel).
-func buildFramed(enc *zstd.Encoder, blobs [][]byte) (data, index []byte) {
-	var (
-		out     []byte
-		offs    []byte
-		payload []byte
-	)
-	offs = binary.LittleEndian.AppendUint64(offs, 0)
-	for i := 0; i < len(blobs); i += framedGroup {
-		payload = payload[:0]
-		for j := i; j < i+framedGroup && j < len(blobs); j++ {
-			payload = binary.AppendUvarint(payload, uint64(len(blobs[j])))
-			payload = append(payload, blobs[j]...)
-		}
-		out = enc.EncodeAll(payload, out)
-		offs = binary.LittleEndian.AppendUint64(offs, uint64(len(out)))
+// finish writes the footer (magic, version, start, count, txs, the hash-chain
+// link, the section table) and adopts the file into the spool under its own
+// hash. Returns that hash.
+func (o *epochOut) finish(src *epochSrc) (string, error) {
+	var ft [epochFooterSize]byte
+	copy(ft[0:4], epochMagic[:])
+	binary.LittleEndian.PutUint32(ft[4:8], epochVersion)
+	binary.LittleEndian.PutUint64(ft[8:16], src.Start)
+	binary.LittleEndian.PutUint64(ft[16:24], src.Count)
+	binary.LittleEndian.PutUint64(ft[24:32], src.TxCount)
+	copy(ft[32:64], src.Prev[:])
+	for i := 0; i < epochNumSections; i++ {
+		binary.LittleEndian.PutUint64(ft[epochTableOff+i*16:], o.tab[i][0])
+		binary.LittleEndian.PutUint64(ft[epochTableOff+8+i*16:], o.tab[i][1])
 	}
-	return out, offs
+	copy(ft[epochFooterSize-4:], epochMagic[:])
+	if err := o.write(ft[:]); err != nil {
+		return "", err
+	}
+	if err := o.w.Flush(); err != nil {
+		return "", err
+	}
+	if err := o.f.Sync(); err != nil {
+		return "", err
+	}
+	if err := o.f.Close(); err != nil {
+		return "", err
+	}
+	o.f = nil
+	hash, err := o.st.Adopt(o.path, o.d)
+	if err != nil {
+		return "", err
+	}
+	o.path = "" // adopted: not ours to remove any more
+	return hash, nil
 }
+
+// discard drops a half-written artifact. Deferred by the builder: an error
+// must not leave a multi-GB stray in the spool.
+func (o *epochOut) discard() {
+	if o.f != nil {
+		o.f.Close()
+		o.f = nil
+	}
+	if o.path != "" {
+		os.Remove(o.path)
+		o.path = ""
+	}
+}
+
+// ---------- the state sections ----------
 
 const (
 	sstIdxEntrySize = sortedKeySize + 8 + 8 // key, first block, section offset
 	deleteEntrySize = sortedKeySize + 8
+
+	// sstRecKeySize is what orders an externally sorted post-image row:
+	// key53 | block u64 BE | seq u32 BE, so plain byte order over the record
+	// IS (key, block, seq) order and the value rides along untouched.
+	sstRecKeySize = sortedKeySize + 8 + 4
 )
 
 // sstWriter packs rows into dict-compressed blocks. Rows must arrive in
 // final (key, block) order, already deduped: the packing rule is what makes
 // two independent seals of the same chain content produce the same bytes.
 // Row wire format inside a block: key53 | block u64 BE | uvarint vlen | value.
+//
+// Blocks go straight into the artifact and unique keys straight into a scratch
+// file (the bloom cannot be sized until the last one is known, and 30M+ keys
+// on the heap waiting for that is 2 GB of nothing).
 type sstWriter struct {
-	enc *zstd.Encoder
+	enc  *zstd.Encoder
+	o    *epochOut
+	base uint64 // artifact offset the sst section starts at
 
-	sst      []byte
 	sstIdx   []byte
 	deletes  []byte
-	keys     [][]byte
+	keys     *bufio.Writer
+	nKeys    uint64
 	raw      []byte
+	frame    []byte
 	firstKey []byte
 	firstBlk uint64
 	lastKey  []byte
 }
 
-func (w *sstWriter) flush() {
+func (w *sstWriter) flush() error {
 	if len(w.raw) == 0 {
-		return
+		return nil
 	}
 	w.sstIdx = append(w.sstIdx, w.firstKey...)
 	w.sstIdx = binary.BigEndian.AppendUint64(w.sstIdx, w.firstBlk)
-	w.sstIdx = binary.LittleEndian.AppendUint64(w.sstIdx, uint64(len(w.sst)))
-	w.sst = w.enc.EncodeAll(w.raw, w.sst)
+	w.sstIdx = binary.LittleEndian.AppendUint64(w.sstIdx, w.o.off-w.base)
+	w.frame = w.enc.EncodeAll(w.raw, w.frame[:0])
+	if err := w.o.write(w.frame); err != nil {
+		return err
+	}
 	w.raw = w.raw[:0]
 	w.firstKey = nil
+	return nil
 }
 
-func (w *sstWriter) add(key []byte, block uint64, val []byte) {
+func (w *sstWriter) add(key []byte, block uint64, val []byte) error {
 	if w.lastKey == nil || !bytes.Equal(w.lastKey, key) {
-		k := append([]byte(nil), key...)
-		w.keys = append(w.keys, k)
-		w.lastKey = k
+		w.lastKey = append(w.lastKey[:0], key...)
+		if _, err := w.keys.Write(key); err != nil {
+			return err
+		}
+		w.nKeys++
 	}
 	if key[0] == recKindAccount && len(val) == 0 {
 		w.deletes = append(w.deletes, key...)
@@ -598,37 +856,193 @@ func (w *sstWriter) add(key []byte, block uint64, val []byte) {
 	w.raw = binary.AppendUvarint(w.raw, uint64(len(val)))
 	w.raw = append(w.raw, val...)
 	if len(w.raw) >= sstBlockTarget {
-		w.flush()
+		return w.flush()
 	}
+	return nil
 }
 
-// buildSST sorts and dedupes the epoch's post-image rows, merges in the v3
-// code rows, and returns the sst data, sparse index, the raw account-delete
-// rows, and every unique written key (bloom input).
-func buildSST(enc *zstd.Encoder, rows []StateRow, cc *codeCursor) (sst, sstIdx, deletes []byte, keys [][]byte) {
-	sort.Slice(rows, func(i, j int) bool {
-		if c := bytes.Compare(rows[i].Key[:], rows[j].Key[:]); c != 0 {
-			return c < 0
-		}
-		if rows[i].Block != rows[j].Block {
-			return rows[i].Block < rows[j].Block
-		}
-		return rows[i].Seq < rows[j].Seq
-	})
-
-	w := &sstWriter{enc: enc}
-	for i := range rows {
-		r := &rows[i]
-		// last write of the same (key, block) wins (post-image semantics)
-		if i+1 < len(rows) && rows[i+1].Block == r.Block && rows[i+1].Key == r.Key {
-			continue
-		}
-		cc.upTo(w, r.Key[:])
-		w.add(r.Key[:], r.Block, r.Value)
+// writeSST externally sorts the epoch's post-image rows, dedupes them (last
+// write of the same key+block wins, post-image semantics), merges in the v3
+// code rows and writes the sst, sstIdx and deletes sections. It returns the
+// scratch file of unique keys and their count, which is the key bloom's input.
+func writeSST(o *epochOut, tmp string, enc *zstd.Encoder, src *epochSrc) (keysPath string, nKeys uint64, err error) {
+	rows := newExtSort(tmp, "rows", sstRecKeySize)
+	var rec []byte
+	if err := src.Rows(func(r StateRow) error {
+		rec = append(rec[:0], r.Key[:]...)
+		rec = binary.BigEndian.AppendUint64(rec, r.Block)
+		rec = binary.BigEndian.AppendUint32(rec, uint32(r.Seq))
+		rec = append(rec, r.Value...)
+		return rows.add(rec)
+	}); err != nil {
+		return "", 0, err
 	}
-	cc.upTo(w, nil)
-	w.flush()
-	return w.sst, w.sstIdx, w.deletes, w.keys
+	hashes, getCode, err := src.Code()
+	if err != nil {
+		return "", 0, err
+	}
+	cc := newCodeCursor(hashes, getCode, src.Start)
+
+	keysPath = filepath.Join(tmp, "sstkeys")
+	kf, err := os.Create(keysPath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer kf.Close()
+
+	o.begin(secSST)
+	w := &sstWriter{enc: enc, o: o, base: o.off, keys: bufio.NewWriterSize(kf, 1<<20)}
+	emit := func(r []byte) error {
+		key := r[:sortedKeySize]
+		if err := cc.upTo(w, key); err != nil {
+			return err
+		}
+		return w.add(key, binary.BigEndian.Uint64(r[sortedKeySize:]), r[sstRecKeySize:])
+	}
+	// One record of lookahead IS the dedupe: a row is written only once the
+	// next one proves it was not overwritten in the same block.
+	var pend []byte
+	if err := rows.sorted(func(r []byte) error {
+		if len(pend) > 0 && !bytes.Equal(pend[:sortedKeySize+8], r[:sortedKeySize+8]) {
+			if err := emit(pend); err != nil {
+				return err
+			}
+		}
+		pend = append(pend[:0], r...)
+		return nil
+	}); err != nil {
+		return "", 0, err
+	}
+	if len(pend) > 0 {
+		if err := emit(pend); err != nil {
+			return "", 0, err
+		}
+	}
+	if err := cc.upTo(w, nil); err != nil {
+		return "", 0, err
+	}
+	if err := w.flush(); err != nil {
+		return "", 0, err
+	}
+	o.end(secSST)
+	if err := o.section(secSSTIdx, w.sstIdx); err != nil {
+		return "", 0, err
+	}
+	if err := o.section(secDeletes, w.deletes); err != nil {
+		return "", 0, err
+	}
+	if err := w.keys.Flush(); err != nil {
+		return "", 0, err
+	}
+	return keysPath, w.nKeys, kf.Close()
+}
+
+// ---------- the stored-logs sections ----------
+
+// writeStored derives the five v2 sections. The logs dict is trained on the
+// epoch's stored-logs records IN SORTED ORDER, so Stored is walked three
+// times: once to sample, once per section. Re-reading the raw receipts family
+// (sequential) is cheaper than holding several GB of records to walk twice.
+// The receipt frames reuse the container dict encoder, as they always have.
+func writeStored(o *epochOut, tmp string, enc *zstd.Encoder, src *epochSrc) error {
+	if src.Stored == nil {
+		for _, id := range []int{secLogsDict, secFullLogs, secFullLogsIdx, secRcpt, secRcptIdx} {
+			if err := o.section(id, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	logsDict, err := trainLogsDict(tmp, src)
+	if err != nil {
+		return err
+	}
+	if err := o.section(secLogsDict, logsDict); err != nil {
+		return err
+	}
+	encL, err := newEpochEncoder(logsDict)
+	if err != nil {
+		return err
+	}
+	defer encL.Close()
+
+	half := func(logs bool) func(func(uint64, []byte) error) error {
+		return func(yield func(uint64, []byte) error) error {
+			return src.Stored(func(b uint64, l, r []byte) error {
+				rec := r
+				if logs {
+					rec = l
+				}
+				if len(rec) == 0 {
+					return nil
+				}
+				return yield(b, rec)
+			})
+		}
+	}
+	logsIdx, err := o.storedFrames(secFullLogs, encL, src.Start, half(true))
+	if err != nil {
+		return err
+	}
+	if err := o.section(secFullLogsIdx, logsIdx); err != nil {
+		return err
+	}
+	rcptIdx, err := o.storedFrames(secRcpt, enc, src.Start, half(false))
+	if err != nil {
+		return err
+	}
+	return o.section(secRcptIdx, rcptIdx)
+}
+
+// trainLogsDict picks the logs dict's samples exactly as the whole-slice
+// builder did: the epoch's stored-logs records in byte order, every step-th
+// one, at most dictMaxSamples of them. The sort is external because the
+// records themselves are gigabytes.
+func trainLogsDict(tmp string, src *epochSrc) ([]byte, error) {
+	recs := newExtSort(tmp, "logsdict", 0)
+	n := 0
+	if err := src.Stored(func(_ uint64, logs, _ []byte) error {
+		if len(logs) == 0 {
+			return nil
+		}
+		n++
+		return recs.add(logs)
+	}); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	step := 1
+	if n > dictMaxSamples {
+		step = n / dictMaxSamples
+	}
+	var samples [][]byte
+	i := 0
+	if err := recs.sorted(func(rec []byte) error {
+		if i%step == 0 {
+			samples = append(samples, append([]byte(nil), rec...))
+		}
+		i++
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return trainDictCLI(samples, uint32(src.Start%0xfffffffe)+2, logsDictTarget), nil
+}
+
+// ---------- the tx and log indexes ----------
+
+// writeTxidx writes the fingerprint index and the bloom that guards it.
+func writeTxidx(o *epochOut, src *epochSrc) error {
+	idx, bloom, err := buildEpochTxidx(src.TxPairs, src.Count, src.Count+src.TxCount)
+	if err != nil {
+		return err
+	}
+	if err := o.section(secTxidx, idx); err != nil {
+		return err
+	}
+	return o.section(secTxBloom, bloom)
 }
 
 // buildEpochTxidx encodes the epoch's fingerprints exactly like the raw
@@ -646,22 +1060,18 @@ func buildSST(enc *zstd.Encoder, rows []StateRow, cc *codeCursor) (sst, sstIdx, 
 // harmless because the caller knows which kind it wants and verifies against
 // the header or the body, costing one wasted read exactly as a same-kind
 // collision already did.
-func buildEpochTxidx(in *EpochInput, count uint64) (idx, bloom []byte) {
+//
+// ponytail: the pairs stay on the heap (16 B each, ~240 MB for an 8M-tx epoch
+// of a sparse chain, against a few GB for everything else the seal does).
+// External-sort them too if a chain is ever seen at 100M blocks per epoch.
+func buildEpochTxidx(walk func(func(fp, blk uint64) error) error, count, hint uint64) (idx, bloom []byte, err error) {
 	type pair struct{ fp, blk uint64 }
-	pairs := make([]pair, 0, len(in.Headers)+int(in.TxCount))
-	for i, hdr := range in.Headers {
-		pairs = append(pairs, pair{
-			fp:  txFingerprint(BlockHashFromHeaderRLP(hdr)),
-			blk: uint64(i),
-		})
-	}
-	for blk, hashes := range in.TxHashes {
-		for _, h := range hashes {
-			pairs = append(pairs, pair{
-				fp:  binary.BigEndian.Uint64(h[:8]) >> 16,
-				blk: blk - in.Start,
-			})
-		}
+	pairs := make([]pair, 0, hint)
+	if err := walk(func(fp, blk uint64) error {
+		pairs = append(pairs, pair{fp: fp, blk: blk})
+		return nil
+	}); err != nil {
+		return nil, nil, err
 	}
 	sort.Slice(pairs, func(i, j int) bool {
 		if pairs[i].fp != pairs[j].fp {
@@ -690,7 +1100,7 @@ func buildEpochTxidx(in *EpochInput, count uint64) (idx, bloom []byte) {
 	out = writeWords(out, e.sel0)
 	out = writeWords(out, e.sel1)
 	out = writeWords(out, blk.w)
-	return out, buildTxBloom(fps)
+	return out, buildTxBloom(fps), nil
 }
 
 // buildLogidx encodes position-agnostic posting lists. Layout:
@@ -700,10 +1110,15 @@ func buildEpochTxidx(in *EpochInput, count uint64) (idx, bloom []byte) {
 //	lists blob (per list: EF over epoch-relative blocks, efMarshal)
 //
 // Entries sorted by key; listOff is relative to the lists blob.
-func buildLogidx(logs []LogRec, start, count uint64) []byte {
+//
+// ponytail: the posting lists are built on the heap (one uint64 per logged
+// address per block). That is bounded by the epoch's log volume, not by its
+// block count, and measured a distant second to everything this file now
+// streams; external-sort it if a log-heavy chain ever tops the profile.
+func buildLogidx(walk func(func(LogRec) error) error, start, count uint64) ([]byte, error) {
 	addrBlocks := map[[20]byte][]uint64{}
 	topicBlocks := map[[32]byte][]uint64{}
-	for _, lr := range logs {
+	if err := walk(func(lr LogRec) error {
 		rel := lr.Block - start
 		for _, a := range lr.Addrs {
 			addrBlocks[a] = append(addrBlocks[a], rel)
@@ -711,6 +1126,9 @@ func buildLogidx(logs []LogRec, start, count uint64) []byte {
 		for _, t := range lr.Topics {
 			topicBlocks[t] = append(topicBlocks[t], rel)
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	addrs := make([][20]byte, 0, len(addrBlocks))
 	for a := range addrBlocks {
@@ -743,7 +1161,7 @@ func buildLogidx(logs []LogRec, start, count uint64) []byte {
 		out = append(out, t[:]...)
 		out = binary.LittleEndian.AppendUint64(out, marshalList(topicBlocks[t]))
 	}
-	return append(out, lists...)
+	return append(out, lists...), nil
 }
 
 // efMarshal serializes an ef as: n u64 | l u32 | 4 length-prefixed word
@@ -828,14 +1246,28 @@ func bloomSet(words []uint64, m, k uint64, key []byte) {
 	}
 }
 
-// buildBloom is the key bloom: k = bloomHashes, double hashing over xxhash.
-func buildBloom(keys [][]byte) []byte {
-	m := bloomBits(uint64(len(keys)), bloomBitsPerKey)
+// buildBloomFile is the key bloom, over the unique keys the SST streamed to a
+// scratch file: m is a function of the key COUNT, which is not known until the
+// last row is written, and tens of millions of 53-byte keys waiting on the
+// heap for that is 2 GB of pure latency. k = bloomHashes, double hashing over
+// xxhash, OR-accumulated so read order cannot reach the bytes.
+func buildBloomFile(path string, nKeys uint64) ([]byte, error) {
+	m := bloomBits(nKeys, bloomBitsPerKey)
 	words := make([]uint64, m/64)
-	for _, k := range keys {
-		bloomSet(words, m, bloomHashes, k)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	return encodeBloom(m, bloomHashes, words)
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 1<<20)
+	var key [sortedKeySize]byte
+	for i := uint64(0); i < nKeys; i++ {
+		if _, err := io.ReadFull(r, key[:]); err != nil {
+			return nil, fmt.Errorf("epoch bloom: key %d of %d: %w", i, nKeys, err)
+		}
+		bloomSet(words, m, bloomHashes, key[:])
+	}
+	return encodeBloom(m, bloomHashes, words), nil
 }
 
 // buildTxBloom is the tx-fingerprint bloom over the fp48s of one epoch, keyed

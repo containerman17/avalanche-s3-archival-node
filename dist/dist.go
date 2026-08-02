@@ -212,10 +212,11 @@ func (s *Store) Remote() bool { return s.cas != nil }
 // SpoolPath is where the file for hash lives while it is still local.
 func (s *Store) SpoolPath(hash string) string { return filepath.Join(s.spool, hash) }
 
-// SpoolTemp is a scratch path in the spool directory for a writer that will
-// Adopt its output: same filesystem, and the name cannot be mistaken for
-// content (casfs only ever looks at hash-named entries).
-func (s *Store) SpoolTemp(name string) string { return filepath.Join(s.spool, name+".tmp") }
+// SpoolDir is the spool itself, for a writer that builds its artifact in place
+// and then Adopts it: a file created here is on the spool's own filesystem, so
+// the adopting rename cannot fail with EXDEV, and casfs ignores whatever is
+// not a hash-named file (a half-built epoch is `epoch-*.tmp`).
+func (s *Store) SpoolDir() string { return s.spool }
 
 // ---------- publishing ----------
 

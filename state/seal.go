@@ -30,7 +30,7 @@ import (
 // rcpt tail family, same encoding), never from re-execution: the DeriveStored
 // seal stage is gone, proven byte-identical before deletion. A range whose
 // tx-bearing blocks have no captured records is REFUSED, not backfilled
-// (corpora are disposable by ruling; see gatherEpoch).
+// (corpora are disposable by ruling; see scanEpoch).
 //
 // Epoch boundaries come from EpochTxsAt alone (no flag, no config): the epoch
 // index is how many epochs are already sealed, so a resumed seal cuts exactly
@@ -59,7 +59,7 @@ type sealRun struct {
 	// RetryAt is the exec head below which another pass cannot cut anything,
 	// extrapolated from the tx rate of the tail it just measured. It is what
 	// lets a live process attempt a seal on every cook tick without paying for
-	// a full gather every time.
+	// a full scan every time.
 	RetryAt uint64
 }
 
@@ -209,9 +209,9 @@ func sealedHead(dir string) (count int, end uint64, hash string, err error) {
 // truncate and never create, so it is safe beside the live writer that owns
 // those files.
 //
-// ctx is checked BETWEEN epochs only: a gather is one indivisible unit of
-// several minutes, and dropping a nearly finished one buys nothing (the next
-// pass would gather it again from the same block).
+// ctx is checked BETWEEN epochs only: cutting one epoch is an indivisible
+// unit of several minutes, and dropping a nearly finished one buys nothing
+// (the next pass would build it again from the same block).
 func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]byte, onEpoch func(sealedEnd uint64) error) (sealRun, error) {
 	var run sealRun
 	store, err := OpenReadOnly(dir)
@@ -228,6 +228,7 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 		return run, err
 	}
 	defer reader.Close()
+	sweepSealScratch(out)
 
 	// THE MARKERS, NOT THE EPOCHS. Everything this needs is in the local index
 	// (how many epochs exist, where the last one ends, what it hashes to), and
@@ -270,20 +271,21 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 			return run, nil
 		}
 		epochTxs := epochTxsAt(idx)
-		in, full, rawBytes, err := gatherEpoch(store, reader, next, execHead, epochTxs)
+		s, full, err := scanEpoch(store, reader, next, execHead, epochTxs)
 		if err != nil {
 			return run, err
 		}
 		if !full {
 			log.Printf("seal: tail %d..%d stays raw (below epoch %d's %d txs)", next, execHead, idx, epochTxs)
-			run.RetryAt = retryAt(in, execHead, epochTxs)
+			run.RetryAt = retryAt(s.txs, s.count, execHead, epochTxs)
 			break
 		}
 		t0 := time.Now()
-		in.Prev = prev
-		hash, err := BuildEpoch(out, in)
+		src := s.src()
+		src.Prev = prev
+		hash, err := buildEpoch(out, src)
 		if err != nil {
-			return run, fmt.Errorf("seal epoch at %d: %w", in.Start, err)
+			return run, fmt.Errorf("seal epoch at %d: %w", s.start, err)
 		}
 		if prev, err = hashBytes(hash); err != nil {
 			return run, err
@@ -293,30 +295,30 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 		}
 		st, _ := os.Stat(out.SpoolPath(hash))
 		log.Printf("seal: %s (%s) blocks=%d txs=%d code=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
-			EpochMarkerName(in.Start, uint64(len(in.Containers))), hash[:12], len(in.Containers), in.TxCount, len(in.Code),
-			float64(rawBytes.total())/1e6, float64(st.Size())/1e6,
-			float64(rawBytes.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
+			EpochMarkerName(s.start, s.count), hash[:12], s.count, s.txs, len(s.code),
+			float64(s.raw.total())/1e6, float64(st.Size())/1e6,
+			float64(s.raw.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
 		if e, err := OpenEpoch(out, hash); err == nil {
-			s := e.SectionSizes()
+			sz := e.SectionSizes()
 			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB rcpt=%.2fMB",
-				float64(rawBytes.containers)/1e6, float64(rawBytes.headers)/1e6,
-				float64(rawBytes.writelog)/1e6, float64(rawBytes.logs)/1e6,
-				float64(rawBytes.rcpt)/1e6)
+				float64(s.raw.containers)/1e6, float64(s.raw.headers)/1e6,
+				float64(s.raw.writelog)/1e6, float64(s.raw.logs)/1e6,
+				float64(s.raw.rcpt)/1e6)
 			log.Printf("seal:   sealed: dict=%.2fMB bodies=%.2fMB(+idx %.2f) headers=%.2fMB(+idx %.2f) sst=%.2fMB(+idx %.2f) deletes=%.2fMB txidx=%.2fMB(+bloom %.2f) logidx=%.2fMB bloom=%.2fMB",
-				float64(s["dict"])/1e6,
-				float64(s["bodies"])/1e6, float64(s["bodiesIdx"])/1e6,
-				float64(s["headers"])/1e6, float64(s["headersIdx"])/1e6,
-				float64(s["sst"])/1e6, float64(s["sstIdx"])/1e6,
-				float64(s["deletes"])/1e6, float64(s["txidx"])/1e6,
-				float64(s["txbloom"])/1e6,
-				float64(s["logidx"])/1e6, float64(s["keybloom"])/1e6)
+				float64(sz["dict"])/1e6,
+				float64(sz["bodies"])/1e6, float64(sz["bodiesIdx"])/1e6,
+				float64(sz["headers"])/1e6, float64(sz["headersIdx"])/1e6,
+				float64(sz["sst"])/1e6, float64(sz["sstIdx"])/1e6,
+				float64(sz["deletes"])/1e6, float64(sz["txidx"])/1e6,
+				float64(sz["txbloom"])/1e6,
+				float64(sz["logidx"])/1e6, float64(sz["keybloom"])/1e6)
 			e.Close()
 		}
-		next = in.Start + uint64(len(in.Containers))
+		next = s.start + s.count
 		idx++
 		run.Cut++
 		run.SealedEnd = next - 1
-		// Publish and retire this epoch before gathering the next one. The
+		// Publish and retire this epoch before scanning the next one. The
 		// unlink onEpoch does frees the disk even though this pass is still
 		// reading the same dir: both readers it holds are LRU-capped (4 bucket
 		// pairs per raw family, 4 staging segments) and it walks heights
@@ -329,22 +331,22 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 	return run, nil
 }
 
-// retryAt extrapolates the exec head at which the tail in reaches epochTxs,
-// from the tx rate of the tail itself. Being late costs only a bigger raw
-// tail (the boundary is cut exactly where it always was, just on a later
-// tick), being early costs a whole wasted gather, so the estimate is
-// deliberately halved rather than doubled: a tail whose tx rate doubles still
-// gets its epoch on the first tick after the boundary.
+// retryAt extrapolates the exec head at which a tail of blocks blocks
+// carrying txCount txs reaches epochTxs, from the tx rate of the tail itself.
+// Being late costs only a bigger raw tail (the boundary is cut exactly where
+// it always was, just on a later tick), being early costs a whole wasted
+// scan, so the estimate is deliberately halved rather than doubled: a tail
+// whose tx rate doubles still gets its epoch on the first tick after the
+// boundary.
 //
 // ponytail: a rate guess, not a counter. The exact answer needs a per-block
 // tx count nothing durable carries; add one only if a real chain is ever seen
-// spending several gathers per epoch.
-func retryAt(in *EpochInput, execHead, epochTxs uint64) uint64 {
-	need := epochTxs - min(in.TxCount, epochTxs)
-	blocks := uint64(len(in.Containers))
+// spending several scans per epoch.
+func retryAt(txCount, blocks, execHead, epochTxs uint64) uint64 {
+	need := epochTxs - min(txCount, epochTxs)
 	ahead := need // no txs in the whole tail: no rate to extrapolate from
-	if in.TxCount > 0 && blocks > 0 {
-		ahead = need * blocks / in.TxCount / 2
+	if txCount > 0 && blocks > 0 {
+		ahead = need * blocks / txCount / 2
 	}
 	return execHead + max(ahead, 1)
 }
@@ -357,141 +359,262 @@ func (r rawSizes) total() uint64 {
 	return r.containers + r.headers + r.writelog + r.logs + r.rcpt
 }
 
-// gatherEpoch collects blocks from start until the cumulative tx count
-// reaches epochTxs (that block included). full=false means the boundary was
-// not reached (the tail stays raw); the input is returned anyway, holding
-// everything scanned, because its tx-per-block rate is what dates the next
-// attempt (retryAt).
-func gatherEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uint64) (*EpochInput, bool, rawSizes, error) {
-	in := &EpochInput{
-		Start:    start,
-		TxHashes: map[uint64][][32]byte{},
-		FullLogs: map[uint64][]byte{},
-		RcptRecs: map[uint64][]byte{},
-	}
-	var rawBytes rawSizes
+// txPair is one (fingerprint, epoch-relative block) entry of the tx index.
+type txPair struct{ fp, blk uint64 }
+
+// epochStream is the sealer's BOUNDED source for one epoch. It holds only
+// what is not re-derivable cheaply (the block count, the tx/block-hash
+// fingerprints, the set of code hashes) and RE-READS THE RAW CORPUS once per
+// section family, instead of gathering an epoch's containers, headers, write
+// rows, log records and receipt records into RAM first.
+//
+// That gather cost a measured 2.75 KB PER BLOCK (2026-08-02, synthetic sparse
+// corpus), which a sparse L1 turns into ~18 GB for the 6.7M blocks its 8M-tx
+// epoch spans, and is what OOM-killed the Fuji crunch three times in 24h. The
+// re-reads are sequential over files whose handles are LRU-capped, and the
+// blocks are walked ascending, so a pass costs disk bandwidth and no memory.
+type epochStream struct {
+	store  *Store
+	reader *fetch.Reader
+
+	start, count, txs uint64
+	pairs             []txPair
+	code              map[common.Hash]struct{}
+
+	raw rawSizes
+	// A family is walked more than once (the builder writes sections in file
+	// order, the logs dict wants its records before they are compressed), so
+	// only the first pass over each one counts its bytes into raw.
+	rowsPass, logsPass, storedPass int
+}
+
+// scanEpoch walks blocks ascending from start until the cumulative tx count
+// reaches epochTxs (that block included), and is the ONLY pass that decodes a
+// block body: it fixes the epoch's block count and collects the tx and block
+// hash fingerprints, so nothing later has to keccak a transaction again.
+// full=false means the boundary was not reached (the tail stays raw); the
+// stream comes back anyway, because its tx-per-block rate is what dates the
+// next attempt (retryAt).
+func scanEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uint64) (*epochStream, bool, error) {
+	s := &epochStream{store: store, reader: reader, start: start, code: map[common.Hash]struct{}{}}
+	var hashes []common.Hash
 	for n := start; n <= execHead; n++ {
 		container, ok, err := reader.GetByHeight(n)
 		if err != nil {
-			return in, false, rawSizes{}, err
+			return s, false, err
 		}
 		if !ok {
-			return in, false, rawSizes{}, nil // staging gap below exec head should not happen, but never seal past one
+			return s, false, nil // staging gap below exec head should not happen, but never seal past one
 		}
 		headerRLP, ok, err := store.HeaderRLP(n)
 		if err != nil || !ok {
-			return in, false, rawSizes{}, fmt.Errorf("seal: header %d: ok=%v err=%v", n, ok, err)
+			return s, false, fmt.Errorf("seal: header %d: ok=%v err=%v", n, ok, err)
 		}
-		in.Containers = append(in.Containers, container)
-		in.Headers = append(in.Headers, headerRLP)
-		rawBytes.containers += uint64(len(container))
-		rawBytes.headers += uint64(len(headerRLP))
+		s.count++
+		s.raw.containers += uint64(len(container))
+		s.raw.headers += uint64(len(headerRLP))
+		s.pairs = append(s.pairs, txPair{fp: txFingerprint(BlockHashFromHeaderRLP(headerRLP)), blk: n - start})
 
-		hashes, err := extractTxHashes(innerEthBlock(container), nil)
+		hashes, err = extractTxHashes(innerEthBlock(container), hashes[:0])
 		if err != nil {
-			return in, false, rawSizes{}, fmt.Errorf("seal: block %d txs: %w", n, err)
+			return s, false, fmt.Errorf("seal: block %d txs: %w", n, err)
 		}
-		if len(hashes) > 0 {
-			hs := make([][32]byte, len(hashes))
-			for i, h := range hashes {
-				hs[i] = [32]byte(h)
-			}
-			in.TxHashes[n] = hs
-			in.TxCount += uint64(len(hashes))
+		for _, h := range hashes {
+			s.pairs = append(s.pairs, txPair{fp: txFingerprint(h), blk: n - start})
 		}
+		s.txs += uint64(len(hashes))
 
 		// THE NO-RECORDS RULE: the stored sections are a byte copy of the
 		// executor's live capture. A tx-bearing block without one cannot be
 		// sealed, and there is deliberately no backfill-by-re-execution
 		// crutch: corpora are disposable (DESIGN.md work order item 2), so
 		// the answer to a pre-capture corpus is a fresh sync, not a patch.
-		rcptRaw, hasRcpt, err := store.RcptRecord(n)
-		if err != nil {
-			return in, false, rawSizes{}, err
-		}
-		if len(hashes) > 0 && !hasRcpt {
-			return in, false, rawSizes{}, fmt.Errorf(
+		// Checked here against the index alone: the records themselves are
+		// read by the stored sections, which is the only pass that needs them.
+		if len(hashes) > 0 && !store.rc.Has(n) {
+			return s, false, fmt.Errorf(
 				"seal: block %d has %d txs but no captured receipts record: this corpus was executed before live receipt capture, resync it (there is no backfill)",
 				n, len(hashes))
 		}
-		if hasRcpt {
-			logsRec, rcptRec, err := DecodeTailRcpt(rcptRaw)
-			if err != nil {
-				return in, false, rawSizes{}, fmt.Errorf("seal: block %d: %w", n, err)
-			}
-			rawBytes.rcpt += uint64(len(rcptRaw))
-			if len(logsRec) > 0 {
-				in.FullLogs[n] = logsRec
-			}
-			if len(rcptRec) > 0 {
-				in.RcptRecs[n] = rcptRec
-			}
-		}
 
-		if frame, ok, err := store.wl.Get(n); err != nil {
-			return in, false, rawSizes{}, err
-		} else if ok {
-			rawBytes.writelog += uint64(len(frame))
-			seq := 0
-			if err := parseFrame(frame, func(kind byte, key [sortedKeySize]byte, valOff int, vlen uint32) {
-				if kind == recKindCodeUse {
-					return
-				}
-				in.StateRows = append(in.StateRows, StateRow{
-					Key:   key,
-					Block: n,
-					Value: append([]byte(nil), frame[valOff:valOff+int(vlen)]...),
-					Seq:   seq,
-				})
-				seq++
-			}); err != nil {
-				return in, false, rawSizes{}, fmt.Errorf("seal: writelog frame %d: %w", n, err)
-			}
-		}
-
-		if rec, ok, err := store.LogsRecord(n); err != nil {
-			return in, false, rawSizes{}, err
-		} else if ok {
-			rawBytes.logs += uint64(len(rec))
-			lr, err := decodeLogRec(n, rec)
-			if err != nil {
-				return in, false, rawSizes{}, fmt.Errorf("seal: logs record %d: %w", n, err)
-			}
-			in.Logs = append(in.Logs, lr)
-		}
-
-		if in.TxCount >= epochTxs {
-			return in, true, rawBytes, fillEpochCode(in, store)
+		if s.txs >= epochTxs {
+			return s, true, nil
 		}
 	}
-	return in, false, rawSizes{}, nil // ran out of replayed blocks before the boundary
+	return s, false, nil // ran out of replayed blocks before the boundary
 }
 
-// fillEpochCode resolves the code of every account row this epoch writes,
-// pulled from code.log. This loop IS the v3 placement rule (see
-// EpochInput.Code).
-func fillEpochCode(in *EpochInput, store *Store) error {
-	in.Code = map[common.Hash][]byte{}
-	for i := range in.StateRows {
-		r := &in.StateRows[i]
-		if r.Key[0] != recKindAccount || len(r.Value) == 0 {
-			continue
+// src is the builder's pull side over this stream: one walk per section
+// family, each re-reading the raw files ascending.
+func (s *epochStream) src() *epochSrc {
+	end := s.start + s.count
+	container := func(n uint64) ([]byte, error) {
+		c, ok, err := s.reader.GetByHeight(n)
+		if err != nil {
+			return nil, err
 		}
-		hash, ok := accountCodeHash(r.Value)
-		if !ok || hash == types.EmptyCodeHash || hash == (common.Hash{}) {
-			continue
+		if !ok {
+			return nil, fmt.Errorf("seal: container %d vanished mid-seal", n)
 		}
-		if _, done := in.Code[hash]; done {
-			continue
-		}
-		blob, ok, err := store.code.Get(hash)
+		return c, nil
+	}
+	return &epochSrc{
+		Start:   s.start,
+		Count:   s.count,
+		TxCount: s.txs,
+		Container: func(i uint64) ([]byte, error) {
+			return container(s.start + i)
+		},
+		Containers: func(yield func([]byte) error) error {
+			for n := s.start; n < end; n++ {
+				c, err := container(n)
+				if err != nil {
+					return err
+				}
+				if err := yield(c); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Headers: func(yield func([]byte) error) error {
+			for n := s.start; n < end; n++ {
+				hdr, ok, err := s.store.HeaderRLP(n)
+				if err != nil || !ok {
+					return fmt.Errorf("seal: header %d: ok=%v err=%v", n, ok, err)
+				}
+				if err := yield(hdr); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rows: s.rows,
+		Code: func() ([]common.Hash, func(common.Hash) ([]byte, error), error) {
+			hashes := make([]common.Hash, 0, len(s.code))
+			for h := range s.code {
+				hashes = append(hashes, h)
+			}
+			return hashes, s.codeBlob, nil
+		},
+		Logs:   s.logs,
+		Stored: s.stored,
+		TxPairs: func(yield func(fp, blk uint64) error) error {
+			for _, p := range s.pairs {
+				if err := yield(p.fp, p.blk); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// rows walks the write-capture frames ascending and yields their post-image
+// rows, collecting on the way the code hashes this epoch's account rows
+// reference (the v3 placement rule, EpochInput.Code). Values are views into
+// the frame, which the builder copies into its sort at once.
+func (s *epochStream) rows(yield func(StateRow) error) error {
+	first := s.rowsPass == 0
+	s.rowsPass++
+	for n := s.start; n < s.start+s.count; n++ {
+		frame, ok, err := s.store.wl.Get(n)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("seal epoch at %d: code %x referenced by an account row is not in code.log", in.Start, hash)
+			continue
 		}
-		in.Code[hash] = blob
+		if first {
+			s.raw.writelog += uint64(len(frame))
+		}
+		seq := 0
+		var yerr error
+		if err := parseFrame(frame, func(kind byte, key [sortedKeySize]byte, valOff int, vlen uint32) {
+			if kind == recKindCodeUse || yerr != nil {
+				return
+			}
+			val := frame[valOff : valOff+int(vlen)]
+			if kind == recKindAccount && vlen > 0 {
+				if h, ok := accountCodeHash(val); ok && h != types.EmptyCodeHash && h != (common.Hash{}) {
+					s.code[h] = struct{}{}
+				}
+			}
+			yerr = yield(StateRow{Key: key, Block: n, Value: val, Seq: seq})
+			seq++
+		}); err != nil {
+			return fmt.Errorf("seal: writelog frame %d: %w", n, err)
+		}
+		if yerr != nil {
+			return yerr
+		}
+	}
+	return nil
+}
+
+// codeBlob resolves one code blob out of code.log. A referenced blob that is
+// not there is a corpus defect, not a hole to paper over.
+func (s *epochStream) codeBlob(h common.Hash) ([]byte, error) {
+	blob, ok, err := s.store.code.Get(h)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("seal epoch at %d: code %x referenced by an account row is not in code.log", s.start, h)
+	}
+	return blob, nil
+}
+
+// logs walks the per-block log tuple records (the logidx input).
+func (s *epochStream) logs(yield func(LogRec) error) error {
+	first := s.logsPass == 0
+	s.logsPass++
+	for n := s.start; n < s.start+s.count; n++ {
+		rec, ok, err := s.store.LogsRecord(n)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if first {
+			s.raw.logs += uint64(len(rec))
+		}
+		lr, err := decodeLogRec(n, rec)
+		if err != nil {
+			return fmt.Errorf("seal: logs record %d: %w", n, err)
+		}
+		if err := yield(lr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stored walks the live capture's receipt records and splits each into the
+// two epoch-encoded halves it already holds (state/storedlogs.go). No
+// re-execution, here or anywhere else in a seal.
+func (s *epochStream) stored(yield func(uint64, []byte, []byte) error) error {
+	first := s.storedPass == 0
+	s.storedPass++
+	for n := s.start; n < s.start+s.count; n++ {
+		raw, ok, err := s.store.RcptRecord(n)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if first {
+			s.raw.rcpt += uint64(len(raw))
+		}
+		logsRec, rcptRec, err := DecodeTailRcpt(raw)
+		if err != nil {
+			return fmt.Errorf("seal: block %d: %w", n, err)
+		}
+		if err := yield(n, logsRec, rcptRec); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -528,6 +651,36 @@ func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
 		off += 32
 	}
 	return lr, nil
+}
+
+// sweepSealScratch drops what a KILLED build left behind. The external sorts
+// spill into a scratch directory in the data dir, and the artifact itself is
+// built as a file in the spool; a finished build removes both, an OOM kill
+// (three of those on this corpus in 24h) removes neither, and a multi-GB stray
+// per kill is exactly what a crunch cannot afford.
+//
+// The data dir belongs to this seal alone (single-caller by contract), so its
+// scratch goes unconditionally. The spool may be SHARED with sibling chains in
+// a fleet, so a half-written artifact goes only once it is a day old and
+// therefore cannot belong to a live build (an epoch takes ~2h at the worst
+// size the schedule allows).
+func sweepSealScratch(out *dist.Store) {
+	dirs, _ := filepath.Glob(filepath.Join(out.Dir(), sealTmpPrefix+"*"))
+	for _, d := range dirs {
+		if err := os.RemoveAll(d); err == nil {
+			log.Printf("seal: removed stale scratch %s", d)
+		}
+	}
+	files, _ := filepath.Glob(filepath.Join(out.SpoolDir(), "epoch-*.tmp"))
+	for _, f := range files {
+		st, err := os.Stat(f)
+		if err != nil || time.Since(st.ModTime()) < 24*time.Hour {
+			continue
+		}
+		if err := os.Remove(f); err == nil {
+			log.Printf("seal: removed abandoned epoch build %s", f)
+		}
+	}
 }
 
 // DeleteSealedRaw removes raw bucket files whose entire block range is at
