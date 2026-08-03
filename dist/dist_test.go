@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -112,7 +111,7 @@ func TestPointersOutsideChunkCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache := filepath.Join(rootFor(dir), cacheName)
+	cache := cacheRoot(dir)
 	for _, name := range []string{LatestPointer([32]byte{5}), ChunkPointer(hex.EncodeToString(bytes.Repeat([]byte{3}, 32)))} {
 		p := s.pointerPath(name)
 		if p == cache || strings.HasPrefix(p, cache+string(os.PathSeparator)) {

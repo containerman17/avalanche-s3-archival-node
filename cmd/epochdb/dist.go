@@ -97,7 +97,7 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 
 // joinChain IS A NODE'S START SEQUENCE, and there is no other one [RULING
 // 2026-08-03: THERE IS NO SEPARATE BOOTSTRAP STORY]. Every `epochdb serve` and
-// every chain of a `--chains` process runs it before anything opens the data dir,
+// runs it before anything opens the data dir,
 // and the whole decision is these four cases:
 //
 //  1. No `latest` pointer, locally or in the bucket -> a genuinely fresh chain.
@@ -140,7 +140,7 @@ func joinChain(cfg nodeConfig, build func(dataDir string, st *dist.Store, c *cha
 	// is local-first with a bucket fallback, so this really does mean nowhere.
 	l, err := st.Latest(root)
 	if errors.Is(err, fs.ErrNotExist) {
-		cfg.logf("join: no `%s` pointer locally or in the bucket: fresh chain, starting from genesis", ptr)
+		logf("join: no `%s` pointer locally or in the bucket: fresh chain, starting from genesis", ptr)
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("read the `%s` pointer: %w", ptr, err)
@@ -160,12 +160,12 @@ func joinChain(cfg nodeConfig, build func(dataDir string, st *dist.Store, c *cha
 	if head > 0 {
 		epochs, covered, err := checkLocalIndex(cfg.DataDir, l.Epoch)
 		if err == nil {
-			cfg.logf("join: warm start, local index covers blocks 1..%d in %d epochs (executed to %d)", covered, epochs, head)
+			logf("join: warm start, local index covers blocks 1..%d in %d epochs (executed to %d)", covered, epochs, head)
 			return nil
 		}
 		// Self-healing, and the only reason this is not fatal: a lost marker is
 		// re-derivable from the chain itself, so fall through to the walk.
-		cfg.logf("join: local index unusable (%v), re-walking the epoch chain", err)
+		logf("join: local index unusable (%v), re-walking the epoch chain", err)
 	}
 
 	// (2) A pointer exists, so this chain HAS published history: either every
@@ -178,13 +178,13 @@ func joinChain(cfg nodeConfig, build func(dataDir string, st *dist.Store, c *cha
 			" check EPOCHDB_S3_ENDPOINT/BUCKET/PREFIX point at this chain's own bucket, and that the artifact above is in it",
 			ptr, epochs, err)
 	}
-	cfg.logf("join: epoch chain intact, %d epochs linked from `%s` to the chain root", epochs, ptr)
+	logf("join: epoch chain intact, %d epochs linked from `%s` to the chain root", epochs, ptr)
 	if head > 0 {
 		return nil // a warm dir whose index just healed; nothing to build
 	}
 
 	// (3) COLD: the chain is whole but this dir has no state of its own.
-	cfg.logf("join: chain intact but this dir has no execution state: merging %d sealed epochs into a state frontier."+
+	logf("join: chain intact but this dir has no execution state: merging %d sealed epochs into a state frontier."+
 		" This is minutes to hours; the RPC port is already bound and requests wait.", epochs)
 	if err := build(cfg.DataDir, st, cfg.Chain); err != nil {
 		return fmt.Errorf("build the state frontier: %w", err)

@@ -168,8 +168,9 @@ func dispatch(args []string, w io.Writer) int {
 		cmd(args[2:])
 		return 0
 	case "fleet":
-		fmt.Fprintln(w, "epochdb: `fleet` is gone. One process hosting several chains is `epochdb serve --chains C,<blockchainID>,...`;")
-		fmt.Fprintln(w, "         every flag it had is a serve flag, including per-chain --tip-override <chain>=<containerID>.")
+		fmt.Fprintln(w, "epochdb: `fleet` is gone, and so is hosting several chains in one process. ONE PROCESS SERVES ONE CHAIN:")
+		fmt.Fprintln(w, "         run one `epochdb serve --data <dir> --chain <C|blockchainID>` per chain, one container each, and")
+		fmt.Fprintln(w, "         point them all at the same EPOCHDB_CACHE_DIR to share one chunk cache.")
 		return 2
 	}
 	if _, ok := devCommands[args[0]]; ok {
@@ -183,14 +184,15 @@ func dispatch(args []string, w io.Writer) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--chains C,<blockchainID>,...]")
-	fmt.Fprintln(w, "                     [--port 9650] [--vdr-sources <p-chain rpcs>] [--verify] [--tip-override <containerID>|<chain>=<containerID>,...]")
+	fmt.Fprintln(w, "usage: epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>]")
+	fmt.Fprintln(w, "                     [--port 9650] [--vdr-sources <p-chain rpcs>] [--verify] [--tip-override <containerID>]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "serve is the only command. It follows the chain, executes it, indexes it, cuts and publishes")
 	fmt.Fprintln(w, "epoch files, uploads them, and answers RPC, in one process that recovers by itself.")
-	fmt.Fprintln(w, "--chains hosts several chains at once: each answers at /ext/bc/<blockchainID>/rpc, and /status")
-	fmt.Fprintln(w, "reports all of them. A chain that cannot start does not take the process or its siblings down.")
-	fmt.Fprintln(w, "--verify re-verifies the SEALED epochs before serving them; a chain that fails does not start.")
+	fmt.Fprintln(w, "ONE PROCESS SERVES ONE CHAIN: several chains on a box are several processes (one container each),")
+	fmt.Fprintln(w, "sharing one chunk cache through EPOCHDB_CACHE_DIR. It answers at / and at /ext/bc/<blockchainID>/rpc,")
+	fmt.Fprintln(w, "and /status reports this chain. A start that fails exits nonzero: restarting it is the supervisor's job.")
+	fmt.Fprintln(w, "--verify re-verifies the SEALED epochs before serving them; a failure means the node does not start.")
 }
 
 // devUsage lists what `dev` still carries. Names only: the stages are ours, and

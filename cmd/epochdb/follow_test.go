@@ -1,10 +1,33 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestStatusIsOneChain pins the shape /status answers with since 2026-08-04: ONE
+// OBJECT, not the fleet's array, and it answers from the bind rather than from
+// the moment the chain is up, which on a cold dir is hours later. The nil node
+// IS that window, and `serving` is what tells an operator which side of it they
+// are looking at.
+func TestStatusIsOneChain(t *testing.T) {
+	b, err := json.Marshal(statusOf("C", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if !strings.HasPrefix(got, "{") {
+		t.Fatalf("/status is not a single object: %s", got)
+	}
+	for _, want := range []string{`"chain":"C"`, `"serving":false`, `"accepted":0`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("/status before the chain is up: %s, want %s", got, want)
+		}
+	}
+}
 
 // TestServeBindsBeforeStartupWork pins the ordering serveOn exists for: the RPC
 // port is taken BEFORE any startup work, so a collision is an error in

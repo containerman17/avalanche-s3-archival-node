@@ -313,8 +313,9 @@ func New(cfg Config) (*Executor, error) {
 	// well under saturation. A real node cache keeps the hot trie
 	// interior resident.
 	//
-	// SIZED BY FORMULA since the fleet ruling (DESIGN "THE FLEET"), because a
-	// hardcoded 4GB is a per-chain grant and the box now runs many chains: the
+	// SIZED BY FORMULA since the fleet ruling (DESIGN "THE FLEET"), and still
+	// right now that the fleet is N processes instead of N goroutines, because a
+	// hardcoded 4GB is a per-chain grant and a box runs many chains: the
 	// cache holds DECODED nodes, so it is anon memory, and anon is the one
 	// thing the kernel cannot evict under pressure. The measured-good C-chain
 	// point was 4GB against 157GB of Firewood, i.e. 2.5%, so the calibrated

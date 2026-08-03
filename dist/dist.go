@@ -22,6 +22,10 @@
 //	EPOCHDB_S3_PREFIX      optional key prefix, used verbatim
 //	EPOCHDB_S3_REGION      optional; default the chain's region, else "auto"
 //	                       (R2 wants "auto"; MinIO ignores it)
+//	EPOCHDB_CACHE_DIR      the chunk cache's root, default <data>/cache. THE ONE
+//	                       THING SEVERAL CHAIN PROCESSES SHARE (RULING
+//	                       2026-08-04): point every process on a box at one
+//	                       directory and they share one elastic LRU.
 //	EPOCHDB_CACHE_MIN_FREE bytes of free space the chunk cache stops filling at,
 //	                       default 5% of the filesystem
 //	EPOCHDB_CACHE_MAX_AGE  a chunk's ceiling age (Go duration), default 720h
@@ -79,10 +83,10 @@ func ViewOf(b []byte) *View { return casfs.ViewOf(b) }
 // authority: every artifact self-verifies by hash and the epoch footers chain
 // back to the chain root.
 //
-// THE NAME CARRIES THE CHAIN ROOT, and that is not cosmetic: a fleet shares one
-// spool and one bucket prefix across N chains (dist.SetRoot, DESIGN.md "THE
-// FLEET"), so an unqualified `latest` meant every chain published its tip over
-// its siblings'. Content is safe there because artifacts are named by their
+// THE NAME CARRIES THE CHAIN ROOT, and that is not cosmetic: N chains publish
+// into one bucket prefix, so an unqualified `latest` meant every chain
+// published its tip over the others'. Content is safe there because artifacts
+// are named by their
 // hash; the pointer is the only mutable name, so it is the only one that needs
 // the qualifier. The chain root is the right qualifier because every side
 // already holds it: the producer to link epoch 1's footer, the consumer to
@@ -102,8 +106,9 @@ type Store struct {
 // stores over one directory would each run an eviction worker and each keep a
 // chunk map, which is duplicated work, but the cache is shared by design and a
 // wrong map entry costs an ENOENT and a refetch. Across PROCESSES it is
-// explicitly fine (a sibling tool against a serving node's data dir now warms
-// the same cache instead of wiping it). Both bootstrap paths need the sharing:
+// explicitly fine, and since RULING 2026-08-04 it is the POINT: one process per
+// chain, N processes sharing one EPOCHDB_CACHE_DIR, no coordination at all.
+// Both bootstrap paths need the sharing:
 // `bootstrap --frontier` opens the artifact store and then a whole state layer
 // over the same directory.
 var (
@@ -113,15 +118,26 @@ var (
 
 type sharedCas struct {
 	*casfs.Store
-	dir  string
+	key  string
 	refs int
 }
 
-func openCas(cacheDir string, cfg casfs.Config) (*sharedCas, error) {
-	key, err := filepath.Abs(cacheDir)
+// openCas keys on the cache dir AND the spool, not the cache dir alone: since
+// 2026-08-04 two data dirs share one cache root, and they still have their own
+// spool, their own namespace and their own not-yet-uploaded artifacts. Two
+// opens of the SAME data dir (bootstrap --frontier opens the artifact store and
+// then a state layer over it) still land on one store, which is all the
+// refcount was ever for.
+func openCas(cacheDir, spool string, cfg casfs.Config) (*sharedCas, error) {
+	cd, err := filepath.Abs(cacheDir)
 	if err != nil {
 		return nil, err
 	}
+	sp, err := filepath.Abs(spool)
+	if err != nil {
+		return nil, err
+	}
+	key := cd + "\x00" + sp
 	casMu.Lock()
 	defer casMu.Unlock()
 	if s := casShared[key]; s != nil {
@@ -132,7 +148,7 @@ func openCas(cacheDir string, cfg casfs.Config) (*sharedCas, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &sharedCas{Store: st, dir: key, refs: 1}
+	s := &sharedCas{Store: st, key: key, refs: 1}
 	casShared[key] = s
 	return s, nil
 }
@@ -144,38 +160,34 @@ func (s *sharedCas) close() error {
 	if s.refs--; s.refs > 0 {
 		return nil
 	}
-	delete(casShared, s.dir)
+	delete(casShared, s.key)
 	return s.Store.Close()
 }
 
-// casRoot, when set, moves the spool and the chunk cache OUT of each data
-// directory into ONE shared place. That is the fleet's rule (DESIGN.md "THE
-// FLEET"): N chains in one process share one casfs, so the SSD-tier LRU is
-// global across chains, a dead chain drains to zero and a hot one takes what it
-// needs. Cross-chain collisions are impossible because artifacts are named by
-// their content hash, and the only per-chain state (the epoch markers, the
-// local `latest`) still lives in each chain's own data dir. Set it once at
-// startup before any Open; empty keeps every store self-contained.
-var casRoot string
-
-// SetRoot points every later Open/Local at a shared spool and chunk cache.
-func SetRoot(dir string) { casRoot = dir }
-
-func rootFor(dataDir string) string {
-	if casRoot != "" {
-		return casRoot
+// cacheRoot is where the chunk cache lives, and it is THE ONLY THING SEVERAL
+// CHAIN PROCESSES SHARE (RULING 2026-08-04: one process = one chain). Default
+// <data>/cache, i.e. self-contained; EPOCHDB_CACHE_DIR points N processes at
+// one directory and they then share one elastic LRU, with zero coordination:
+// casfs evicts whole windows and tolerates a chunk vanishing under it, so a
+// sibling's eviction costs a refetch and never a wrong answer.
+//
+// The SPOOL is deliberately NOT shared: it is one chain's durable, not-yet-
+// uploaded artifacts, and it stays at <data>/cas with the epoch markers and the
+// local `latest` that name them.
+func cacheRoot(dataDir string) string {
+	if dir := os.Getenv("EPOCHDB_CACHE_DIR"); dir != "" {
+		return dir
 	}
-	return dataDir
+	return filepath.Join(dataDir, cacheName)
 }
 
-// chainKey names this chain inside the shared chunk cache
-// (<root>/cache/<window>/<chainKey>/...). It is THE DATA DIRECTORY'S OWN NAME,
-// which needs no plumbing at all and is already the right string: in a fleet
-// each chain's dir IS its blockchainID (resolveServeChain), the same id
-// /status and /ext/bc/<id>/rpc use, so `du -sh cache/*/<blockchainID>` and
-// `rm -r cache/*/<blockchainID>` name a chain the way an operator already
-// does. Solo, the cache root is inside that one chain's dir anyway, so the
-// level is pure legibility and the layout stays identical either way.
+// chainKey names this chain inside the chunk cache
+// (<cacheRoot>/<window>/<chainKey>/...). It is THE DATA DIRECTORY'S OWN NAME,
+// which needs no plumbing at all and is already the right string: a chain's dir
+// is the one thing an operator names it by, so `du -sh <cache>/*/<dir>` and
+// `rm -r <cache>/*/<dir>` name a chain the way an operator already does. With
+// the default cache root the level is pure legibility, since that root is
+// inside the one chain's dir anyway, and the layout stays identical either way.
 //
 // The chain root hex would be the other candidate, since it qualifies the tip
 // pointer, but dist does not have it until SetLatest: it comes from a P-chain
@@ -218,13 +230,12 @@ func Open(dataDir string) (*Store, error) {
 		}
 		maxAge = d
 	}
-	root := rootFor(dataDir)
-	cacheDir := filepath.Join(root, cacheName)
-	os.RemoveAll(filepath.Join(root, legacyCacheName))
+	cacheDir := cacheRoot(dataDir)
+	os.RemoveAll(filepath.Join(dataDir, legacyCacheName))
 	// Empty keys are not an error: casfs falls back to the AWS default chain,
 	// which is what makes an SSO session or an instance role work with nothing
 	// but an endpoint and a bucket set.
-	cas, err := openCas(cacheDir, casfs.Config{
+	cas, err := openCas(cacheDir, s.spool, casfs.Config{
 		Endpoint:     endpoint,
 		Region:       os.Getenv("EPOCHDB_S3_REGION"),
 		Bucket:       os.Getenv("EPOCHDB_S3_BUCKET"),
@@ -247,7 +258,7 @@ func Open(dataDir string) (*Store, error) {
 // Local builds a store that never talks to S3 whatever the environment says
 // (tests, tools, and any node run without credentials).
 func Local(dataDir string) (*Store, error) {
-	s := &Store{dir: dataDir, spool: filepath.Join(rootFor(dataDir), spoolName)}
+	s := &Store{dir: dataDir, spool: filepath.Join(dataDir, spoolName)}
 	if err := os.MkdirAll(s.spool, 0o755); err != nil {
 		return nil, err
 	}

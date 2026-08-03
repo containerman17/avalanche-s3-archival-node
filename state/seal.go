@@ -660,9 +660,9 @@ func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
 // per kill is exactly what a crunch cannot afford.
 //
 // The data dir belongs to this seal alone (single-caller by contract), so its
-// scratch goes unconditionally. The spool may be SHARED with sibling chains in
-// a fleet, so a half-written artifact goes only once it is a day old and
-// therefore cannot belong to a live build (an epoch takes ~2h at the worst
+// scratch goes unconditionally. The spool is this chain's alone since 2026-08-04, but a
+// half-written artifact still goes only once it is a day old and therefore
+// cannot belong to a live build (a second tool over the same dir) (an epoch takes ~2h at the worst
 // size the schedule allows).
 func sweepSealScratch(out *dist.Store) {
 	dirs, _ := filepath.Glob(filepath.Join(out.Dir(), sealTmpPrefix+"*"))

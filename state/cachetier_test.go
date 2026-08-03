@@ -149,26 +149,27 @@ func wipeCache(t *testing.T, dir string) {
 	}
 }
 
-// TestSharedSpoolKeepsOneLatestPerChain is the fleet's pointer namespace: N
-// chains through ONE casfs (dist.SetRoot, so one spool and one bucket prefix)
-// each publish a tip, and neither the shared spool nor the bucket may let one
-// overwrite the other's. A consumer that has only the bucket then resolves each
-// chain's tip from its chain root alone, which is the single-chain bootstrap
-// path (`epochdb bootstrap`) reading a fleet's output.
-func TestSharedSpoolKeepsOneLatestPerChain(t *testing.T) {
+// TestSharedBucketKeepsOneLatestPerChain is the pointer namespace: two chain
+// PROCESSES (own data dir each, RULING 2026-08-04) publishing into ONE bucket
+// prefix, and the bucket may not let one chain's tip overwrite the other's. A
+// consumer that has only the bucket then resolves each chain's tip from its
+// chain root alone. They also share ONE chunk cache here, which is the whole
+// coordination between them: EPOCHDB_CACHE_DIR, no spool sharing, no process
+// sharing, nothing to agree on.
+func TestSharedBucketKeepsOneLatestPerChain(t *testing.T) {
 	s3 := newFakeS3(t)
 	t.Setenv("EPOCHDB_S3_ENDPOINT", s3.URL)
 	t.Setenv("EPOCHDB_S3_BUCKET", "epochs")
 	t.Setenv("EPOCHDB_S3_ACCESS_KEY", "ak")
 	t.Setenv("EPOCHDB_S3_SECRET_KEY", "sk")
 
-	fleetRoot := t.TempDir()
-	dist.SetRoot(fleetRoot)
-	t.Cleanup(func() { dist.SetRoot("") })
+	box := t.TempDir()
+	cache := filepath.Join(box, "shared-cache")
+	t.Setenv("EPOCHDB_CACHE_DIR", cache)
 
 	rootA, rootB := [32]byte{0xaa, 1}, [32]byte{0xbb, 2}
 	open := func(name string) *dist.Store {
-		dir := filepath.Join(fleetRoot, name)
+		dir := filepath.Join(box, name)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -177,6 +178,10 @@ func TestSharedSpoolKeepsOneLatestPerChain(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { st.Close() })
+		// The cache is the shared one, so nothing landed in the data dir.
+		if _, err := os.Stat(filepath.Join(dir, "cache")); !os.IsNotExist(err) {
+			t.Fatalf("%s cached inside its data dir despite EPOCHDB_CACHE_DIR: %v", name, err)
+		}
 		return st
 	}
 	a, b := open("chain-a"), open("chain-b")
@@ -192,15 +197,18 @@ func TestSharedSpoolKeepsOneLatestPerChain(t *testing.T) {
 	if err := b.SetLatest(rootB, dist.Latest{Epoch: hb}); err != nil {
 		t.Fatal(err)
 	}
-	// One Sync for the whole fleet: the stores share the casfs, so a sibling's
-	// would upload the same spool again (see fleetMain's single syncLoop).
+	// Each process uploads its OWN spool: the spool is per chain now, and only
+	// the cache is shared.
 	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(); err != nil {
 		t.Fatal(err)
 	}
 
 	// The consumer is a fresh box: its own spool and cache, nothing local, the
 	// same bucket.
-	dist.SetRoot("")
+	os.Unsetenv("EPOCHDB_CACHE_DIR")
 	c, err := dist.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,13 +11,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 
@@ -29,16 +30,18 @@ import (
 	"github.com/containerman17/epochdb/verify"
 )
 
-// serveMain is `epochdb serve`, THE ONLY OPERATOR COMMAND (RULING 2026-08-03).
-// ONE process that follows the chain, executes, indexes, seals, publishes and
-// serves RPC continuously, for ONE chain or for N of them (`--chains`, which is
-// what `epochdb fleet` used to be). No restarts, ever, and no static mode:
-// following is what a node does (ruling 2026-07-29). The serve process is the
-// sole writer and sole server of its data dir; side consumers use its RPC port.
+// serveMain is `epochdb serve`, THE ONLY OPERATOR COMMAND (RULING 2026-08-03),
+// hosting exactly ONE CHAIN (RULING 2026-08-04). One process that follows the
+// chain, executes, indexes, seals, publishes and serves RPC continuously. No
+// restarts, ever, and no static mode: following is what a node does (ruling
+// 2026-07-29). The serve process is the sole writer and sole server of its data
+// dir; side consumers use its RPC port.
 //
-// Everything genuinely multi-chain lives in fleet.go (the supervisor, the
-// per-chain failure boundary and /status): N chains are N of the stack below
-// side by side, and that IS the whole difference.
+// SEVERAL CHAINS ON A BOX ARE SEVERAL PROCESSES, one container each, sharing
+// EPOCHDB_CACHE_DIR. Nothing here coordinates them: the windowed chunk cache is
+// cross-process by construction, so the fleet supervisor that used to be the
+// coordination layer is gone, and per-chain failure isolation is the OS's job.
+// A chain that cannot start exits nonzero and the orchestrator restarts it.
 //
 // Who owns what:
 //
@@ -71,40 +74,29 @@ import (
 // the ordering that makes deleting raw safe under a live reader.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "data directory. ONE chain owns it; with two or more --chains each chain gets <data>/<blockchainID> and they share <data>/cas and <data>/cache")
-	port := fs.Int("port", 9650, "HTTP listen port; every chain also answers at /ext/bc/<blockchainID>/rpc, and /status reports all of them")
-	network := fs.String("network", "fuji", "network: fuji|mainnet (the network the chains live on)")
+	dataDir := fs.String("data", "./data", "data directory; ONE chain owns it, and this process serves that one chain")
+	port := fs.Int("port", 9650, "HTTP listen port; the chain answers at / and at /ext/bc/<blockchainID>/rpc, and /status reports it")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the network --chain lives on)")
 	chainSpec := fs.String("chain", "C", "chain: C for --network's primary C-chain, or an L1's blockchainID")
-	chainsSpec := fs.String("chains", "", "several chains in ONE process, comma-separated (C or blockchainIDs); one entry is exactly --chain")
-	doVerify := fs.Bool("verify", false, "before serving, re-verify every SEALED epoch of each chain with the full no-execution engine (diff-applied state roots, txRoot, receiptsRoot reconstructed from the stored logs, header chain). Pulls every byte of the corpus; a chain that fails does not start")
+	doVerify := fs.Bool("verify", false, "before serving, re-verify every SEALED epoch with the full no-execution engine (diff-applied state roots, txRoot, receiptsRoot reconstructed from the stored logs, header chain). Pulls every byte of the corpus; a failure means the process does not start")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: --node URI only, with a warning")
-	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default: the public endpoint for each chain's networkID)")
-	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB, PER CHAIN (0 disables)")
+	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default: the public endpoint for the chain's networkID)")
+	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
 	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook (index + txindex) that drags the historical window up to the head, and for the seal that rides it")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
-	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks). With several --chains it is per chain: <chain>=<containerID>[,...]")
-	walks := fs.Int("walks", 16, "concurrent backward walks per overridden chain (--tip-override)")
+	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
+	walks := fs.Int("walks", 16, "concurrent backward walks (--tip-override)")
 	syncEvery := fs.Duration("sync-every", 5*time.Minute, "cadence for uploading spooled artifacts to the bucket and releasing the local copies (no-op without S3 credentials)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
 
-	specs, err := serveSpecs(*chainSpec, *chainsSpec)
-	if err != nil {
-		log.Fatalf("epochdb: serve: %v", err)
-	}
-	// SOLO is the shape of every corpus that exists and of the docker example:
-	// one chain, and --data IS its directory. Two or more chains cannot share a
-	// directory, so they get one each under --data.
-	solo := len(specs) == 1
-	overrides, err := parseTipOverrides(*tipOverride, specs)
-	if err != nil {
-		log.Fatalf("epochdb: serve: --tip-override: %v", err)
-	}
-	if !solo {
-		// Before any store opens: one spool and one chunk cache for the whole
-		// process, which makes the SSD-tier LRU global across chains. Safe
-		// because artifacts are named by content hash.
-		dist.SetRoot(*dataDir)
+	// Bad flag values die before anything binds or dials.
+	var tip ids.ID
+	if *tipOverride != "" {
+		var err error
+		if tip, err = parseTipOverride(*tipOverride); err != nil {
+			log.Fatalf("epochdb: serve: --tip-override: %v", err)
+		}
 	}
 	if *pprofAddr != "" {
 		go func() { log.Printf("epochdb: pprof: %v", http.ListenAndServe(*pprofAddr, nil)) }()
@@ -116,25 +108,37 @@ func serveMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// A chain that dies takes down the PROCESS only when it is the only chain
-	// there is (RULING 2026-08-03): with siblings serving, a dead chain is a
-	// /status entry and nothing more.
-	dead := make(chan string, 1)
-	f := &fleet{}
-	if solo {
-		f.onFail = func(id string) {
+	// THE FAILURE MODEL, whole (RULING 2026-08-04): a component that dies takes
+	// the process with it, nonzero, after flushing. There is nothing left to
+	// serve and nothing to keep alive for a sibling, so restart-on-exit is the
+	// isolation, and that is the orchestrator's job.
+	dead := make(chan error, 1)
+	report := func(what string, err error) {
+		switch {
+		case err == nil:
+			log.Printf("epochdb: serve: %s finished; the chain keeps serving", what)
+		case errors.Is(err, context.Canceled):
+			log.Printf("epochdb: serve: %s stopped: %v", what, err)
+		default:
 			select {
-			case dead <- id:
+			case dead <- fmt.Errorf("%s: %w", what, err):
 			default:
 			}
 		}
 	}
+
+	// /status answers from the bind, i.e. through the hour of startup work, so
+	// the handler reads the node through a pointer that is nil until it is up.
+	var node atomic.Pointer[chainNode]
 	mux := http.NewServeMux()
-	mux.HandleFunc("/status", f.statusHandler)
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(statusOf(*chainSpec, node.Load()))
+	})
 	srv := &http.Server{Handler: mux}
 	exit := 0
 
-	err = serveOn(*port, func(ln net.Listener) {
+	err := serveOn(*port, func(ln net.Listener) {
 		go func() {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("epochdb: serve: FATAL rpc listener: %v", err)
@@ -142,110 +146,71 @@ func serveMain(args []string) {
 			}
 		}()
 
-		var first *chainNode
-		kind, seen := chain.VMKind(""), map[string]bool{}
-		for _, spec := range specs {
-			dir, c, err := resolveServeChain(ctx, spec, execNetID(*network), *dataDir, solo)
-			if err != nil {
-				f.fail(spec, err)
-				continue
-			}
-			id := c.BlockchainID.String()
-			// libevm's extras registry is process-global: a second kind in this
-			// process panics on registration, which is why the C-chain (coreth)
-			// runs in its own process.
-			if kind != "" && c.VMKind != kind {
-				f.fail(id, fmt.Errorf("this chain is %s but the process is already running %s: libevm extras are process-global, so it needs a process of its own", c.VMKind, kind))
-				continue
-			}
-			kind = c.VMKind
-			if seen[id] {
-				f.fail(id, errors.New("listed twice in --chains"))
-				continue
-			}
-			seen[id] = true
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		c, err := chain.Resolve(rctx, *chainSpec, execNetID(*network), *dataDir)
+		cancel()
+		if err != nil {
+			log.Fatalf("epochdb: serve: --chain %s: %v", *chainSpec, err)
+		}
+		id := c.BlockchainID.String()
 
-			cfg := nodeConfig{
-				DataDir:       dir,
-				Chain:         c,
-				NodeURI:       *nodeURI,
-				StateCacheGiB: *stateCacheGiB,
-				PerPeer:       *perPeer,
-				CookEvery:     *cookEvery,
-				Verify:        *doVerify,
-			}
-			// The descriptor, not --network, names the network to dial: it is
-			// what the dir was built with, and an L1 on mainnet under the
-			// default `--network fuji` would otherwise dial the wrong network's
-			// bootstrap node.
-			if cfg.NodeURI == "" {
-				_, cfg.NodeURI, _ = netParams(avaconstants.NetworkIDToNetworkName[c.NetworkID])
-			}
-			if *vdrSources != "" {
-				cfg.VdrSources = strings.Split(*vdrSources, ",")
-			}
-			if !solo {
-				cfg.Label = id[:8]
-			}
-			if tip, ok := overrides[spec]; ok {
-				// Same process, same staging store, different source of blocks:
-				// a bounded backfill instead of the consensus tip (fixed-corpus
-				// builds and integration runs). Everything else is identical.
-				log.Printf("epochdb: serve: %s backfills to container %s instead of following", id, tip)
-				cfg.Backfill = func(ctx context.Context, fe *fetch.Fetcher) error {
-					return fe.SyncTo(ctx, resolveTipOverride(ctx, fe, tip), *walks)
-				}
-			}
-			if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-				f.fail(id, err)
-				continue
-			}
-			// A chain that cannot start is a chain that does not start. The
-			// process is not allowed to die of one bad data directory, at boot
-			// any more than at runtime.
-			fc, err := f.add(ctx, id, cfg)
-			if err != nil {
-				f.fail(id, err)
-				continue
-			}
-			// avalanchego's own routing, so wallets, subnets.avax.network
-			// tooling and the ab-benches all point at a chain unchanged. /ws is
-			// the same handler: rpc.Server upgrades websockets itself.
-			mux.Handle("/ext/bc/"+id+"/rpc", fc.node.srv)
-			mux.Handle("/ext/bc/"+id+"/ws", fc.node.srv)
-			if solo {
-				// One chain owns the port at every path, which is what every
-				// existing script, bench and docker run points at.
-				mux.Handle("/", fc.node.srv)
-			}
-			if first == nil {
-				first = fc.node
-			}
-			log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc), executed=%d cooked=%d chainId=%s (cook every %s)",
-				id, *port, id, fc.node.e.LiveHead(), fc.node.hist.StateHead(), fc.node.chainID, *cookEvery)
+		cfg := nodeConfig{
+			DataDir:       *dataDir,
+			Chain:         c,
+			NodeURI:       *nodeURI,
+			StateCacheGiB: *stateCacheGiB,
+			PerPeer:       *perPeer,
+			CookEvery:     *cookEvery,
+			Verify:        *doVerify,
 		}
-		if first == nil {
-			if solo {
-				log.Fatalf("epochdb: serve: the chain did not start")
-			}
-			// Nothing to serve, but /status is the answer to "why", and it is
-			// already answering. Dying here would take that away.
-			log.Printf("epochdb: serve: NO CHAIN STARTED; the process stays up on :%d and /status says why", *port)
-		} else {
-			// One syncLoop for the shared spool; any chain's store reaches the
-			// same casfs.
-			go syncLoop(ctx, first.store.Cas(), *syncEvery)
+		// The descriptor, not --network, names the network to dial: it is what
+		// the dir was built with, and an L1 on mainnet under the default
+		// `--network fuji` would otherwise dial the wrong network's bootstrap
+		// node.
+		if cfg.NodeURI == "" {
+			_, cfg.NodeURI, _ = netParams(avaconstants.NetworkIDToNetworkName[c.NetworkID])
 		}
+		if *vdrSources != "" {
+			cfg.VdrSources = strings.Split(*vdrSources, ",")
+		}
+		if *tipOverride != "" {
+			// Same process, same staging store, different source of blocks: a
+			// bounded backfill instead of the consensus tip (fixed-corpus builds
+			// and integration runs). Everything else is identical.
+			log.Printf("epochdb: serve: %s backfills to container %s instead of following", id, tip)
+			cfg.Backfill = func(ctx context.Context, fe *fetch.Fetcher) error {
+				return fe.SyncTo(ctx, resolveTipOverride(ctx, fe, tip), *walks)
+			}
+		}
+		if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+			log.Fatalf("epochdb: serve: %v", err)
+		}
+		n, err := startNode(ctx, cfg, report)
+		if err != nil {
+			log.Fatalf("epochdb: serve: %s did not start: %v", id, err)
+		}
+		node.Store(n)
+		// / is what every existing script, bench and docker run points at;
+		// /ext/bc/<id>/rpc is avalanchego's own routing, so wallets,
+		// subnets.avax.network tooling and the ab-benches point at this chain
+		// unchanged. /ws is the same handler: rpc.Server upgrades websockets
+		// itself.
+		mux.Handle("/ext/bc/"+id+"/rpc", n.srv)
+		mux.Handle("/ext/bc/"+id+"/ws", n.srv)
+		mux.Handle("/", n.srv)
+		log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc), executed=%d cooked=%d chainId=%s (cook every %s)",
+			id, *port, id, n.e.LiveHead(), n.hist.StateHead(), n.chainID, *cookEvery)
+		go syncLoop(ctx, n.store.Cas(), *syncEvery)
 
 		select {
 		case <-ctx.Done():
 			log.Printf("epochdb: serve: shutting down, flushing")
-		case id := <-dead:
+		case err := <-dead:
 			// The writers close before we die, so the restart is a clean resume
 			// rather than a crash walk-back. stop() cancels ctx first, because
 			// closeAll waits for the executor goroutine to return before it
 			// releases the executor's writers.
-			log.Printf("epochdb: FATAL: %s stopped and it is the only chain", id)
+			log.Printf("epochdb: serve: FATAL: %v", err)
 			stop()
 			exit = 1
 		}
@@ -254,7 +219,7 @@ func serveMain(args []string) {
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		srv.Shutdown(sctx)
 		cancel()
-		f.closeAll()
+		n.closeAll()
 	})
 	if err != nil {
 		log.Fatalf("epochdb: serve: %v", err)
@@ -264,67 +229,51 @@ func serveMain(args []string) {
 	}
 }
 
-// serveSpecs reconciles --chain and --chains. They are ONE knob: --chains with a
-// single entry is exactly --chain (same data dir, same everything), and only two
-// or more entries change anything. --chains wins when both are given, because
-// --chain has a default and cannot be told apart from an unset flag.
-func serveSpecs(one, many string) ([]string, error) {
-	if strings.TrimSpace(many) == "" {
-		if one = strings.TrimSpace(one); one == "" {
-			return nil, errors.New("--chain is empty (C, or an L1's blockchainID)")
-		}
-		return []string{one}, nil
-	}
-	var specs []string
-	seen := map[string]bool{}
-	for _, spec := range strings.Split(many, ",") {
-		if spec = strings.TrimSpace(spec); spec == "" {
-			continue
-		}
-		// A blockchainID is cb58 and IS case-sensitive; only the C alias folds.
-		key := spec
-		if strings.EqualFold(spec, "C") {
-			key = "C"
-		}
-		if seen[key] {
-			return nil, fmt.Errorf("--chains lists %q twice", spec)
-		}
-		seen[key] = true
-		specs = append(specs, spec)
-	}
-	if len(specs) == 0 {
-		return nil, errors.New("--chains is empty (comma-separated chain IDs, or C)")
-	}
-	return specs, nil
+// serveStatus is /status: ONE chain, because a process is one chain (RULING
+// 2026-08-04). An aggregate over the chains of a box is an orchestrator's
+// concern, not ours: it polls one of these per container.
+//
+// The cache block is the chunk tier's own account of itself. CacheHorizon is
+// the age of the window its eviction worker last deleted from, i.e. how far
+// back this node's disk actually reaches before a read costs a GET, and it
+// counts what SIBLING PROCESSES evicted too, since the cache is shared. Empty
+// until something has been evicted, which is the honest answer for a node whose
+// cache has never filled.
+type serveStatus struct {
+	Chain        string `json:"chain"`
+	Serving      bool   `json:"serving"`
+	Accepted     uint64 `json:"accepted"`
+	Executed     uint64 `json:"executed"`
+	Cooked       uint64 `json:"cooked"`
+	CacheHorizon string `json:"cacheHorizon,omitempty"`
+	CacheEvicted uint64 `json:"cacheEvictions,omitempty"`
+	CacheRefused uint64 `json:"cacheRefusals,omitempty"`
+	CacheFree    int64  `json:"cacheFreeBytes,omitempty"`
+	CacheMinFree int64  `json:"cacheMinFreeBytes,omitempty"`
 }
 
-// resolveServeChain resolves ONE --chains entry to its descriptor and the data
-// directory it owns, and it is the only place the solo/multi layout difference
-// lives: solo, the chain IS --data (every existing corpus and the docker
-// example); multi, it is <data>/<blockchainID>, which is also where its cached
-// descriptor and its optional upgrade.json live.
-func resolveServeChain(ctx context.Context, spec string, networkID uint32, root string, solo bool) (string, *chain.Chain, error) {
-	dir := root
-	if !solo {
-		// The dir is named by the blockchainID, which for an L1 IS the spec;
-		// only "C" has to be resolved to its ID first.
-		key := spec
-		if strings.EqualFold(spec, "C") {
-			id, _, err := chain.PrimaryC(networkID)
-			if err != nil {
-				return "", nil, err
-			}
-			key = id.String()
+// statusOf builds that answer. n is nil between the bind and the moment the
+// chain is up, which is minutes to hours on a cold dir: serving=false and the
+// spec the operator asked for is the whole honest answer there.
+func statusOf(spec string, n *chainNode) serveStatus {
+	if n == nil {
+		return serveStatus{Chain: spec}
+	}
+	s := serveStatus{
+		Chain:    n.cfg.Chain.BlockchainID.String(),
+		Serving:  true,
+		Accepted: n.accepted(),
+		Executed: n.e.LiveHead(),
+		Cooked:   n.hist.StateHead(),
+	}
+	if cs, ok := n.store.Cas().CacheStats(); ok {
+		if cs.VictimAge > 0 {
+			s.CacheHorizon = cs.VictimAge.String()
 		}
-		dir = filepath.Join(root, key)
+		s.CacheEvicted, s.CacheRefused = cs.Evictions, cs.Refusals
+		s.CacheFree, s.CacheMinFree = cs.FreeBytes, cs.MinFree
 	}
-	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	c, err := chain.Resolve(rctx, spec, networkID, dir)
-	if err != nil {
-		return "", nil, err
-	}
-	return dir, c, nil
+	return s
 }
 
 // serveOn binds the RPC port and ONLY THEN does the startup work on it. The
@@ -374,17 +323,16 @@ func verifySealed(cfg nodeConfig) error {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	cfg.logf("verify: re-verifying the sealed epochs before serving; this reads the whole corpus")
+	logf("verify: re-verifying the sealed epochs before serving; this reads the whole corpus")
 	blocks, wall, err := verify.VerifySet(st, tmp, cfg.Chain, 0)
 	if err != nil {
 		return fmt.Errorf("FAIL after %d blocks in %s: %w", blocks, wall.Round(time.Second), err)
 	}
-	cfg.logf("verify: PASS, %d sealed blocks in %s", blocks, wall.Round(time.Second))
+	logf("verify: PASS, %d sealed blocks in %s", blocks, wall.Round(time.Second))
 	return nil
 }
 
-// nodeConfig is everything one chain's node needs. `serve` fills one per
-// --chains entry.
+// nodeConfig is everything the node needs. `serve` fills exactly one.
 type nodeConfig struct {
 	DataDir       string
 	Chain         *chain.Chain
@@ -393,28 +341,21 @@ type nodeConfig struct {
 	StateCacheGiB int
 	PerPeer       int
 	CookEvery     time.Duration
-	// Label prefixes this node's log lines so a fleet's chains are
-	// distinguishable. Empty keeps single-chain serve's log format verbatim.
-	Label string
 	// Backfill replaces the consensus follower with a bounded walk
 	// (serve --tip-override). nil follows the live tip.
 	Backfill func(context.Context, *fetch.Fetcher) error
-	// Verify re-verifies this chain's SEALED epochs before it serves anything
-	// (serve --verify). A failure means this chain does not start.
+	// Verify re-verifies the SEALED epochs before the node serves anything
+	// (serve --verify). A failure means the process does not start.
 	Verify bool
 }
 
-func (c nodeConfig) logf(format string, args ...any) {
-	if c.Label != "" {
-		format = c.Label + ": " + format
-	}
-	log.Printf("epochdb: "+format, args...)
-}
+// logf is every node log line. One chain per process means the line needs no
+// chain label: the container is the label.
+func logf(format string, args ...any) { log.Printf("epochdb: "+format, args...) }
 
-// chainNode is ONE chain's running stack: follower, executor, state layer,
-// history and RPC handler, all on the caller's context. `serve` runs one;
-// `fleet` runs N of them side by side in one process, which is the entire
-// difference between the two commands.
+// chainNode is the chain's running stack: follower, executor, state layer,
+// history and RPC handler, all on the caller's context. `serve` runs exactly
+// one.
 type chainNode struct {
 	cfg      nodeConfig
 	fetcher  *fetch.Fetcher
@@ -425,19 +366,18 @@ type chainNode struct {
 	txidx    *txIndexHolder
 	accepted func() uint64
 	chainID  fmt.Stringer // eth chainId, for the startup line
-	stopOnce sync.Once
 	// execDone closes when the executor goroutine has RETURNED. Closing the
 	// executor while Run is still in a block would corrupt exactly the writers
-	// the flush exists to protect, so stop waits on this. Cancel the node's
+	// the flush exists to protect, so closeAll waits on this. Cancel the node's
 	// context first or the wait never ends.
 	execDone chan struct{}
 }
 
 // startNode wires one chain's goroutines onto ctx and returns with it running.
-// Every component goroutine's exit goes to report (fleetChain.report), which
-// stops THAT chain and nothing else. Nothing here calls log.Fatal, because the
-// process must survive one chain's bad data directory: it either recovers the
-// dir by itself or this chain refuses to start with a reason /status can show.
+// Every component goroutine's exit goes to report, which takes the process down
+// nonzero on a real failure. Nothing here calls log.Fatal: a start failure is an
+// error the caller reports and exits on, so the same code is usable from a test
+// and the flush on the way out is never skipped.
 func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err error)) (n *chainNode, err error) {
 	// THE START SEQUENCE, before a single file of this dir is opened: resolve
 	// the chain's `latest` pointer, refuse to start if it names history we
@@ -456,8 +396,8 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		}
 	}
 
-	// Unwind whatever is already open if a later step fails: in the fleet this
-	// runs while sibling chains are serving, so leaking fds is not an option.
+	// Unwind whatever is already open if a later step fails, so a start that
+	// gives up releases the Firewood handle and the mmaps it took.
 	var closers []func()
 	defer func() {
 		if err == nil {
@@ -503,7 +443,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	var onBlock atomic.Pointer[func(uint64, common.Hash)]
 	// exec.New stamps the data dir with the VM kind and refuses a dir built by
 	// the other one (state.Store.BindVMKind): that check is what keeps a
-	// subnet-evm fleet from opening a coreth corpus.
+	// subnet-evm node from opening a coreth corpus.
 	e, err := exec.New(exec.Config{
 		DataDir: cfg.DataDir,
 		Blocks:  blocks,
@@ -571,7 +511,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	if err != nil {
 		return nil, fmt.Errorf("tail overlay: %w", err)
 	}
-	cfg.logf("tail overlay: cooked=%d executed=%d, backfilled %d uncooked blocks (%d entries, %.1fMB)",
+	logf("tail overlay: cooked=%d executed=%d, backfilled %d uncooked blocks (%d entries, %.1fMB)",
 		hist.StateHead(), e.LiveHead(), tailBlocks, tailEntries, float64(tailBytes)/1e6)
 
 	// --- RPC -----------------------------------------------------------------
@@ -608,29 +548,21 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	return n, nil
 }
 
-// stop flushes and releases what a STOPPED chain must not leave dirty: the
-// executor's open batch, the state watermark and the Firewood handle, all of
-// which the executor alone touches. It deliberately does NOT close the state
-// layer, the history or the staging store: the RPC goroutines read their
-// mmaps, and a use-after-close there is a segfault, i.e. exactly the
-// process-wide failure the per-chain boundary exists to prevent. A stopped
-// chain keeps answering frozen data until the process restarts.
-func (n *chainNode) stop() {
-	n.stopOnce.Do(func() {
-		<-n.execDone
-		if err := n.e.Close(); err != nil {
-			n.cfg.logf("executor close: %v", err)
-		}
-	})
-}
-
 // closeAll is the clean process-shutdown path: every writer flushed and
-// released, executor first (it is the only writer of the state layer). Safe
-// only once the RPC listener is done with this node.
+// released, executor first (it is the only writer of the state layer, and the
+// holder of the open batch, the state watermark and the Firewood handle).
+//
+// CANCEL THE NODE'S CONTEXT FIRST or the wait on execDone never ends: closing
+// the executor while Run is still inside a block would corrupt exactly the
+// writers the flush exists to protect. Safe only once the RPC listener is done
+// with this node, because it unmaps files those goroutines read.
 func (n *chainNode) closeAll() {
-	n.stop()
+	<-n.execDone
+	if err := n.e.Close(); err != nil {
+		logf("executor close: %v", err)
+	}
 	if err := n.fetcher.Close(); err != nil {
-		n.cfg.logf("fetch close: %v", err)
+		logf("fetch close: %v", err)
 	}
 	n.hist.Close()
 	n.store.Close()
@@ -715,19 +647,19 @@ func (n *chainNode) cookOnce(ctx context.Context) {
 	start := time.Now()
 	dir, hist := n.cfg.DataDir, n.hist
 	if err := state.CookIndex(dir); err != nil {
-		n.cfg.logf("COOK FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
+		logf("COOK FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
 		return
 	}
 	if err := state.CookTxIndex(dir); err != nil {
-		n.cfg.logf("COOK-TXINDEX FAILED (tail tx lookups frozen, chain unaffected): %v", err)
+		logf("COOK-TXINDEX FAILED (tail tx lookups frozen, chain unaffected): %v", err)
 	}
 	if err := hist.Refresh(); err != nil {
-		n.cfg.logf("HISTORY REFRESH FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
+		logf("HISTORY REFRESH FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
 		return
 	}
 	n.txidx.reopen(dir, hist.Epochs())
 	entries, size := hist.PruneTail()
-	n.cfg.logf("cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
+	logf("cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
 		hist.StateHead(), time.Since(start).Round(time.Millisecond), entries, float64(size)/1e6)
 	n.sealOnce(ctx)
 }
@@ -754,17 +686,17 @@ func (n *chainNode) sealOnce(ctx context.Context) {
 	epochs, sealedEnd, err := n.hist.SealTail(ctx, n.cfg.Chain.Root(), func(end uint64) {
 		n.fetcher.SetFloor(end)
 		if err := n.fetcher.Store().Retire(end); err != nil {
-			n.cfg.logf("seal: retiring staging segments: %v", err)
+			logf("seal: retiring staging segments: %v", err)
 		}
 	})
 	if err != nil {
-		n.cfg.logf("SEAL FAILED (history stays raw, chain unaffected): %v", err)
+		logf("SEAL FAILED (history stays raw, chain unaffected): %v", err)
 		return
 	}
 	if epochs == 0 {
 		return
 	}
-	n.cfg.logf("seal: %d epoch(s) cut, sealed through %d, raw retired (in %s)",
+	logf("seal: %d epoch(s) cut, sealed through %d, raw retired (in %s)",
 		epochs, sealedEnd, time.Since(start).Round(time.Millisecond))
 }
 
@@ -777,12 +709,12 @@ func (n *chainNode) statusLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		n.cfg.logf("serve: %s", n.status())
+		logf("serve: %s", n.status())
 	}
 }
 
-// status is the one-line health of this chain, shared by the log loop and the
-// fleet's /status endpoint.
+// status is the one-line health of this chain, for the log loop. /status
+// answers with the structured twin (statusOf).
 func (n *chainNode) status() string {
 	acc, ex := n.accepted(), n.e.LiveHead()
 	entries, size := n.hist.TailStats()
