@@ -80,15 +80,15 @@ func TestMinioRoundTrip(t *testing.T) {
 		t.Fatal("a view straddling a chunk boundary differs")
 	}
 
-	// And the cache really was written: window directories with chunk files in
-	// them, not an empty tree that happened to serve from memory.
+	// And the cache really was written: <cache>/<window>/<chain>/ with chunk
+	// files in it, not an empty tree that happened to serve from memory.
 	wins, err := os.ReadDir(filepath.Join(dir, cacheName))
 	if err != nil || len(wins) == 0 {
 		t.Fatalf("no window directories after a full read: %v", err)
 	}
 	var files int
 	for _, w := range wins {
-		ents, err := os.ReadDir(filepath.Join(dir, cacheName, w.Name()))
+		ents, err := os.ReadDir(filepath.Join(dir, cacheName, w.Name(), chainKey(dir)))
 		if err != nil {
 			t.Fatal(err)
 		}

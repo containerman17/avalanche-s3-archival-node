@@ -8,7 +8,7 @@ package main
 //   - ONE VM KIND. libevm's extras registry is process-global and panics on
 //     re-registration, so every chain must be the same kind; a chain that is not
 //     refuses to start and its siblings carry on (serveMain's loop).
-//   - ONE CASFS. dist.SetRoot puts the spool and the chunk cache at the --data
+//   - ONE CASFS. dist.SetRoot puts the spool and <data>/cache at the --data
 //     root instead of inside each chain's dir, which makes the SSD-tier LRU
 //     global across chains. Safe because artifacts are named by content hash.
 //     One syncLoop, not N: the stores share the underlying casfs.

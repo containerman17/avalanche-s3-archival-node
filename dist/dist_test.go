@@ -105,7 +105,7 @@ func TestStoreLocalRoundtrip(t *testing.T) {
 
 // TestPointersOutsideChunkCache pins the one thing that made the credentialed
 // path eat its own metadata: casfs deletes everything in its cache directory
-// that is not one of its sharded artifact files, so no pointer may live there.
+// that is not one of its own window directories, so no pointer may live there.
 func TestPointersOutsideChunkCache(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Local(dir)

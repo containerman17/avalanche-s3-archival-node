@@ -53,12 +53,18 @@ const (
 	ChunkSize = casfs.DefaultChunkSize
 
 	spoolName = "cas" // <data>/cas/<hash>: durable until uploaded
-	// cacheName is the casfs chunk cache, disposable. It must NOT collide with
-	// a pointer name: casfs owns its cache directory and deletes everything in
+	// cacheName is the casfs chunk cache, disposable, laid out as
+	// <data>/cache/<window>/<chain>/<hash>.<index>. It must NOT collide with a
+	// pointer name: casfs owns its cache directory and deletes everything in
 	// it that is not one of its own window directories, so a cache dir named
 	// "chunks" silently ate the chunk-list pointers at <data>/chunks/<hash>
-	// the moment a credentialed store opened.
-	cacheName = "chunkcache"
+	// the moment a credentialed store opened. Nothing is published under
+	// "cache".
+	cacheName = "cache"
+	// legacyCacheName was the same thing until 2026-08-03. It is deleted on
+	// sight rather than left to rot, because the cache is disposable by
+	// construction and a stale one is pure wasted disk.
+	legacyCacheName = "chunkcache"
 )
 
 // View is a long-lived window onto an artifact, one mapping per 4MB chunk.
@@ -162,6 +168,29 @@ func rootFor(dataDir string) string {
 	return dataDir
 }
 
+// chainKey names this chain inside the shared chunk cache
+// (<root>/cache/<window>/<chainKey>/...). It is THE DATA DIRECTORY'S OWN NAME,
+// which needs no plumbing at all and is already the right string: in a fleet
+// each chain's dir IS its blockchainID (resolveServeChain), the same id
+// /status and /ext/bc/<id>/rpc use, so `du -sh cache/*/<blockchainID>` and
+// `rm -r cache/*/<blockchainID>` name a chain the way an operator already
+// does. Solo, the cache root is inside that one chain's dir anyway, so the
+// level is pure legibility and the layout stays identical either way.
+//
+// The chain root hex would be the other candidate, since it qualifies the tip
+// pointer, but dist does not have it until SetLatest: it comes from a P-chain
+// resolve that happens long after the store is open.
+func chainKey(dataDir string) string {
+	abs, err := filepath.Abs(dataDir)
+	if err != nil {
+		abs = dataDir
+	}
+	if base := filepath.Base(abs); base != "" && base != "." && base != string(filepath.Separator) {
+		return base
+	}
+	return "default"
+}
+
 // Open builds the store for a data directory from the environment.
 func Open(dataDir string) (*Store, error) {
 	s, err := Local(dataDir)
@@ -189,7 +218,9 @@ func Open(dataDir string) (*Store, error) {
 		}
 		maxAge = d
 	}
-	cacheDir := filepath.Join(rootFor(dataDir), cacheName)
+	root := rootFor(dataDir)
+	cacheDir := filepath.Join(root, cacheName)
+	os.RemoveAll(filepath.Join(root, legacyCacheName))
 	// Empty keys are not an error: casfs falls back to the AWS default chain,
 	// which is what makes an SSO session or an instance role work with nothing
 	// but an endpoint and a bucket set.
@@ -202,6 +233,7 @@ func Open(dataDir string) (*Store, error) {
 		SecretKey:    os.Getenv("EPOCHDB_S3_SECRET_KEY"),
 		SpoolDir:     s.spool,
 		CacheDir:     cacheDir,
+		Namespace:    chainKey(dataDir),
 		CacheMinFree: minFree,
 		CacheMaxAge:  maxAge,
 	})

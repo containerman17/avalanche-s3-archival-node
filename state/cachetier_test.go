@@ -134,16 +134,16 @@ func credStore(t *testing.T, dir string, minFree int64) (*dist.Store, *fakeS3) {
 // refuseEverything is a watermark no filesystem can be under.
 const refuseEverything = int64(1) << 62
 
-// wipeCache deletes every window directory under a data dir, i.e. what a
-// sibling process's eviction worker does to this one's cache.
+// wipeCache drops every window under a data dir, i.e. exactly what a sibling
+// process's eviction worker does to this one's cache: whole cohorts, not files.
 func wipeCache(t *testing.T, dir string) {
 	t.Helper()
-	ents, err := os.ReadDir(filepath.Join(dir, "chunkcache"))
+	ents, err := os.ReadDir(filepath.Join(dir, "cache"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range ents {
-		if err := os.RemoveAll(filepath.Join(dir, "chunkcache", e.Name())); err != nil {
+		if err := os.RemoveAll(filepath.Join(dir, "cache", e.Name())); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -368,7 +368,7 @@ func TestCredentialedEpochUnderAHostileCache(t *testing.T) {
 	if fetched, chunks := s3.rangedGets.Load(), (want.blob.Size()+dist.ChunkSize-1)/dist.ChunkSize; fetched <= int64(chunks) {
 		t.Fatalf("%d ranged GETs over a %d-chunk artifact: the cache was not refusing, so this proved nothing", fetched, chunks)
 	}
-	if n, err := os.ReadDir(filepath.Join(dir, "chunkcache")); err != nil || len(n) != 0 {
+	if n, err := os.ReadDir(filepath.Join(dir, "cache")); err != nil || len(n) != 0 {
 		t.Fatalf("the cache wrote %d window dirs while over the watermark: %v", len(n), err)
 	}
 }

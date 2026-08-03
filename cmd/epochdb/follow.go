@@ -71,7 +71,7 @@ import (
 // the ordering that makes deleting raw safe under a live reader.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "data directory. ONE chain owns it; with two or more --chains each chain gets <data>/<blockchainID> and they share <data>/cas and the chunk cache")
+	dataDir := fs.String("data", "./data", "data directory. ONE chain owns it; with two or more --chains each chain gets <data>/<blockchainID> and they share <data>/cas and <data>/cache")
 	port := fs.Int("port", 9650, "HTTP listen port; every chain also answers at /ext/bc/<blockchainID>/rpc, and /status reports all of them")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (the network the chains live on)")
 	chainSpec := fs.String("chain", "C", "chain: C for --network's primary C-chain, or an L1's blockchainID")
