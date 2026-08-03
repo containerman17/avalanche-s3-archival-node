@@ -202,13 +202,23 @@ func (c *fleetChain) stopped() error {
 // ones have stopped and why. The one place an operator learns that chain 3 is
 // dead while 1, 2 and 4 are at tip.
 func (f *fleet) statusHandler(w http.ResponseWriter, r *http.Request) {
+	// The cache block is the chunk tier's own account of itself. CacheHorizon
+	// is the age of the window its eviction worker last deleted from, i.e. how
+	// far back this node's disk actually reaches before a read costs a GET.
+	// Empty until something has been evicted, which is the honest answer for a
+	// node whose cache has never filled.
 	type chainStatus struct {
-		Chain    string `json:"chain"`
-		Stopped  bool   `json:"stopped"`
-		Error    string `json:"error,omitempty"`
-		Accepted uint64 `json:"accepted"`
-		Executed uint64 `json:"executed"`
-		Cooked   uint64 `json:"cooked"`
+		Chain        string `json:"chain"`
+		Stopped      bool   `json:"stopped"`
+		Error        string `json:"error,omitempty"`
+		Accepted     uint64 `json:"accepted"`
+		Executed     uint64 `json:"executed"`
+		Cooked       uint64 `json:"cooked"`
+		CacheHorizon string `json:"cacheHorizon,omitempty"`
+		CacheEvicted uint64 `json:"cacheEvictions,omitempty"`
+		CacheRefused uint64 `json:"cacheRefusals,omitempty"`
+		CacheFree    int64  `json:"cacheFreeBytes,omitempty"`
+		CacheMinFree int64  `json:"cacheMinFreeBytes,omitempty"`
 	}
 	f.mu.Lock()
 	chains := append([]*fleetChain(nil), f.chains...)
@@ -221,6 +231,13 @@ func (f *fleet) statusHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if c.node != nil {
 			s.Accepted, s.Executed, s.Cooked = c.node.accepted(), c.node.e.LiveHead(), c.node.hist.StateHead()
+			if cs, ok := c.node.store.Cas().CacheStats(); ok {
+				if cs.VictimAge > 0 {
+					s.CacheHorizon = cs.VictimAge.String()
+				}
+				s.CacheEvicted, s.CacheRefused = cs.Evictions, cs.Refusals
+				s.CacheFree, s.CacheMinFree = cs.FreeBytes, cs.MinFree
+			}
 		}
 		out = append(out, s)
 	}

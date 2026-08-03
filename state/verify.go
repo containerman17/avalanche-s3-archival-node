@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/containerman17/epochdb/dist"
 )
 
 // WalkHeadersRange calls fn with the RLP header of every block in
@@ -27,19 +29,18 @@ func (e *Epoch) WalkContainersRange(from, to uint64, fn func(n uint64, raw []byt
 	return e.walkFramedRange(secBodies, e.sec[secBodiesIdx], from, to, fn)
 }
 
-func (e *Epoch) walkFramedRange(dataSec int, index []byte, from, to uint64, fn func(uint64, []byte) error) error {
+func (e *Epoch) walkFramedRange(dataSec int, index *dist.View, from, to uint64, fn func(uint64, []byte) error) error {
 	if from < e.Start || to > e.End()+1 || from >= to {
 		return fmt.Errorf("walk range [%d,%d) outside epoch [%d,%d]", from, to, e.Start, e.End())
 	}
 	for f := (from - e.Start) / framedGroup; f*framedGroup < to-e.Start; f++ {
-		lo := binary.LittleEndian.Uint64(index[f*8:])
-		hi := binary.LittleEndian.Uint64(index[(f+1)*8:])
-		frame, release, err := e.read(dataSec, lo, hi-lo)
+		lo := vu64(index, f*8)
+		hi := vu64(index, (f+1)*8)
+		frame, err := e.read(dataSec, lo, hi-lo)
 		if err != nil {
 			return fmt.Errorf("frame %d: %w", f, err)
 		}
 		raw, err := e.decodeAll(frame)
-		release()
 		if err != nil {
 			return fmt.Errorf("frame %d: %w", f, err)
 		}

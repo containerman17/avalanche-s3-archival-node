@@ -16,6 +16,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -70,26 +71,33 @@ func BlockHashFromHeaderRLP(headerRLP []byte) common.Hash {
 //
 // Every serialized index below is little-endian u64 words, and the READ side
 // never copies them onto the Go heap: it indexes the section bytes straight
-// out of the mapping with binary.LittleEndian.Uint64, which needs no
+// out of a dist.View with binary.LittleEndian.Uint64, which needs no
 // alignment. That is the whole of DESIGN.md ruling 3's "the Elias-Fano tx
-// index becomes a mapped byte view": the kernel tiers those pages, and the
-// caller keeps the range pinned for as long as it reads them.
+// index becomes a mapped byte view"; since the window cache the view is one
+// mapping per 4MB chunk, and a word that straddles a boundary is the one that
+// gets copied.
 
-type words []byte
+type words struct {
+	v   *dist.View
+	off int64 // byte offset of word 0 inside v
+	n   int   // words
+}
 
-func (w words) get(i int) uint64 { return binary.LittleEndian.Uint64(w[i*8:]) }
+func (w words) get(i int) uint64 {
+	return binary.LittleEndian.Uint64(w.v.Slice(w.off+int64(i)*8, 8))
+}
 
 // sliceWords returns the length-prefixed word section at pos as a view.
-func sliceWords(b []byte, pos int) (words, int, error) {
-	if pos+8 > len(b) {
-		return nil, 0, fmt.Errorf("truncated section length at %d", pos)
+func sliceWords(v *dist.View, pos int64) (words, int64, error) {
+	if pos+8 > v.Len() {
+		return words{}, 0, fmt.Errorf("truncated section length at %d", pos)
 	}
-	n := int(binary.LittleEndian.Uint64(b[pos:]))
+	n := int64(binary.LittleEndian.Uint64(v.Slice(pos, 8)))
 	pos += 8
-	if n < 0 || pos+8*n > len(b) {
-		return nil, 0, fmt.Errorf("truncated section (%d words) at %d", n, pos)
+	if n < 0 || pos+8*n > v.Len() {
+		return words{}, 0, fmt.Errorf("truncated section (%d words) at %d", n, pos)
 	}
-	return words(b[pos : pos+8*n]), pos + 8*n, nil
+	return words{v: v, off: pos, n: int(n)}, pos + 8*n, nil
 }
 
 // ---------- bit-packed array ----------
@@ -589,10 +597,13 @@ func openTxBucket(path string, bucket uint64) (*txBucket, error) {
 	l := uint(binary.LittleEndian.Uint32(b[24:28]))
 	blkBits := uint(binary.LittleEndian.Uint32(b[28:32]))
 
-	pos := txidxHdrSize
+	// The local bucket index is a whole file already on the heap, so its view
+	// is one part and nothing in it can straddle.
+	v := dist.ViewOf(b)
+	pos := int64(txidxHdrSize)
 	var sections [6]words
 	for i := range sections {
-		if sections[i], pos, err = sliceWords(b, pos); err != nil {
+		if sections[i], pos, err = sliceWords(v, pos); err != nil {
 			return nil, err
 		}
 	}
@@ -628,7 +639,7 @@ func (t *TxIndex) BlocksWithTxs(bucket uint64) []bool {
 			continue
 		}
 		for i := range out {
-			if w := i / 64; w*8 < len(tb.hasTx) && tb.hasTx.get(w)&(1<<(i%64)) != 0 {
+			if w := i / 64; w < tb.hasTx.n && tb.hasTx.get(w)&(1<<(i%64)) != 0 {
 				out[i] = true
 			}
 		}

@@ -106,22 +106,47 @@ func parseTestRange(h string, size int64) (start, end int64, ok bool) {
 	return start, end, true
 }
 
-// credStore is the CREDENTIALED path: a real casfs store over the fake bucket,
-// with a cache cap of cacheBytes. Nothing above dist knows the difference.
-func credStore(t *testing.T, dir string, cacheBytes int64) (*dist.Store, *fakeS3) {
+// credStore is the CREDENTIALED path: a real casfs store over the fake bucket.
+// Nothing above dist knows the difference.
+//
+// minFree is the admission watermark. A watermark larger than the disk means
+// the cache REFUSES EVERY FILL, which is the harshest thing the window cache
+// can do to a reader and the replacement for the old one-chunk byte cap: every
+// read refetches, and every answer still has to be right.
+func credStore(t *testing.T, dir string, minFree int64) (*dist.Store, *fakeS3) {
 	t.Helper()
 	s3 := newFakeS3(t)
 	t.Setenv("EPOCHDB_S3_ENDPOINT", s3.URL)
 	t.Setenv("EPOCHDB_S3_BUCKET", "epochs")
 	t.Setenv("EPOCHDB_S3_ACCESS_KEY", "ak")
 	t.Setenv("EPOCHDB_S3_SECRET_KEY", "sk")
-	t.Setenv("EPOCHDB_CACHE_BYTES", strconv.FormatInt(cacheBytes, 10))
+	if minFree > 0 {
+		t.Setenv("EPOCHDB_CACHE_MIN_FREE", strconv.FormatInt(minFree, 10))
+	}
 	st, err := dist.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
 	return st, s3
+}
+
+// refuseEverything is a watermark no filesystem can be under.
+const refuseEverything = int64(1) << 62
+
+// wipeCache deletes every window directory under a data dir, i.e. what a
+// sibling process's eviction worker does to this one's cache.
+func wipeCache(t *testing.T, dir string) {
+	t.Helper()
+	ents, err := os.ReadDir(filepath.Join(dir, "chunkcache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if err := os.RemoveAll(filepath.Join(dir, "chunkcache", e.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // TestSharedSpoolKeepsOneLatestPerChain is the fleet's pointer namespace: N
@@ -243,19 +268,20 @@ func chunkyEpoch(t *testing.T, st *dist.Store, start uint64) (*EpochInput, strin
 	return in, hash
 }
 
-// TestCredentialedEpochSurvivesEviction is the pin contract end to end, on the
-// path a node with S3 credentials actually takes.
+// TestCredentialedEpochUnderAHostileCache is the correctness contract of the
+// window cache, on the path a node with S3 credentials actually takes.
 //
 // The epoch is published, uploaded, and its local copy released, so every byte
-// now comes from the bucket through the casfs chunk cache. The cache is then
-// capped at ONE chunk while the artifact is several, so every read punches
-// holes in whatever it is not reading. The resident sections are pinned at
-// open, so they must survive that; everything else must be refilled and
-// re-verified by the read itself. A punched page reads back as zeros with no
-// error, so any mistake here shows up as WRONG ANSWERS, not as failures.
-func TestCredentialedEpochSurvivesEviction(t *testing.T) {
+// now comes from the bucket. The cache is then told the disk is full, so it
+// REFUSES EVERY FILL: nothing is ever written, every read refetches, and the
+// resident views hold heap bytes instead of mappings. Then the window tree is
+// wiped underneath the open epoch, which is what a sibling process's eviction
+// worker does. Every answer must still be identical to the one taken while the
+// artifact was local, because a cache is not allowed to change an answer, only
+// its cost.
+func TestCredentialedEpochUnderAHostileCache(t *testing.T) {
 	dir := t.TempDir()
-	st, s3 := credStore(t, dir, dist.ChunkSize) // one chunk of cache
+	st, s3 := credStore(t, dir, refuseEverything)
 	in, hash := chunkyEpoch(t, st, 1000)
 
 	// Answers taken while the artifact is still spool-resident: the reference.
@@ -277,6 +303,7 @@ func TestCredentialedEpochSurvivesEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
+	wipeCache(t, dir) // a sibling's worker, mid-flight
 
 	for i := range in.Containers {
 		n := in.Start + uint64(i)
@@ -292,8 +319,8 @@ func TestCredentialedEpochSurvivesEviction(t *testing.T) {
 			t.Fatalf("header %d: %v", n, err)
 		}
 	}
-	// The blooms and the sparse index are resident: they are the ones a hole
-	// punch would turn into false negatives.
+	// The blooms are on the heap and the sparse index is a held view: neither
+	// may be affected by anything the cache does underneath.
 	for i := 0; i < 20000; i += 977 {
 		k := synthKey('s', i)
 		wv, wb, wf, err1 := want.StateSearch(k[:], in.Start+63)
@@ -335,11 +362,14 @@ func TestCredentialedEpochSurvivesEviction(t *testing.T) {
 		t.Fatalf("walked %d rows, want %d", rows, wantRows)
 	}
 
-	// Eviction has to have actually bitten, or none of the above proved
-	// anything: with a one-chunk cap over a multi-chunk artifact, the reads
-	// above refetch ranges they already had.
+	// The refusal has to have actually bitten, or none of the above proved
+	// anything: with nothing allowed to land, the reads above refetch ranges
+	// they already had, many times over.
 	if fetched, chunks := s3.rangedGets.Load(), (want.blob.Size()+dist.ChunkSize-1)/dist.ChunkSize; fetched <= int64(chunks) {
-		t.Fatalf("%d ranged GETs over a %d-chunk artifact: nothing was ever evicted, the pins proved nothing", fetched, chunks)
+		t.Fatalf("%d ranged GETs over a %d-chunk artifact: the cache was not refusing, so this proved nothing", fetched, chunks)
+	}
+	if n, err := os.ReadDir(filepath.Join(dir, "chunkcache")); err != nil || len(n) != 0 {
+		t.Fatalf("the cache wrote %d window dirs while over the watermark: %v", len(n), err)
 	}
 }
 
@@ -351,7 +381,7 @@ func TestCredentialedEpochSurvivesEviction(t *testing.T) {
 // strictly more.
 func TestReadEpochLinkReadsOnlyTheFooter(t *testing.T) {
 	dir := t.TempDir()
-	st, s3 := credStore(t, dir, 64<<20) // whole artifact fits: nothing is evicted
+	st, s3 := credStore(t, dir, 0) // the real watermark: everything is cached
 	in, hash := chunkyEpoch(t, st, 3000)
 	if err := st.Sync(); err != nil { // upload, then unlink the local copy
 		t.Fatal(err)
@@ -385,13 +415,13 @@ func TestReadEpochLinkReadsOnlyTheFooter(t *testing.T) {
 	}
 }
 
-// TestConcurrentTxWalkUnderEviction: the tx index is a byte view now, so a
-// candidate walk reads the mapping directly. Many goroutines walking the same
-// unpinned-by-default section at once, under eviction pressure, must each pin
-// their own traversal and get the right answer (run with -race).
-func TestConcurrentTxWalkUnderEviction(t *testing.T) {
+// TestConcurrentTxWalkSharesOneMappedIndex: the tx index is mapped once, on
+// the first query that gets past the bloom, and shared from then on. Many
+// goroutines racing that first mapping, over a cache that refuses to keep
+// anything, must all get the right answer (run with -race).
+func TestConcurrentTxWalkSharesOneMappedIndex(t *testing.T) {
 	dir := t.TempDir()
-	st, _ := credStore(t, dir, dist.ChunkSize)
+	st, _ := credStore(t, dir, refuseEverything)
 	in, hash := chunkyEpoch(t, st, 2000)
 	if err := st.Sync(); err != nil {
 		t.Fatal(err)
@@ -454,16 +484,19 @@ func TestEFByteViewMatchesHeapDecode(t *testing.T) {
 	}
 	defer e.Close()
 
-	tx, release, err := e.read(secTxidx, 0, e.off[secTxidx][1])
+	raw, err := e.read(secTxidx, 0, e.off[secTxidx][1])
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer release()
-	view, viewBlk, err := e.txIndex(tx)
+	txv, err := e.txidx()
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, refBlk := heapDecodeTxIdx(t, tx)
+	view, viewBlk, err := e.txIndex(txv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, refBlk := heapDecodeTxIdx(t, raw)
 
 	if view.n != ref.n || view.l != ref.l {
 		t.Fatalf("header: n=%d l=%d, reference n=%d l=%d", view.n, view.l, ref.n, ref.l)
@@ -631,4 +664,48 @@ func (e *efHeap) lookup(v uint64) (int, int) {
 		}
 	}
 	return s, eIdx
+}
+
+// TestBloomsAreLoadedOnceOntoTheHeap is the ruling that took the two filters
+// out of the cache entirely (2026-08-03): an epoch is immutable, so its blooms
+// are copied at open and never read again. The proof is brutal on purpose: the
+// entire chunk cache is deleted and the bucket is shut down, and both filters
+// must still answer, for keys that are there and for keys that are not.
+//
+// A filter is exactly the structure where a byte that changed underneath is a
+// WRONG ANSWER rather than a slow one: a zeroed bloom page turns "maybe" into
+// "definitely not", i.e. history the node holds and denies.
+func TestBloomsAreLoadedOnceOntoTheHeap(t *testing.T) {
+	dir := t.TempDir()
+	st, s3 := credStore(t, dir, 0)
+	in, hash := chunkyEpoch(t, st, 4000)
+	if err := st.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	e, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	wipeCache(t, dir)
+	s3.Server.Close() // nothing can be re-read from anywhere, ever again
+
+	for i := 0; i < 20000; i += 331 {
+		k := synthKey('s', i)
+		if !e.MayContainKey(k[:]) {
+			t.Fatalf("key bloom denies key %d with the cache gone: the filter was not on the heap", i)
+		}
+	}
+	if k := synthKey('s', 1<<20); e.MayContainKey(k[:]) {
+		t.Fatal("key bloom claims a key nothing ever wrote (the probe itself is broken)")
+	}
+	for _, hashes := range in.TxHashes {
+		if !e.MayContainTx(txFingerprint(hashes[0])) {
+			t.Fatal("tx bloom denies a tx it holds with the cache gone")
+		}
+	}
+	if e.MayContainTx(1<<fpBits - 1) {
+		t.Fatal("tx bloom claims a fingerprint nothing wrote")
+	}
 }

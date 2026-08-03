@@ -75,13 +75,18 @@ func TestStoreLocalRoundtrip(t *testing.T) {
 	if b.Size() != uint64(len(body)) {
 		t.Fatalf("size %d, want %d", b.Size(), len(body))
 	}
-	got, err := b.Slice(10, 40)
+	got, err := b.Read(10, 40)
 	if err != nil || !bytes.Equal(got, body[10:50]) {
-		t.Fatalf("slice: %q %v", got, err)
+		t.Fatalf("read: %q %v", got, err)
 	}
-	if _, err := b.Slice(b.Size()-1, 2); err == nil {
+	if _, err := b.Read(b.Size()-1, 2); err == nil {
 		t.Fatal("a range past the end must error")
 	}
+	v, err := b.View(10, 40)
+	if err != nil || !bytes.Equal(v.Slice(0, 40), body[10:50]) {
+		t.Fatalf("view: %v", err)
+	}
+	v.Close()
 	list, err := s.Chunks(hash)
 	if err != nil {
 		t.Fatal(err)

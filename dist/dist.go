@@ -22,7 +22,9 @@
 //	EPOCHDB_S3_PREFIX      optional key prefix, used verbatim
 //	EPOCHDB_S3_REGION      optional; default the chain's region, else "auto"
 //	                       (R2 wants "auto"; MinIO ignores it)
-//	EPOCHDB_CACHE_BYTES    chunk cache cap, default 8GiB
+//	EPOCHDB_CACHE_MIN_FREE bytes of free space the chunk cache stops filling at,
+//	                       default 5% of the filesystem
+//	EPOCHDB_CACHE_MAX_AGE  a chunk's ceiling age (Go duration), default 720h
 package dist
 
 import (
@@ -39,6 +41,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/containerman17/casfs"
 )
@@ -52,13 +55,19 @@ const (
 	spoolName = "cas" // <data>/cas/<hash>: durable until uploaded
 	// cacheName is the casfs chunk cache, disposable. It must NOT collide with
 	// a pointer name: casfs owns its cache directory and deletes everything in
-	// it that is not one of its own sharded artifact files, so a cache dir
-	// named "chunks" silently ate the chunk-list pointers at
-	// <data>/chunks/<hash> the moment a credentialed store opened.
+	// it that is not one of its own window directories, so a cache dir named
+	// "chunks" silently ate the chunk-list pointers at <data>/chunks/<hash>
+	// the moment a credentialed store opened.
 	cacheName = "chunkcache"
-
-	defaultCacheBytes = 8 << 30
 )
+
+// View is a long-lived window onto an artifact, one mapping per 4MB chunk.
+// Held for the life of an epoch by the sections every query starts from.
+type View = casfs.View
+
+// ViewOf wraps bytes that are already in hand as a View, so a caller that
+// parses a structure does not care whether it came from a mapping or a pread.
+func ViewOf(b []byte) *View { return casfs.ViewOf(b) }
 
 // LatestPointer names a chain's one mutable object. It is a HINT, never an
 // authority: every artifact self-verifies by hash and the epoch footers chain
@@ -82,15 +91,15 @@ type Store struct {
 	cas   *sharedCas
 }
 
-// ONE CASFS PER CACHE DIRECTORY, and it is not a nicety: casfs.New removes the
-// clean marker and wipes anything it cannot vouch for, so a second store over
-// a live cache directory would delete the first one's chunks out from under it
-// and leave two LRUs fighting over one byte cap. Nothing enforces that across
-// PROCESSES (running a sibling tool against a serving node's data dir costs
-// that node its warm cache, never its correctness: the spool and the bucket are
-// untouched), so inside a process the stores are shared and refcounted. Both
-// bootstrap paths need it: `bootstrap --frontier` opens the artifact store and
-// then a whole state layer over the same directory.
+// ONE CASFS PER CACHE DIRECTORY inside a process, refcounted. Since the window
+// cache went in this is a cost question rather than a correctness one: two
+// stores over one directory would each run an eviction worker and each keep a
+// chunk map, which is duplicated work, but the cache is shared by design and a
+// wrong map entry costs an ENOENT and a refetch. Across PROCESSES it is
+// explicitly fine (a sibling tool against a serving node's data dir now warms
+// the same cache instead of wiping it). Both bootstrap paths need the sharing:
+// `bootstrap --frontier` opens the artifact store and then a whole state layer
+// over the same directory.
 var (
 	casMu     sync.Mutex
 	casShared = map[string]*sharedCas{}
@@ -122,7 +131,7 @@ func openCas(cacheDir string, cfg casfs.Config) (*sharedCas, error) {
 	return s, nil
 }
 
-// close drops one reference and marks the cache clean at the last one.
+// close drops one reference and stops the eviction worker at the last one.
 func (s *sharedCas) close() error {
 	casMu.Lock()
 	defer casMu.Unlock()
@@ -163,28 +172,38 @@ func Open(dataDir string) (*Store, error) {
 	if endpoint == "" {
 		return s, nil
 	}
-	cacheBytes := int64(defaultCacheBytes)
-	if v := os.Getenv("EPOCHDB_CACHE_BYTES"); v != "" {
+	// Zero means casfs's own defaults: 5% of the filesystem free, 30 days.
+	var minFree int64
+	if v := os.Getenv("EPOCHDB_CACHE_MIN_FREE"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("dist: EPOCHDB_CACHE_BYTES=%q is not a positive byte count", v)
+			return nil, fmt.Errorf("dist: EPOCHDB_CACHE_MIN_FREE=%q is not a positive byte count", v)
 		}
-		cacheBytes = n
+		minFree = n
+	}
+	var maxAge time.Duration
+	if v := os.Getenv("EPOCHDB_CACHE_MAX_AGE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("dist: EPOCHDB_CACHE_MAX_AGE=%q is not a positive duration", v)
+		}
+		maxAge = d
 	}
 	cacheDir := filepath.Join(rootFor(dataDir), cacheName)
 	// Empty keys are not an error: casfs falls back to the AWS default chain,
 	// which is what makes an SSO session or an instance role work with nothing
 	// but an endpoint and a bucket set.
 	cas, err := openCas(cacheDir, casfs.Config{
-		Endpoint:   endpoint,
-		Region:     os.Getenv("EPOCHDB_S3_REGION"),
-		Bucket:     os.Getenv("EPOCHDB_S3_BUCKET"),
-		Prefix:     os.Getenv("EPOCHDB_S3_PREFIX"),
-		AccessKey:  os.Getenv("EPOCHDB_S3_ACCESS_KEY"),
-		SecretKey:  os.Getenv("EPOCHDB_S3_SECRET_KEY"),
-		SpoolDir:   s.spool,
-		CacheDir:   cacheDir,
-		CacheBytes: cacheBytes,
+		Endpoint:     endpoint,
+		Region:       os.Getenv("EPOCHDB_S3_REGION"),
+		Bucket:       os.Getenv("EPOCHDB_S3_BUCKET"),
+		Prefix:       os.Getenv("EPOCHDB_S3_PREFIX"),
+		AccessKey:    os.Getenv("EPOCHDB_S3_ACCESS_KEY"),
+		SecretKey:    os.Getenv("EPOCHDB_S3_SECRET_KEY"),
+		SpoolDir:     s.spool,
+		CacheDir:     cacheDir,
+		CacheMinFree: minFree,
+		CacheMaxAge:  maxAge,
 	})
 	if err != nil {
 		return nil, err
@@ -208,6 +227,19 @@ func (s *Store) Dir() string { return s.dir }
 
 // Remote reports whether S3 credentials are configured.
 func (s *Store) Remote() bool { return s.cas != nil }
+
+// CacheStats is what the chunk cache has actually been doing. ok=false without
+// credentials, where there is no cache at all: the spool IS the storage.
+//
+// VictimAge is the number worth watching. It is the age of the window the
+// eviction worker last deleted from, i.e. how long a chunk really survives on
+// this node, which a configured byte cap could never have told anyone.
+func (s *Store) CacheStats() (casfs.Stats, bool) {
+	if s.cas == nil {
+		return casfs.Stats{}, false
+	}
+	return s.cas.Stats(), true
+}
 
 // SpoolPath is where the file for hash lives while it is still local.
 func (s *Store) SpoolPath(hash string) string { return filepath.Join(s.spool, hash) }
@@ -286,18 +318,14 @@ func (s *Store) Chunks(hash string) ([]byte, error) {
 		return nil, err
 	}
 	defer b.Close()
-	if err := b.Pin(0, b.Size()); err != nil {
-		return nil, err
-	}
-	defer b.Unpin(0, b.Size())
-	list, err := b.Slice(0, b.Size())
+	list, err := b.Read(0, b.Size())
 	if err != nil {
 		return nil, err
 	}
 	if len(list)%sha256.Size != 0 {
 		return nil, fmt.Errorf("dist: chunk list %s is %d bytes, not a multiple of %d", lh, len(list), sha256.Size)
 	}
-	return append([]byte(nil), list...), nil
+	return list, nil
 }
 
 // Sync uploads everything in the spool the bucket does not have yet and then
@@ -318,10 +346,9 @@ func (s *Store) Sync() error {
 
 // ---------- reading ----------
 
-// Close releases the chunk cache cleanly. Without it casfs wipes the cache on
-// the next start (a missing clean marker means a chunk may be half written),
-// so every long-lived consumer calls this on the way out and keeps its cache
-// warm across restarts. Costs the cache and nothing durable if it is skipped.
+// Close stops casfs's eviction worker. The cache is a tree of finished files,
+// so skipping this costs nothing at all: the next start reads whatever is
+// there.
 func (s *Store) Close() error {
 	if s.cas == nil {
 		return nil
@@ -330,9 +357,8 @@ func (s *Store) Close() error {
 }
 
 // Open returns the bytes of one artifact. Without credentials that is an mmap
-// of the spool file; with them it is casfs, whose View is a window onto a
-// mapping of the sparse cache file, filled from the spool or a ranged GET.
-// Either way Slice is zero-copy: nothing an epoch reads lands on the Go heap.
+// of the spool file; with them it is casfs, reading the window chunk cache and
+// filling it from the spool or a ranged GET.
 func (s *Store) Open(hash string) (*Blob, error) {
 	if s.cas == nil {
 		b, err := MmapBlob(s.SpoolPath(hash))
@@ -348,18 +374,19 @@ func (s *Store) Open(hash string) (*Blob, error) {
 	return &Blob{size: uint64(f.Size()), f: f}, nil
 }
 
-// Blob is one artifact's bytes, always as a mapping: the spool file without
-// credentials, casfs's sparse cache file with them.
+// Blob is one artifact's bytes: a whole-file mapping of the spool file without
+// credentials, casfs's window chunk cache with them.
 //
-// THE PIN CONTRACT, and it is correctness, not tuning: casfs evicts by
-// punching a hole, and a hole under a live mapping reads back as ZEROS with no
-// error. A zeroed bloom page is a false negative, i.e. a wrong answer. So
-// every read of a Slice must happen inside Pin/Unpin of that range. Both are
-// no-ops without credentials, where nothing can evict anything.
+// TWO WAYS TO READ IT, and the choice is the whole cost model. Read copies and
+// is for everything transient (a query's binary search, one decompression
+// frame). View maps, one mapping per 4MB chunk, and is ONLY for the ranges an
+// epoch holds for the process's life. Nothing is pinned any more: casfs evicts
+// by unlinking, and unlinking a mapped file cannot turn live bytes into zeros
+// the way the old hole punch could.
 type Blob struct {
 	size uint64
 	mm   []byte      // no credentials: whole-file mapping of the spool file
-	f    *casfs.File // credentials: View/Pin/Unpin over the chunk cache
+	f    *casfs.File // credentials: the chunk cache
 }
 
 // MmapBlob maps a plain file. Used for spool-resident artifacts and by tools
@@ -386,36 +413,48 @@ func MmapBlob(path string) (*Blob, error) {
 
 func (b *Blob) Size() uint64 { return b.size }
 
-// Slice returns bytes [off, off+n) as a view of the mapping: read-only, never
-// valid past Close, and only stable while the range is pinned (see Blob).
-func (b *Blob) Slice(off, n uint64) ([]byte, error) {
+func (b *Blob) bounds(off, n uint64) error {
 	if off > b.size || n > b.size-off {
-		return nil, fmt.Errorf("dist: range [%d,%d) outside a %d byte artifact", off, off+n, b.size)
+		return fmt.Errorf("dist: range [%d,%d) outside a %d byte artifact", off, off+n, b.size)
+	}
+	return nil
+}
+
+// Read copies bytes [off, off+n) onto the heap. This is the query path: the
+// bytes are the caller's, they cannot change underneath, and a chunk evicted
+// the instant afterwards is somebody else's problem.
+func (b *Blob) Read(off, n uint64) ([]byte, error) {
+	if err := b.bounds(off, n); err != nil {
+		return nil, err
 	}
 	if n == 0 {
 		return nil, nil
 	}
-	if b.f != nil {
-		return b.f.View(int64(off), int64(n))
+	if b.f == nil {
+		return append([]byte(nil), b.mm[off:off+n]...), nil
 	}
-	return b.mm[off : off+n], nil
+	p := make([]byte, n)
+	if _, err := b.f.ReadAt(p, int64(off)); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
-// Pin holds [off, off+n) against eviction until Unpin. Nested and overlapping
-// pins are counted, so an inner read of an already-pinned range is free to pin
-// it again.
-func (b *Blob) Pin(off, n uint64) error {
-	if b.f == nil || n == 0 {
-		return nil
+// View maps [off, off+n) for as long as the caller holds it. Only the sections
+// an epoch keeps resident should use this: each one pins its chunk files'
+// blocks on disk until Close, so the ghost disk a node can hold is the size of
+// its resident set.
+func (b *Blob) View(off, n uint64) (*View, error) {
+	if err := b.bounds(off, n); err != nil {
+		return nil, err
 	}
-	return b.f.Pin(int64(off), int64(n))
-}
-
-func (b *Blob) Unpin(off, n uint64) error {
-	if b.f == nil || n == 0 {
-		return nil
+	if n == 0 {
+		return ViewOf(nil), nil
 	}
-	return b.f.Unpin(int64(off), int64(n))
+	if b.f == nil {
+		return ViewOf(b.mm[off : off+n]), nil
+	}
+	return b.f.View(int64(off), int64(n))
 }
 
 func (b *Blob) Close() error {

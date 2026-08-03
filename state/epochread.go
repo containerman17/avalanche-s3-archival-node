@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/ava-labs/libevm/common"
@@ -17,11 +18,18 @@ import (
 )
 
 // Epoch is one open sealed epoch artifact. Bytes come from dist: an mmap of
-// the spool file on a node with no S3 credentials, casfs (chunk cache, ranged
-// GETs) on one with them. The SMALL sections are read once at open and kept;
-// the big ones (bodies, headers, sst, logidx, stored logs and receipts) are
-// read by range as queries need them, which is what makes an epoch servable
-// without holding it locally at all.
+// the spool file on a node with no S3 credentials, casfs (window chunk cache,
+// ranged GETs) on one with them. The SMALL sections are read once at open and
+// kept; the big ones (bodies, headers, sst, logidx, stored logs and receipts)
+// are read by range as queries need them, which is what makes an epoch
+// servable without holding it locally at all.
+//
+// TWO KINDS OF RESIDENT SECTION since the window cache (DESIGN.md ruling of
+// 2026-08-03). The two BLOOMS are copied onto the Go heap once and never read
+// again: an epoch is immutable, so there is nothing to re-read, and a filter
+// is exactly the structure where a byte that turns into something else is a
+// wrong answer rather than a slow one. Everything else keeps a dist.View, one
+// mapping per 4MB chunk, held for the life of the epoch.
 type Epoch struct {
 	Start   uint64
 	Count   uint64 // blocks
@@ -34,49 +42,53 @@ type Epoch struct {
 	Prev [32]byte
 
 	blob *dist.Blob
-	off  [epochNumSections][2]uint64 // offset, length per section
-	sec  [epochNumSections][]byte    // resident sections (nil = read on demand)
-	dec  *zstd.Decoder               // registered with this epoch's dicts
+	off  [epochNumSections][2]uint64  // offset, length per section
+	sec  [epochNumSections]*dist.View // resident views (nil = read on demand)
+	dec  *zstd.Decoder                // registered with this epoch's dicts
 
-	keyBloom bloomView
-	txBloom  bloomView
+	keyBloom bloom
+	txBloom  bloom
 
-	// pinned is the resident sections' byte ranges, held against casfs
-	// eviction for the life of the epoch and released at Close. Without S3
-	// credentials pinning is a no-op (nothing can evict a spool file).
-	pinned [][2]uint64
+	// txidx is the one section that is resident ON DEMAND: the tx bloom
+	// rejects an unknown hash without touching it, so an epoch nobody asks a
+	// tx question about never pays for it, and one that is asked keeps the
+	// view rather than re-mapping per query.
+	txidxOnce sync.Once
+	txidxView *dist.View
+	txidxErr  error
 
 	// txLoads counts tx-index traversals, i.e. how often the tx bloom failed
 	// to reject (tests).
 	txLoads atomic.Uint64
 }
 
-// bloomView is a filter read straight out of the section bytes: on a
-// credentials-free node that is a zero-copy view of the mmap, and the probe
-// reads words with binary.LittleEndian.Uint64, which needs no alignment. So a
-// bloom costs page cache, not Go heap.
-type bloomView struct {
+// bloom is a filter on the Go heap. It was a view of the mapping until the
+// window cache landed; it is a copy now because it is read on every descent
+// forever, so one copy at open beats a mapping to defend for the life of the
+// process. The probe reads words with binary.LittleEndian.Uint64, which needs
+// no alignment.
+type bloom struct {
 	m    uint64
 	k    uint32
 	bits []byte
 }
 
-func parseBloom(sec []byte) (bloomView, error) {
+func parseBloom(sec []byte) (bloom, error) {
 	if len(sec) < 16 {
-		return bloomView{}, fmt.Errorf("truncated bloom (%d bytes)", len(sec))
+		return bloom{}, fmt.Errorf("truncated bloom (%d bytes)", len(sec))
 	}
-	b := bloomView{
+	b := bloom{
 		m:    binary.LittleEndian.Uint64(sec[0:8]),
 		k:    binary.LittleEndian.Uint32(sec[8:12]),
 		bits: sec[16:],
 	}
 	if b.m == 0 || uint64(len(b.bits))*8 < b.m {
-		return bloomView{}, fmt.Errorf("bloom claims %d bits over %d bytes", b.m, len(b.bits))
+		return bloom{}, fmt.Errorf("bloom claims %d bits over %d bytes", b.m, len(b.bits))
 	}
 	return b, nil
 }
 
-func (b bloomView) mayContain(key []byte) bool {
+func (b bloom) mayContain(key []byte) bool {
 	h1, h2 := bloomHash(key)
 	for i := uint64(0); i < uint64(b.k); i++ {
 		bit := (h1 + i*h2) % b.m
@@ -88,20 +100,38 @@ func (b bloomView) mayContain(key []byte) bool {
 	return true
 }
 
-// residentSections are read at open, PINNED, and kept for the life of the
-// epoch: the indexes and filters every query starts from. Everything else is
-// ranged. secTxidx is deliberately NOT here (see Epoch.TxCandidates).
+// residentSections are MAPPED at open and kept for the life of the epoch: the
+// indexes every query starts from. Everything else is ranged. The two blooms
+// are resident too but go on the heap instead (see Epoch), and secTxidx is
+// mapped lazily (see Epoch.TxCandidates).
 var residentSections = []int{
 	secDict, secBodiesIdx, secHeadersIdx, secSSTIdx, secDeletes,
-	secTxBloom, secKeybloom, secLogsDict, secFullLogsIdx, secRcptIdx,
+	secLogsDict, secFullLogsIdx, secRcptIdx,
 }
+
+// vu64 and vu32 read one little-endian word out of a view. A word CAN straddle
+// a 4MB chunk boundary, because a section starts at an arbitrary artifact
+// offset and none of the strides here divide 4MB; View.Slice copies in exactly
+// that case, so nothing above it has to know where the chunks are.
+func vu64(v *dist.View, off uint64) uint64 {
+	return binary.LittleEndian.Uint64(v.Slice(int64(off), 8))
+}
+
+func vu32(v *dist.View, off uint64) uint32 {
+	return binary.LittleEndian.Uint32(v.Slice(int64(off), 4))
+}
+
+// vslice is View.Slice in the uint64 offsets the epoch format uses.
+func vslice(v *dist.View, off, n uint64) []byte { return v.Slice(int64(off), int64(n)) }
+
+func vlen(v *dist.View) uint64 { return uint64(v.Len()) }
 
 // End returns the last block in the epoch (inclusive).
 func (e *Epoch) End() uint64 { return e.Start + e.Count - 1 }
 
 // Dict returns the epoch's trained zstd dictionary (empty for dict-less
 // epochs).
-func (e *Epoch) Dict() []byte { return e.sec[secDict] }
+func (e *Epoch) Dict() []byte { return vslice(e.sec[secDict], 0, vlen(e.sec[secDict])) }
 
 // SectionSizes returns section byte sizes by name (compression scoreboard).
 func (e *Epoch) SectionSizes() map[string]uint64 {
@@ -137,11 +167,7 @@ func (e *Epoch) parseFooter(blob *dist.Blob, hash string) error {
 	if size < epochFooterSize {
 		return fmt.Errorf("epoch %s: too small", hash)
 	}
-	if err := blob.Pin(size-epochFooterSize, epochFooterSize); err != nil {
-		return err
-	}
-	defer blob.Unpin(size-epochFooterSize, epochFooterSize)
-	ft, err := blob.Slice(size-epochFooterSize, epochFooterSize)
+	ft, err := blob.Read(size-epochFooterSize, epochFooterSize)
 	if err != nil {
 		return err
 	}
@@ -184,9 +210,10 @@ func (l EpochLink) End() uint64 { return l.Start + l.Count - 1 }
 // ReadEpochLink reads ONE epoch's FOOTER and stops there: existence (the blob
 // open is a size probe, a HEAD under casfs) plus the ~1KB tail that carries the
 // coverage and the prev-hash. NOTHING ELSE IS TOUCHED, which is the whole
-// point: OpenEpoch additionally pins every resident section (the key bloom
-// alone is 20 bits per key, gigabytes across a mainnet corpus), and a startup
-// chain walk that paid that would download the corpus to prove it exists.
+// point: OpenEpoch additionally materializes every resident section (the key
+// bloom alone is 20 bits per key, gigabytes across a mainnet corpus), and a
+// startup chain walk that paid that would download the corpus to prove it
+// exists.
 // Content is never rehashed here either; that is `serve --verify`.
 func ReadEpochLink(st *dist.Store, hash string) (EpochLink, error) {
 	blob, err := st.Open(hash)
@@ -208,33 +235,42 @@ func openEpochBlob(blob *dist.Blob, hash string) (*Epoch, error) {
 	}
 	var err error
 	for _, id := range residentSections {
-		if e.sec[id], err = e.pinSection(id); err != nil {
+		if e.sec[id], err = e.view(id); err != nil {
 			e.Close()
 			return nil, fmt.Errorf("epoch %s: section %d: %w", hash, id, err)
 		}
 	}
 	var dicts [][]byte
-	if len(e.sec[secDict]) > 0 {
-		dicts = append(dicts, e.sec[secDict])
+	if d := e.Dict(); len(d) > 0 {
+		dicts = append(dicts, d)
 	}
-	if len(e.sec[secLogsDict]) > 0 {
-		dicts = append(dicts, e.sec[secLogsDict]) // DecodeAll picks by frame dictID
+	if d := vslice(e.sec[secLogsDict], 0, vlen(e.sec[secLogsDict])); len(d) > 0 {
+		dicts = append(dicts, d) // DecodeAll picks by frame dictID
 	}
 	var decOpts []zstd.DOption
 	if len(dicts) > 0 {
 		decOpts = append(decOpts, zstd.WithDecoderDicts(dicts...))
 	}
 	if e.dec, err = zstd.NewReader(nil, decOpts...); err != nil {
+		e.Close()
 		return nil, err
 	}
 
-	if e.keyBloom, err = parseBloom(e.sec[secKeybloom]); err != nil {
-		e.Close()
-		return nil, fmt.Errorf("epoch %s: keybloom: %w", hash, err)
-	}
-	if e.txBloom, err = parseBloom(e.sec[secTxBloom]); err != nil {
-		e.Close()
-		return nil, fmt.Errorf("epoch %s: txbloom: %w", hash, err)
+	// The blooms are COPIED, once, and never read from the artifact again.
+	for _, b := range []struct {
+		id   int
+		name string
+		dst  *bloom
+	}{{secKeybloom, "keybloom", &e.keyBloom}, {secTxBloom, "txbloom", &e.txBloom}} {
+		raw, err := e.read(b.id, 0, e.off[b.id][1])
+		if err != nil {
+			e.Close()
+			return nil, fmt.Errorf("epoch %s: %s: %w", hash, b.name, err)
+		}
+		if *b.dst, err = parseBloom(raw); err != nil {
+			e.Close()
+			return nil, fmt.Errorf("epoch %s: %s: %w", hash, b.name, err)
+		}
 	}
 	return e, nil
 }
@@ -244,50 +280,40 @@ func (e *Epoch) Close() {
 		e.dec.Close()
 		e.dec = nil
 	}
-	for _, p := range e.pinned {
-		e.blob.Unpin(p[0], p[1])
+	for i, v := range e.sec {
+		if v != nil {
+			v.Close()
+			e.sec[i] = nil
+		}
 	}
-	e.pinned = nil
+	if e.txidxView != nil {
+		e.txidxView.Close()
+		e.txidxView = nil
+	}
 	if e.blob != nil {
 		e.blob.Close()
 		e.blob = nil
 	}
-	for i := range e.sec {
-		e.sec[i] = nil
-	}
-	e.keyBloom, e.txBloom = bloomView{}, bloomView{}
+	e.keyBloom, e.txBloom = bloom{}, bloom{}
 }
 
-// pinSection maps a whole section and holds it against eviction until Close.
-// A resident section is read all the time and must never turn into zeros
-// under a live view, which is what an unpinned hole punch would silently do.
-func (e *Epoch) pinSection(id int) ([]byte, error) {
-	off, n := e.off[id][0], e.off[id][1]
-	if err := e.blob.Pin(off, n); err != nil {
-		return nil, err
-	}
-	e.pinned = append(e.pinned, [2]uint64{off, n})
-	return e.blob.Slice(off, n)
+// view maps a whole section and holds the mapping until Close. A resident
+// section is read all the time, so it is worth one mapping per chunk rather
+// than a pread per access; the price is that its chunk files keep their blocks
+// on disk while the epoch is open, even if the eviction worker unlinks them.
+func (e *Epoch) view(id int) (*dist.View, error) {
+	return e.blob.View(e.off[id][0], e.off[id][1])
 }
 
-// read returns bytes [off, off+n) of one section, PINNED until the returned
-// release runs. The result aliases the artifact's mapping: read-only, invalid
-// after Close, and guaranteed to be the file's real bytes only until release
-// (casfs evicts by punching a hole, which reads back as zeros, silently).
-func (e *Epoch) read(id int, off, n uint64) ([]byte, func(), error) {
+// read COPIES bytes [off, off+n) of one section onto the heap. This is the
+// query path: the bytes are the caller's from then on, so there is nothing to
+// hold, nothing to release, and no way for the cache underneath to change
+// them.
+func (e *Epoch) read(id int, off, n uint64) ([]byte, error) {
 	if off > e.off[id][1] || n > e.off[id][1]-off {
-		return nil, nil, fmt.Errorf("epoch %d: section %d range [%d,%d) outside %d bytes", e.Start, id, off, off+n, e.off[id][1])
+		return nil, fmt.Errorf("epoch %d: section %d range [%d,%d) outside %d bytes", e.Start, id, off, off+n, e.off[id][1])
 	}
-	abs := e.off[id][0] + off
-	if err := e.blob.Pin(abs, n); err != nil {
-		return nil, nil, err
-	}
-	b, err := e.blob.Slice(abs, n)
-	if err != nil {
-		e.blob.Unpin(abs, n)
-		return nil, nil, err
-	}
-	return b, func() { e.blob.Unpin(abs, n) }, nil
+	return e.blob.Read(e.off[id][0]+off, n)
 }
 
 // decodeAll is goroutine-safe: zstd Decoder.DecodeAll is documented
@@ -297,19 +323,18 @@ func (e *Epoch) decodeAll(frame []byte) ([]byte, error) {
 }
 
 // framedBlob returns entry (block - Start) from a framed section pair.
-func (e *Epoch) framedBlob(dataSec int, index []byte, rel uint64) ([]byte, error) {
+func (e *Epoch) framedBlob(dataSec int, index *dist.View, rel uint64) ([]byte, error) {
 	frame := rel / framedGroup
-	if int(frame+2)*8 > len(index) {
+	if (frame+2)*8 > vlen(index) {
 		return nil, fmt.Errorf("frame %d beyond index", frame)
 	}
-	lo := binary.LittleEndian.Uint64(index[frame*8:])
-	hi := binary.LittleEndian.Uint64(index[(frame+1)*8:])
-	frameBytes, release, err := e.read(dataSec, lo, hi-lo)
+	lo := vu64(index, frame*8)
+	hi := vu64(index, (frame+1)*8)
+	frameBytes, err := e.read(dataSec, lo, hi-lo)
 	if err != nil {
 		return nil, err
 	}
 	raw, err := e.decodeAll(frameBytes)
-	release() // the decode copied; nothing below reads the mapping
 	if err != nil {
 		return nil, err
 	}
@@ -355,30 +380,28 @@ func (e *Epoch) MayContainTx(fp uint64) bool {
 }
 
 // sstBlock decodes the SST block the sparse-index entry bi points at.
-func (e *Epoch) sstBlock(idx []byte, bi, nEntries int) ([]byte, error) {
-	lo := binary.LittleEndian.Uint64(idx[bi*sstIdxEntrySize+sortedKeySize+8:])
+func (e *Epoch) sstBlock(idx *dist.View, bi, nEntries int) ([]byte, error) {
+	lo := vu64(idx, uint64(bi*sstIdxEntrySize+sortedKeySize+8))
 	hi := e.off[secSST][1]
 	if bi+1 < nEntries {
-		hi = binary.LittleEndian.Uint64(idx[(bi+1)*sstIdxEntrySize+sortedKeySize+8:])
+		hi = vu64(idx, uint64((bi+1)*sstIdxEntrySize+sortedKeySize+8))
 	}
-	block, release, err := e.read(secSST, lo, hi-lo)
+	block, err := e.read(secSST, lo, hi-lo)
 	if err != nil {
 		return nil, err
 	}
-	raw, err := e.decodeAll(block)
-	release()
-	return raw, err
+	return e.decodeAll(block)
 }
 
 // StateSearch finds the largest write <= n of key inside this epoch.
 // val nil with found=true is an explicit delete/zero record.
 func (e *Epoch) StateSearch(key []byte, n uint64) (val []byte, blk uint64, found bool, err error) {
 	idx := e.sec[secSSTIdx]
-	nEntries := len(idx) / sstIdxEntrySize
+	nEntries := int(vlen(idx)) / sstIdxEntrySize
 	if nEntries == 0 {
 		return nil, 0, false, nil
 	}
-	entry := func(i int) []byte { return idx[i*sstIdxEntrySize : (i+1)*sstIdxEntrySize] }
+	entry := func(i int) []byte { return vslice(idx, uint64(i*sstIdxEntrySize), sstIdxEntrySize) }
 	// first sparse entry > (key, n)
 	ub := sort.Search(nEntries, func(i int) bool {
 		en := entry(i)
@@ -435,7 +458,7 @@ func (e *Epoch) Code(hash common.Hash) ([]byte, bool, error) {
 // Values are views into a transient decode buffer: copy to retain.
 func (e *Epoch) WalkStateRows(fn func(StateRow)) error {
 	idx := e.sec[secSSTIdx]
-	nEntries := len(idx) / sstIdxEntrySize
+	nEntries := int(vlen(idx)) / sstIdxEntrySize
 	for bi := 0; bi < nEntries; bi++ {
 		raw, err := e.sstBlock(idx, bi, nEntries)
 		if err != nil {
@@ -461,23 +484,25 @@ func (e *Epoch) WalkStateRows(fn func(StateRow)) error {
 // AccountDeletes calls fn for every account-delete row in this epoch.
 func (e *Epoch) AccountDeletes(fn func(key []byte, block uint64)) {
 	d := e.sec[secDeletes]
-	for pos := 0; pos+deleteEntrySize <= len(d); pos += deleteEntrySize {
-		fn(d[pos:pos+sortedKeySize], binary.BigEndian.Uint64(d[pos+sortedKeySize:]))
+	n := vlen(d)
+	for pos := uint64(0); pos+deleteEntrySize <= n; pos += deleteEntrySize {
+		ent := vslice(d, pos, deleteEntrySize)
+		fn(ent[:sortedKeySize], binary.BigEndian.Uint64(ent[sortedKeySize:]))
 	}
 }
 
-// txIndex is a READER over the txidx section bytes: a 16-byte header and five
-// slices, nothing decoded and nothing on the Go heap (DESIGN.md ruling 3).
-// The caller must hold the section pinned for as long as it uses the result,
-// because every accessor reads the mapping.
-func (e *Epoch) txIndex(tx []byte) (efIdx *ef, blk packed, err error) {
-	if len(tx) < 16 {
+// txIndex is a READER over the txidx section: a 16-byte header and five word
+// slices, nothing decoded and nothing copied (DESIGN.md ruling 3). Every
+// accessor reads the view, so the view must outlive the result, which is why
+// the epoch owns it.
+func (e *Epoch) txIndex(tx *dist.View) (efIdx *ef, blk packed, err error) {
+	if tx.Len() < 16 {
 		return nil, packed{}, fmt.Errorf("epoch %d: truncated txidx", e.Start)
 	}
-	nTx := binary.LittleEndian.Uint64(tx[0:8])
-	efL := uint(binary.LittleEndian.Uint32(tx[8:12]))
-	blkBits := uint(binary.LittleEndian.Uint32(tx[12:16]))
-	pos := 16
+	nTx := vu64(tx, 0)
+	efL := uint(vu32(tx, 8))
+	blkBits := uint(vu32(tx, 12))
+	pos := int64(16)
 	var secs [5]words
 	for i := range secs {
 		if secs[i], pos, err = sliceWords(tx, pos); err != nil {
@@ -494,22 +519,28 @@ func (e *Epoch) txIndex(tx []byte) (efIdx *ef, blk packed, err error) {
 	}, packed{w: secs[4], bits: blkBits}, nil
 }
 
+// txidx maps the tx index ONCE, on the first query that gets past the bloom,
+// and keeps the mapping for the life of the epoch. Lazily, not at open: the
+// bloom rejects an unknown hash outright, so an epoch nobody asks a tx
+// question about never fetches a single Elias-Fano chunk, which is what keeps
+// eth_getTransactionByHash for a pending tx off the whole of history.
+func (e *Epoch) txidx() (*dist.View, error) {
+	e.txidxOnce.Do(func() {
+		e.txidxView, e.txidxErr = e.view(secTxidx)
+	})
+	return e.txidxView, e.txidxErr
+}
+
 // TxCandidates returns absolute candidate blocks for a fingerprint (a tx
 // hash, or since v6 a block hash mapping to its own height), descending.
-//
-// The txidx section is not resident, so the walk PINS it for the traversal and
-// unpins after: an unpinned page could be punched mid-walk and read back as
-// zeros, which is a wrong answer rather than a slow one. The bloom rejects
-// first and IS resident, so an unknown hash still touches no Elias-Fano page.
 func (e *Epoch) TxCandidates(fp uint64) ([]uint64, error) {
 	if !e.MayContainTx(fp) {
 		return nil, nil
 	}
-	tx, release, err := e.read(secTxidx, 0, e.off[secTxidx][1])
+	tx, err := e.txidx()
 	if err != nil {
 		return nil, err
 	}
-	defer release()
 	e.txLoads.Add(1)
 	idx, blk, err := e.txIndex(tx)
 	if err != nil {
@@ -536,17 +567,15 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if total < 4 {
 		return nil, nil
 	}
-	// Each probe pins the few bytes it reads and releases them immediately:
-	// the section is far too big to hold pinned (pinning fills), and a view
-	// read outside its pin can silently be a punched hole full of zeros.
+	// Each probe preads the few bytes it needs. The section is far too big to
+	// map (mapping it would fill every chunk of it), and a copy of four bytes
+	// is not worth avoiding.
 	u32 := func(off uint64) (uint32, error) {
-		b, release, err := e.read(secLogidx, off, 4)
+		b, err := e.read(secLogidx, off, 4)
 		if err != nil {
 			return 0, err
 		}
-		v := binary.LittleEndian.Uint32(b)
-		release()
-		return v, nil
+		return binary.LittleEndian.Uint32(b), nil
 	}
 	nAddr64, err := u32(0)
 	if err != nil {
@@ -592,25 +621,21 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	}
 	listAt := func(i uint64) (uint64, error) {
 		entOff, width, _ := entryOff(i)
-		ent, release, err := e.read(secLogidx, entOff, width)
+		ent, err := e.read(secLogidx, entOff, width)
 		if err != nil {
 			return 0, err
 		}
-		v := binary.LittleEndian.Uint64(ent[width-8:])
-		release()
-		return v, nil
+		return binary.LittleEndian.Uint64(ent[width-8:]), nil
 	}
 
 	var searchErr error
 	i := uint64(sort.Search(int(count), func(i int) bool {
-		ent, release, err := e.read(secLogidx, base+uint64(i)*stride, uint64(len(key)))
+		ent, err := e.read(secLogidx, base+uint64(i)*stride, uint64(len(key)))
 		if err != nil {
 			searchErr = err
 			return true
 		}
-		ge := bytes.Compare(ent, key) >= 0
-		release()
-		return ge
+		return bytes.Compare(ent, key) >= 0
 	}))
 	if searchErr != nil {
 		return nil, searchErr
@@ -618,16 +643,14 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if i >= count {
 		return nil, nil
 	}
-	ent, release, err := e.read(secLogidx, base+i*stride, stride)
+	ent, err := e.read(secLogidx, base+i*stride, stride)
 	if err != nil {
 		return nil, err
 	}
-	match := bytes.Equal(ent[:len(key)], key)
-	off := binary.LittleEndian.Uint64(ent[len(key):])
-	release()
-	if !match {
+	if !bytes.Equal(ent[:len(key)], key) {
 		return nil, nil
 	}
+	off := binary.LittleEndian.Uint64(ent[len(key):])
 	end := total - listsOff
 	if _, _, ok := entryOff(i + 1); ok {
 		if end, err = listAt(i + 1); err != nil {
@@ -637,12 +660,11 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if end < off {
 		return nil, fmt.Errorf("epoch %d: logidx list [%d,%d) is inverted", e.Start, off, end)
 	}
-	raw, release, err := e.read(secLogidx, listsOff+off, end-off)
+	raw, err := e.read(secLogidx, listsOff+off, end-off)
 	if err != nil {
 		return nil, err
 	}
-	defer release() // ef reads the mapping straight through, values() copies
-	ef, _, err := efUnmarshal(raw)
+	ef, _, err := efUnmarshal(dist.ViewOf(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -663,34 +685,33 @@ func (e *Epoch) LogTopicBlocks(topic [32]byte) ([]uint64, error) { return e.logi
 // HasStoredLogs reports whether this epoch carries the stored-logs
 // sections (index headers present; an epoch with zero logs still counts).
 func (e *Epoch) HasStoredLogs() bool {
-	return len(e.sec[secFullLogsIdx]) >= 4 && len(e.sec[secRcptIdx]) >= 4
+	return vlen(e.sec[secFullLogsIdx]) >= 4 && vlen(e.sec[secRcptIdx]) >= 4
 }
 
 // storedRecord fetches block n's record from a stored-frames section pair.
-func (e *Epoch) storedRecord(dataSec int, index []byte, n uint64) ([]byte, bool, error) {
-	if len(index) < 4 {
+func (e *Epoch) storedRecord(dataSec int, index *dist.View, n uint64) ([]byte, bool, error) {
+	if vlen(index) < 4 {
 		return nil, false, fmt.Errorf("epoch %d: stored section absent", e.Start)
 	}
-	nMembers := int(binary.LittleEndian.Uint32(index[0:4]))
-	members := index[4 : 4+nMembers*12]
-	offs := index[4+nMembers*12:]
+	nMembers := int(vu32(index, 0))
+	member := func(i int) uint64 { return uint64(4 + i*12) }
+	offs := uint64(4 + nMembers*12)
 	rel := uint32(n - e.Start)
 	i := sort.Search(nMembers, func(i int) bool {
-		return binary.LittleEndian.Uint32(members[i*12:]) >= rel
+		return vu32(index, member(i)) >= rel
 	})
-	if i == nMembers || binary.LittleEndian.Uint32(members[i*12:]) != rel {
+	if i == nMembers || vu32(index, member(i)) != rel {
 		return nil, false, nil
 	}
-	frame := binary.LittleEndian.Uint32(members[i*12+4:])
-	slot := binary.LittleEndian.Uint32(members[i*12+8:])
-	lo := binary.LittleEndian.Uint64(offs[frame*8:])
-	hi := binary.LittleEndian.Uint64(offs[(frame+1)*8:])
-	frameBytes, release, err := e.read(dataSec, lo, hi-lo)
+	frame := uint64(vu32(index, member(i)+4))
+	slot := vu32(index, member(i)+8)
+	lo := vu64(index, offs+frame*8)
+	hi := vu64(index, offs+(frame+1)*8)
+	frameBytes, err := e.read(dataSec, lo, hi-lo)
 	if err != nil {
 		return nil, false, err
 	}
 	raw, err := e.decodeAll(frameBytes)
-	release()
 	if err != nil {
 		return nil, false, err
 	}
@@ -723,7 +744,7 @@ func (e *Epoch) StoredRcptRecord(n uint64) ([]byte, bool, error) {
 // sampleSSTRow returns a random (key, block) row for bench probing.
 func (e *Epoch) sampleSSTRow(r *rand.Rand) (key [sortedKeySize]byte, blk uint64, ok bool) {
 	idx := e.sec[secSSTIdx]
-	nEntries := len(idx) / sstIdxEntrySize
+	nEntries := int(vlen(idx)) / sstIdxEntrySize
 	if nEntries == 0 {
 		return key, 0, false
 	}

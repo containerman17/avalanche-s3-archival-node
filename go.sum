@@ -132,6 +132,10 @@ github.com/containerman17/casfs v0.0.0-20260802001404-d1c6745b161e h1:Ni8VkykC8J
 github.com/containerman17/casfs v0.0.0-20260802001404-d1c6745b161e/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
 github.com/containerman17/casfs v0.0.0-20260802002250-4ae6b4fc66b1 h1:sfBENOj22XMws9LFil2Jyns2iBsIzDcCn9P8e9dyMfc=
 github.com/containerman17/casfs v0.0.0-20260802002250-4ae6b4fc66b1/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
+github.com/containerman17/casfs v0.0.0-20260803112539-66aba744fb30 h1:gazPnfBVD+Fpj+RPkyXpd40Wwm/o8Q6wpxrw5zH/YoY=
+github.com/containerman17/casfs v0.0.0-20260803112539-66aba744fb30/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
+github.com/containerman17/casfs v0.0.0-20260803114432-976b0ef9abed h1:MxkBFWc0u4TfKvLqi1w9zOvmHaH41+As3AbFAmTxjPA=
+github.com/containerman17/casfs v0.0.0-20260803114432-976b0ef9abed/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
 github.com/coreos/etcd v3.3.10+incompatible/go.mod h1:uF7uidLiAD3TWHmW31ZFd/JWoc32PjwdhPthX9715RE=
 github.com/coreos/go-etcd v2.0.0+incompatible/go.mod h1:Jez6KQU2B/sWsbdaef3ED8NzMklzPG4d5KIOhIy30Tk=
 github.com/coreos/go-semver v0.2.0/go.mod h1:nnelYz7RCh+5ahJtPPxZlU+153eP4D4r3EedlOD2RNk=

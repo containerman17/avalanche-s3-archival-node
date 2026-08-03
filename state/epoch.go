@@ -1176,18 +1176,18 @@ func efMarshal(e *efBuild) []byte {
 	return out
 }
 
-// efUnmarshal is the inverse: a reader over b, copying nothing.
-func efUnmarshal(b []byte) (*ef, int, error) {
-	if len(b) < 12 {
+// efUnmarshal is the inverse: a reader over v, copying nothing.
+func efUnmarshal(v *dist.View) (*ef, int64, error) {
+	if v.Len() < 12 {
 		return nil, 0, fmt.Errorf("ef: truncated header")
 	}
-	n := binary.LittleEndian.Uint64(b[0:8])
-	l := uint(binary.LittleEndian.Uint32(b[8:12]))
-	pos := 12
+	n := binary.LittleEndian.Uint64(v.Slice(0, 8))
+	l := uint(binary.LittleEndian.Uint32(v.Slice(8, 4)))
+	pos := int64(12)
 	var secs [4]words
 	var err error
 	for i := range secs {
-		if secs[i], pos, err = sliceWords(b, pos); err != nil {
+		if secs[i], pos, err = sliceWords(v, pos); err != nil {
 			return nil, 0, err
 		}
 	}

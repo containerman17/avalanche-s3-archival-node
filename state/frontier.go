@@ -29,6 +29,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/containerman17/epochdb/dist"
+
 	"github.com/ava-labs/libevm/common"
 )
 
@@ -49,7 +51,7 @@ type FrontierRow struct {
 // order, holding exactly one decoded SST block at a time.
 type sstCursor struct {
 	e        *Epoch
-	idx      []byte
+	idx      *dist.View
 	nEntries int
 	bi       int // next sparse-index block to decode
 	raw      []byte
@@ -62,7 +64,7 @@ type sstCursor struct {
 
 func newSSTCursor(e *Epoch) *sstCursor {
 	idx := e.sec[secSSTIdx]
-	return &sstCursor{e: e, idx: idx, nEntries: len(idx) / sstIdxEntrySize}
+	return &sstCursor{e: e, idx: idx, nEntries: int(vlen(idx)) / sstIdxEntrySize}
 }
 
 // next advances to the following row. ok=false = the epoch is exhausted.

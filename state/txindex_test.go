@@ -13,6 +13,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
+	"github.com/containerman17/epochdb/dist"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -77,7 +78,7 @@ func TestEFRoundtripAndDuplicates(t *testing.T) {
 // bytes, which is the only shape the read path ever sees.
 func efRoundtrip(t *testing.T, b *efBuild) *ef {
 	t.Helper()
-	e, _, err := efUnmarshal(efMarshal(b))
+	e, _, err := efUnmarshal(dist.ViewOf(efMarshal(b)))
 	if err != nil {
 		t.Fatal(err)
 	}
