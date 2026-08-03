@@ -343,6 +343,48 @@ func TestCredentialedEpochSurvivesEviction(t *testing.T) {
 	}
 }
 
+// TestReadEpochLinkReadsOnlyTheFooter pins RULING 2026-08-03's cheapness
+// constraint where it can actually be measured: the startup chain walk must
+// never DOWNLOAD an epoch to prove it exists. Over a bucket-only artifact,
+// reading one epoch's link costs the footer's chunk and nothing else, while
+// OpenEpoch (the SERVING path, where paying for the blooms is the point) costs
+// strictly more.
+func TestReadEpochLinkReadsOnlyTheFooter(t *testing.T) {
+	dir := t.TempDir()
+	st, s3 := credStore(t, dir, 64<<20) // whole artifact fits: nothing is evicted
+	in, hash := chunkyEpoch(t, st, 3000)
+	if err := st.Sync(); err != nil { // upload, then unlink the local copy
+		t.Fatal(err)
+	}
+
+	before := s3.rangedGets.Load()
+	link, err := ReadEpochLink(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	footer := s3.rangedGets.Load() - before
+	if link.Start != in.Start || link.Count != uint64(len(in.Containers)) || link.Prev != in.Prev {
+		t.Fatalf("link %+v, want start %d count %d prev %x", link, in.Start, len(in.Containers), in.Prev)
+	}
+	if link.End() != in.Start+uint64(len(in.Containers))-1 {
+		t.Fatalf("link ends at %d", link.End())
+	}
+	// Exactly one: 0 would mean casfs pulled the whole object instead, which is
+	// the download this test exists to forbid.
+	if footer != 1 {
+		t.Fatalf("reading one epoch's link cost %d ranged GETs, want the footer's chunk alone", footer)
+	}
+
+	e, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if full := s3.rangedGets.Load() - before - footer; full == 0 {
+		t.Fatal("OpenEpoch read nothing beyond the footer's chunk, so this comparison proves nothing about the walk")
+	}
+}
+
 // TestConcurrentTxWalkUnderEviction: the tx index is a byte view now, so a
 // candidate walk reads the mapping directly. Many goroutines walking the same
 // unpinned-by-default section at once, under eviction pressure, must each pin

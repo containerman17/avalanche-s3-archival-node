@@ -86,7 +86,9 @@ func fleetMain(args []string) {
 	defer stop()
 
 	// The listener FIRST, before chain resolution and the per-chain startup work
-	// below, which on a big corpus is over an hour: a bad port must be a dead
+	// below (startNode, which joins each chain to its published history and may
+	// frontier-build it from the bucket, one chain at a time), which on a big
+	// corpus is over an hour: a bad port must be a dead
 	// process in milliseconds, not a FATAL after the whole boot (Fuji,
 	// 2026-08-01, twice on serve). /status answers from this moment too, so an
 	// operator can watch the chains come up instead of guessing; a chain's own

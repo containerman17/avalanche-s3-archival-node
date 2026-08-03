@@ -167,7 +167,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120]")
 	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet] [--chain <blockchainID>]")
 	fmt.Fprintln(os.Stderr, "       epochdb publish [--data <dir>]  (upload the spool to the bucket, then release the local copies; needs EPOCHDB_S3_*)")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--chain <blockchainID>] [--frontier] [--verify]")
+	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--chain <blockchainID>] [--frontier] [--verify]  (MANUAL/OFFLINE form: serve and fleet join a published chain by themselves)")
 	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--chain <blockchainID>] [--workers N]")
 	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
 	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
@@ -229,11 +229,14 @@ func cookTxMain(args []string) {
 	}
 }
 
-// bootstrapMain learns a chain's history from the `latest` pointer: walk the
-// epoch hash chain backward, write the local index, done. Nothing is
-// downloaded eagerly (with credentials the node reads history lazily; without
-// them the artifacts are already in the spool). Operator flow on a new
-// machine: bootstrap --frontier, then serve.
+// bootstrapMain is the MANUAL, OFFLINE form of what `serve` and `fleet` now do
+// by themselves (RULING 2026-08-03: there is no separate bootstrap story, see
+// joinChain): walk the epoch hash chain backward from the `latest` pointer,
+// write the local index, and optionally merge the frontier and verify the
+// corpus. Nothing is downloaded eagerly (with credentials the node reads
+// history lazily; without them the artifacts are already in the spool). Kept
+// for offline prep, for a box that is not going to serve, and for --verify;
+// starting a node NEVER requires it.
 func bootstrapMain(args []string) {
 	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
@@ -257,7 +260,9 @@ func bootstrapMain(args []string) {
 	}
 	log.Printf("bootstrap: %d epochs indexed, chain rooted at %x", epochs, chainRoot[:8])
 	if *frontier {
-		buildFrontier(*dataDir, st, c)
+		if err := buildFrontier(*dataDir, st, c); err != nil {
+			log.Fatalf("epochdb: bootstrap --frontier: %v", err)
+		}
 	}
 	if !*doVerify {
 		return

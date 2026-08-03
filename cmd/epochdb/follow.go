@@ -152,8 +152,9 @@ func serveMain(args []string) {
 }
 
 // serveOn binds the RPC port and ONLY THEN starts the node on it. The order is
-// the whole point: startNode is an hour of work on a big corpus (the epoch
-// chain walk, the exec open, the startup cook and the tail overlay), and while
+// the whole point: startNode is an hour of work on a big corpus (joinChain's
+// walk and, on an empty dir, its whole frontier build, then the exec open, the
+// startup cook and the tail overlay), and while
 // it ran nothing had touched the port, so a collision surfaced as FATAL 68
 // minutes in (Fuji, 2026-08-01, twice in one night). A bad port now fails in
 // milliseconds.
@@ -227,6 +228,15 @@ type chainNode struct {
 // fleet. Nothing here calls log.Fatal, because a fleet must survive one chain's
 // bad data directory.
 func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err error)) (n *chainNode, err error) {
+	// THE START SEQUENCE, before a single file of this dir is opened: resolve
+	// the chain's `latest` pointer, refuse to start if it names history we
+	// cannot assemble, and frontier-build if the dir has none of its own
+	// (joinChain, RULING 2026-08-03). An empty data dir with credentials joins
+	// the published chain here; there is no bootstrap step to remember.
+	if err := joinChain(cfg, buildFrontier); err != nil {
+		return nil, err
+	}
+
 	// Unwind whatever is already open if a later step fails: in the fleet this
 	// runs while sibling chains are serving, so leaking fds is not an option.
 	var closers []func()
@@ -263,16 +273,6 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		return nil, fmt.Errorf("open state layer: %w", err)
 	}
 	closers = append(closers, func() { store.Close() })
-
-	// Never serve an epoch set with a hole in it: walk the hash chain from
-	// `latest` back to the chain root before anything opens it.
-	epochs, err := validateChain(store.Cas(), cfg.Chain.Root())
-	if err != nil {
-		return nil, fmt.Errorf("epoch chain: %w", err)
-	}
-	if epochs > 0 {
-		cfg.logf("epoch chain: %d epochs linked from `latest` to the chain root", epochs)
-	}
 
 	g, err := exec.ChainGenesis(cfg.Chain)
 	if err != nil {

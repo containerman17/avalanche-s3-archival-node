@@ -129,45 +129,84 @@ func OpenEpoch(st *dist.Store, hash string) (*Epoch, error) {
 	return e, nil
 }
 
-func openEpochBlob(blob *dist.Blob, hash string) (*Epoch, error) {
+// parseFooter fills e from the artifact's fixed-size footer: format check,
+// coverage, prev-hash and the section table. It reads the tail of the blob and
+// nothing else.
+func (e *Epoch) parseFooter(blob *dist.Blob, hash string) error {
 	size := blob.Size()
 	if size < epochFooterSize {
-		return nil, fmt.Errorf("epoch %s: too small", hash)
+		return fmt.Errorf("epoch %s: too small", hash)
 	}
 	if err := blob.Pin(size-epochFooterSize, epochFooterSize); err != nil {
-		return nil, err
+		return err
 	}
 	defer blob.Unpin(size-epochFooterSize, epochFooterSize)
 	ft, err := blob.Slice(size-epochFooterSize, epochFooterSize)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// v5 is the only supported format. Older files are recognized far enough
 	// to say so and no further: there is no upgrade path (user ruling
 	// 2026-07-28), the corpus is disposable and gets resynced.
 	if !bytes.Equal(ft[0:4], epochMagic[:]) || !bytes.Equal(ft[epochFooterSize-4:], epochMagic[:]) {
-		return nil, fmt.Errorf("epoch %s: unrecognized footer, not format v%d (older formats are unsupported: delete the corpus and resync)", hash, epochVersion)
+		return fmt.Errorf("epoch %s: unrecognized footer, not format v%d (older formats are unsupported: delete the corpus and resync)", hash, epochVersion)
 	}
 	if v := binary.LittleEndian.Uint32(ft[4:8]); v != epochVersion {
-		return nil, fmt.Errorf("epoch %s is format v%d, unsupported: delete the corpus and resync", hash, v)
+		return fmt.Errorf("epoch %s is format v%d, unsupported: delete the corpus and resync", hash, v)
 	}
-	e := &Epoch{
-		Start:   binary.LittleEndian.Uint64(ft[8:16]),
-		Count:   binary.LittleEndian.Uint64(ft[16:24]),
-		TxCount: binary.LittleEndian.Uint64(ft[24:32]),
-		Hash:    hash,
-		blob:    blob,
-	}
+	e.Start = binary.LittleEndian.Uint64(ft[8:16])
+	e.Count = binary.LittleEndian.Uint64(ft[16:24])
+	e.TxCount = binary.LittleEndian.Uint64(ft[24:32])
+	e.Hash = hash
 	copy(e.Prev[:], ft[32:64])
 	body := size - epochFooterSize
 	for i := 0; i < epochNumSections; i++ {
 		off := binary.LittleEndian.Uint64(ft[epochTableOff+i*16:])
 		ln := binary.LittleEndian.Uint64(ft[epochTableOff+8+i*16:])
 		if off > body || ln > body-off { // overflow-safe bounds check
-			return nil, fmt.Errorf("epoch %s: section %d out of bounds", hash, i)
+			return fmt.Errorf("epoch %s: section %d out of bounds", hash, i)
 		}
 		e.off[i] = [2]uint64{off, ln}
 	}
+	return nil
+}
+
+// EpochLink is what a chain WALK needs from an epoch and nothing else: the
+// range it covers and the artifact it chains back to. See ReadEpochLink.
+type EpochLink struct {
+	Start, Count uint64
+	Prev         [32]byte
+}
+
+// End is the epoch's last block.
+func (l EpochLink) End() uint64 { return l.Start + l.Count - 1 }
+
+// ReadEpochLink reads ONE epoch's FOOTER and stops there: existence (the blob
+// open is a size probe, a HEAD under casfs) plus the ~1KB tail that carries the
+// coverage and the prev-hash. NOTHING ELSE IS TOUCHED, which is the whole
+// point: OpenEpoch additionally pins every resident section (the key bloom
+// alone is 20 bits per key, gigabytes across a mainnet corpus), and a startup
+// chain walk that paid that would download the corpus to prove it exists.
+// Content is never rehashed here either; that is `epochdb verify`.
+func ReadEpochLink(st *dist.Store, hash string) (EpochLink, error) {
+	blob, err := st.Open(hash)
+	if err != nil {
+		return EpochLink{}, err
+	}
+	defer blob.Close()
+	e := &Epoch{}
+	if err := e.parseFooter(blob, hash); err != nil {
+		return EpochLink{}, err
+	}
+	return EpochLink{Start: e.Start, Count: e.Count, Prev: e.Prev}, nil
+}
+
+func openEpochBlob(blob *dist.Blob, hash string) (*Epoch, error) {
+	e := &Epoch{blob: blob}
+	if err := e.parseFooter(blob, hash); err != nil {
+		return nil, err
+	}
+	var err error
 	for _, id := range residentSections {
 		if e.sec[id], err = e.pinSection(id); err != nil {
 			e.Close()

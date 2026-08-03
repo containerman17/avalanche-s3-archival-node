@@ -104,15 +104,13 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("open misc store: %w", err)
 	}
 	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
-	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
-	if err == nil && len(raw) == 8 {
-		s.execHead = binary.BigEndian.Uint64(raw)
-		s.execHeadOK = true
-	} else if err != nil && !os.IsNotExist(err) {
+	head, ok, err := ExecHead(dir)
+	if err != nil {
 		s.Close()
-		return nil, fmt.Errorf("read exechead: %w", err)
+		return nil, err
 	}
-	raw, err = os.ReadFile(filepath.Join(dir, logsStartFile))
+	s.execHead, s.execHeadOK = head, ok
+	raw, err := os.ReadFile(filepath.Join(dir, logsStartFile))
 	if err == nil && len(raw) == 8 {
 		s.logsStart = binary.BigEndian.Uint64(raw)
 		s.logsStartOK = true
@@ -142,6 +140,22 @@ func (s *Store) Close() error {
 
 // ExecHead returns the durable executor head. ok=false on a fresh store.
 func (s *Store) ExecHead() (uint64, bool) { return s.execHead, s.execHeadOK }
+
+// ExecHead reads a data dir's durable executor head WITHOUT opening the state
+// layer: it is one 8-byte file, while Open builds a RAM index over every
+// unsealed raw bucket (182 B/block, see DESIGN.md's seal-memory section). The
+// startup decision tree only needs to know whether this dir has ever executed
+// anything (cmd/epochdb joinChain), so it must not pay that twice.
+func ExecHead(dir string) (uint64, bool, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
+	switch {
+	case err == nil && len(raw) == 8:
+		return binary.BigEndian.Uint64(raw), true, nil
+	case err != nil && !os.IsNotExist(err):
+		return 0, false, fmt.Errorf("read exechead: %w", err)
+	}
+	return 0, false, nil
+}
 
 // RetireBuckets drops this store's handles and index entries for the raw
 // buckets a seal has just deleted (History.SealTail's last step). Without it
