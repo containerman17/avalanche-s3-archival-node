@@ -1,16 +1,13 @@
 package main
 
 import (
-	"context"
 	"net"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
 
 // TestServeBindsBeforeStartupWork pins the ordering serveOn exists for: the RPC
-// port is taken BEFORE the startup work, so a collision is an error in
+// port is taken BEFORE any startup work, so a collision is an error in
 // milliseconds and nothing in the data dir has been opened. Before this, serve
 // bound last and a taken port surfaced as FATAL 68 minutes into a 57M-block
 // Fuji start, twice in one night (2026-08-01).
@@ -21,21 +18,19 @@ func TestServeBindsBeforeStartupWork(t *testing.T) {
 	}
 	defer busy.Close()
 
-	dir := filepath.Join(t.TempDir(), "data")
-	port := busy.Addr().(*net.TCPAddr).Port
+	ran := false
 	start := time.Now()
-	n, ln, err := serveOn(context.Background(), nodeConfig{DataDir: dir}, port, func(string, error) {})
+	err = serveOn(busy.Addr().(*net.TCPAddr).Port, func(net.Listener) { ran = true })
 	if err == nil {
-		ln.Close()
-		n.closeAll()
-		t.Fatal("a taken port started a node")
+		t.Fatal("a taken port started serving")
+	}
+	// The one assertion that catches a reordering: everything after the bind
+	// (chain resolution, joinChain's walk, the frontier build, the exec open)
+	// lives in this callback, and none of it may run.
+	if ran {
+		t.Fatal("the startup work ran before the bind succeeded")
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("the port collision took %s to surface", d)
-	}
-	// The one assertion that catches a reordering: startNode would have created
-	// the data dir on its way to the epoch-chain walk.
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("startNode ran before the bind: %s exists (%v)", dir, err)
 	}
 }

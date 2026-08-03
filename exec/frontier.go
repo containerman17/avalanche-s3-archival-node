@@ -66,7 +66,7 @@ const frontierHeaderWindow = 256
 func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	h := epochs.CoveredEnd()
 	if h == 0 {
-		return fmt.Errorf("build frontier: no contiguous sealed epochs from genesis in this data dir (run epochdb bootstrap first)")
+		return fmt.Errorf("build frontier: no contiguous sealed epochs from genesis in this data dir (run `epochdb dev bootstrap` on this dir)")
 	}
 	if end, _ := epochs.SealedEnd(); end != h {
 		return fmt.Errorf("build frontier: sealed coverage is contiguous only through block %d but the set reaches %d: fill the gap first", h, end)

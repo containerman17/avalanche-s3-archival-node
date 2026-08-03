@@ -489,7 +489,7 @@ func openSortedBucket(dir string, bucket uint64) (*sortedBucket, uint64, error) 
 	}
 	wst, err := wl.Stat()
 	if err == nil && uint64(wst.Size()) < wlSize {
-		err = fmt.Errorf("stale sorted index: writelog is %d bytes, cooked against %d (re-run epochdb cook-index)", wst.Size(), wlSize)
+		err = fmt.Errorf("stale sorted index: writelog is %d bytes, cooked against %d (the node cooks on its own cadence; `epochdb dev cook-index` fixes an offline dir)", wst.Size(), wlSize)
 	}
 	if err != nil {
 		syscall.Munmap(mm)
@@ -852,7 +852,7 @@ func (h *History) StateAt(n uint64) state.Database {
 func (h *History) EnableTail(executedHead uint64) (blocks int, entries int, size uint64, err error) {
 	from := h.stateHead.Load() + 1
 	if executedHead >= from && executedHead-from+1 > 2*BucketBlocks {
-		return 0, 0, 0, fmt.Errorf("cooked through %d but executed to %d: %d uncooked blocks would not fit in the tail overlay (run epochdb cook-index first)",
+		return 0, 0, 0, fmt.Errorf("cooked through %d but executed to %d: %d uncooked blocks would not fit in the tail overlay (run `epochdb dev cook-index` on this dir)",
 			from-1, executedHead, executedHead-from+1)
 	}
 	t := newTail()

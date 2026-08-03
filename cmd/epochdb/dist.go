@@ -62,7 +62,7 @@ func publishMain(args []string) {
 // casfs) plus its ~1KB footer, which is the only place the prev-hash lives. No
 // section is pinned, no content is rehashed and no artifact is downloaded to be
 // validated: the bytes come down when the frontier build or a read actually
-// wants them, and full content verification stays `epochdb verify`.
+// wants them, and full content verification stays `serve --verify`.
 func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) {
 	l, err := st.Latest(chainRoot)
 	if err != nil {
@@ -97,8 +97,8 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 
 // joinChain IS A NODE'S START SEQUENCE, and there is no other one [RULING
 // 2026-08-03: THERE IS NO SEPARATE BOOTSTRAP STORY]. Every `epochdb serve` and
-// every fleet chain runs it before anything opens the data dir, and the whole
-// decision is these four cases:
+// every chain of a `--chains` process runs it before anything opens the data dir,
+// and the whole decision is these four cases:
 //
 //  1. No `latest` pointer, locally or in the bucket -> a genuinely fresh chain.
 //     Fetch from genesis and execute, the path that always existed.
@@ -108,8 +108,8 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 //     history, and that is a disaster, not a degraded mode.
 //  3. The chain walks clean and this dir has never executed -> build the state
 //     frontier out of the sealed epochs right here, automatically. That is the
-//     k-way merge `epochdb bootstrap --frontier` does by hand; it takes minutes
-//     to hours, which is fine, because serveOn/fleetMain bound the listener
+//     k-way merge `epochdb dev bootstrap --frontier` does by hand; it takes minutes
+//     to hours, which is fine, because serveOn bound the listener
 //     first and requests wait in the accept backlog.
 //  4. The chain walks clean and the dir has state -> today's warm start,
 //     untouched.
@@ -120,7 +120,7 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 // per epoch a size probe and its ~1KB footer, which is where the prev-hash
 // lives. Neither ever rehashes content or downloads an artifact to validate it;
 // bytes come down when the frontier build or a read actually wants them, and
-// full content verification is `epochdb verify` and nothing else.
+// full content verification is `serve --verify` and nothing else.
 //
 // Providers bootstrap from their OWN bucket, and that is the only case: seeding
 // a new box by copying a bucket is an operator's business, so nothing here
@@ -197,7 +197,7 @@ func joinChain(cfg nodeConfig, build func(dataDir string, st *dist.Store, c *cha
 // one second): the local markers must name the epoch `latest` points at and
 // must cover blocks 1..N with no gap and nothing stranded above one. No
 // artifact is opened, no footer is read, no request is made, and no content is
-// ever rehashed (that is `epochdb verify`, and only ever that).
+// ever rehashed (that is `serve --verify`, and only ever that).
 //
 // An error here is not fatal to the caller: the local index is derivable from
 // the chain, so a bad one means walk again, not refuse.

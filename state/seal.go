@@ -41,7 +41,7 @@ import (
 // existing ones).
 //
 // This is the OFFLINE all-in-one (`epochdb seal` on a dir nobody is serving).
-// A live serve/fleet process seals through History.SealTail, which splits the
+// A live serve process seals through History.SealTail, which splits the
 // same work so the new epochs reach its readers before the raw goes.
 func SealEpochs(dir string, out *dist.Store, chainRoot [32]byte) error {
 	_, err := sealEpochs(context.Background(), dir, out, chainRoot, func(sealedEnd uint64) error {

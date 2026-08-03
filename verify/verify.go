@@ -416,7 +416,7 @@ func reconstructReceipts(e *state.Epoch, n uint64, txs types.Transactions) (type
 }
 
 // VerifySet verifies every epoch of the local set in chain order (the
-// standalone `epochdb verify` path, and `bootstrap --verify`, which just runs
+// standalone `epochdb dev verify` path, `serve --verify` and `dev bootstrap --verify`, which just runs
 // it once the hash chain has been walked). Reads pull whatever bytes they need
 // through dist, so a node with S3 credentials verifies history it does not
 // hold locally. Returns total blocks and wall time for the runbook numbers.

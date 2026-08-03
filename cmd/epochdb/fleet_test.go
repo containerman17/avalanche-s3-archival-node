@@ -48,12 +48,13 @@ func TestParseTipOverrideRefusesAHeight(t *testing.T) {
 	}
 }
 
-// TestParseFleetTipOverrides pins the per-chain form: a fleet runs N chains,
-// so the override names one of --chains and a bare value is refused.
-func TestParseFleetTipOverrides(t *testing.T) {
+// TestParseTipOverrides pins the per-chain form: with N chains in the process
+// the override names one of --chains and a bare value is refused, and with ONE
+// chain the bare value single-chain serve always took still works.
+func TestParseTipOverrides(t *testing.T) {
 	specs := []string{"C", cb58Tip}
 
-	got, err := parseFleetTipOverrides("C="+hexTip+", "+cb58Tip+"="+cb58Tip, specs)
+	got, err := parseTipOverrides("C="+hexTip+", "+cb58Tip+"="+cb58Tip, specs)
 	if err != nil {
 		t.Fatalf("valid override refused: %v", err)
 	}
@@ -61,10 +62,10 @@ func TestParseFleetTipOverrides(t *testing.T) {
 		t.Fatalf("parsed wrong: %v", got)
 	}
 	// A chain with no entry keeps following: absent, not zero.
-	if got, err := parseFleetTipOverrides("C="+cb58Tip, specs); err != nil || len(got) != 1 {
+	if got, err := parseTipOverrides("C="+cb58Tip, specs); err != nil || len(got) != 1 {
 		t.Fatalf("one entry: %v %v", got, err)
 	}
-	if got, err := parseFleetTipOverrides("", specs); err != nil || len(got) != 0 {
+	if got, err := parseTipOverrides("", specs); err != nil || len(got) != 0 {
 		t.Fatalf("empty flag: %v %v", got, err)
 	}
 
@@ -76,8 +77,65 @@ func TestParseFleetTipOverrides(t *testing.T) {
 		"height per key":  "C=3000000",
 		"garbage per key": "C=nope",
 	} {
-		if _, err := parseFleetTipOverrides(v, specs); err == nil {
+		if _, err := parseTipOverrides(v, specs); err == nil {
 			t.Fatalf("%s accepted: %q", name, v)
+		}
+	}
+
+	// ONE chain: the bare form is the whole point of `serve --tip-override <id>`
+	// and it must keep meaning that chain. The keyed form still parses.
+	for _, one := range [][]string{{"C"}, {cb58Tip}} {
+		got, err := parseTipOverrides(hexTip, one)
+		if err != nil {
+			t.Fatalf("%v: bare value refused: %v", one, err)
+		}
+		if len(got) != 1 || got[one[0]].String() != cb58Tip {
+			t.Fatalf("%v: bare value parsed wrong: %v", one, got)
+		}
+		if got, err := parseTipOverrides(one[0]+"="+hexTip, one); err != nil || got[one[0]].String() != cb58Tip {
+			t.Fatalf("%v: keyed value: %v %v", one, got, err)
+		}
+		if _, err := parseTipOverrides("3000000", one); err == nil {
+			t.Fatalf("%v: a height was accepted", one)
+		}
+	}
+}
+
+// TestServeSpecs pins the flag fold: --chains and --chain are ONE knob, a single
+// --chains entry is exactly --chain, and only two or more chains make this a
+// fleet at all.
+func TestServeSpecs(t *testing.T) {
+	for name, tc := range map[string]struct {
+		one, many string
+		want      []string
+	}{
+		"default":          {"C", "", []string{"C"}},
+		"chain":            {cb58Tip, "", []string{cb58Tip}},
+		"chains, one":      {"C", cb58Tip, []string{cb58Tip}},
+		"chains, several":  {"C", "C," + cb58Tip, []string{"C", cb58Tip}},
+		"chains, spaced":   {"C", " C , " + cb58Tip + " ", []string{"C", cb58Tip}},
+		"chains, trailing": {"C", "C,", []string{"C"}},
+	} {
+		got, err := serveSpecs(tc.one, tc.many)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: got %v want %v", name, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("%s: got %v want %v", name, got, tc.want)
+			}
+		}
+	}
+	for name, tc := range map[string][2]string{
+		"empty --chain":  {"", ""},
+		"empty --chains": {"C", " , "},
+		"duplicate":      {"C", "C,c"},
+	} {
+		if got, err := serveSpecs(tc[0], tc[1]); err == nil {
+			t.Fatalf("%s accepted: %v", name, got)
 		}
 	}
 }
@@ -144,20 +202,72 @@ func TestFleetChainStopsAlone(t *testing.T) {
 	default:
 	}
 
-	rec := httptest.NewRecorder()
-	f.statusHandler(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
-	var got []struct {
-		Chain   string `json:"chain"`
-		Stopped bool   `json:"stopped"`
-		Error   string `json:"error"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
-		t.Fatalf("status: %v", err)
-	}
+	got := statusOf(t, f)
 	if len(got) != 2 || got[0].Chain != "dead" || !got[0].Stopped || got[1].Chain != "alive" || got[1].Stopped {
 		t.Fatalf("status does not name the dead chain alone: %+v", got)
 	}
 	if !strings.Contains(got[0].Error, "root mismatch at 42") {
 		t.Fatalf("status hides the cause: %+v", got[0])
 	}
+}
+
+// TestChainThatNeverStartedIsAStatusEntry pins the boot half of the resilience
+// contract (RULING 2026-08-03): a chain that REFUSES TO START is a per-chain
+// failure state, not a dead process. The process is up, the healthy sibling is
+// untouched, and /status carries the operator-facing reason for the broken one.
+func TestChainThatNeverStartedIsAStatusEntry(t *testing.T) {
+	f := &fleet{}
+	f.fail("broken", errors.New("the `latest` pointer names history this node cannot assemble"))
+	alive, aliveCtx, aliveStops := newTestChain(context.Background(), "alive")
+	f.mu.Lock()
+	f.chains = append(f.chains, alive)
+	f.mu.Unlock()
+
+	// Nothing about the refusal reached the sibling: not its context, not its
+	// writers, and it is not marked stopped.
+	if err := alive.stopped(); err != nil {
+		t.Fatalf("sibling stopped by another chain's refusal: %v", err)
+	}
+	if aliveStops.Load() != 0 {
+		t.Fatalf("sibling flushed by another chain's refusal")
+	}
+	select {
+	case <-aliveCtx.Done():
+		t.Fatal("sibling's goroutines were cancelled by another chain's refusal")
+	default:
+	}
+
+	got := statusOf(t, f)
+	if len(got) != 2 || got[0].Chain != "broken" || !got[0].Stopped || got[1].Chain != "alive" || got[1].Stopped {
+		t.Fatalf("status does not name the refusing chain alone: %+v", got)
+	}
+	if !strings.Contains(got[0].Error, "cannot assemble") {
+		t.Fatalf("status hides why the chain refused: %+v", got[0])
+	}
+
+	// With a single chain the process has nothing left to serve, and only then
+	// does a refusal reach the process.
+	var died string
+	solo := &fleet{onFail: func(id string) { died = id }}
+	solo.fail("only", errors.New("boom"))
+	if died != "only" {
+		t.Fatalf("a solo chain's refusal did not reach the process: %q", died)
+	}
+}
+
+type statusRow struct {
+	Chain   string `json:"chain"`
+	Stopped bool   `json:"stopped"`
+	Error   string `json:"error"`
+}
+
+func statusOf(t *testing.T, f *fleet) []statusRow {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	f.statusHandler(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	var got []statusRow
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	return got
 }

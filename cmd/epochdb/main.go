@@ -7,11 +7,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -110,68 +112,97 @@ const tipOverrideHowTo = "cb58, or a 0x-hex eth block hash for pre-ProposerVM bl
 	"The fetch log prints one per accepted block, 'consensus: accepted height=N container=<ID>', " +
 	"and any checkpoint anchor line ('fetch: tip-override <ID> at height N') carries one too"
 
-func main() {
-	if len(os.Args) < 2 {
-		usage()
-	}
-	switch os.Args[1] {
-	case "fetch":
-		fetchMain(os.Args[2:])
-	case "exec":
-		execMain(os.Args[2:])
-	case "cook-index":
-		cookMain(os.Args[2:])
-	case "cook-txindex":
-		cookTxMain(os.Args[2:])
-	case "serve":
-		serveMain(os.Args[2:])
-	case "fleet":
-		fleetMain(os.Args[2:])
-	case "ab-bench":
-		benchMain(os.Args[2:])
-	case "ab-bench-tx":
-		benchTxMain(os.Args[2:])
-	case "ab-bench-rpc":
-		benchRPCMain(os.Args[2:])
-	case "ab-bench-logs":
-		benchLogsMain(os.Args[2:])
-	case "rpc-bench":
-		rpcBenchMain(os.Args[2:])
-	case "seal":
-		sealMain(os.Args[2:])
-	case "publish":
-		publishMain(os.Args[2:])
-	case "bootstrap":
-		bootstrapMain(os.Args[2:])
-	case "verify":
-		verifyMain(os.Args[2:])
-	case "backfill-logs":
-		backfillLogsMain(os.Args[2:])
-	case "verify-logs":
-		verifyLogsMain(os.Args[2:])
-	default:
-		usage()
-	}
+// devCommands are the pipeline stages and the benches. They are NOT operator
+// surface (RULING 2026-08-03: the operator surface is `serve` and nothing else)
+// and they are deliberately absent from `usage`, but they still exist, because
+// our own release gates and experiments drive them: `epochdb dev seal ...`,
+// `epochdb dev ab-bench ...`. Flag sets are unchanged.
+var devCommands = map[string]func([]string){
+	"fetch":         fetchMain,
+	"exec":          execMain,
+	"cook-index":    cookMain,
+	"cook-txindex":  cookTxMain,
+	"seal":          sealMain,
+	"publish":       publishMain,
+	"bootstrap":     bootstrapMain,
+	"verify":        verifyMain,
+	"verify-logs":   verifyLogsMain,
+	"backfill-logs": backfillLogsMain,
+	"ab-bench":      benchMain,
+	"ab-bench-tx":   benchTxMain,
+	"ab-bench-rpc":  benchRPCMain,
+	"ab-bench-logs": benchLogsMain,
+	"rpc-bench":     rpcBenchMain,
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, "usage: epochdb fetch [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--node <uri>] [--tip <containerID>]")
-	fmt.Fprintln(os.Stderr, "       epochdb exec  [--data <dir>] [--network mainnet] [--chain C|<blockchainID>]")
-	fmt.Fprintln(os.Stderr, "       epochdb cook-index [--data <dir>]")
-	fmt.Fprintln(os.Stderr, "       epochdb cook-txindex [--data <dir>]")
-	fmt.Fprintln(os.Stderr, "       epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--port 9650] [--vdr-sources <p-chain rpcs>] [--tip-override <containerID>]")
-	fmt.Fprintln(os.Stderr, "       epochdb fleet [--chains <blockchainID>,<blockchainID>] [--data <root>] [--port 9650] [--tip-override <chain>=<containerID>,...]  (all subnet-evm chains in one process; /ext/bc/<blockchainID>/rpc)")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench [--data <dir>] [--local <url>] [--remote <url>] [--n 1000]")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-tx [--data <dir>] [--local <url>] [--remote <url>] [--n 600]")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-rpc [--local <url>] [--remote <url>] [--n 300]")
-	fmt.Fprintln(os.Stderr, "       epochdb ab-bench-logs [--data <dir>] [--local <url>] [--remote <url>] [--n 120]")
-	fmt.Fprintln(os.Stderr, "       epochdb seal [--data <dir>] [--out <dir>] [--network mainnet] [--chain <blockchainID>]")
-	fmt.Fprintln(os.Stderr, "       epochdb publish [--data <dir>]  (upload the spool to the bucket, then release the local copies; needs EPOCHDB_S3_*)")
-	fmt.Fprintln(os.Stderr, "       epochdb bootstrap [--data <dir>] [--network mainnet] [--chain <blockchainID>] [--frontier] [--verify]  (MANUAL/OFFLINE form: serve and fleet join a published chain by themselves)")
-	fmt.Fprintln(os.Stderr, "       epochdb verify [--data <dir>] [--network mainnet] [--chain <blockchainID>] [--workers N]")
-	fmt.Fprintln(os.Stderr, "       epochdb backfill-logs [--data <dir>] [--workers 12]")
-	fmt.Fprintln(os.Stderr, "       epochdb verify-logs [--data <dir>] [--remote <url>] [--n 300] [--parity 50]")
-	os.Exit(2)
+func main() {
+	os.Exit(dispatch(os.Args[1:], os.Stderr))
+}
+
+// dispatch returns the process exit code for a command line that never reached
+// a command; 0 means a command ran (and owns its own exit from there).
+//
+// A retired top-level name FAILS LOUDLY instead of running: a stale script that
+// still says `epochdb seal` must stop with a pointer, not silently do the thing
+// the node now does for itself.
+func dispatch(args []string, w io.Writer) int {
+	if len(args) == 0 {
+		usage(w)
+		return 2
+	}
+	switch args[0] {
+	case "serve":
+		serveMain(args[1:])
+		return 0
+	case "dev":
+		if len(args) < 2 {
+			devUsage(w)
+			return 2
+		}
+		cmd, ok := devCommands[args[1]]
+		if !ok {
+			fmt.Fprintf(w, "epochdb dev: no such stage %q\n", args[1])
+			devUsage(w)
+			return 2
+		}
+		cmd(args[2:])
+		return 0
+	case "fleet":
+		fmt.Fprintln(w, "epochdb: `fleet` is gone. One process hosting several chains is `epochdb serve --chains C,<blockchainID>,...`;")
+		fmt.Fprintln(w, "         every flag it had is a serve flag, including per-chain --tip-override <chain>=<containerID>.")
+		return 2
+	}
+	if _, ok := devCommands[args[0]]; ok {
+		fmt.Fprintf(w, "epochdb: `%s` is not an operator command. `epochdb serve` is the whole surface: it fetches, executes,\n", args[0])
+		fmt.Fprintf(w, "         indexes, cuts and publishes epoch files and answers RPC by itself, and recovers on its own.\n")
+		fmt.Fprintf(w, "         The stage still exists for our own gates as `epochdb dev %s` (undocumented, unsupported, same flags).\n", args[0])
+		return 2
+	}
+	usage(w)
+	return 2
+}
+
+func usage(w io.Writer) {
+	fmt.Fprintln(w, "usage: epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>] [--chains C,<blockchainID>,...]")
+	fmt.Fprintln(w, "                     [--port 9650] [--vdr-sources <p-chain rpcs>] [--verify] [--tip-override <containerID>|<chain>=<containerID>,...]")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "serve is the only command. It follows the chain, executes it, indexes it, cuts and publishes")
+	fmt.Fprintln(w, "epoch files, uploads them, and answers RPC, in one process that recovers by itself.")
+	fmt.Fprintln(w, "--chains hosts several chains at once: each answers at /ext/bc/<blockchainID>/rpc, and /status")
+	fmt.Fprintln(w, "reports all of them. A chain that cannot start does not take the process or its siblings down.")
+	fmt.Fprintln(w, "--verify re-verifies the SEALED epochs before serving them; a chain that fails does not start.")
+}
+
+// devUsage lists what `dev` still carries. Names only: the stages are ours, and
+// each one prints its own flags with -h.
+func devUsage(w io.Writer) {
+	names := make([]string, 0, len(devCommands))
+	for name := range devCommands {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Fprintln(w, "usage: epochdb dev <stage> [flags]   (NOT operator surface: `epochdb serve` does all of this by itself)")
+	fmt.Fprintln(w, "stages:", strings.Join(names, " "))
 }
 
 // cookMain external-sorts the writelog buckets into sorted_NNNNN.idx.
@@ -229,9 +260,10 @@ func cookTxMain(args []string) {
 	}
 }
 
-// bootstrapMain is the MANUAL, OFFLINE form of what `serve` and `fleet` now do
-// by themselves (RULING 2026-08-03: there is no separate bootstrap story, see
-// joinChain): walk the epoch hash chain backward from the `latest` pointer,
+// bootstrapMain is the MANUAL, OFFLINE form of what `serve` now does by itself
+// (RULING 2026-08-03: there is no separate bootstrap story, see joinChain), and
+// it lives under `dev` for exactly that reason: walk the epoch hash chain
+// backward from the `latest` pointer,
 // write the local index, and optionally merge the frontier and verify the
 // corpus. Nothing is downloaded eagerly (with credentials the node reads
 // history lazily; without them the artifacts are already in the spool). Kept

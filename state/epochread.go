@@ -187,7 +187,7 @@ func (l EpochLink) End() uint64 { return l.Start + l.Count - 1 }
 // point: OpenEpoch additionally pins every resident section (the key bloom
 // alone is 20 bits per key, gigabytes across a mainnet corpus), and a startup
 // chain walk that paid that would download the corpus to prove it exists.
-// Content is never rehashed here either; that is `epochdb verify`.
+// Content is never rehashed here either; that is `serve --verify`.
 func ReadEpochLink(st *dist.Store, hash string) (EpochLink, error) {
 	blob, err := st.Open(hash)
 	if err != nil {

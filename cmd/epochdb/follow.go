@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,12 +26,19 @@ import (
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
 	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/verify"
 )
 
-// serveMain is `epochdb serve`: ONE process that follows the chain, executes,
-// and serves RPC continuously. No restarts, ever, and no static mode: following
-// is what a node does (ruling 2026-07-29). The serve process is the sole
-// writer and sole server of its data dir; side consumers use its RPC port.
+// serveMain is `epochdb serve`, THE ONLY OPERATOR COMMAND (RULING 2026-08-03).
+// ONE process that follows the chain, executes, indexes, seals, publishes and
+// serves RPC continuously, for ONE chain or for N of them (`--chains`, which is
+// what `epochdb fleet` used to be). No restarts, ever, and no static mode:
+// following is what a node does (ruling 2026-07-29). The serve process is the
+// sole writer and sole server of its data dir; side consumers use its RPC port.
+//
+// Everything genuinely multi-chain lives in fleet.go (the supervisor, the
+// per-chain failure boundary and /status): N chains are N of the stack below
+// side by side, and that IS the whole difference.
 //
 // Who owns what:
 //
@@ -63,120 +71,320 @@ import (
 // the ordering that makes deleting raw safe under a live reader.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "shared data directory")
-	port := fs.Int("port", 9650, "HTTP listen port")
-	network, resolveChain := chainFlags(fs)
+	dataDir := fs.String("data", "./data", "data directory. ONE chain owns it; with two or more --chains each chain gets <data>/<blockchainID> and they share <data>/cas and the chunk cache")
+	port := fs.Int("port", 9650, "HTTP listen port; every chain also answers at /ext/bc/<blockchainID>/rpc, and /status reports all of them")
+	network := fs.String("network", "fuji", "network: fuji|mainnet (the network the chains live on)")
+	chainSpec := fs.String("chain", "C", "chain: C for --network's primary C-chain, or an L1's blockchainID")
+	chainsSpec := fs.String("chains", "", "several chains in ONE process, comma-separated (C or blockchainIDs); one entry is exactly --chain")
+	doVerify := fs.Bool("verify", false, "before serving, re-verify every SEALED epoch of each chain with the full no-execution engine (diff-applied state roots, txRoot, receiptsRoot reconstructed from the stored logs, header chain). Pulls every byte of the corpus; a chain that fails does not start")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: --node URI only, with a warning")
-	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network)")
-	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
-	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook (index + txindex) that drags the historical window up to the head")
+	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default: the public endpoint for each chain's networkID)")
+	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB, PER CHAIN (0 disables)")
+	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook (index + txindex) that drags the historical window up to the head, and for the seal that rides it")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
-	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks; fixed-corpus builds and integration runs: the executor still chases staging live)")
-	walks := fs.Int("walks", 16, "concurrent backward walks (--tip-override)")
+	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks). With several --chains it is per chain: <chain>=<containerID>[,...]")
+	walks := fs.Int("walks", 16, "concurrent backward walks per overridden chain (--tip-override)")
 	syncEvery := fs.Duration("sync-every", 5*time.Minute, "cadence for uploading spooled artifacts to the bucket and releasing the local copies (no-op without S3 credentials)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
 
-	// The descriptor comes FIRST: on `--chain` it, not `--network`, names the
-	// network to dial, and it is what the fetcher, the executor and the genesis
-	// all key on. An L1 on mainnet with the default `--network fuji` would
-	// otherwise dial the wrong network's bootstrap node.
-	c := resolveChain(*dataDir)
-	if c.SubnetID != avaconstants.PrimaryNetworkID {
-		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
+	specs, err := serveSpecs(*chainSpec, *chainsSpec)
+	if err != nil {
+		log.Fatalf("epochdb: serve: %v", err)
 	}
-	_, defNode, _ := netParams(*network)
-	if *nodeURI == "" {
-		*nodeURI = defNode
+	// SOLO is the shape of every corpus that exists and of the docker example:
+	// one chain, and --data IS its directory. Two or more chains cannot share a
+	// directory, so they get one each under --data.
+	solo := len(specs) == 1
+	overrides, err := parseTipOverrides(*tipOverride, specs)
+	if err != nil {
+		log.Fatalf("epochdb: serve: --tip-override: %v", err)
+	}
+	if !solo {
+		// Before any store opens: one spool and one chunk cache for the whole
+		// process, which makes the SSD-tier LRU global across chains. Safe
+		// because artifacts are named by content hash.
+		dist.SetRoot(*dataDir)
 	}
 	if *pprofAddr != "" {
 		go func() { log.Printf("epochdb: pprof: %v", http.ListenAndServe(*pprofAddr, nil)) }()
 	}
+	if *vdrSources == "" && *tipOverride == "" {
+		log.Printf("epochdb: serve: no --vdr-sources, validator set cross-checked against the --node URI only")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	fatal := make(chan error, 4)
 
-	cfg := nodeConfig{
-		DataDir:       *dataDir,
-		Chain:         c,
-		NodeURI:       *nodeURI,
-		StateCacheGiB: *stateCacheGiB,
-		PerPeer:       *perPeer,
-		CookEvery:     *cookEvery,
-	}
-	if *vdrSources != "" {
-		cfg.VdrSources = strings.Split(*vdrSources, ",")
-	} else if *tipOverride == "" {
-		log.Printf("epochdb: serve: no --vdr-sources, validator set cross-checked against the --node URI only")
-	}
-	if *tipOverride != "" {
-		// Same process, same staging store, different source of blocks: a
-		// bounded backfill instead of the consensus tip (fixed-corpus builds
-		// and integration runs). Everything else is identical.
-		id, err := parseTipOverride(*tipOverride)
-		if err != nil {
-			log.Fatalf("epochdb: serve: --tip-override: %v", err)
-		}
-		cfg.Backfill = func(ctx context.Context, f *fetch.Fetcher) error {
-			return f.SyncTo(ctx, resolveTipOverride(ctx, f, id), *walks)
+	// A chain that dies takes down the PROCESS only when it is the only chain
+	// there is (RULING 2026-08-03): with siblings serving, a dead chain is a
+	// /status entry and nothing more.
+	dead := make(chan string, 1)
+	f := &fleet{}
+	if solo {
+		f.onFail = func(id string) {
+			select {
+			case dead <- id:
+			default:
+			}
 		}
 	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", f.statusHandler)
+	srv := &http.Server{Handler: mux}
+	exit := 0
 
-	n, ln, err := serveOn(ctx, cfg, *port, func(what string, err error) { report(fatal, what, err) })
+	err = serveOn(*port, func(ln net.Listener) {
+		go func() {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("epochdb: serve: FATAL rpc listener: %v", err)
+				stop()
+			}
+		}()
+
+		var first *chainNode
+		kind, seen := chain.VMKind(""), map[string]bool{}
+		for _, spec := range specs {
+			dir, c, err := resolveServeChain(ctx, spec, execNetID(*network), *dataDir, solo)
+			if err != nil {
+				f.fail(spec, err)
+				continue
+			}
+			id := c.BlockchainID.String()
+			// libevm's extras registry is process-global: a second kind in this
+			// process panics on registration, which is why the C-chain (coreth)
+			// runs in its own process.
+			if kind != "" && c.VMKind != kind {
+				f.fail(id, fmt.Errorf("this chain is %s but the process is already running %s: libevm extras are process-global, so it needs a process of its own", c.VMKind, kind))
+				continue
+			}
+			kind = c.VMKind
+			if seen[id] {
+				f.fail(id, errors.New("listed twice in --chains"))
+				continue
+			}
+			seen[id] = true
+
+			cfg := nodeConfig{
+				DataDir:       dir,
+				Chain:         c,
+				NodeURI:       *nodeURI,
+				StateCacheGiB: *stateCacheGiB,
+				PerPeer:       *perPeer,
+				CookEvery:     *cookEvery,
+				Verify:        *doVerify,
+			}
+			// The descriptor, not --network, names the network to dial: it is
+			// what the dir was built with, and an L1 on mainnet under the
+			// default `--network fuji` would otherwise dial the wrong network's
+			// bootstrap node.
+			if cfg.NodeURI == "" {
+				_, cfg.NodeURI, _ = netParams(avaconstants.NetworkIDToNetworkName[c.NetworkID])
+			}
+			if *vdrSources != "" {
+				cfg.VdrSources = strings.Split(*vdrSources, ",")
+			}
+			if !solo {
+				cfg.Label = id[:8]
+			}
+			if tip, ok := overrides[spec]; ok {
+				// Same process, same staging store, different source of blocks:
+				// a bounded backfill instead of the consensus tip (fixed-corpus
+				// builds and integration runs). Everything else is identical.
+				log.Printf("epochdb: serve: %s backfills to container %s instead of following", id, tip)
+				cfg.Backfill = func(ctx context.Context, fe *fetch.Fetcher) error {
+					return fe.SyncTo(ctx, resolveTipOverride(ctx, fe, tip), *walks)
+				}
+			}
+			if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+				f.fail(id, err)
+				continue
+			}
+			// A chain that cannot start is a chain that does not start. The
+			// process is not allowed to die of one bad data directory, at boot
+			// any more than at runtime.
+			fc, err := f.add(ctx, id, cfg)
+			if err != nil {
+				f.fail(id, err)
+				continue
+			}
+			// avalanchego's own routing, so wallets, subnets.avax.network
+			// tooling and the ab-benches all point at a chain unchanged. /ws is
+			// the same handler: rpc.Server upgrades websockets itself.
+			mux.Handle("/ext/bc/"+id+"/rpc", fc.node.srv)
+			mux.Handle("/ext/bc/"+id+"/ws", fc.node.srv)
+			if solo {
+				// One chain owns the port at every path, which is what every
+				// existing script, bench and docker run points at.
+				mux.Handle("/", fc.node.srv)
+			}
+			if first == nil {
+				first = fc.node
+			}
+			log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc), executed=%d cooked=%d chainId=%s (cook every %s)",
+				id, *port, id, fc.node.e.LiveHead(), fc.node.hist.StateHead(), fc.node.chainID, *cookEvery)
+		}
+		if first == nil {
+			if solo {
+				log.Fatalf("epochdb: serve: the chain did not start")
+			}
+			// Nothing to serve, but /status is the answer to "why", and it is
+			// already answering. Dying here would take that away.
+			log.Printf("epochdb: serve: NO CHAIN STARTED; the process stays up on :%d and /status says why", *port)
+		} else {
+			// One syncLoop for the shared spool; any chain's store reaches the
+			// same casfs.
+			go syncLoop(ctx, first.store.Cas(), *syncEvery)
+		}
+
+		select {
+		case <-ctx.Done():
+			log.Printf("epochdb: serve: shutting down, flushing")
+		case id := <-dead:
+			// The writers close before we die, so the restart is a clean resume
+			// rather than a crash walk-back. stop() cancels ctx first, because
+			// closeAll waits for the executor goroutine to return before it
+			// releases the executor's writers.
+			log.Printf("epochdb: FATAL: %s stopped and it is the only chain", id)
+			stop()
+			exit = 1
+		}
+		// Stop serving BEFORE closing the read side: closeAll unmaps files the
+		// RPC goroutines read.
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		srv.Shutdown(sctx)
+		cancel()
+		f.closeAll()
+	})
 	if err != nil {
 		log.Fatalf("epochdb: serve: %v", err)
 	}
-
-	go func() { report(fatal, "rpc server", http.Serve(ln, n.srv)) }()
-	go syncLoop(ctx, n.store.Cas(), *syncEvery)
-
-	log.Printf("epochdb: serve on :%d, executed=%d cooked=%d chainId=%s (cook every %s)",
-		*port, n.e.LiveHead(), n.hist.StateHead(), n.chainID, *cookEvery)
-
-	select {
-	case <-ctx.Done():
-		log.Printf("epochdb: shutting down, flushing")
-	case err := <-fatal:
-		// Close the writers before dying so the restart is a clean resume
-		// rather than a crash walk-back. stop() cancels ctx first, because
-		// closeAll waits for the executor goroutine to return before it
-		// releases the executor's writers.
-		log.Printf("epochdb: FATAL: %v", err)
-		stop()
-		n.closeAll()
-		os.Exit(1)
+	if exit != 0 {
+		os.Exit(exit)
 	}
-	n.closeAll()
-	log.Printf("epochdb: stopped at executed=%d", n.e.LiveHead())
 }
 
-// serveOn binds the RPC port and ONLY THEN starts the node on it. The order is
-// the whole point: startNode is an hour of work on a big corpus (joinChain's
-// walk and, on an empty dir, its whole frontier build, then the exec open, the
-// startup cook and the tail overlay), and while
-// it ran nothing had touched the port, so a collision surfaced as FATAL 68
-// minutes in (Fuji, 2026-08-01, twice in one night). A bad port now fails in
-// milliseconds.
+// serveSpecs reconciles --chain and --chains. They are ONE knob: --chains with a
+// single entry is exactly --chain (same data dir, same everything), and only two
+// or more entries change anything. --chains wins when both are given, because
+// --chain has a default and cannot be told apart from an unset flag.
+func serveSpecs(one, many string) ([]string, error) {
+	if strings.TrimSpace(many) == "" {
+		if one = strings.TrimSpace(one); one == "" {
+			return nil, errors.New("--chain is empty (C, or an L1's blockchainID)")
+		}
+		return []string{one}, nil
+	}
+	var specs []string
+	seen := map[string]bool{}
+	for _, spec := range strings.Split(many, ",") {
+		if spec = strings.TrimSpace(spec); spec == "" {
+			continue
+		}
+		// A blockchainID is cb58 and IS case-sensitive; only the C alias folds.
+		key := spec
+		if strings.EqualFold(spec, "C") {
+			key = "C"
+		}
+		if seen[key] {
+			return nil, fmt.Errorf("--chains lists %q twice", spec)
+		}
+		seen[key] = true
+		specs = append(specs, spec)
+	}
+	if len(specs) == 0 {
+		return nil, errors.New("--chains is empty (comma-separated chain IDs, or C)")
+	}
+	return specs, nil
+}
+
+// resolveServeChain resolves ONE --chains entry to its descriptor and the data
+// directory it owns, and it is the only place the solo/multi layout difference
+// lives: solo, the chain IS --data (every existing corpus and the docker
+// example); multi, it is <data>/<blockchainID>, which is also where its cached
+// descriptor and its optional upgrade.json live.
+func resolveServeChain(ctx context.Context, spec string, networkID uint32, root string, solo bool) (string, *chain.Chain, error) {
+	dir := root
+	if !solo {
+		// The dir is named by the blockchainID, which for an L1 IS the spec;
+		// only "C" has to be resolved to its ID first.
+		key := spec
+		if strings.EqualFold(spec, "C") {
+			id, _, err := chain.PrimaryC(networkID)
+			if err != nil {
+				return "", nil, err
+			}
+			key = id.String()
+		}
+		dir = filepath.Join(root, key)
+	}
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	c, err := chain.Resolve(rctx, spec, networkID, dir)
+	if err != nil {
+		return "", nil, err
+	}
+	return dir, c, nil
+}
+
+// serveOn binds the RPC port and ONLY THEN does the startup work on it. The
+// order is the whole point: starting a chain is an hour of work on a big corpus
+// (joinChain's walk and, on an empty dir, its whole frontier build, then the
+// exec open, the startup cook and the tail overlay), and while it ran nothing
+// had touched the port, so a collision surfaced as FATAL 68 minutes in (Fuji,
+// 2026-08-01, twice in one night). A bad port now fails in milliseconds.
 //
-// Connections that arrive before the node is up wait in the kernel's accept
-// backlog until http.Serve starts reading it: zero code, and unlike a 503
-// nothing a client has to learn to retry.
-func serveOn(ctx context.Context, cfg nodeConfig, port int, report func(string, error)) (*chainNode, net.Listener, error) {
+// Connections that arrive before a chain is up wait in the kernel's accept
+// backlog until its handler registers: zero code, and unlike a 503 nothing a
+// client has to learn to retry. /status answers from the moment of the bind, so
+// an operator can watch the chains come up instead of guessing.
+func serveOn(port int, run func(net.Listener)) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	n, err := startNode(ctx, cfg, report)
-	if err != nil {
-		ln.Close()
-		return nil, nil, err
-	}
-	return n, ln, nil
+	defer ln.Close()
+	run(ln)
+	return nil
 }
 
-// nodeConfig is everything one chain's node needs. `serve` fills one from its
-// flags; `fleet` fills one per descriptor (fleet.go).
+// verifySealed re-verifies what has been SEALED (and therefore published): the
+// full no-execution engine over this chain's epoch set, `epochdb dev verify` and
+// its log half in one, subnet-evm included because the verifier takes its VM
+// kind off the descriptor.
+//
+// IT DELIBERATELY DOES NOT VERIFY THE LOCAL RAW TAIL [RULING 2026-08-03]. The
+// honest way to verify raw is to re-download and re-execute it, which is what a
+// from-scratch start already does, and the tail is at most one epoch (8M txs).
+// So from-scratch reprocessing IS the local-raw verification story, and the
+// sealed epochs, the artifacts other people consume, are the thing that needs a
+// dedicated verifier.
+//
+// It runs at startup, after joinChain has walked the epoch chain (the local
+// index is what names the epochs) and before the chain serves anything. A
+// failure is an error out of startNode, i.e. THAT chain refuses to start.
+func verifySealed(cfg nodeConfig) error {
+	st, err := dist.Open(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	tmp, err := os.MkdirTemp(cfg.DataDir, ".verify-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	cfg.logf("verify: re-verifying the sealed epochs before serving; this reads the whole corpus")
+	blocks, wall, err := verify.VerifySet(st, tmp, cfg.Chain, 0)
+	if err != nil {
+		return fmt.Errorf("FAIL after %d blocks in %s: %w", blocks, wall.Round(time.Second), err)
+	}
+	cfg.logf("verify: PASS, %d sealed blocks in %s", blocks, wall.Round(time.Second))
+	return nil
+}
+
+// nodeConfig is everything one chain's node needs. `serve` fills one per
+// --chains entry.
 type nodeConfig struct {
 	DataDir       string
 	Chain         *chain.Chain
@@ -191,6 +399,9 @@ type nodeConfig struct {
 	// Backfill replaces the consensus follower with a bounded walk
 	// (serve --tip-override). nil follows the live tip.
 	Backfill func(context.Context, *fetch.Fetcher) error
+	// Verify re-verifies this chain's SEALED epochs before it serves anything
+	// (serve --verify). A failure means this chain does not start.
+	Verify bool
 }
 
 func (c nodeConfig) logf(format string, args ...any) {
@@ -223,10 +434,10 @@ type chainNode struct {
 }
 
 // startNode wires one chain's goroutines onto ctx and returns with it running.
-// Every component goroutine's exit goes to report, which decides what a
-// failure means: fatal for `serve` (one chain IS the process), per-chain in the
-// fleet. Nothing here calls log.Fatal, because a fleet must survive one chain's
-// bad data directory.
+// Every component goroutine's exit goes to report (fleetChain.report), which
+// stops THAT chain and nothing else. Nothing here calls log.Fatal, because the
+// process must survive one chain's bad data directory: it either recovers the
+// dir by itself or this chain refuses to start with a reason /status can show.
 func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err error)) (n *chainNode, err error) {
 	// THE START SEQUENCE, before a single file of this dir is opened: resolve
 	// the chain's `latest` pointer, refuse to start if it names history we
@@ -235,6 +446,14 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	// the published chain here; there is no bootstrap step to remember.
 	if err := joinChain(cfg, buildFrontier); err != nil {
 		return nil, err
+	}
+	// AFTER the join, because the join is what makes the epoch set nameable
+	// (and, on a cold dir, present at all), and before anything of this dir is
+	// opened for serving.
+	if cfg.Verify {
+		if err := verifySealed(cfg); err != nil {
+			return nil, fmt.Errorf("verify: %w", err)
+		}
 	}
 
 	// Unwind whatever is already open if a later step fails: in the fleet this
@@ -415,22 +634,6 @@ func (n *chainNode) closeAll() {
 	}
 	n.hist.Close()
 	n.store.Close()
-}
-
-// report routes a component goroutine's exit. Only a REAL error is fatal: a
-// clean finish (the bounded backfill running out of spans, exec hitting a stop
-// height) and a cancellation both leave the rest of the node serving. Wrapping
-// a nil error here is what killed the first gate run: fmt.Errorf("...: %w",
-// nil) is a non-nil error, so "backfill complete" read as "node dead".
-func report(fatal chan<- error, what string, err error) {
-	switch {
-	case err == nil:
-		log.Printf("epochdb: %s finished; the rest of the node keeps serving", what)
-	case errors.Is(err, context.Canceled):
-		log.Printf("epochdb: %s stopped: %v", what, err)
-	default:
-		fatal <- fmt.Errorf("%s: %w", what, err)
-	}
 }
 
 // liveNode is the executor plus the follower's accepted height: the rpc.Live

@@ -50,7 +50,7 @@ func (s *Server) HeightByHash(hash common.Hash) (uint64, bool, error) {
 		return n, true, nil
 	}
 	if s.txidx == nil {
-		return 0, false, errors.New("block hash index not available (run epochdb cook-txindex)")
+		return 0, false, errors.New("block hash index not available yet (the node cooks it on its own cadence)")
 	}
 	var (
 		height uint64
@@ -77,7 +77,7 @@ func (s *Server) HeightByHash(hash common.Hash) (uint64, bool, error) {
 // "unknown tx".
 func (s *Server) FindTx(hash common.Hash) (blk *types.Block, txIndex int, found bool, err error) {
 	if s.txidx == nil {
-		return nil, 0, false, errors.New("tx index not available (run epochdb cook-txindex)")
+		return nil, 0, false, errors.New("tx index not available yet (the node cooks it on its own cadence)")
 	}
 	return s.findTx(hash)
 }

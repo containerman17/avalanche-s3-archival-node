@@ -120,7 +120,7 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 
 func (s *Server) debugTraceTransaction(params []json.RawMessage) (any, *rpcError) {
 	if s.txidx == nil {
-		return nil, &rpcError{Code: -32000, Message: "tx index not available (run epochdb cook-txindex)"}
+		return nil, &rpcError{Code: -32000, Message: "tx index not available yet (the node cooks it on its own cadence)"}
 	}
 	hash, rerr := txHashParam(params)
 	if rerr != nil {
@@ -202,7 +202,7 @@ func (s *Server) debugGetRawHeader(params []json.RawMessage) (any, *rpcError) {
 
 func (s *Server) debugGetRawTransaction(params []json.RawMessage) (any, *rpcError) {
 	if s.txidx == nil {
-		return nil, &rpcError{Code: -32000, Message: "tx index not available (run epochdb cook-txindex)"}
+		return nil, &rpcError{Code: -32000, Message: "tx index not available yet (the node cooks it on its own cadence)"}
 	}
 	hash, rerr := txHashParam(params)
 	if rerr != nil {

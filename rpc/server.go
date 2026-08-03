@@ -222,7 +222,7 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.ethCall(req.Params)
 	case "eth_getTransactionByHash", "eth_getTransactionReceipt":
 		if s.txidx == nil {
-			return nil, &rpcError{Code: -32000, Message: "tx index not available (run epochdb cook-txindex)"}
+			return nil, &rpcError{Code: -32000, Message: "tx index not available yet (the node cooks it on its own cadence)"}
 		}
 		if req.Method == "eth_getTransactionByHash" {
 			return s.getTransactionByHash(req.Params)
