@@ -582,11 +582,20 @@ func (e *Executor) loadHeader(blockNum uint64) (*types.Header, error) {
 // Close flushes any open batch and the state layer watermark, then
 // releases Firewood.
 func (e *Executor) Close() error {
+	var flushErr error
 	if e.batchOpen && e.batchCount > 0 {
-		if err := e.flushBatch(); err != nil {
-			e.triedb.Close()
-			return fmt.Errorf("close: flush batch: %w", err)
-		}
+		flushErr = e.flushBatch()
+	}
+	// The open batch's shared account trie is a FIREWOOD KEEP-ALIVE HANDLE,
+	// and triedb.Close waits 5s for every one of them to be finalized. On the
+	// error path (Run returned mid-batch, or the flush above failed) nothing
+	// else drops it, so the handle is still reachable from this Executor and
+	// the wait can only time out: every death of the Tokyo crash-loop also
+	// logged "cannot close database with active keep-alive handles".
+	e.wrapDB.endBatch()
+	if flushErr != nil {
+		e.triedb.Close()
+		return fmt.Errorf("close: flush batch: %w", flushErr)
 	}
 	if err := e.ring.close(); err != nil {
 		e.triedb.Close()

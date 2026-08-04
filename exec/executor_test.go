@@ -32,6 +32,35 @@ func (f fakeSource) GetByHeight(n uint64) ([]byte, bool, error) {
 // block, whose Firewood Update resolves its parent by the genesis BLOCK
 // hash. A fresh-opened Firewood only knows the zero hash until
 // SetHashAndHeight registers the real one.
+// TestCloseReleasesOpenBatchTrie is the second half of the Tokyo crash-loop:
+// every death also logged "executor close: cannot close database with active
+// keep-alive handles: context deadline exceeded". A batch that an error left
+// open still holds Firewood's shared account trie, and triedb.Close can only
+// wait 5s for a handle this Executor is still pointing at.
+func TestCloseReleasesOpenBatchTrie(t *testing.T) {
+	fetch.RegisterExtras(chain.Coreth)
+	dir := t.TempDir()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	e, err := New(Config{DataDir: dir, Blocks: fakeSource{}, Store: store, CommitEvery: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly what executeBatched leaves behind when a block errors out:
+	// batch open, shared trie materialised, nothing flushed.
+	e.batchOpen = true
+	e.wrapDB.beginBatch(e.headRoot)
+	if _, err := e.wrapDB.OpenTrie(e.headRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("close with a batch left open: %v", err)
+	}
+}
+
 func TestRestartAtGenesisExecutesFirstBlock(t *testing.T) {
 	fetch.RegisterExtras(chain.Coreth)
 	dir := t.TempDir()
