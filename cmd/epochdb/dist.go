@@ -244,8 +244,14 @@ func checkLocalIndex(dir, latest string) (epochs int, covered uint64, err error)
 // of 2026-07-31).
 //
 // It opens and releases its own state layer and executor, because it must be
-// done with the Firewood handle before startNode takes it.
+// done with the Firewood handle before startNode takes it. A previous build
+// that was killed halfway is wiped first (exec.HealTornFrontier): its Firewood
+// is a partial frontier no one can start on, and it is derived state, so the
+// node organizes itself instead of crash-looping.
 func buildFrontier(dataDir string, st *dist.Store, c *chain.Chain) error {
+	if _, err := exec.HealTornFrontier(dataDir); err != nil {
+		return err
+	}
 	set, err := state.OpenEpochSet(st)
 	if err != nil {
 		return err
@@ -257,10 +263,11 @@ func buildFrontier(dataDir string, st *dist.Store, c *chain.Chain) error {
 	}
 	defer store.Close()
 	e, err := exec.New(exec.Config{
-		DataDir: dataDir,
-		Blocks:  set, // containers come from the epochs; nothing is staged yet
-		Store:   store,
-		Chain:   c,
+		DataDir:       dataDir,
+		Blocks:        set, // containers come from the epochs; nothing is staged yet
+		Store:         store,
+		Chain:         c,
+		FrontierBuild: true, // Firewood keeps no history for a merge, see exec.New
 	})
 	if err != nil {
 		return fmt.Errorf("exec.New: %w", err)

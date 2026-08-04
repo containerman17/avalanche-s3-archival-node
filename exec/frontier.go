@@ -28,8 +28,11 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/ava-labs/avalanchego/graft/evm/firewood"
 	"github.com/ava-labs/avalanchego/vms/saevm/hook"
 	ffi "github.com/ava-labs/firewood-go-ethhash/ffi"
 	"github.com/ava-labs/libevm/common"
@@ -60,9 +63,10 @@ const frontierHeaderWindow = 256
 // settles above it. Idempotent: a store already at or past that height is left
 // alone.
 //
-// The merge is linear per epoch and the working set is one active SST block
-// per epoch cursor, so this streams a full corpus without ever holding more
-// than a batch of rows.
+// The merge is linear per epoch and its working set is one active SST block
+// per epoch cursor, so the Go side never holds more than a batch of rows. The
+// side that is NOT free is Firewood's, which retains a revision per batch
+// unless the Executor was opened with Config.FrontierBuild (see New).
 func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	h := epochs.CoveredEnd()
 	if h == 0 {
@@ -264,6 +268,58 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	log.Printf("exec: frontier built at %d root=%x from %d epochs: %d rows -> %d accounts, %d slots, %d deletes, %d skipped, %d batches in %s (%.0f rows/s)",
 		target, common.Hash(root), len(epochs.All()), nRows, nAcct, nSlot, nDel, nSkip, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
 	return nil
+}
+
+// HealTornFrontier makes a dir whose frontier build died mid-merge buildable
+// again, and it is the whole crash story of the build: the merge writes
+// Firewood as it streams, so a kill leaves a Firewood holding some prefix of
+// the frontier under an exec head of 0, and exec.New then refuses to open the
+// dir forever ("head=0 but firewood root X != genesis Y"). That is a permanent
+// crash loop out of state that is DERIVED and DISPOSABLE, which the resilience
+// rule says a node organizes by itself.
+//
+// THE GUARD IS THE SIGNATURE, and it needs nothing on disk to remember: exec
+// head 0 with a non-empty Firewood cannot be an executed history (a dir that
+// executed anything has head > 0), so it is either a torn build or a Firewood
+// holding nothing but the genesis alloc, and both are rebuilt from scratch in
+// the same seconds. A dir with head > 0 is never touched.
+//
+// Everything wiped is a frontier build's own output: Firewood, the header
+// window it copies down (with head 0 those headers would send the next
+// exec.New walking back to re-execute blocks nothing has executed) and the SAE
+// ring it seeds. The frontier floor stays: it is one misc key that the rebuild
+// overwrites and that is only ever read against the exec head.
+func HealTornFrontier(dataDir string) (bool, error) {
+	head, _, err := state.ExecHead(dataDir)
+	if err != nil {
+		return false, err
+	}
+	if head > 0 {
+		return false, nil
+	}
+	fw := filepath.Join(dataDir, firewood.Directory)
+	ents, err := os.ReadDir(fw)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if len(ents) == 0 {
+		return false, nil
+	}
+	log.Printf("exec: torn frontier build in %s (firewood is non-empty but nothing was ever executed): wiping it and rebuilding from the epochs", dataDir)
+	victims := []string{fw, filepath.Join(dataDir, saeRingFile)}
+	hdrs, err := filepath.Glob(filepath.Join(dataDir, "headers_*.log"))
+	if err != nil {
+		return false, err
+	}
+	for _, p := range append(victims, hdrs...) {
+		if err := os.RemoveAll(p); err != nil {
+			return false, fmt.Errorf("heal torn frontier: remove %s: %w", p, err)
+		}
+	}
+	return true, nil
 }
 
 // epochHeader decodes the stored header of block n out of the epoch that

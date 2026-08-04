@@ -3,10 +3,15 @@ package exec
 import (
 	"encoding/binary"
 	"math/big"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	ccustomtypes "github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
+	ffi "github.com/ava-labs/firewood-go-ethhash/ffi"
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
@@ -428,5 +433,232 @@ func TestBuildFrontierSAERefusesSelfSettle(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "cannot settle itself") {
 		t.Fatalf("self-settling header: %v, want a refusal", err)
+	}
+}
+
+// tearFrontier reproduces what the OOM left behind on the Tokyo box: Firewood
+// holds what the merge committed before the kill, the exec head is the 0 the
+// first exec.New seeded, and the header window and the ring (which the build
+// writes only after the root check) never happened.
+func tearFrontier(t *testing.T, dir string, keepHeaders bool) {
+	t.Helper()
+	// "exechead" is state.Store's own file name; 0 is what a dir that opened
+	// an executor and never executed a block carries.
+	if err := os.WriteFile(filepath.Join(dir, "exechead"), make([]byte, 8), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if keepHeaders {
+		return
+	}
+	if err := os.Remove(filepath.Join(dir, saeRingFile)); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	hdrs, err := filepath.Glob(filepath.Join(dir, "headers_*.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range hdrs {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// buildFrontierIn seals the corpus into a fresh dir and merges it, the way a
+// downloaded node does, and hands the dir back closed.
+func buildFrontierIn(t *testing.T, roots map[uint64]common.Hash, rows map[uint64][]state.StateRow) string {
+	t.Helper()
+	dir := t.TempDir()
+	set := sealCorpus(t, dir, roots, rows)
+	defer set.Close()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(Config{DataDir: dir, Blocks: set, Store: store, FrontierBuild: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.BuildFrontier(set); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestHealTornFrontier is the second half of the join-from-bucket incident: the
+// build was killed mid-merge, and every restart afterwards died in exec.New
+// ("head=0 but firewood root ... != genesis"), which crash-looped the container
+// until docker gave up. A half-built frontier is derived state, so the node
+// must wipe it and rebuild by itself; a dir that really executed something must
+// never be wiped.
+func TestHealTornFrontier(t *testing.T) {
+	fetch.RegisterExtras(chain.Coreth)
+	roots, rows := replayCorpus(t, t.TempDir())
+
+	// (a) Killed DURING the merge: Firewood alone, and it wedges the dir.
+	dir := buildFrontierIn(t, roots, rows)
+	tearFrontier(t, dir, false)
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Config{DataDir: dir, Blocks: fakeSource{}, Store: store}); err == nil ||
+		!strings.Contains(err.Error(), "head=0 but firewood root") {
+		t.Fatalf("a torn dir opened with %v, want the crash-loop refusal", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	healed, err := HealTornFrontier(dir)
+	if err != nil || !healed {
+		t.Fatalf("heal a torn dir: %v %v", healed, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "firewood")); !os.IsNotExist(err) {
+		t.Fatalf("firewood survived the heal: %v", err)
+	}
+
+	// The rebuild is the whole point: same dir, same epochs, right root.
+	set, err := state.OpenEpochSet(mustLocalStore(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	store2, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	e2, err := New(Config{DataDir: dir, Blocks: set, Store: store2, FrontierBuild: true})
+	if err != nil {
+		t.Fatalf("healed dir still refuses to open: %v", err)
+	}
+	defer e2.Close()
+	if err := e2.BuildFrontier(set); err != nil {
+		t.Fatalf("rebuild after heal: %v", err)
+	}
+	if got := common.Hash(e2.fwBackend.Firewood.Root()); got != roots[8] || e2.Head() != 8 {
+		t.Fatalf("rebuilt frontier at %d root %x, want 8 %x", e2.Head(), got, roots[8])
+	}
+	// An executed dir is not torn, whatever else is on disk.
+	if healed, err := HealTornFrontier(dir); err != nil || healed {
+		t.Fatalf("heal on a dir executed to 8: %v %v, want no-op", healed, err)
+	}
+
+	// (b) Killed AFTER the root check: the header window and the ring are on
+	// disk under a head of 0. Wiping Firewood without them would leave the next
+	// start walking back into blocks nothing ever executed, so they go too.
+	dir2 := buildFrontierIn(t, roots, rows)
+	tearFrontier(t, dir2, true)
+	healed, err = HealTornFrontier(dir2)
+	if err != nil || !healed {
+		t.Fatalf("heal a dir torn after the root check: %v %v", healed, err)
+	}
+	for _, p := range []string{"firewood", saeRingFile} {
+		if _, err := os.Stat(filepath.Join(dir2, p)); !os.IsNotExist(err) {
+			t.Fatalf("%s survived the heal: %v", p, err)
+		}
+	}
+	if hdrs, _ := filepath.Glob(filepath.Join(dir2, "headers_*.log")); len(hdrs) != 0 {
+		t.Fatalf("header window survived the heal: %v", hdrs)
+	}
+}
+
+// mustLocalStore reopens a dir's artifact store (the epochs are in its spool).
+func mustLocalStore(t *testing.T, dir string) *dist.Store {
+	t.Helper()
+	st, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+// rssAnonKB is the process's ANONYMOUS resident memory, which is where
+// Firewood's Rust allocations land and where the OOM happened (63.9GB anon on
+// a 64GB box). The Go heap is a rounding error next to it and shows up here
+// too, so this is the number to bound.
+func rssAnonKB(t *testing.T) int {
+	t.Helper()
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Skipf("no /proc/self/status: %v", err)
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(l, "RssAnon:") {
+			continue
+		}
+		n, err := strconv.Atoi(strings.Fields(l)[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	t.Skip("no RssAnon in /proc/self/status")
+	return 0
+}
+
+// TestFrontierBuildFirewoodMemoryBounded is bug one, pinned. The frontier build
+// streams the whole corpus through Firewood in batches, and with the executor's
+// serving profile (128 in-memory revisions, 64 of them unpersisted) every batch
+// stayed resident: growth was dead linear in BATCH COUNT, i.e. in corpus size,
+// and the first real join was OOM-killed at 63.9GB. Opening Firewood for the
+// build with no history to keep makes the per-batch cost FALL instead, which is
+// the property this asserts: the second half of the batches must cost less than
+// the first, at a total the old code passed before batch 4.
+//
+// Measured here at 8 batches of 100k ops: 1483MB retained with the serving
+// profile, 688MB with the build's, second half 1.44x the first vs 0.42x.
+func TestFrontierBuildFirewoodMemoryBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("streams 800k trie ops through Firewood")
+	}
+	const batches, per = 8, 100_000
+	dir := t.TempDir()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	e, err := New(Config{DataDir: dir, Blocks: fakeSource{}, Store: store, FrontierBuild: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	// The same shape BuildFrontier streams: 32-byte hashed account keys in no
+	// order at all, with account-RLP-sized values.
+	rng := rand.New(rand.NewSource(1))
+	base, half := rssAnonKB(t), 0
+	for b := 0; b < batches; b++ {
+		ops := make([]ffi.BatchOp, 0, per)
+		for i := 0; i < per; i++ {
+			k, v := make([]byte, 32), make([]byte, 80)
+			rng.Read(k)
+			rng.Read(v)
+			ops = append(ops, ffi.Put(k, v))
+		}
+		if _, err := e.fwBackend.Firewood.Update(ops); err != nil {
+			t.Fatal(err)
+		}
+		if b == batches/2-1 {
+			half = rssAnonKB(t)
+		}
+	}
+	end := rssAnonKB(t)
+	first, second := half-base, end-half
+	t.Logf("firewood anon: +%dMB over the first %d batches, +%dMB over the next %d",
+		first>>10, batches/2, second>>10, batches/2)
+	if second >= first {
+		t.Fatalf("per-batch cost is not falling (+%dMB then +%dMB): the build is retaining every batch again", first>>10, second>>10)
+	}
+	if grew := end - base; grew>>10 > 1200 {
+		t.Fatalf("%d batches of %d ops retained %dMB, want well under the 1200MB the serving profile passes before batch 4", batches, per, grew>>10)
 	}
 }

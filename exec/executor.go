@@ -75,6 +75,10 @@ type Config struct {
 	// Chain is the chain descriptor (genesis bytes, ids, VM kind).
 	// nil defaults to the Fuji C-chain.
 	Chain *chain.Chain
+	// FrontierBuild says this Executor exists only to run BuildFrontier and
+	// then close, which is what unpins Firewood's in-memory history (see
+	// New).
+	FrontierBuild bool
 	// StopAt makes Run return cleanly after executing this height
 	// (fixed-corpus builds; staging above it is disposable). 0 = never.
 	StopAt uint64
@@ -307,6 +311,22 @@ func New(cfg Config) (*Executor, error) {
 	if cfg.CommitEvery > 1 {
 		fwCfg.DeferredCommitInterval = max(1, 64/uint64(cfg.CommitEvery))
 	}
+	// A FRONTIER BUILD KEEPS NO HISTORY AT ALL, and that is the difference
+	// between a merge that fits in a container and one the kernel kills.
+	// Firewood retains RevisionsInMemory committed revisions and defers
+	// persisting DeferredCommitInterval of them, so the serving profile (128
+	// and 64) holds up to 128 batches' worth of trie deltas in Rust memory:
+	// measured 470MB per 200k-op batch here, i.e. tens of GB long before the
+	// merge ends, which is what OOM-killed the first real join (63.9GB anon on
+	// a 64GB box). Nothing reads a historical revision during a build and the
+	// build is all-or-nothing anyway (a torn one is wiped, see
+	// HealTornFrontier), so 2 revisions is all it needs; graft clamps the
+	// deferred count to revisions-1, i.e. persist every batch. Measured over 8
+	// 100k-op batches: 1483MB retained at 128 revisions, 688MB at 2, and the
+	// per-batch cost keeps falling instead of staying linear.
+	if cfg.FrontierBuild {
+		fwCfg.RevisionsInMemory = 2
+	}
 	// The default 1MB node cache collapses once state outgrows it: at
 	// height ~3.7M a 60s CPU profile showed ~50% of samples inside the
 	// Rust library (per-SLOAD trie walks re-reading upper nodes), disk
@@ -321,7 +341,7 @@ func New(cfg Config) (*Executor, error) {
 	// point was 4GB against 157GB of Firewood, i.e. 2.5%, so the calibrated
 	// ratio is 3% of what this chain actually has on disk, clamped to
 	// [64MB, 4GB]. A fresh directory gets the floor and grows into its share.
-	fwBytes := dirBytes(filepath.Join(cfg.DataDir, "firewood"))
+	fwBytes := dirBytes(filepath.Join(cfg.DataDir, firewood.Directory))
 	fwCfg.CacheSizeBytes = uint(min(max(fwBytes*3/100, 64<<20), 4<<30))
 	log.Printf("exec: firewood node cache %d MB (3%% of %d MB on disk, clamped to [64MB, 4GB])",
 		fwCfg.CacheSizeBytes>>20, fwBytes>>20)
