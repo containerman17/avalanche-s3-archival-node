@@ -37,14 +37,25 @@ import (
 // FrontierRow is one winning row of the merge: the newest post-image of key
 // at or below the target height. An EMPTY Value means the key is NOT part of
 // the frontier (an explicit delete, a zero write, or storage killed by a
-// later SELFDESTRUCT); the caller only has to act on those for keys the
-// genesis alloc put in the trie.
+// later SELFDESTRUCT), and the caller must apply it as a real tombstone: the
+// key may well be in the trie already, because the caller starts from the
+// VM's committed genesis state and that holds more than the alloc (see
+// Destroyed).
+//
+// Destroyed is set on ACCOUNT rows only: the highest block at or below the
+// target where this account was SELFDESTRUCTed, or 0 if it never was. It is
+// NOT redundant with an empty Value, because a destruct followed by a
+// recreation collapses into a single winning row that only shows the
+// recreation: the caller still has to wipe the account's storage subtree
+// before writing it back, or whatever genesis put under that account and no
+// later row overwrote would survive a destruct that really happened.
 //
 // Key and Value alias decode buffers: copy to retain.
 type FrontierRow struct {
-	Key   []byte
-	Value []byte
-	Block uint64
+	Key       []byte
+	Value     []byte
+	Block     uint64
+	Destroyed uint64
 }
 
 // sstCursor is a pull iterator over one epoch's SST rows in (key, block)
@@ -182,6 +193,9 @@ func MergeFrontier(epochs []*Epoch, h uint64, fn func(FrontierRow) error) error 
 		}
 		if !seen || key[0] == recKindCodeUse {
 			continue
+		}
+		if key[0] == recKindAccount {
+			win.Destroyed = destroyed[common.Address(key[1:21])]
 		}
 		if key[0] == recKindStorage && len(win.Value) > 0 {
 			if d, ok := destroyed[common.Address(key[1:21])]; ok && d > win.Block {

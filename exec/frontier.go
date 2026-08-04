@@ -16,6 +16,23 @@ package exec
 // and header(H).Root is the cryptographic commitment to it. Same strength as
 // the pre-SAE check, one header hop away.
 //
+// WHAT THE MERGE STREAMS ONTO (RULING 2026-08-05). The merge does not start on
+// an empty trie: it starts on the VM's OWN COMMITTED GENESIS, which every node
+// materialises for itself (exec.New), and the epochs only carry what changed
+// after it. So a tombstone in the merge is a real delete against real state
+// and is applied UNCONDITIONALLY.
+//
+// It used to be applied only for addresses in the genesis ALLOC, on the theory
+// that nothing else could be in the trie that no epoch row put there. That is
+// false on subnet-evm: Genesis.Commit also runs ApplyPrecompileActivations, so
+// every precompile enabled AT GENESIS gets an account (nonce 1, code 0x01) and
+// its configured storage, and none of that is in the alloc. Beam (mainnet L1
+// 2tmrrBo1...) enables contractDeployerAllowList in genesis and DISABLES it in
+// upgrade.json, and subnet-evm disables a precompile with statedb.SelfDestruct;
+// the epochs carried that tombstone, the build dropped it, and the merged root
+// at 6,034,097 came out 40e033de... against a header committing to 91851ed9...
+// Nothing was wrong with the epochs, and nothing needed re-sealing.
+//
 // The pairing is FORCED, not chosen. The settled height is the only height
 // above the boundary whose post-execution root AND gas clock consensus ever
 // publishes (the roots of every other height live nowhere but the executor's
@@ -112,15 +129,15 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 
 	t0 := time.Now()
 	var (
-		batch                  []ffi.BatchOp
-		root                   ffi.Hash
-		nAcct, nSlot, nDel     uint64
-		accKey                 [32]byte
-		slotKey                [64]byte
-		lastAddr               common.Address
-		lastAddrHash           common.Hash
-		haveAddr               bool
-		nRows, nSkip, nBatches uint64
+		batch              []ffi.BatchOp
+		root               ffi.Hash
+		nAcct, nSlot, nDel uint64
+		accKey             [32]byte
+		slotKey            [64]byte
+		lastAddr           common.Address
+		lastAddrHash       common.Hash
+		haveAddr           bool
+		nRows, nBatches    uint64
 	)
 	addrHash := func(a common.Address) common.Hash {
 		if !haveAddr || a != lastAddr {
@@ -146,17 +163,17 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		switch r.Key[0] {
 		case 'a':
 			copy(accKey[:], addrHash(addr).Bytes())
-			if len(r.Value) == 0 {
-				// Only the genesis alloc can have put this account in the trie
-				// (every other row here IS the trie's content), and a
-				// PrefixDelete drops its storage with it.
-				if _, inAlloc := e.alloc[addr]; !inAlloc {
-					nSkip++
-					return nil
-				}
+			// EVERY destruct is applied, and it is applied even when a later
+			// row recreates the account, because a PrefixDelete is the only
+			// thing that clears the storage subtree genesis left under it.
+			// Ordering is what makes that safe: account keys sort before
+			// storage keys ('a' < 's'), so the whole account phase, and with
+			// it every PrefixDelete, is queued before the first storage Put.
+			if r.Destroyed > 0 {
 				nDel++
 				batch = append(batch, ffi.PrefixDelete(bytes.Clone(accKey[:])))
-			} else {
+			}
+			if len(r.Value) > 0 {
 				nAcct++
 				// Captured account RLP is byte-for-byte what firewood's
 				// UpdateAccount writes (zero storage root included, see
@@ -167,11 +184,6 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 			copy(slotKey[:32], addrHash(addr).Bytes())
 			copy(slotKey[32:], crypto.Keccak256(r.Key[21:53]))
 			if len(r.Value) == 0 {
-				ga, inAlloc := e.alloc[addr]
-				if !inAlloc || ga.Storage == nil {
-					nSkip++
-					return nil
-				}
 				nDel++
 				batch = append(batch, ffi.Delete(bytes.Clone(slotKey[:])))
 			} else {
@@ -265,8 +277,8 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		return fmt.Errorf("build frontier: seed exechead: %w", err)
 	}
 	dt := time.Since(t0)
-	log.Printf("exec: frontier built at %d root=%x from %d epochs: %d rows -> %d accounts, %d slots, %d deletes, %d skipped, %d batches in %s (%.0f rows/s)",
-		target, common.Hash(root), len(epochs.All()), nRows, nAcct, nSlot, nDel, nSkip, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
+	log.Printf("exec: frontier built at %d root=%x from %d epochs: %d rows -> %d accounts, %d slots, %d deletes, %d batches in %s (%.0f rows/s)",
+		target, common.Hash(root), len(epochs.All()), nRows, nAcct, nSlot, nDel, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
 	return nil
 }
 

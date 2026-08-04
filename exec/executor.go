@@ -117,10 +117,6 @@ type Executor struct {
 	ring *saeRing
 	sae  *saeExec
 
-	// alloc is the genesis alloc, the only state a merged frontier can find
-	// already in the trie (BuildFrontier's tombstone rule).
-	alloc types.GenesisAlloc
-
 	// live is the last executed height, published after each committed block.
 	// It is a HEIGHT and nothing else: since the 2026-07-29 ruling nothing
 	// reads state from Firewood, so there is no frontier handle to publish.
@@ -393,7 +389,6 @@ func New(cfg Config) (*Executor, error) {
 		headNum:     0,
 		headTime:    g.Timestamp,
 		lastFwHash:  g.Hash,
-		alloc:       g.Alloc,
 	}
 
 	e.chainCtx = chainContext{e: e, store: cfg.Store}

@@ -231,6 +231,10 @@ func (s *Store) AppendWrites(block uint64, frame []byte) error {
 // HasWrites reports whether block already has a writelog frame.
 func (s *Store) HasWrites(block uint64) bool { return s.wl.Has(block) }
 
+// Writes returns block's raw write-capture frame, for a caller that wants the
+// executor's post-images back out (FrameRows decodes one).
+func (s *Store) Writes(block uint64) ([]byte, bool, error) { return s.wl.Get(block) }
+
 // AppendHeader stores block's RLP header. Idempotent per block.
 func (s *Store) AppendHeader(block uint64, headerRLP []byte) error {
 	return s.hd.Append(block, headerRLP)

@@ -2,7 +2,6 @@ package exec
 
 import (
 	"bytes"
-	"encoding/binary"
 	"math/big"
 	"math/rand"
 	"os"
@@ -50,9 +49,11 @@ var (
 //	3 C created                        7 B recreated with slot2 only
 //	4 D.slot2 written                  8 C deleted, D.slot2 zeroed
 //
-// Block 8 also SELFDESTRUCTs a GENESIS ALLOC account, the one case where a
-// tombstone has to reach Firewood at all (everything else the merge writes IS
-// the trie's content, so a dead key is simply not written).
+// Block 8 also SELFDESTRUCTs a GENESIS ALLOC account: a tombstone against
+// state no epoch row put there, which is the case the build has to apply
+// rather than assume away. Block 6/7 is its sibling on B, a destruct followed
+// by a recreation, where the PrefixDelete has to be queued BEFORE the
+// recreating Put.
 func frontierBlocks(n uint64, alloc common.Address, sdb *ethstate.StateDB) {
 	set := func(a common.Address, nonce uint64, bal int64) {
 		sdb.SetNonce(a, nonce)
@@ -93,9 +94,14 @@ func frontierBlocks(n uint64, alloc common.Address, sdb *ethstate.StateDB) {
 
 // allocAddr is the lowest genesis-alloc address, the one the script
 // SELFDESTRUCTs.
-func allocAddr(e *Executor) common.Address {
+func allocAddr(t *testing.T) common.Address {
+	t.Helper()
+	g, err := ChainGenesis(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var out common.Address
-	for a := range e.alloc {
+	for a := range g.Alloc {
 		if out == (common.Address{}) || a.Cmp(out) < 0 {
 			out = a
 		}
@@ -103,33 +109,15 @@ func allocAddr(e *Executor) common.Address {
 	return out
 }
 
-// frameRows decodes one captured write frame into epoch SST rows. It is the
-// same layout state's cook reads (kind | addr 20 | [slot 32] | uvarint vlen |
-// value), so the rows sealed here are the executor's post-images verbatim.
+// frameRows decodes one captured write frame into the epoch SST rows the seal
+// would cut from it, through the seal's OWN decoder.
 func frameRows(t *testing.T, buf []byte, block uint64) []state.StateRow {
 	t.Helper()
-	var out []state.StateRow
-	for pos := 0; pos < len(buf); {
-		kind := buf[pos]
-		var r state.StateRow
-		r.Key[0] = kind
-		p := pos + 21 // account: kind | addr
-		if kind != 'a' {
-			p = pos + 53 // storage: + slot; code-use: + code hash
-		}
-		copy(r.Key[1:], buf[pos+1:p])
-		vlen, vn := binary.Uvarint(buf[p:])
-		p += vn
-		r.Block, r.Seq = block, len(out)
-		if vlen > 0 {
-			r.Value = append([]byte(nil), buf[p:p+int(vlen)]...)
-		}
-		if kind != 'c' { // code-use records are reads; cook drops them too
-			out = append(out, r)
-		}
-		pos = p + int(vlen)
+	rows, err := state.FrameRows(buf, block)
+	if err != nil {
+		t.Fatalf("decode frame %d: %v", block, err)
 	}
-	return out
+	return rows
 }
 
 // replayCorpus executes frontierBlocks 1..8 through the real capture +
@@ -157,7 +145,7 @@ func replayCorpus(t *testing.T, dir string) (roots map[uint64]common.Hash, rows 
 		if err != nil {
 			t.Fatal(err)
 		}
-		frontierBlocks(n, allocAddr(e), sdb)
+		frontierBlocks(n, allocAddr(t), sdb)
 		blkHash := common.BigToHash(big.NewInt(int64(n) + 1000))
 		root, err := sdb.Commit(n, true, stateconf.WithTrieDBUpdateOpts(
 			stateconf.WithTrieDBUpdatePayload(parentHash, blkHash)))

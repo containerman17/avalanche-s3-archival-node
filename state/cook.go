@@ -226,6 +226,23 @@ func cookBucket(dir string, wl *bucketLog, bucket uint64, blocks []uint64, cooke
 	return written, os.Rename(tmp, filepath.Join(dir, sortedName(bucket)))
 }
 
+// FrameRows decodes one write-capture frame into the epoch state rows the
+// seal would cut from it: the same records, the same Seq numbering, and the
+// same dropped 'c' rows (code-use records are reads, and the blobs travel in
+// the epoch's code section). Values alias frame.
+func FrameRows(frame []byte, block uint64) ([]StateRow, error) {
+	var out []StateRow
+	err := parseFrame(frame, func(kind byte, key [sortedKeySize]byte, valOff int, vlen uint32) {
+		if kind == recKindCodeUse {
+			return
+		}
+		out = append(out, StateRow{
+			Key: key, Block: block, Value: frame[valOff : valOff+int(vlen)], Seq: len(out),
+		})
+	})
+	return out, err
+}
+
 // parseFrame walks one write-capture frame (exec/capture.go layout) and
 // calls fn per record with the 53-byte sorted key, the value offset within
 // the frame, and the value length.
