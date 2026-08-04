@@ -19,14 +19,36 @@ import (
 // skipped in memory. The view is a snapshot of what was durable at open
 // time. Appends/flushes on a read-only store are not supported.
 func OpenReadOnly(dir string) (*Store, error) {
-	wl, err := openBucketLogRO(dir, "writelog")
+	// EXECHEAD IS READ FIRST, and that order is load-bearing. The writer
+	// appends every family of a block (writes, header, logs, receipts) BEFORE
+	// FlushAndSetExecHead names it, so an exechead read at t names a height
+	// whose records were all on disk before t, and every scan below (which
+	// happens after t) therefore sees them. Reading it last, as this did until
+	// 2026-08-05, dated it AFTER the scans: rebuilding the RAM index over a few
+	// million raw blocks takes seconds, a catching-up executor lands thousands
+	// of blocks in those seconds, and the snapshot then carried a head it could
+	// not serve. That is the seal's "header N: ok=false err=<nil>" (the first
+	// height past where the header scan happened to stop, hence always a
+	// commit-batch boundary + 1).
+	head, headOK, err := ExecHead(dir)
 	if err != nil {
-		return nil, fmt.Errorf("open writelog ro: %w", err)
+		return nil, err
 	}
+	// HEADERS ARE SCANNED FIRST, for the same reason and it is the same rule
+	// once more: the writer appends a block's write frame BEFORE its header, so
+	// only a header snapshot older than the writelog's makes HeadersMax the
+	// highest FULLY appended block (what the SDK follower advances its tail
+	// overlay to). Scanned in writer order, as this was until 2026-08-05, a
+	// header could be visible while its own write frame was not, and
+	// AdvanceTail skips a frameless block for good.
 	hd, err := openBucketLogRO(dir, "headers")
 	if err != nil {
-		wl.Close()
 		return nil, fmt.Errorf("open headers ro: %w", err)
+	}
+	wl, err := openBucketLogRO(dir, "writelog")
+	if err != nil {
+		hd.Close()
+		return nil, fmt.Errorf("open writelog ro: %w", err)
 	}
 	lg, err := openBucketLogRO(dir, "logs")
 	if err != nil {
@@ -72,15 +94,8 @@ func OpenReadOnly(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
-	raw, err := os.ReadFile(filepath.Join(dir, execHeadFile))
-	if err == nil && len(raw) == 8 {
-		s.execHead = binary.BigEndian.Uint64(raw)
-		s.execHeadOK = true
-	} else if err != nil && !os.IsNotExist(err) {
-		s.Close()
-		return nil, fmt.Errorf("read exechead: %w", err)
-	}
-	raw, err = os.ReadFile(filepath.Join(dir, logsStartFile))
+	s.execHead, s.execHeadOK = head, headOK
+	raw, err := os.ReadFile(filepath.Join(dir, logsStartFile))
 	if err == nil && len(raw) == 8 {
 		s.logsStart = binary.BigEndian.Uint64(raw)
 		s.logsStartOK = true
@@ -105,8 +120,12 @@ func OpenReadOnly(dir string) (*Store, error) {
 //
 // misc.log is deliberately not rescanned: it holds the handful of static
 // rawdb keys written at genesis, which no read path re-reads.
+//
+// The families are rescanned in REVERSE WRITER ORDER (headers first) for
+// exactly that reason: it is what keeps the header snapshot the oldest of the
+// four, and therefore what makes the sentence above true.
 func (s *Store) RescanRO() error {
-	for _, l := range []*bucketLog{s.wl, s.hd, s.lg, s.rc} {
+	for _, l := range []*bucketLog{s.hd, s.wl, s.lg, s.rc} {
 		if err := l.rescanRO(); err != nil {
 			return err
 		}

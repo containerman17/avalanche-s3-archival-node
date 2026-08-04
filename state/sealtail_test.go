@@ -260,6 +260,74 @@ func TestSealTailCancelBetweenEpochs(t *testing.T) {
 	}
 }
 
+// TestSealTailCatchUpCeiling is the wasted-gather failure of 2026-08-05, in
+// miniature: on a node CATCHING UP, `seal: header N: ok=false err=<nil>` threw
+// away a whole epoch gather (minutes of CPU, gigabytes of scanned rows) on
+// every cook tick for hours, on every VM kind including the C-chain.
+//
+// The shape is this one: the fetcher is far ahead (containers for 11..12 are in
+// staging), the executor's raw appends reach 10, and exechead names 12. The
+// seal used to take exechead as its ceiling, walk into 11 and die on a header
+// that was never its to read. It must instead bound itself to what it can
+// serve: cut the epochs it can, decline the rest through the normal
+// tail-stays-raw path, and stay byte-identical to a seal of the same blocks
+// with no skew.
+func TestSealTailCatchUpCeiling(t *testing.T) {
+	fixedEpochTxs(t, 10)     // 3 txs/block: epochs of 4 blocks, 1-4 and 5-8
+	fixedBucketBlocks(t, 16) // no whole bucket retires, so the raw tail survives
+
+	// The reference: the same eight sealable blocks, no skew at all.
+	refDir := t.TempDir()
+	refSt, _ := sealCorpus(t, refDir, 8)
+	defer refSt.Close()
+	refHist, err := OpenHistory(refDir, refSt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer refHist.Close()
+	if cut, end, err := refHist.SealTail(context.Background(), [32]byte{}, nil); err != nil || cut != 2 || end != 8 {
+		t.Fatalf("reference seal cut %d through %d: %v", cut, end, err)
+	}
+	want := epochHashes(refHist.Epochs())
+
+	dir := t.TempDir()
+	st, _ := sealCorpus(t, dir, 10)
+	defer st.Close()
+	for h := uint64(11); h <= 12; h++ {
+		writeStagingBlock(t, dir, 0, h, 3)
+	}
+	// The executor ran ahead of its own visible raw tail: exechead 12, headers
+	// (and every other family) 10.
+	if err := st.FlushAndSetExecHead(12); err != nil {
+		t.Fatal(err)
+	}
+	hist, err := OpenHistory(dir, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hist.Close()
+
+	cut, end, err := hist.SealTail(context.Background(), [32]byte{}, nil)
+	if err != nil {
+		t.Fatalf("seal on a catching-up corpus: %v", err)
+	}
+	if cut != 2 || end != 8 {
+		t.Fatalf("catch-up seal cut %d epochs through %d, want 2 through 8", cut, end)
+	}
+	if got := epochHashes(hist.Epochs()); !slices.Equal(got, want) {
+		t.Fatalf("catch-up seal produced %v, unskewed %v", got, want)
+	}
+	// It declined the rest rather than failing, so the pass dated the retry
+	// gate (a failed pass leaves it at zero, 2026-08-02) and the next tick is
+	// cheap instead of another full gather.
+	if hist.sealRetryAt == 0 {
+		t.Fatal("the declining pass did not date the retry gate")
+	}
+	if cut, _, err := hist.SealTail(context.Background(), [32]byte{}, nil); err != nil || cut != 0 {
+		t.Fatalf("second pass cut %d epochs: %v", cut, err)
+	}
+}
+
 // TestSealTailNeedsNoBucket is the ruling of 2026-08-02: SEALING DOES NOT KNOW
 // S3 EXISTS. The store here is fully credentialed and its endpoint is a closed
 // port, so any byte the seal sends is a connection refused; if the seal path

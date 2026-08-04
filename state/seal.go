@@ -223,6 +223,16 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 	if !ok || execHead == 0 {
 		return run, fmt.Errorf("seal: no exec head, nothing replayed yet")
 	}
+	// THE CEILING IS WHAT THIS SNAPSHOT CAN READ. OpenReadOnly takes exechead
+	// before its scans, so every block at or below it is already readable here;
+	// this second clamp costs one map read and bounds the pass by the headers
+	// it actually holds even if some future skew reappears. A pass that cannot
+	// reach the boundary must decline through the full=false path (which dates
+	// the retry gate), never by gathering an epoch's worth of blocks and then
+	// tripping over a height it was never able to serve.
+	if maxHdr, ok := store.HeadersMax(); ok && maxHdr < execHead {
+		execHead = maxHdr
+	}
 	reader, err := fetch.OpenReader(dir)
 	if err != nil {
 		return run, err
@@ -407,8 +417,15 @@ func scanEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uin
 			return s, false, nil // staging gap below exec head should not happen, but never seal past one
 		}
 		headerRLP, ok, err := store.HeaderRLP(n)
-		if err != nil || !ok {
-			return s, false, fmt.Errorf("seal: header %d: ok=%v err=%v", n, ok, err)
+		if err != nil {
+			return s, false, fmt.Errorf("seal: read header %d: %w", n, err)
+		}
+		if !ok {
+			// A NOT-FOUND IS NOT AN ERROR VALUE: printing one as `err=<nil>`
+			// told an operator nothing (same defect as the checkpoint path's
+			// %!w(<nil>), 2026-08-04). Below the ceiling this is a real hole in
+			// the raw headers family, and the only cure is a resync.
+			return s, false, fmt.Errorf("seal: header %d is missing from the raw headers family while sealing %d..%d: the corpus has a hole below its readable head, resync it", n, start, execHead)
 		}
 		s.count++
 		s.raw.containers += uint64(len(container))
@@ -480,8 +497,11 @@ func (s *epochStream) src() *epochSrc {
 		Headers: func(yield func([]byte) error) error {
 			for n := s.start; n < end; n++ {
 				hdr, ok, err := s.store.HeaderRLP(n)
-				if err != nil || !ok {
-					return fmt.Errorf("seal: header %d: ok=%v err=%v", n, ok, err)
+				if err != nil {
+					return fmt.Errorf("seal: read header %d: %w", n, err)
+				}
+				if !ok {
+					return fmt.Errorf("seal: header %d vanished mid-seal (epoch %d..%d): its raw bucket was retired under this pass", n, s.start, end-1)
 				}
 				if err := yield(hdr); err != nil {
 					return err

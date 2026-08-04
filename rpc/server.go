@@ -607,8 +607,11 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 		return nil, rerr
 	}
 	raw, ok, err := s.hist.HeaderRLP(n)
-	if err != nil || !ok {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d unavailable: ok=%v err=%v", n, ok, err)}
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("read header %d: %v", n, err)}
+	}
+	if !ok {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d is not in this node's history", n)}
 	}
 	var header types.Header
 	if err := rlp.DecodeBytes(raw, &header); err != nil {

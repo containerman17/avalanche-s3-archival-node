@@ -151,8 +151,11 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 func (s *Server) storedSections(n uint64) (rcptRec, logsRec []byte, _ *rpcError) {
 	if e, ok := s.hist.Epochs().At(n); ok {
 		rcptRec, ok, err := e.StoredRcptRecord(n)
-		if err != nil || !ok {
-			return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts for block %d: ok=%v err=%v", n, ok, err)}
+		if err != nil {
+			return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("read stored receipts for block %d: %v", n, err)}
+		}
+		if !ok {
+			return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("block %d has no stored receipts in epoch %s", n, e.Hash)}
 		}
 		logsRec, _, err := e.StoredLogsRecord(n)
 		if err != nil {
