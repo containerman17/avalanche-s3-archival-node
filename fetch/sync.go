@@ -116,12 +116,26 @@ func (f *Fetcher) Checkpoints() []ids.ID {
 // anchor above the activation height. Fetched containers (and the
 // ancestor batches that ride along) land in the store; staging above the
 // corpus ceiling is disposable.
+//
+// ONLY CHECKPOINTS ABOVE THE SEALED FLOOR (mainnet, 2026-08-04). A checkpoint
+// inside sealed history is not a walk seed: its whole span is durable and no
+// walk descends there (SetFloor). Reading it is not merely useless, it is
+// impossible, because sealing RETIRES the raw staging buckets below the floor,
+// so the read this used to do returned "not here" and killed a node that sealed
+// and then backfilled with --tip-override. Skip them before touching the store.
 func (f *Fetcher) ResolveCheckpoints(ctx context.Context) ([]Anchor, error) {
+	floor := f.floor.Load()
 	var anchors []Anchor
 	for _, id := range f.Checkpoints() {
+		if h, ok := f.store.HeightOf(id); ok && h <= floor {
+			continue
+		}
 		parsed, err := f.getContainer(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("resolve checkpoint %s: %w", id, err)
+		}
+		if parsed.blockNumber <= floor {
+			continue // its height was not known until now, same ruling
 		}
 		anchors = append(anchors, Anchor{ID: id, Height: parsed.blockNumber})
 	}
@@ -260,8 +274,13 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 func (f *Fetcher) getContainer(ctx context.Context, id ids.ID) (parsedContainer, error) {
 	if h, ok := f.store.HeightOf(id); ok {
 		raw, ok, err := f.store.GetByHeight(h)
-		if err != nil || !ok {
+		if err != nil {
 			return parsedContainer{}, fmt.Errorf("read stored container %s: %w", id, err)
+		}
+		if !ok {
+			// The index knows the height and the raw is not there: a seal
+			// retired the bucket. Say so, rather than wrapping a nil error.
+			return parsedContainer{}, fmt.Errorf("container %s (height %d) is not in staging: its raw bucket was retired by a seal", id, h)
 		}
 		return parseContainer(raw)
 	}

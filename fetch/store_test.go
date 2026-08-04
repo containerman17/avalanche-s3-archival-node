@@ -230,3 +230,73 @@ func TestWalkSpanStopsAtSealedFloor(t *testing.T) {
 		t.Fatalf("floor=%d after a lower SetFloor, want %d", got, sealedEnd)
 	}
 }
+
+// TestResolveCheckpointsSkipsSealedHistory is the mainnet stage-1 node of
+// 2026-08-04: it sealed epoch 2, restarted with --tip-override, and died in the
+// checkpoint resolve because sealing had retired the raw staging buckets the
+// resolve reads. Those checkpoints are inside sealed history and are not needed
+// as walk seeds at all, so the fix is to skip them; a checkpoint above the floor
+// that cannot be resolved must still fail loudly.
+func TestResolveCheckpointsSkipsSealedHistory(t *testing.T) {
+	const (
+		fujiNetworkID = 5
+		sealedEnd     = 400_000
+	)
+	cChain, err := ids.FromString("yH8D7ThNJkxmtkuv2jgBa4P1Rn3Qpr4pPr7QYNfcdoS6k6HWp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	f := &Fetcher{store: s, networkID: fujiNetworkID, chainID: cChain, dispatchErrCh: make(chan error, 1)}
+	cps := f.Checkpoints()
+	if len(cps) == 0 {
+		t.Fatal("no embedded checkpoints for the Fuji C-chain; the test proves nothing")
+	}
+
+	// Every checkpoint sits deep inside what the seal has covered, and its raw
+	// is gone exactly the way seal leaves it: the files unlinked, this process's
+	// handles dropped, the RAM index still holding the heights.
+	for i, id := range cps {
+		if err := s.Append(parsedContainer{containerID: id, blockHash: id, blockNumber: uint64(i) + 1}, []byte("raw")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"arrival_00000.log", "index_00000.log"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Retire(sealedEnd); err != nil {
+		t.Fatal(err)
+	}
+
+	// A cancelled context stands in for "the network is not an option here":
+	// anything that tries to resolve a container has to fail.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Unfloored, this is the crash, verbatim.
+	if _, err := f.ResolveCheckpoints(ctx); err == nil {
+		t.Fatal("unfloored resolve succeeded over retired staging; the floor test proves nothing")
+	}
+
+	f.SetFloor(sealedEnd)
+	anchors, err := f.ResolveCheckpoints(ctx)
+	if err != nil {
+		t.Fatalf("resolve after seal: %v", err)
+	}
+	if len(anchors) != 0 {
+		t.Fatalf("%d anchors inside sealed history, want none", len(anchors))
+	}
+
+	// The --tip-override anchor itself is still resolved strictly: a container
+	// nobody has is an error, not a shrug.
+	if _, err := f.ResolveAnchor(ctx, ids.GenerateTestID()); err == nil {
+		t.Fatal("a missing tip-override anchor resolved anyway")
+	}
+}
