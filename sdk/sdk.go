@@ -264,6 +264,7 @@ type liveHead struct{ n atomic.Uint64 }
 func (l *liveHead) LiveHead() uint64      { return l.n.Load() }
 func (l *liveHead) AcceptedHead() uint64  { return l.n.Load() }
 func (l *liveHead) SettledHeight() uint64 { return l.n.Load() }
+func (l *liveHead) SyncTarget() uint64    { return l.n.Load() }
 
 // txIndex swaps the raw tx index as the writer's cook rebuilds it. Heap-only,
 // so a replaced one is just garbage.

@@ -64,11 +64,18 @@ type Live interface {
 	// LiveHead is the last EXECUTED height: the `latest` label.
 	LiveHead() uint64
 	// AcceptedHead is the last height the follower accepted (>= LiveHead):
-	// the `pending` label.
+	// the `pending` label. It BOUNDS WHAT A READ MAY NAME, so it is only ever
+	// a height whose container this node holds.
 	AcceptedHead() uint64
 	// SettledHeight is the last SAE-settled height: the `safe`/`finalized`
 	// labels. Below the Helicon boundary it equals LiveHead.
 	SettledHeight() uint64
+	// SyncTarget is the height this node is syncing TOWARD, and nothing but
+	// eth_syncing's highestBlock reads it. Deliberately NOT AcceptedHead: a
+	// goal is allowed to sit far above any height this node can answer for,
+	// which is exactly the case in a bounded backfill (serve --tip-override),
+	// where it is the walk's ceiling. Following, the two coincide.
+	SyncTarget() uint64
 }
 
 // EnableLive wires the executor frontier into the server (serve).
@@ -262,16 +269,18 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 	case "web3_clientVersion":
 		return ClientVersion, nil
 	case "eth_syncing":
-		// Following: report the geth-shaped object whenever execution trails
-		// what the follower already accepted. A node 60M blocks behind the tip
-		// answering `false` is the lie that hides a broken pipeline.
+		// Report the geth-shaped object whenever execution trails the height
+		// this node is syncing toward. A node 60M blocks behind the tip
+		// answering `false` is the lie that hides a broken pipeline; a node
+		// advertising a highestBlock its run will never reach is the lie a
+		// client can act on.
 		if s.live != nil {
-			cur, acc := s.live.LiveHead(), s.live.AcceptedHead()
-			if acc > cur+1 {
+			cur, target := s.live.LiveHead(), s.live.SyncTarget()
+			if target > cur+1 {
 				return map[string]string{
 					"startingBlock": hexutil.EncodeUint64(0),
 					"currentBlock":  hexutil.EncodeUint64(cur),
-					"highestBlock":  hexutil.EncodeUint64(acc),
+					"highestBlock":  hexutil.EncodeUint64(target),
 				}, nil
 			}
 		}

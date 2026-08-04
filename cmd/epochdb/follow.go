@@ -428,9 +428,8 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	var blocks rpc.BlockSource = fetcher.Store()
 	// The FOLLOWER's accepted head, and only the follower's: the staging store
 	// keeps every index sidecar the dir ever got, so under --tip-override this
-	// is a leftover height and not this run's ceiling. Status reports the
-	// ceiling instead (nodeStatus); the rpc.Live surface still takes this,
-	// where it is only an upper bound on what a tail read may name.
+	// is a leftover height and not this run's ceiling. Nothing reads it in that
+	// mode (see nodeStatus and liveNode).
 	accepted := func() uint64 { h, _ := fetcher.Store().Head(); return h }
 
 	// --- state layer: the executor owns the writer, the RPC shares it ---------
@@ -523,7 +522,13 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 
 	// --- RPC -----------------------------------------------------------------
 	n.srv = rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
-	n.srv.EnableLive(liveNode{Executor: e, accepted: accepted})
+	live := liveNode{live: e.LiveHead, settled: e.SettledHeight}
+	if cfg.Backfill != nil {
+		live.target = fetcher.SyncTarget
+	} else {
+		live.accepted = accepted
+	}
+	n.srv.EnableLive(live)
 
 	n.txidx.reopen(cfg.DataDir, hist.Epochs())
 	n.srv.EnableTxAPIs(n.txidx, rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: blocks}, exec.ParseEthBlock)
@@ -575,14 +580,41 @@ func (n *chainNode) closeAll() {
 	n.store.Close()
 }
 
-// liveNode is the executor plus the follower's accepted height: the rpc.Live
-// surface (SAE labels pending/latest/safe).
+// liveNode is the rpc.Live surface (SAE labels pending/latest/safe) plus the
+// height eth_syncing advertises.
+//
+// TWO QUESTIONS, TWO VALUES (2026-08-05), because making one number answer both
+// is what put a leftover height in front of clients. AcceptedHead bounds what a
+// read may NAME (`pending`, the block-number ceiling), so it is only ever a
+// height whose container this node holds; SyncTarget is only the goal, and may
+// sit millions of blocks above anything answerable. Following they coincide, so
+// both funcs below are the follower's accepted head. Under --tip-override there
+// is NO follower: the staging store's head is whatever an earlier run left in
+// the dir, so nothing above the executed head may be named, while the goal is
+// the walk's ceiling.
 type liveNode struct {
-	*exec.Executor
-	accepted func() uint64
+	live     func() uint64 // executed head
+	settled  func() uint64
+	accepted func() uint64 // the follower's accepted head; nil when backfilling
+	target   func() uint64 // the backfill ceiling; nil when following
 }
 
-func (l liveNode) AcceptedHead() uint64 { return max(l.accepted(), l.Executor.LiveHead()) }
+func (l liveNode) LiveHead() uint64      { return l.live() }
+func (l liveNode) SettledHeight() uint64 { return l.settled() }
+
+func (l liveNode) AcceptedHead() uint64 {
+	if l.accepted == nil {
+		return l.live()
+	}
+	return max(l.accepted(), l.live())
+}
+
+func (l liveNode) SyncTarget() uint64 {
+	if l.target == nil {
+		return l.AcceptedHead()
+	}
+	return l.target()
+}
 
 // cookLoop drags the historical read window up to the head: cook-index makes
 // state at newly executed heights answerable by the descent, cook-txindex
