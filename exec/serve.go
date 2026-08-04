@@ -14,9 +14,10 @@ import (
 )
 
 // ChainGenesis returns the fully wired genesis (chain config with Avalanche
-// upgrades + alloc) for a chain descriptor, for read-side consumers: the
-// historical overlay needs the alloc as its below-first-capture floor, the RPC
-// server needs the chain config for eth_call. nil means the Fuji C-chain.
+// upgrades + the genesis trie state) for a chain descriptor, for read-side
+// consumers: the historical overlay needs TrieAlloc as its below-first-capture
+// floor, the RPC server needs the chain config for eth_call. nil means the Fuji
+// C-chain.
 //
 // It also performs this process's one-and-only extras registration, for the
 // descriptor's VM kind.

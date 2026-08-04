@@ -1,9 +1,12 @@
 package exec
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/libevm/core/types"
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
@@ -31,6 +34,35 @@ func TestSnowContextChainIDs(t *testing.T) {
 		}
 		if got := ctx.AVAXAssetID.String(); got != tc.assetID {
 			t.Errorf("network %d AVAXAssetID = %s, want %s", tc.networkID, got, tc.assetID)
+		}
+	}
+}
+
+// TestCorethTrieAllocIsTheAllocLiteral pins the coreth half of the genesis
+// trie-state floor: the C-chain genesis trie IS its alloc, so TrieAlloc must
+// stay the descriptor's alloc, entry for entry, however much the subnet-evm
+// side adds to its own (vm_sevm.go trieAlloc). The oracle is an independent
+// unmarshal of the same descriptor bytes.
+func TestCorethTrieAllocIsTheAllocLiteral(t *testing.T) {
+	fetch.RegisterExtras(chain.Coreth)
+	for _, networkID := range []uint32{avaconstants.FujiID, avaconstants.MainnetID} {
+		c := mustCChain(t, networkID)
+		g, err := ChainGenesis(c)
+		if err != nil {
+			t.Fatalf("network %d: %v", networkID, err)
+		}
+		var raw struct {
+			Alloc types.GenesisAlloc `json:"alloc"`
+		}
+		if err := json.Unmarshal(c.GenesisJSON, &raw); err != nil {
+			t.Fatalf("network %d: unmarshal alloc: %v", networkID, err)
+		}
+		if len(raw.Alloc) == 0 {
+			t.Fatalf("network %d: descriptor alloc is empty, the check is vacuous", networkID)
+		}
+		if !reflect.DeepEqual(raw.Alloc, g.TrieAlloc) {
+			t.Errorf("network %d: TrieAlloc (%d entries) is not the alloc (%d entries)",
+				networkID, len(g.TrieAlloc), len(raw.Alloc))
 		}
 	}
 }

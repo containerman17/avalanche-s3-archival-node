@@ -46,7 +46,7 @@ func openCorpus(t *testing.T) *corpusEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	hist, err := state.OpenHistory(corpusDir, store, gm.Alloc)
+	hist, err := state.OpenHistory(corpusDir, store, gm.TrieAlloc)
 	if err != nil {
 		t.Fatal(err)
 	}

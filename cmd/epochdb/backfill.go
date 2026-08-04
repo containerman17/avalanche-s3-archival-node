@@ -64,7 +64,7 @@ func openBfEnv(dataDir string, c *chain.Chain) (*bfEnv, func()) {
 	if !ok || logsStart == 0 {
 		log.Fatalf("backfill-logs: no logs.start marker (live capture never ran)")
 	}
-	hist, err := state.OpenHistory(dataDir, store, g.Alloc)
+	hist, err := state.OpenHistory(dataDir, store, g.TrieAlloc)
 	if err != nil {
 		log.Fatalf("backfill-logs: open history: %v", err)
 	}

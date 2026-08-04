@@ -37,16 +37,20 @@ var errOverlayReadOnly = errors.New("epochdb overlay: read-only historical view"
 
 // History serves historical account/storage reads from the cooked
 // sorted_NNNNN.idx buckets (mmap binary search) and sealed epochs, falling
-// through to the genesis alloc for keys never written. Fully goroutine-safe:
-// everything here is immutable after open and the store's bucketLogs are
-// internally locked.
+// through to the genesis TRIE STATE for keys never written. Fully
+// goroutine-safe: everything here is immutable after open and the store's
+// bucketLogs are internally locked.
 //
 // There is no floor and no pruned mode (DESIGN.md ruling 1 of 2026-07-31):
-// every node's descent ends at the genesis alloc, and a bootstrapped node
+// every node's descent ends at the genesis trie state, and a bootstrapped node
 // gets its Firewood frontier from the epochs themselves (exec.BuildFrontier).
 type History struct {
-	dir     string
-	store   *Store
+	dir   string
+	store *Store
+	// genesis is exec.Genesis.TrieAlloc: what the genesis MATERIALISED, which
+	// on subnet-evm is more than its `alloc` (a precompile enabled at genesis
+	// has an account and storage there and is in no alloc). Handing the alloc
+	// literal here answers a read of such an address with "does not exist".
 	genesis types.GenesisAlloc
 	epochs  *EpochSet // sealed epochs (may be empty)
 
@@ -113,10 +117,10 @@ type sortedBucket struct {
 	cooked uint64   // cookedThrough from the file header (Refresh's change test)
 }
 
-// OpenHistory mmaps every sorted bucket in dir. alloc is the genesis alloc,
-// the floor every descent ends at.
-func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, error) {
-	h := &History{dir: dir, store: store, genesis: alloc}
+// OpenHistory mmaps every sorted bucket in dir. trieAlloc is the genesis trie
+// state (exec.Genesis.TrieAlloc), the floor every descent ends at.
+func OpenHistory(dir string, store *Store, trieAlloc types.GenesisAlloc) (*History, error) {
+	h := &History{dir: dir, store: store, genesis: trieAlloc}
 	var (
 		stateHead uint64
 		err       error
@@ -679,7 +683,7 @@ func (h *History) AccountAt(addr common.Address, n uint64) (*types.StateAccount,
 		return nil, err
 	}
 	if !found {
-		// Below the first capture / never written: genesis alloc floor.
+		// Below the first capture / never written: genesis trie-state floor.
 		ga, ok := h.genesis[addr]
 		if !ok {
 			return nil, nil
@@ -739,7 +743,8 @@ func (h *History) StorageAt(addr common.Address, slot []byte, n uint64) ([]byte,
 
 // CodeByHash serves contract code from code.log (the hot tail: everything
 // deployed above the sealed end), then the sealed epochs newest-to-oldest,
-// then the genesis alloc. Never any frontier. EmptyCodeHash resolves to nil.
+// then the genesis trie state. Never any frontier. EmptyCodeHash resolves to
+// nil.
 //
 // The epoch descent is what makes a download-bootstrapped node (no code.log
 // at all) serve eth_getCode: a v3 epoch carries the code of every account it
@@ -753,8 +758,9 @@ func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 		return nil, err
 	}
 	if !ok {
-		// Genesis alloc code was never deployed by a block, so no epoch
-		// carries it; the alloc ships with the binary.
+		// Genesis code was never deployed by a block, so no epoch carries it;
+		// the genesis trie state is derived from the descriptor at open. That
+		// includes a subnet-evm precompile's 0x01 body, which is in no alloc.
 		for _, ga := range h.genesis {
 			if len(ga.Code) > 0 && crypto.Keccak256Hash(ga.Code) == codeHash {
 				return ga.Code, nil

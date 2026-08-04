@@ -36,13 +36,21 @@ import (
 )
 
 // Genesis is the VM-NEUTRAL view of a chain's genesis: what the executor and
-// every read-side consumer actually keep from it. Config and Alloc are libevm
-// types shared by both VM kinds (the VM-specific part of Config lives in its
-// libevm extras payload, which the process-global registration pins), so a
+// every read-side consumer actually keep from it. Config and TrieAlloc are
+// libevm types shared by both VM kinds (the VM-specific part of Config lives in
+// its libevm extras payload, which the process-global registration pins), so a
 // caller holding this never has to know which VM produced it.
 type Genesis struct {
-	Config    *params.ChainConfig
-	Alloc     types.GenesisAlloc
+	Config *params.ChainConfig
+
+	// TrieAlloc is what the genesis actually MATERIALISES IN THE TRIE, which is
+	// not the same thing as the genesis `alloc` and is deliberately not named
+	// after it: on subnet-evm a precompile enabled at genesis has an account and
+	// its configured storage in the trie while the alloc lists only EOAs (see
+	// trieAlloc in vm_sevm.go). Every read-side floor is this map, so anything
+	// missing from it reads back as "account does not exist".
+	TrieAlloc types.GenesisAlloc
+
 	Timestamp uint64
 	Hash      common.Hash // genesis block hash
 	Root      common.Hash // genesis state root

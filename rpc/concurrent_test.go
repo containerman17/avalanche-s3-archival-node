@@ -63,7 +63,7 @@ func newCorpusServer(t *testing.T) (*httptest.Server, uint64, combinedBlocks) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	hist, err := state.OpenHistory(dir, store, g.Alloc)
+	hist, err := state.OpenHistory(dir, store, g.TrieAlloc)
 	if err != nil {
 		t.Fatal(err)
 	}

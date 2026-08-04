@@ -101,7 +101,7 @@ func allocAddr(t *testing.T) common.Address {
 		t.Fatal(err)
 	}
 	var out common.Address
-	for a := range g.Alloc {
+	for a := range g.TrieAlloc {
 		if out == (common.Address{}) || a.Cmp(out) < 0 {
 			out = a
 		}

@@ -6,6 +6,8 @@ package exec
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"math/big"
 
 	sevmcommontype "github.com/ava-labs/avalanchego/graft/subnet-evm/commontype"
 	sevmconsensus "github.com/ava-labs/avalanchego/graft/subnet-evm/consensus"
@@ -14,6 +16,7 @@ import (
 	sevmextstate "github.com/ava-labs/avalanchego/graft/subnet-evm/core/extstate"
 	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
 	sevmextras "github.com/ava-labs/avalanchego/graft/subnet-evm/params/extras"
+	sevmmodules "github.com/ava-labs/avalanchego/graft/subnet-evm/precompile/modules"
 
 	// GENESIS PRECOMPILES DO NOT PARSE WITHOUT THIS, AND THEY FAIL SILENTLY.
 	// extras.Precompiles.UnmarshalJSON walks modules.RegisteredModules() and
@@ -24,6 +27,8 @@ import (
 	// whole fix.
 	_ "github.com/ava-labs/avalanchego/graft/subnet-evm/precompile/registry"
 	"github.com/ava-labs/avalanchego/snow"
+	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core/rawdb"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/core/vm"
@@ -87,10 +92,14 @@ func (sevmVM) genesis(c *chain.Chain, snowCtx *snow.Context) (*Genesis, error) {
 		return nil, fmt.Errorf("set eth upgrades: %w", err)
 	}
 
+	alloc, err := trieAlloc(g)
+	if err != nil {
+		return nil, err
+	}
 	blk := g.ToBlock()
 	return &Genesis{
 		Config:    g.Config,
-		Alloc:     g.Alloc,
+		TrieAlloc: alloc,
 		Timestamp: g.Timestamp,
 		Hash:      blk.Hash(),
 		Root:      blk.Root(),
@@ -99,6 +108,82 @@ func (sevmVM) genesis(c *chain.Chain, snowCtx *snow.Context) (*Genesis, error) {
 			return err
 		},
 	}, nil
+}
+
+// trieAlloc returns what this genesis actually MATERIALISES, which on
+// subnet-evm is more than g.Alloc: Genesis.toBlock runs
+// ApplyPrecompileActivations BEFORE it writes the alloc, so every precompile
+// enabled at time 0 gets an account (nonce 1, code 0x01) plus whatever its
+// module's Configure stores, and a nativeMinter initialMint credits addresses
+// that need not be in the alloc either. None of that is in `alloc`, and the
+// historical read overlay uses this map as its below-first-capture floor
+// (state/overlay.go), so anything missing here answers an RPC read of a
+// genesis-configured precompile with "account does not exist". That is the
+// read-path half of the blind spot that merged a wrong frontier root on the
+// first Beam join (see BuildFrontier, DESIGN 2026-08-05).
+//
+// It runs the VM'S OWN activation code against a throwaway in-memory statedb
+// holding NOTHING but the activations, so no rule here is a second
+// implementation of one in subnet-evm and the cost is the precompile count
+// (six addresses at most), not the alloc size. Once, at open.
+//
+// RESIDUAL GAP, honest: a genesis AirdropData block would also be in the trie
+// and is not modelled here. It is a coreth-era C-chain field that subnet-evm
+// still parses, no L1 sets it, and one would only cost balances (never an
+// account's existence) on a chain that did.
+func trieAlloc(g *sevmcore.Genesis) (types.GenesisAlloc, error) {
+	db := rawdb.NewMemoryDatabase()
+	// Preimages: the dump below is how the raw addresses and slot keys come
+	// back out of the hashed trie.
+	tdb := triedb.NewDatabase(db, &triedb.Config{Preimages: true})
+	sdb, err := ethstate.New(types.EmptyRootHash, sevmextstate.NewDatabaseWithNodeDB(db, tdb), nil)
+	if err != nil {
+		return nil, err
+	}
+	blockCtx := sevmcore.NewBlockContext(new(big.Int).SetUint64(g.Number), g.Timestamp)
+	if err := sevmcore.ApplyPrecompileActivations(g.Config, nil, blockCtx, sdb); err != nil {
+		return nil, fmt.Errorf("configure genesis precompiles: %w", err)
+	}
+	root, err := sdb.Commit(0, false) // deleteEmptyObjects=false, as toBlock commits
+	if err != nil {
+		return nil, err
+	}
+	if root == types.EmptyRootHash {
+		return g.Alloc, nil // no precompile at time 0: the trie IS the alloc
+	}
+	if sdb, err = ethstate.New(root, sevmextstate.NewDatabaseWithNodeDB(db, tdb), nil); err != nil {
+		return nil, err
+	}
+	out := make(types.GenesisAlloc, len(g.Alloc)+len(sevmmodules.RegisteredModules()))
+	for _, da := range sdb.RawDump(&ethstate.DumpConfig{}).Accounts {
+		if da.Address == nil {
+			return nil, fmt.Errorf("genesis precompile account %x has no preimage", da.AddressHash)
+		}
+		bal, ok := new(big.Int).SetString(da.Balance, 10)
+		if !ok {
+			return nil, fmt.Errorf("genesis precompile %s: undecodable balance %q", da.Address, da.Balance)
+		}
+		acct := types.Account{Nonce: da.Nonce, Balance: bal, Code: da.Code}
+		if len(da.Storage) > 0 {
+			acct.Storage = make(map[common.Hash]common.Hash, len(da.Storage))
+			for slot, v := range da.Storage {
+				acct.Storage[slot] = common.HexToHash(v)
+			}
+		}
+		out[*da.Address] = acct
+	}
+	for addr, a := range g.Alloc {
+		// The alloc is applied AFTER the activations, field by field: SetBalance,
+		// SetCode and SetNonce OVERWRITE, SetState per slot MERGES. An alloc entry
+		// at a module address is nonsense, but this is what the trie would hold.
+		if pre, ok := out[addr]; ok && len(pre.Storage) > 0 {
+			st := maps.Clone(pre.Storage)
+			maps.Copy(st, a.Storage)
+			a.Storage = st
+		}
+		out[addr] = a
+	}
+	return out, nil
 }
 
 func (sevmVM) newStateDatabase(db ethdb.Database, tdb *triedb.Database) ethstate.Database {

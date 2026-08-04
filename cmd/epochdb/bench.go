@@ -56,7 +56,7 @@ func benchMain(args []string) {
 	if err != nil {
 		log.Fatalf("ab-bench: genesis: %v", err)
 	}
-	hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
+	hist, err := state.OpenHistory(*dataDir, store, g.TrieAlloc)
 	if err != nil {
 		log.Fatalf("ab-bench: open history: %v", err)
 	}

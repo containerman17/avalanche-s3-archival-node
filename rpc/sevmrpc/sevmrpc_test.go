@@ -34,15 +34,19 @@ import (
 	sevmcore "github.com/ava-labs/avalanchego/graft/subnet-evm/core"
 	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
 	sevmextras "github.com/ava-labs/avalanchego/graft/subnet-evm/params/extras"
+	"github.com/ava-labs/avalanchego/graft/subnet-evm/precompile/contracts/nativeminter"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/upgrade"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
+	"github.com/ava-labs/libevm/core/rawdb"
+	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
+	"github.com/ava-labs/libevm/triedb"
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/exec"
@@ -329,7 +333,7 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { rstore.Close() })
-	hist, err := state.OpenHistory(dir, rstore, g.Alloc)
+	hist, err := state.OpenHistory(dir, rstore, g.TrieAlloc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,6 +523,59 @@ func TestGetBalanceAcrossHeights(t *testing.T) {
 	slot := decodeString(t, e.mustCall(t, "eth_getStorageAt", e.contract, common.Hash{}, "latest"))
 	if got := common.HexToHash(slot).Big().Int64(); got != storedValue {
 		t.Fatalf("storage slot 0 = %s, want %d", slot, storedValue)
+	}
+}
+
+// TestGenesisPrecompileBelowFirstCapture: the NativeMinter this chain enables
+// AT GENESIS is a real account in the genesis trie (nonce 1, code 0x01, its
+// admin's allowlist slot) and is in NO alloc, and no block here ever touches
+// it, so every height is "below the first capture" and every read of it falls
+// through to the overlay's floor. Reading the alloc there answers "account does
+// not exist", which is what an L1 like Beam saw. The oracle is subnet-evm's OWN
+// committed genesis, not a constant typed here.
+//
+// This is the read-path half of the blind spot exec.BuildFrontier had.
+func TestGenesisPrecompileBelowFirstCapture(t *testing.T) {
+	e := newEnv(t)
+
+	// --- what the chain REALLY has, from subnet-evm's own Genesis.Commit ----
+	ref := referenceGenesis(t, testChain())
+	db := rawdb.NewMemoryDatabase()
+	tdb := triedb.NewDatabase(db, nil)
+	if _, err := ref.Commit(db, tdb); err != nil {
+		t.Fatalf("commit reference genesis: %v", err)
+	}
+	gsdb, err := ethstate.New(ref.ToBlock().Root(), ethstate.NewDatabaseWithNodeDB(db, tdb), nil)
+	if err != nil {
+		t.Fatalf("open reference genesis state: %v", err)
+	}
+	adminSlot := common.BytesToHash(fundedAddr().Bytes())
+	var (
+		wantCode  = gsdb.GetCode(nativeminter.ContractAddress)
+		wantNonce = gsdb.GetNonce(nativeminter.ContractAddress)
+		wantRole  = gsdb.GetState(nativeminter.ContractAddress, adminSlot)
+	)
+	if len(wantCode) == 0 || wantNonce == 0 || wantRole == (common.Hash{}) {
+		t.Fatalf("reference genesis has no NativeMinter account: code %x nonce %d role %x",
+			wantCode, wantNonce, wantRole)
+	}
+	if _, ok := ref.Alloc[nativeminter.ContractAddress]; ok {
+		t.Fatal("the alloc lists the precompile, so this test proves nothing")
+	}
+
+	// --- what the served node answers, at every height ----------------------
+	for _, tag := range []string{numTag(0), numTag(blkTransfer), numTag(blkCall), numTag(headBlock), "latest"} {
+		code := decodeString(t, e.mustCall(t, "eth_getCode", nativeminter.ContractAddress, tag))
+		if want := hexutil.Encode(wantCode); code != want {
+			t.Errorf("eth_getCode(nativeMinter) at %s = %s, want %s", tag, code, want)
+		}
+		if got := decodeUint(t, e.mustCall(t, "eth_getTransactionCount", nativeminter.ContractAddress, tag)); got != wantNonce {
+			t.Errorf("eth_getTransactionCount(nativeMinter) at %s = %d, want %d", tag, got, wantNonce)
+		}
+		role := decodeString(t, e.mustCall(t, "eth_getStorageAt", nativeminter.ContractAddress, adminSlot, tag))
+		if got := common.HexToHash(role); got != wantRole {
+			t.Errorf("eth_getStorageAt(nativeMinter, admin) at %s = %x, want %x", tag, got, wantRole)
+		}
 	}
 }
 

@@ -46,8 +46,13 @@ func (corethVM) genesis(c *chain.Chain, snowCtx *snow.Context) (*Genesis, error)
 	}
 	blk := g.ToBlock()
 	return &Genesis{
-		Config:    g.Config,
-		Alloc:     g.Alloc,
+		Config: g.Config,
+		// The C-chain genesis trie IS its alloc. coreth's toBlock runs
+		// ApplyPrecompileActivations exactly as subnet-evm's does, but NO
+		// C-chain genesis enables a precompile at time 0 (mainnet, Fuji and
+		// every local network alike) and none sets an airdrop, so there is
+		// nothing to add and this path stays what it always was, map for map.
+		TrieAlloc: g.Alloc,
 		Timestamp: g.Timestamp,
 		Hash:      blk.Hash(),
 		Root:      blk.Root(),

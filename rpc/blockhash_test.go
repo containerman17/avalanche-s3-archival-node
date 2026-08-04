@@ -133,7 +133,7 @@ func newBlockHashEnv(t *testing.T) *bhEnv {
 		t.Fatal(err)
 	}
 
-	hist, err := state.OpenHistory(dir, store, gm.Alloc)
+	hist, err := state.OpenHistory(dir, store, gm.TrieAlloc)
 	if err != nil {
 		t.Fatal(err)
 	}

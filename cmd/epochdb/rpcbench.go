@@ -53,7 +53,7 @@ func rpcBenchMain(args []string) {
 	if err != nil {
 		log.Fatalf("rpc-bench: %v", err)
 	}
-	hist, err := state.OpenHistory(*dataDir, store, g.Alloc)
+	hist, err := state.OpenHistory(*dataDir, store, g.TrieAlloc)
 	if err != nil {
 		log.Fatalf("rpc-bench: %v", err)
 	}

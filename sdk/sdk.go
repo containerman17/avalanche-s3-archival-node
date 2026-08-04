@@ -96,7 +96,7 @@ func Open(dir string, networkID uint32) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	hist, err := state.OpenHistory(dir, store, g.Alloc)
+	hist, err := state.OpenHistory(dir, store, g.TrieAlloc)
 	if err != nil {
 		store.Close()
 		return nil, err

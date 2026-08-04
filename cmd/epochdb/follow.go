@@ -473,7 +473,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	}
 	closers = append(closers, func() { e.Close() })
 
-	hist, err := state.OpenHistory(cfg.DataDir, store, g.Alloc)
+	hist, err := state.OpenHistory(cfg.DataDir, store, g.TrieAlloc)
 	if err != nil {
 		return nil, fmt.Errorf("open history: %w", err)
 	}
