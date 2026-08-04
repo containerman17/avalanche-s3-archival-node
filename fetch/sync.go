@@ -182,6 +182,7 @@ func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error
 		}
 	}
 	sort.Slice(anchors, func(i, j int) bool { return anchors[i].Height > anchors[j].Height })
+	f.syncTarget.Store(anchors[0].Height)
 	log.Printf("fetch: sync-to height=%d anchors=%d walks=%d", anchors[0].Height, len(anchors), walks)
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -207,6 +208,14 @@ func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error
 	log.Printf("fetch: sync-to complete, %d spans", len(anchors))
 	return nil
 }
+
+// SyncTarget is the ceiling of the bounded backfill this fetcher is running
+// (the highest SyncTo anchor), 0 while following or until the anchors resolve.
+// It is what a backfill measures execution against, because there is no
+// accepted head to measure against: the store's head is whatever a previous
+// follow run left in the dir, which can be tens of millions of blocks above
+// the ceiling this walk was given.
+func (f *Fetcher) SyncTarget() uint64 { return f.syncTarget.Load() }
 
 // walkSpan walks backward from tip until the span floor or the bottom of
 // history. No chain serves its genesis container over GetAncestors, so the

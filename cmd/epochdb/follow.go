@@ -239,10 +239,18 @@ func serveMain(args []string) {
 // counts what SIBLING PROCESSES evicted too, since the cache is shared. Empty
 // until something has been evicted, which is the honest answer for a node whose
 // cache has never filled.
+//
+// TWO MODES, TWO FIELDS, because they are two different numbers and one field
+// meaning either would be a lie in one of them: `accepted` is the follower's
+// accepted head and exists only when following; `target`/`stored` are the
+// --tip-override ceiling and the staged container count, and exist only when
+// backfilling. A follow-mode answer is byte-identical to what it always was.
 type serveStatus struct {
 	Chain        string `json:"chain"`
 	Serving      bool   `json:"serving"`
 	Accepted     uint64 `json:"accepted"`
+	Target       uint64 `json:"target,omitempty"`
+	Stored       uint64 `json:"stored,omitempty"`
 	Executed     uint64 `json:"executed"`
 	Cooked       uint64 `json:"cooked"`
 	CacheHorizon string `json:"cacheHorizon,omitempty"`
@@ -259,13 +267,7 @@ func statusOf(spec string, n *chainNode) serveStatus {
 	if n == nil {
 		return serveStatus{Chain: spec}
 	}
-	s := serveStatus{
-		Chain:    n.cfg.Chain.BlockchainID.String(),
-		Serving:  true,
-		Accepted: n.accepted(),
-		Executed: n.e.LiveHead(),
-		Cooked:   n.hist.StateHead(),
-	}
+	s := n.snapshot().serveStatus(n.cfg.Chain.BlockchainID.String())
 	if cs, ok := n.store.Cas().CacheStats(); ok {
 		if cs.VictimAge > 0 {
 			s.CacheHorizon = cs.VictimAge.String()
@@ -424,6 +426,11 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	}
 	closers = append(closers, func() { fetcher.Close() })
 	var blocks rpc.BlockSource = fetcher.Store()
+	// The FOLLOWER's accepted head, and only the follower's: the staging store
+	// keeps every index sidecar the dir ever got, so under --tip-override this
+	// is a leftover height and not this run's ceiling. Status reports the
+	// ceiling instead (nodeStatus); the rpc.Live surface still takes this,
+	// where it is only an upper bound on what a tail read may name.
 	accepted := func() uint64 { h, _ := fetcher.Store().Head(); return h }
 
 	// --- state layer: the executor owns the writer, the RPC shares it ---------
@@ -709,17 +716,77 @@ func (n *chainNode) statusLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		logf("serve: %s", n.status())
+		logf("serve: %s", n.snapshot().status())
 	}
+}
+
+// nodeStatus is the chain's numbers, read once and rendered two ways: the log
+// line (status) and /status (serveStatus).
+//
+// head IS THE FIX OF 2026-08-05: it is the height execution is measured
+// against, and where it comes from depends on the mode. Following, it is the
+// follower's accepted head. Backfilling (--tip-override) there IS no follower,
+// and the staging store's head is the follower's number: a dir that once
+// followed still holds index sidecars far above a later override's ceiling, so
+// a 10,129,485-block mainnet backfill reported accepted=66854601 and an
+// exec_lag of 59.3M against a height nothing in the run would ever reach. A
+// backfill measures against the ceiling its walk was given.
+type nodeStatus struct {
+	backfill bool
+	head     uint64 // accepted head (follow) or override ceiling (backfill)
+	stored   uint64 // containers in staging; backfill progress toward head
+	executed uint64
+	served   uint64
+	cooked   uint64
+	settled  uint64
+	entries  int
+	bytes    uint64
+}
+
+func (n *chainNode) snapshot() nodeStatus {
+	entries, size := n.hist.TailStats()
+	s := nodeStatus{
+		backfill: n.cfg.Backfill != nil,
+		executed: n.e.LiveHead(),
+		served:   n.hist.Head(),
+		cooked:   n.hist.StateHead(),
+		settled:  n.e.SettledHeight(),
+		entries:  entries,
+		bytes:    size,
+	}
+	if s.backfill {
+		// Count, not a contiguous-run scan: the run above the exec head is
+		// millions of heights wide during a stage-1 walk and probing it every
+		// tick would hold the store's lock against the fetcher.
+		s.head, s.stored = n.fetcher.SyncTarget(), n.fetcher.Store().Count()
+	} else {
+		s.head = n.accepted()
+	}
+	return s
 }
 
 // status is the one-line health of this chain, for the log loop. /status
 // answers with the structured twin (statusOf).
-func (n *chainNode) status() string {
-	acc, ex := n.accepted(), n.e.LiveHead()
-	entries, size := n.hist.TailStats()
-	return fmt.Sprintf("accepted=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%d tail=%d/%.1fMB",
-		acc, ex, n.hist.Head(), n.hist.StateHead(), n.e.SettledHeight(), int64(acc)-int64(ex), entries, float64(size)/1e6)
+func (s nodeStatus) status() string {
+	lead, lag := fmt.Sprintf("accepted=%d", s.head), fmt.Sprintf("%d", int64(s.head)-int64(s.executed))
+	if s.backfill {
+		lead = fmt.Sprintf("target=%d stored=%d", s.head, s.stored)
+		if s.head == 0 { // the walk has not resolved its anchors yet
+			lead, lag = fmt.Sprintf("target=? stored=%d", s.stored), "?"
+		}
+	}
+	return fmt.Sprintf("%s executed=%d served=%d cooked=%d settled=%d exec_lag=%s tail=%d/%.1fMB",
+		lead, s.executed, s.served, s.cooked, s.settled, lag, s.entries, float64(s.bytes)/1e6)
+}
+
+func (s nodeStatus) serveStatus(chain string) serveStatus {
+	out := serveStatus{Chain: chain, Serving: true, Executed: s.executed, Cooked: s.cooked}
+	if s.backfill {
+		out.Target, out.Stored = s.head, s.stored
+	} else {
+		out.Accepted = s.head
+	}
+	return out
 }
 
 // txIndexHolder swaps the raw tx index under the RPC server as cook rebuilds

@@ -128,6 +128,12 @@ type Fetcher struct {
 	// below it is ever requested. See SetFloor.
 	floor atomic.Uint64
 
+	// syncTarget is the ceiling of a bounded backfill (SyncTo's highest
+	// anchor), 0 while following or before the anchors resolve. REPORTING
+	// ONLY: nothing in the walk reads it. It exists because the store's head
+	// is the FOLLOWER's number and a backfill has no follower.
+	syncTarget atomic.Uint64
+
 	// Stats for progress logging.
 	requestsSent    atomic.Uint64
 	answersTotal    atomic.Uint64
