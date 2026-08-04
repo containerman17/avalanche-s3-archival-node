@@ -311,7 +311,7 @@ func dial(cfg Config) (*Fetcher, error) {
 		net.ManuallyTrack(p.ID, peerAddr(p))
 	}
 
-	if err := waitForPeer(ctx, dispatchErrCh, handler.connectedCh, peerIDs, defaultConnectTimeout); err != nil {
+	if err := waitForPeer(ctx, dispatchErrCh, handler.connectedCh, peerIDs, dialTimeout); err != nil {
 		net.StartClose()
 		return nil, fmt.Errorf("connect peer: %w", err)
 	}
