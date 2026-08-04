@@ -125,7 +125,9 @@ func OpenHistory(dir string, store *Store, alloc types.GenesisAlloc) (*History, 
 		h.Close()
 		return nil, err
 	}
-	if h.epochs, err = OpenEpochSet(store.Cas()); err != nil {
+	// The epoch set belongs to the Store, so the executor's rawdb reads and
+	// this descent answer from ONE set (state/store.go Code).
+	if h.epochs, err = store.Epochs(); err != nil {
 		h.Close()
 		return nil, err
 	}
@@ -510,16 +512,13 @@ func (b *sortedBucket) close() {
 	b.wl.Close()
 }
 
-// Close unmaps and closes every bucket and epoch.
+// Close unmaps and closes every bucket. The epoch set is the Store's, so
+// Store.Close is what closes it.
 func (h *History) Close() {
 	for _, b := range h.buckets {
 		b.close()
 	}
 	h.buckets = nil
-	if h.epochs != nil {
-		h.epochs.Close()
-		h.epochs = nil
-	}
 }
 
 // Head returns the highest block this node serves. Static serve: the cooked
@@ -749,15 +748,9 @@ func (h *History) CodeByHash(codeHash common.Hash) ([]byte, error) {
 	if codeHash == types.EmptyCodeHash || codeHash == (common.Hash{}) {
 		return nil, nil
 	}
-	blob, ok, err := h.store.code.Get(codeHash)
+	blob, ok, err := h.store.Code(codeHash)
 	if err != nil {
 		return nil, err
-	}
-	eps := h.epochs.All()
-	for i := len(eps) - 1; !ok && i >= 0; i-- {
-		if blob, ok, err = eps[i].Code(codeHash); err != nil {
-			return nil, err
-		}
 	}
 	if !ok {
 		// Genesis alloc code was never deployed by a block, so no epoch

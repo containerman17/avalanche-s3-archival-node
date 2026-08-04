@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math/big"
 	"math/rand"
@@ -15,6 +16,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/holiman/uint256"
@@ -33,6 +35,10 @@ var (
 
 	frS1 = common.HexToHash("0x01")
 	frS2 = common.HexToHash("0x02")
+
+	// frDCode is the contract code of frD, deployed in block 1 and never
+	// removed, so it is still live at the frontier and past it.
+	frDCode = []byte{0x60, 0x2a, 0x60, 0x00, 0x52}
 )
 
 // frontierBlocks is the replay script. It crosses every rule the merge has
@@ -60,6 +66,10 @@ func frontierBlocks(n uint64, alloc common.Address, sdb *ethstate.StateDB) {
 		sdb.SetState(frB, frS1, common.HexToHash("0x21"))
 		set(frD, 1, 5)
 		sdb.SetState(frD, frS1, common.HexToHash("0x41"))
+		// D is a CONTRACT and it outlives the frontier, which is what the
+		// block-9 execution below needs: its code is deployed inside epoch 1
+		// and the only copy a joined node has is that epoch's 'c' row.
+		sdb.SetCode(frD, frDCode)
 	case 2:
 		sdb.SetState(frB, frS2, common.HexToHash("0x22"))
 	case 3:
@@ -225,6 +235,13 @@ func sealCorpus(t *testing.T, dir string, roots map[uint64]common.Hash, rows map
 			in.Headers = append(in.Headers, hdr)
 			in.StateRows = append(in.StateRows, rows[n]...)
 		}
+		// The v3 placement rule: the epoch that writes an account carries that
+		// account's code. frD is deployed in block 1, so epoch 1 is where its
+		// blob lives, and a joined node executing past block 8 has to descend
+		// to it (state/store.go Code).
+		if start == 1 {
+			in.Code[crypto.Keccak256Hash(frDCode)] = frDCode
+		}
 		if _, err := state.BuildEpoch(st, in); err != nil {
 			t.Fatal(err)
 		}
@@ -300,6 +317,71 @@ func TestBuildFrontierMatchesReplayRoot(t *testing.T) {
 	// Idempotent: a second build over an already-frontiered dir is a no-op.
 	if err := e2.BuildFrontier(set); err != nil {
 		t.Fatalf("rebuild: %v", err)
+	}
+}
+
+// TestExecuteAfterFrontierResolvesCodeFromEpochs IS THE TOKYO CRASH
+// (2026-08-04, first real join-from-bucket node): the frontier merged and
+// root-verified, and then the very first block past it died with "can't load
+// code hash ...: not found". A joined node replayed nothing, so its code.log
+// is EMPTY, and the epochs' 'c' rows are the only contract code it has; the
+// executor's statedb was reading code.log alone.
+//
+// The shape is exactly Tokyo's: a dir holding nothing but epochs, a frontier
+// merged out of them, and a block that touches a contract deployed long
+// before the frontier.
+func TestExecuteAfterFrontierResolvesCodeFromEpochs(t *testing.T) {
+	fetch.RegisterExtras(chain.Coreth)
+	roots, rows := replayCorpus(t, t.TempDir())
+
+	dir := t.TempDir()
+	set := sealCorpus(t, dir, roots, rows)
+	defer set.Close()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	e, err := New(Config{DataDir: dir, Blocks: set, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.BuildFrontier(set); err != nil {
+		t.Fatal(err)
+	}
+	// A joined node's code.log holds the genesis alloc's code and NOTHING
+	// else: it never executed a deploy, so frD's blob is in the epoch or
+	// nowhere.
+	frDHash := crypto.Keccak256Hash(frDCode)
+	raw, err := os.ReadFile(filepath.Join(dir, "code.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, frDHash[:]) {
+		t.Fatal("fixture is not a joined node: frD's code is in code.log")
+	}
+
+	// Block 9 against the merged frontier, the block Tokyo died on.
+	frame := &blockFrame{}
+	e.wrapDB.setFrame(frame)
+	defer e.wrapDB.setFrame(nil)
+	sdb, err := ethstate.New(e.headRoot, e.wrapDB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sdb.GetCode(frD); !bytes.Equal(got, frDCode) {
+		t.Fatalf("code of a contract deployed below the frontier: %x, want %x", got, frDCode)
+	}
+	if err := sdb.Error(); err != nil {
+		t.Fatalf("statedb error after reading epoch-only code: %v", err)
+	}
+	// And the commit must go through: the crash surfaced at the drain as
+	// "commit aborted due to earlier error", the swallowed read above.
+	sdb.SetNonce(frD, 2)
+	if _, err := sdb.Commit(9, true, stateconf.WithTrieDBUpdateOpts(
+		stateconf.WithTrieDBUpdatePayload(e.lastFwHash, common.BigToHash(big.NewInt(1009))))); err != nil {
+		t.Fatalf("block 9 commit: %v", err)
 	}
 }
 

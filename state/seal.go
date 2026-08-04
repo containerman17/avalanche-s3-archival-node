@@ -552,15 +552,18 @@ func (s *epochStream) rows(yield func(StateRow) error) error {
 	return nil
 }
 
-// codeBlob resolves one code blob out of code.log. A referenced blob that is
-// not there is a corpus defect, not a hole to paper over.
+// codeBlob resolves one code blob the placement rule needs: code.log, then the
+// already-sealed epochs (a node that joined from a bucket has an empty
+// code.log, so the code of every contract older than its frontier is only in
+// the epochs it downloaded). A blob in neither is a corpus defect, not a hole
+// to paper over.
 func (s *epochStream) codeBlob(h common.Hash) ([]byte, error) {
-	blob, ok, err := s.store.code.Get(h)
+	blob, ok, err := s.store.Code(h)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("seal epoch at %d: code %x referenced by an account row is not in code.log", s.start, h)
+		return nil, fmt.Errorf("seal epoch at %d: code %x referenced by an account row is in neither code.log nor the sealed epochs", s.start, h)
 	}
 	return blob, nil
 }

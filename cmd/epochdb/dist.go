@@ -248,20 +248,22 @@ func checkLocalIndex(dir, latest string) (epochs int, covered uint64, err error)
 // that was killed halfway is wiped first (exec.HealTornFrontier): its Firewood
 // is a partial frontier no one can start on, and it is derived state, so the
 // node organizes itself instead of crash-looping.
-func buildFrontier(dataDir string, st *dist.Store, c *chain.Chain) error {
+// The join seam passes its own artifact store; this takes the epoch set off
+// the state layer instead, so the merge and the executor that follows it share
+// one set (state.Store.Epochs).
+func buildFrontier(dataDir string, _ *dist.Store, c *chain.Chain) error {
 	if _, err := exec.HealTornFrontier(dataDir); err != nil {
 		return err
 	}
-	set, err := state.OpenEpochSet(st)
-	if err != nil {
-		return err
-	}
-	defer set.Close()
 	store, err := state.Open(dataDir)
 	if err != nil {
 		return fmt.Errorf("open state layer: %w", err)
 	}
 	defer store.Close()
+	set, err := store.Epochs()
+	if err != nil {
+		return err
+	}
 	e, err := exec.New(exec.Config{
 		DataDir:       dataDir,
 		Blocks:        set, // containers come from the epochs; nothing is staged yet

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/containerman17/epochdb/dist"
@@ -33,6 +34,17 @@ type Store struct {
 	rc   *bucketLog
 	code *codeStore
 	misc *miscStore
+
+	// epochs is THE sealed epoch set of this data directory: the RPC descent
+	// (History), the executor's rawdb (ethdb.go) and the sealer (seal.go) all
+	// share it, so an in-process seal's Reload reaches all three at once.
+	// Opened on FIRST USE, because opening it reads every epoch's footer and
+	// those may live in the bucket: a store that only writes (fetch, cook, the
+	// sealer's read-only opener) must keep working with no credentials at all
+	// (TestSealTailNeedsNoBucket).
+	epochsOnce sync.Once
+	epochs     *EpochSet
+	epochsErr  error
 
 	// tail is the uncooked-write overlay, non-nil only when a History
 	// enabled it (serve). Set before the executor goroutine starts.
@@ -130,6 +142,10 @@ func Open(dir string) (*Store, error) {
 // Costs the cache and nothing durable.
 func (s *Store) Close() error {
 	var firstErr error
+	if s.epochs != nil {
+		s.epochs.Close()
+		s.epochs = nil
+	}
 	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.rc.Close, s.code.Close, s.misc.Close, s.cas.Close} {
 		if err := c(); err != nil && firstErr == nil {
 			firstErr = err
@@ -324,6 +340,47 @@ func (s *Store) PutCode(hash common.Hash, blob []byte) error { return s.code.Put
 
 // CodeCount returns the number of unique code blobs stored.
 func (s *Store) CodeCount() int { return s.code.Count() }
+
+// Code resolves a contract code blob: code.log first (the hot tail, every blob
+// this node's own executor ever wrote), then the sealed epochs
+// newest-to-oldest, bloom-gated. Not found is (nil, false, nil).
+//
+// THE EPOCH DESCENT IS NOT A SERVING NICETY, IT IS THE EXECUTION PATH. A node
+// that joined from a bucket replayed nothing, so its code.log is EMPTY, and
+// the format v3 'c' rows are the only code it has: the placement rule puts an
+// account's code in every epoch that writes that account. This is why it lives
+// on the Store and not on History: the executor's rawdb (state/ethdb.go), the
+// RPC descent (History.CodeByHash) and the sealer (seal.go) all resolve code
+// through this one function. Fuji, 2026-08-04: the executor had only code.log
+// and died on the first block past a merged frontier.
+//
+// ponytail: no memo of an epoch hit back into code.log. libevm's cachingDB
+// holds a 64MB code LRU in front of every ContractCode call, so the descent is
+// paid once per blob per process. Revisit only if a profile shows it.
+func (s *Store) Code(hash common.Hash) ([]byte, bool, error) {
+	blob, ok, err := s.code.Get(hash)
+	if err != nil || ok {
+		return blob, ok, err
+	}
+	set, err := s.Epochs()
+	if err != nil {
+		return nil, false, err
+	}
+	eps := set.All()
+	for i := len(eps) - 1; i >= 0; i-- {
+		if blob, ok, err = eps[i].Code(hash); err != nil || ok {
+			return blob, ok, err
+		}
+	}
+	return nil, false, nil
+}
+
+// Epochs is the sealed epoch set of this data directory, opened on first use
+// (see the field).
+func (s *Store) Epochs() (*EpochSet, error) {
+	s.epochsOnce.Do(func() { s.epochs, s.epochsErr = OpenEpochSet(s.cas) })
+	return s.epochs, s.epochsErr
+}
 
 // WritelogBytes returns total writelog payload bytes on disk.
 func (s *Store) WritelogBytes() uint64 { return s.wl.Bytes() }

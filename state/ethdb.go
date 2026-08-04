@@ -15,7 +15,8 @@ import (
 var errNotFound = errors.New("state ethdb: not found")
 
 // EthDB returns a libevm ethdb.KeyValueStore over the Store: contract code
-// (rawdb key 'c'+hash) routes to code.log, every other key to misc.log.
+// (rawdb key 'c'+hash) routes to Store.Code, i.e. code.log and then the sealed
+// epochs, every other key to misc.log.
 // This is the durable backing rawdb needs because Firewood explicitly
 // delegates code storage to rawdb. Lifetime is tied to the Store.
 func (s *Store) EthDB() ethdb.KeyValueStore {
@@ -39,7 +40,8 @@ func (a *ethKV) Has(key []byte) (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if h, ok := isCodeKey(key); ok {
-		return a.s.code.Has(h), nil
+		_, found, err := a.s.Code(h)
+		return found, err
 	}
 	_, ok := a.s.misc.Get(key)
 	return ok, nil
@@ -49,7 +51,7 @@ func (a *ethKV) Get(key []byte) ([]byte, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if h, ok := isCodeKey(key); ok {
-		blob, ok, err := a.s.code.Get(h)
+		blob, ok, err := a.s.Code(h)
 		if err != nil {
 			return nil, err
 		}

@@ -76,6 +76,8 @@ RECEIPTS AND FULL LOGS ARE CAPTURED LIVE INTO THE TAIL (user ruling 2026-07-29: 
 
 STATE AT BLOCK N: the uncooked-tail overlay, then the hot RAM map, then per-epoch key blooms newest-to-oldest from epoch(N), one SST seek on the first hit, then the genesis alloc. There is no floor and no snapshot ladder: every node opens every epoch, and coverage must reach genesis.
 
+CODE BY HASH: `code.log`, then the epochs newest-to-oldest (bloom-gated, one 'c' row), then the genesis alloc. ONE FUNCTION, `state.Store.Code`, and there is no second code path: the RPC descent, the SEALER (which must copy a referenced blob into the epoch it is cutting) and THE EXECUTOR (through its rawdb, `state/ethdb.go`) all call it. That the executor is on it is not a detail: a node that joined from a bucket replayed nothing, so its `code.log` is EMPTY, and the epochs' 'c' rows are the only code it has to execute the first block past its merged frontier with.
+
 MISS COST, and it is the model the whole residency design is sized against. A key nothing ever wrote has NO early exit: the search probes EVERY epoch, and sorted keys are `kind|addr|slot` UNHASHED, so every epoch spans the full key range and no range pruning is possible. Expected WASTED SST block reads per miss = epochCount x per-epoch false-positive rate, and under casfs a wasted block read can be a cold 4MB chunk GET.
 
 THE BLOOM IS 20 BITS PER KEY x 14 HASHES (user-driven ruling 2026-07-30). Measured with the exact bloom, 40M probes per setting, on a 120-epoch mainnet:
