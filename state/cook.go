@@ -48,22 +48,29 @@ const (
 
 func sortedName(bucket uint64) string { return fmt.Sprintf("sorted_%05d.idx", bucket) }
 
-// readSortedHeader returns the cookedThrough and cook-time writelog size of
-// an existing sorted file, ok=false if missing or malformed (= re-cook).
-func readSortedHeader(path string) (cookedThrough, wlSize uint64, ok bool) {
+// readSortedHeader returns the cookedThrough and cook-time writelog size of an
+// existing sorted file.
+//
+// MISSING AND MALFORMED DO NOT SHARE A RETURN. A missing file comes back as
+// fs.ErrNotExist ("never cooked", the ordinary case); a short read or a bad
+// magic comes back as a real error, because a corrupt sorted_NNNNN.idx that
+// reads as "not cooked yet" is skipped forever by History.Refresh, which
+// freezes stateHead and makes every read above it answer the cook-lag refusal,
+// a lie that hides the corrupt file.
+func readSortedHeader(path string) (cookedThrough, wlSize uint64, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, err
 	}
 	defer f.Close()
 	var hdr [sortedHdrSize]byte
 	if _, err := f.ReadAt(hdr[:], 0); err != nil {
-		return 0, 0, false
+		return 0, 0, fmt.Errorf("%s: read header: %w", path, err)
 	}
 	if !bytes.Equal(hdr[0:4], sortedMagic[:]) || binary.BigEndian.Uint32(hdr[4:8]) != sortedRecSize {
-		return 0, 0, false
+		return 0, 0, fmt.Errorf("%s: not a sorted index (magic %x recsize %d)", path, hdr[0:4], binary.BigEndian.Uint32(hdr[4:8]))
 	}
-	return binary.BigEndian.Uint64(hdr[8:16]), binary.BigEndian.Uint64(hdr[16:24]), true
+	return binary.BigEndian.Uint64(hdr[8:16]), binary.BigEndian.Uint64(hdr[16:24]), nil
 }
 
 type cookRec struct {
@@ -123,16 +130,29 @@ func CookIndex(dir string) error {
 		}
 		wlSize := uint64(wlStat.Size())
 		path := filepath.Join(dir, sortedName(b))
-		if got, gotSize, ok := readSortedHeader(path); ok && got >= target && gotSize == wlSize {
+		got, gotSize, hdrErr := readSortedHeader(path)
+		switch {
+		case hdrErr == nil && got >= target && gotSize == wlSize:
 			fmt.Printf("cook: bucket %05d already cooked through %d, skip\n", b, got)
 			continue
+		case hdrErr != nil && !os.IsNotExist(hdrErr):
+			// Re-cooking rewrites the file atomically, so this heals itself.
+			// It still must not be silent: a corrupt sorted file that reads as
+			// "never cooked" is exactly what freezes a serving node.
+			fmt.Printf("cook: bucket %05d: existing sorted index is unusable (%v), re-cooking\n", b, hdrErr)
 		}
 		start := time.Now()
 		n, err := cookBucket(dir, wl, b, inBucket[b], target, wlSize)
 		if err != nil {
 			return fmt.Errorf("cook: bucket %05d: %w", b, err)
 		}
-		st, _ := os.Stat(path)
+		// Not `st, _ :=`: cookBucket just renamed this file into place, so a
+		// stat failure means the cook did not land, and st would be nil in the
+		// log line below (panic).
+		st, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("cook: bucket %05d: stat %s after cooking it: %w", b, path, err)
+		}
 		fmt.Printf("cook: bucket %05d records=%d size=%.1fMB through=%d in %s\n",
 			b, n, float64(st.Size())/1e6, target, time.Since(start).Round(time.Millisecond))
 	}
@@ -150,8 +170,15 @@ func cookBucket(dir string, wl *bucketLog, bucket uint64, blocks []uint64, cooke
 	for _, block := range blocks {
 		loc := wl.idx[block]
 		frame, ok, err := wl.Get(block)
-		if err != nil || !ok {
-			return 0, fmt.Errorf("read frame %d: ok=%v err=%w", block, ok, err)
+		if err != nil {
+			return 0, fmt.Errorf("read frame %d: %w", block, err)
+		}
+		if !ok {
+			// A NOT-FOUND IS NOT AN ERROR VALUE: the old line printed the two
+			// branches as one and rendered `%!w(<nil>)` on this one, which is
+			// the checkpoint incident verbatim (same split already done at
+			// seal.go's header read).
+			return 0, fmt.Errorf("block %d has no write frame in writelog bucket %05d, though the scan indexed one when this cook started: the raw writelog has a hole", block, bucket)
 		}
 		if err := parseFrame(frame, func(kind byte, key [sortedKeySize]byte, valOff int, vlen uint32) {
 			if kind == recKindCodeUse {

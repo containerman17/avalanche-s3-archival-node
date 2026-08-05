@@ -60,6 +60,23 @@ type recLoc struct {
 	ln  uint32
 }
 
+// cleanEOF reports whether err is the ORDINARY end of a recovery scan: io.EOF
+// (the file ended on a record boundary) or io.ErrUnexpectedEOF (a torn tail
+// record, which the truncation rule exists for).
+//
+// Every startup/recovery scan in this package must gate its loop on this and
+// return anything else. The idiom those loops were written with, "read until
+// ANY error, then stop and truncate to what was read", treats EIO, a zeroed
+// sidecar, and a bad sector exactly like a torn tail: the scan stops early,
+// the truncate then DELETES everything past the bad byte, and nothing logs a
+// word. In writelog_idx_NNNNN.log that silently drops every later index
+// record, exec's walk-back never regenerates them, cook builds a sorted index
+// missing them, and the descent answers those keys with the PREVIOUS value
+// forever.
+func cleanEOF(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
 type blPair struct {
 	data    *os.File
 	index   *os.File
@@ -133,7 +150,13 @@ func (l *bucketLog) rebuild(bucket uint64) error {
 	r := io.Reader(index)
 	for {
 		if _, err := io.ReadFull(r, rec[:]); err != nil {
-			break // EOF: clean end; ErrUnexpectedEOF: torn index record, drop
+			// EOF: clean end; ErrUnexpectedEOF: torn index record, drop.
+			// Anything else is a READ FAILURE, and truncating on one would
+			// make the loss permanent and silent (see cleanEOF).
+			if !cleanEOF(err) {
+				return fmt.Errorf("read index record at offset %d: %w", good*blIdxRecSize, err)
+			}
+			break
 		}
 		block := binary.BigEndian.Uint64(rec[0:8])
 		off := binary.BigEndian.Uint64(rec[8:16])

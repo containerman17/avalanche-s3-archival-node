@@ -95,13 +95,9 @@ func OpenReadOnly(dir string) (*Store, error) {
 	}
 	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
 	s.execHead, s.execHeadOK = head, headOK
-	raw, err := os.ReadFile(filepath.Join(dir, logsStartFile))
-	if err == nil && len(raw) == 8 {
-		s.logsStart = binary.BigEndian.Uint64(raw)
-		s.logsStartOK = true
-	} else if err != nil && !os.IsNotExist(err) {
+	if err := s.loadLogsStart(); err != nil {
 		s.Close()
-		return nil, fmt.Errorf("read logs.start: %w", err)
+		return nil, err
 	}
 	return s, nil
 }
@@ -190,6 +186,12 @@ func (l *bucketLog) scanRO(bucket uint64) error {
 	r := bufio.NewReaderSize(index, 1<<20)
 	for {
 		if _, err := io.ReadFull(r, rec[:]); err != nil {
+			if !cleanEOF(err) {
+				// No truncation happens here, but stopping silently freezes
+				// this bucket's offset forever: an SDK follower would just
+				// stop advancing with no log line at all (see cleanEOF).
+				return fmt.Errorf("read index record at offset %d: %w", off, err)
+			}
 			return nil // EOF or torn index record: stop consuming
 		}
 		block := binary.BigEndian.Uint64(rec[0:8])
@@ -263,14 +265,26 @@ func openCodeStoreRO(dir string) (*codeStore, error) {
 	)
 	for {
 		if _, err := io.ReadFull(r, hash[:]); err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("code.log: read hash at %d: %w", pos, err)
+			}
 			break
 		}
 		ln, err := binary.ReadUvarint(r)
 		if err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("code.log: read length at %d: %w", pos, err)
+			}
 			break
 		}
 		blobOff := pos + 32 + uint64(uvarintLen(ln))
 		if _, err := r.Discard(int(ln)); err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("code.log: read blob at %d: %w", blobOff, err)
+			}
 			break
 		}
 		c.idx[hash] = recLoc{off: blobOff, ln: uint32(ln)}
@@ -314,14 +328,26 @@ func (c *codeStore) rescanRO(dir string) error {
 	)
 	for {
 		if _, err := io.ReadFull(r, hash[:]); err != nil {
+			if !cleanEOF(err) {
+				c.off = pos
+				return fmt.Errorf("code.log: read hash at %d: %w", pos, err)
+			}
 			break
 		}
 		ln, err := binary.ReadUvarint(r)
 		if err != nil {
+			if !cleanEOF(err) {
+				c.off = pos
+				return fmt.Errorf("code.log: read length at %d: %w", pos, err)
+			}
 			break
 		}
 		blobOff := pos + 32 + uint64(uvarintLen(ln))
 		if _, err := r.Discard(int(ln)); err != nil {
+			if !cleanEOF(err) {
+				c.off = pos
+				return fmt.Errorf("code.log: read blob at %d: %w", blobOff, err)
+			}
 			break // blob bytes not fully visible yet: retry from pos next time
 		}
 		c.idx[hash] = recLoc{off: blobOff, ln: uint32(ln)}
@@ -348,6 +374,10 @@ func openMiscStoreRO(dir string) (*miscStore, error) {
 	for {
 		end, op, k, v, err := readMiscRecord(r, pos)
 		if err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("misc.log: read record at %d: %w", pos, err)
+			}
 			break
 		}
 		if op == 0 {

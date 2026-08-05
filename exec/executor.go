@@ -188,6 +188,16 @@ type chainContext struct {
 // Engine lives in vm_coreth.go / sevmChainContext: the consensus engine type
 // is one of the few things the two VMs do not share.
 
+// GetHeader returns nil ONLY for a genuine miss, because nil is libevm's "no
+// such header" and BLOCKHASH turns it into the zero hash inside a running
+// contract. A read or decode FAILURE is not a miss and must never be aliased
+// to one: the signature has no error to return, so it panics. A wrong
+// BLOCKHASH answer is silent, permanent, and gets written into logsbf as if it
+// were real; a panic is a restartable stop.
+//
+// The store read goes through Store.HeaderRLP, which falls back to the sealed
+// epochs. The raw-only read this used to do answered "absent" for every header
+// below the sealed end on a node whose raw buckets seal had retired.
 func (c chainContext) GetHeader(_ common.Hash, num uint64) *types.Header {
 	var (
 		raw []byte
@@ -203,7 +213,7 @@ func (c chainContext) GetHeader(_ common.Hash, num uint64) *types.Header {
 		var err error
 		raw, ok, err = c.store.HeaderRLP(num)
 		if err != nil {
-			return nil
+			panic(fmt.Sprintf("exec: read header %d for BLOCKHASH: %v", num, err))
 		}
 		if !ok {
 			return nil
@@ -211,7 +221,7 @@ func (c chainContext) GetHeader(_ common.Hash, num uint64) *types.Header {
 	}
 	var h types.Header
 	if err := rlp.DecodeBytes(raw, &h); err != nil {
-		return nil
+		panic(fmt.Sprintf("exec: decode header %d for BLOCKHASH: %v", num, err))
 	}
 	return &h
 }
@@ -559,6 +569,10 @@ func (e *Executor) reconcile() error {
 	return nil
 }
 
+// loadHeader reads a header for the reconcile walk-back and the SAE ring.
+// Store.HeaderRLP descends into the sealed epochs, which is what makes this
+// work at all on a node whose raw header buckets were retired by seal (it used
+// to fail loudly with "missing from state layer" there, never silently).
 func (e *Executor) loadHeader(blockNum uint64) (*types.Header, error) {
 	raw, ok, err := e.cfg.Store.HeaderRLP(blockNum)
 	if err != nil {
@@ -609,7 +623,7 @@ func (e *Executor) Head() uint64 { return e.headNum }
 // Run executes blocks ascending from headNum+1, polling the block source
 // for heights the fetch walk has not landed yet. Returns on ctx cancel or
 // on the first error (a root mismatch is an error: hard stop).
-func (e *Executor) Run(ctx context.Context) error {
+func (e *Executor) Run(ctx context.Context) (err error) {
 	start := time.Now()
 	lastLog := start
 	lastGas, lastBlocks := uint64(0), uint64(0)
@@ -641,6 +655,16 @@ func (e *Executor) Run(ctx context.Context) error {
 		close(e.flushReq)
 		<-e.flushDone
 		e.flushReq = nil
+		// Drain the flusher's death. Without this a failed group fsync or
+		// exechead write was dropped whenever Run returned for another reason
+		// first (ctx cancel, StopAt), and only Close would resurface it.
+		select {
+		case ferr := <-e.flushErr:
+			if err == nil {
+				err = fmt.Errorf("flusher: %w", ferr)
+			}
+		default:
+		}
 	}()
 
 	// Prefetcher (throughput experiment): container reads and their
@@ -1175,8 +1199,14 @@ func (e *Executor) bisect(computed common.Hash, boundaryNum uint64, boundaryRoot
 
 	for i := from; i <= to; i++ {
 		raw, ok, err := e.cfg.Blocks.GetByHeight(i)
-		if err != nil || !ok {
-			return fmt.Errorf("bisect: read container %d: ok=%v err=%v", i, ok, err)
+		if err != nil {
+			return fmt.Errorf("bisect: read container %d: %w", i, err)
+		}
+		if !ok {
+			// Not an error value: printed as `err=<nil>` it told an operator
+			// nothing, and it fires while they are already staring at a root
+			// mismatch.
+			return fmt.Errorf("bisect: container %d is not in staging, so the batch [%d..%d] that just mismatched cannot be re-executed per block", i, from, to)
 		}
 		blk, err := parseEthBlock(raw)
 		if err != nil {

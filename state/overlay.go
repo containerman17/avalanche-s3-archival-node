@@ -272,9 +272,15 @@ func (h *History) Refresh() error {
 		if _, err := fmt.Sscanf(e.Name(), "sorted_%d.idx", &bucket); err != nil {
 			continue
 		}
-		cooked, _, ok := readSortedHeader(filepath.Join(h.dir, sortedName(bucket)))
-		if !ok {
-			continue
+		cooked, _, err := readSortedHeader(filepath.Join(h.dir, sortedName(bucket)))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // raced with a cook's rename; the next Refresh gets it
+			}
+			// A corrupt sorted file is NOT "nothing new to pick up": skipping
+			// it freezes stateHead here and turns every read above it into the
+			// cook-lag refusal, which hides the real fault forever.
+			return fmt.Errorf("refresh: sorted bucket %05d: %w", bucket, err)
 		}
 		if old, have := cur[bucket]; !have || cooked > old {
 			changed = append(changed, bucket)
@@ -546,21 +552,10 @@ func (h *History) StateHead() uint64 { return h.stateHead.Load() }
 
 // HeaderRLP returns the stored header RLP for block n: raw store first
 // (bucketLog is internally locked), sealed epochs as the fallback once raw
-// buckets are deleted. Goroutine-safe.
-func (h *History) HeaderRLP(n uint64) ([]byte, bool, error) {
-	raw, ok, err := h.store.HeaderRLP(n)
-	if err != nil || ok {
-		return raw, ok, err
-	}
-	if e, ok := h.epochs.At(n); ok {
-		hdr, err := e.HeaderRLP(n)
-		if err != nil {
-			return nil, false, err
-		}
-		return hdr, true, nil
-	}
-	return nil, false, nil
-}
+// buckets are deleted. Goroutine-safe. The descent itself lives on the Store,
+// because the executor's BLOCKHASH needs the same fallback and used to read
+// the raw family alone.
+func (h *History) HeaderRLP(n uint64) ([]byte, bool, error) { return h.store.HeaderRLP(n) }
 
 func (b *sortedBucket) rec(i int) []byte {
 	off := sortedHdrSize + i*sortedRecSize
@@ -1060,8 +1055,11 @@ func (t *overlayTrie) GetStorage(addr common.Address, key []byte) ([]byte, error
 func (t *overlayTrie) Hash() common.Hash {
 	n := t.o.head()
 	raw, ok, err := t.o.hist.HeaderRLP(n)
-	if err != nil || !ok {
-		panic(fmt.Sprintf("epochdb overlay: header %d unavailable: ok=%v err=%v", n, ok, err))
+	if err != nil {
+		panic(fmt.Sprintf("epochdb overlay: read header %d: %v", n, err))
+	}
+	if !ok {
+		panic(fmt.Sprintf("epochdb overlay: header %d is in neither the raw headers family nor a sealed epoch, so this height has no root to answer with", n))
 	}
 	var h types.Header
 	if err := rlp.DecodeBytes(raw, &h); err != nil {

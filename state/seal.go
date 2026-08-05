@@ -303,12 +303,27 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 		if err := setLatestEpoch(out, chainRoot, hash); err != nil {
 			return run, err
 		}
-		st, _ := os.Stat(out.SpoolPath(hash))
-		log.Printf("seal: %s (%s) blocks=%d txs=%d code=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
-			EpochMarkerName(s.start, s.count), hash[:12], s.count, s.txs, len(s.code),
-			float64(s.raw.total())/1e6, float64(st.Size())/1e6,
-			float64(s.raw.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
-		if e, err := OpenEpoch(out, hash); err == nil {
+		// `st, _ := os.Stat` was a nil-deref panic waiting inside a log line,
+		// and it stood AFTER the epoch was adopted and `latest` advanced.
+		if st, err := os.Stat(out.SpoolPath(hash)); err != nil {
+			log.Printf("seal: WARNING: epoch %s (%s) was published and adopted but its spool file cannot be stat'd: %v",
+				EpochMarkerName(s.start, s.count), hash[:12], err)
+		} else {
+			log.Printf("seal: %s (%s) blocks=%d txs=%d code=%d raw=%.1fMB sealed=%.1fMB (%.2fx) in %s",
+				EpochMarkerName(s.start, s.count), hash[:12], s.count, s.txs, len(s.code),
+				float64(s.raw.total())/1e6, float64(st.Size())/1e6,
+				float64(s.raw.total())/float64(st.Size()), time.Since(t0).Round(time.Millisecond))
+		}
+		// Reopening what was just published is the cheapest read-back check
+		// there is, and a failure here is the STRONGEST available signal that
+		// the artifact is bad. It used to be discarded with `err == nil`, so a
+		// node published an unreadable epoch and said nothing. Not fatal (the
+		// epoch is already adopted and `latest` already points at it, so
+		// stopping unpublishes nothing), but never silent.
+		if e, err := OpenEpoch(out, hash); err != nil {
+			log.Printf("seal: WARNING: epoch %s (%s) CANNOT BE REOPENED right after publishing: %v; consumers of this artifact will fail on it",
+				EpochMarkerName(s.start, s.count), hash[:12], err)
+		} else {
 			sz := e.SectionSizes()
 			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB rcpt=%.2fMB",
 				float64(s.raw.containers)/1e6, float64(s.raw.headers)/1e6,
@@ -416,7 +431,7 @@ func scanEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uin
 		if !ok {
 			return s, false, nil // staging gap below exec head should not happen, but never seal past one
 		}
-		headerRLP, ok, err := store.HeaderRLP(n)
+		headerRLP, ok, err := store.RawHeaderRLP(n)
 		if err != nil {
 			return s, false, fmt.Errorf("seal: read header %d: %w", n, err)
 		}
@@ -496,7 +511,7 @@ func (s *epochStream) src() *epochSrc {
 		},
 		Headers: func(yield func([]byte) error) error {
 			for n := s.start; n < end; n++ {
-				hdr, ok, err := s.store.HeaderRLP(n)
+				hdr, ok, err := s.store.RawHeaderRLP(n)
 				if err != nil {
 					return fmt.Errorf("seal: read header %d: %w", n, err)
 				}

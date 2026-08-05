@@ -40,6 +40,10 @@ func openMiscStore(dir string) (*miscStore, error) {
 	for {
 		end, op, k, v, err := readMiscRecord(r, pos)
 		if err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("misc.log: read record at %d: %w", pos, err)
+			}
 			break // clean EOF or torn record: truncate at pos
 		}
 		if op == 0 {

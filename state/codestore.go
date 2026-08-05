@@ -45,14 +45,26 @@ func openCodeStore(dir string) (*codeStore, error) {
 	)
 	for {
 		if _, err := io.ReadFull(r, hash[:]); err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("code.log: read hash at %d: %w", pos, err)
+			}
 			break // clean EOF or torn hash: truncate at pos
 		}
 		ln, err := binary.ReadUvarint(r)
 		if err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("code.log: read length at %d: %w", pos, err)
+			}
 			break
 		}
 		blobOff := pos + 32 + uint64(uvarintLen(ln))
 		if _, err := r.Discard(int(ln)); err != nil {
+			if !cleanEOF(err) {
+				f.Close()
+				return nil, fmt.Errorf("code.log: read blob at %d: %w", blobOff, err)
+			}
 			break
 		}
 		c.idx[hash] = recLoc{off: blobOff, ln: uint32(ln)}

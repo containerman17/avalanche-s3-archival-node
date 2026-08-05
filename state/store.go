@@ -122,15 +122,30 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s.execHead, s.execHeadOK = head, ok
-	raw, err := os.ReadFile(filepath.Join(dir, logsStartFile))
-	if err == nil && len(raw) == 8 {
-		s.logsStart = binary.BigEndian.Uint64(raw)
-		s.logsStartOK = true
-	} else if err != nil && !os.IsNotExist(err) {
+	if err := s.loadLogsStart(); err != nil {
 		s.Close()
-		return nil, fmt.Errorf("read logs.start: %w", err)
+		return nil, err
 	}
 	return s, nil
+}
+
+// loadLogsStart reads logs.start, the first height with event-log capture.
+// Absent means capture never started. PRESENT BUT NOT 8 BYTES IS AN ERROR, not
+// a third silent synonym for absent: falling through both branches made exec
+// re-stamp the file at its current head and silently declare every block below
+// it log-free.
+func (s *Store) loadLogsStart() error {
+	raw, err := os.ReadFile(filepath.Join(s.dir, logsStartFile))
+	switch {
+	case err == nil && len(raw) == 8:
+		s.logsStart = binary.BigEndian.Uint64(raw)
+		s.logsStartOK = true
+	case err == nil:
+		return fmt.Errorf("logs.start is %d bytes, want 8: the capture floor is unreadable, so no read can tell a log-free block from an uncaptured one", len(raw))
+	case !os.IsNotExist(err):
+		return fmt.Errorf("read logs.start: %w", err)
+	}
+	return nil
 }
 
 // Close flushes everything and releases file handles. It does NOT advance
@@ -240,8 +255,42 @@ func (s *Store) AppendHeader(block uint64, headerRLP []byte) error {
 	return s.hd.Append(block, headerRLP)
 }
 
-// HeaderRLP returns the stored RLP header for block.
-func (s *Store) HeaderRLP(block uint64) ([]byte, bool, error) { return s.hd.Get(block) }
+// RawHeaderRLP returns the RLP header from the RAW headers family only, with
+// NO epoch fallback: not-found is the honest answer for "is this height still
+// in the unsealed tail", which is all the sealer wants. Every other caller
+// wants HeaderRLP, because seal RETIRES the raw buckets it sealed, and below
+// the sealed end this answers "absent" for every header the node still has.
+func (s *Store) RawHeaderRLP(block uint64) ([]byte, bool, error) { return s.hd.Get(block) }
+
+// HeaderRLP resolves a block header: the raw headers family first (the hot
+// tail), then the sealed epochs. Same rule and same reason as Code: on a node
+// whose raw buckets were retired by seal, or one that joined from a bucket and
+// never executed, the epochs are the ONLY place the header exists.
+//
+// It lives on the Store and not on History because the EXECUTOR needs it too:
+// chainContext.GetHeader serves BLOCKHASH from here, and a raw-only read there
+// returns nil, which libevm reads as "no such header" and turns into the ZERO
+// HASH inside a running contract: wrong logs, written to disk, and no longer
+// distinguishable from real ones.
+func (s *Store) HeaderRLP(block uint64) ([]byte, bool, error) {
+	raw, ok, err := s.hd.Get(block)
+	if err != nil || ok {
+		return raw, ok, err
+	}
+	set, err := s.Epochs()
+	if err != nil {
+		return nil, false, err
+	}
+	e, ok := set.At(block)
+	if !ok {
+		return nil, false, nil
+	}
+	hdr, err := e.HeaderRLP(block)
+	if err != nil {
+		return nil, false, err
+	}
+	return hdr, true, nil
+}
 
 // HeadersMax returns the highest stored header height, ok=false if none.
 func (s *Store) HeadersMax() (uint64, bool) { return s.hd.Max() }
