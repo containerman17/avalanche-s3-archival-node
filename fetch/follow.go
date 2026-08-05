@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
@@ -30,28 +31,32 @@ const vdrRefreshInterval = time.Hour
 // between stored history and the anchor is backfilled by the regular
 // archival-pool walk.
 func (f *Fetcher) Follow(ctx context.Context) error {
-	vdrs := validators.NewManager()
 	weights, err := crossCheckedWeights(ctx, f.vdrSources(), f.subnetID)
 	if err != nil {
 		return fmt.Errorf("validator set: %w", err)
 	}
-	if err := reconcileValidators(vdrs, weights, f.subnetID); err != nil {
-		return err
+	vdrs, err := managerFor(weights, f.subnetID)
+	if err != nil {
+		return fmt.Errorf("validator set: %w", err)
 	}
+	cnet := &consensusNet{f: f}
+	cnet.vdrs.Store(vdrs)
 	totalWeight, _ := vdrs.TotalWeight(f.subnetID)
 	log.Printf("fetch: validator set loaded validators=%d total_weight=%d",
 		len(weights), totalWeight)
-	go f.refreshValidators(ctx, vdrs)
+	go f.refreshValidators(ctx, cnet)
 
 	eng, err := consensus.New(consensus.Config{
-		Net:   &consensusNet{f: f, vdrs: vdrs},
+		Net:   cnet,
 		Parse: parseForConsensus,
-		OnAnchor: func(c *consensus.Container) {
+		OnAnchor: func(c *consensus.Container) error {
 			// Persist the anchor, then backfill everything below it with the
 			// archival-pool walk until it short-circuits on stored history.
+			// AN ANCHOR THAT DID NOT PERSIST IS FATAL: logging and returning
+			// left the anchor unstored and the backfill never started, on a
+			// node that otherwise looked live.
 			if err := f.appendContainer(c); err != nil {
-				log.Printf("fetch: store anchor: %v", err)
-				return
+				return fmt.Errorf("store anchor at height %d: %w", c.Height, err)
 			}
 			go func() {
 				f.activeWalks.Add(1)
@@ -62,6 +67,7 @@ func (f *Fetcher) Follow(ctx context.Context) error {
 				}
 				log.Printf("fetch: anchor backfill complete height=%d", c.Height)
 			}()
+			return nil
 		},
 		OnAccept: func(c *consensus.Container) error {
 			if err := f.appendContainer(c); err != nil {
@@ -145,14 +151,20 @@ func (f *Fetcher) vdrSources() []string {
 // consensusNet adapts the fetcher's transport and peer pool to the consensus
 // engine's Net interface.
 type consensusNet struct {
-	f    *Fetcher
-	vdrs validators.Manager
+	f *Fetcher
+	// vdrs is swapped WHOLE by every refresh, never mutated in place: see
+	// managerFor.
+	vdrs atomic.Value // validators.Manager
+}
+
+func (n *consensusNet) manager() validators.Manager {
+	return n.vdrs.Load().(validators.Manager)
 }
 
 func (n *consensusNet) NextRequestID() uint32 { return n.f.reqIDCounter.Add(1) }
 
 func (n *consensusNet) SampleValidators(k int) ([]ids.NodeID, error) {
-	return n.vdrs.Sample(n.f.subnetID, k)
+	return n.manager().Sample(n.f.subnetID, k)
 }
 
 func (n *consensusNet) IsConnected(nodeID ids.NodeID) bool {
@@ -283,39 +295,31 @@ func weightsAgree(a, b map[ids.NodeID]uint64, exact bool) error {
 	return nil
 }
 
-// reconcileValidators diffs the manager's set for subnetID against the fetched
-// weights: new validators are added, changed weights adjusted, missing
-// validators removed. Weights of zero are dropped. (Ported verbatim from
-// flatstate follower/net.)
-func reconcileValidators(m validators.Manager, weights map[ids.NodeID]uint64, subnetID ids.ID) error {
-	for _, id := range m.GetValidatorIDs(subnetID) {
-		cur := m.GetWeight(subnetID, id)
-		want := weights[id]
-		delete(weights, id)
-		switch {
-		case want == cur:
-		case want > cur:
-			if err := m.AddWeight(subnetID, id, want-cur); err != nil {
-				return err
-			}
-		default:
-			if err := m.RemoveWeight(subnetID, id, cur-want); err != nil {
-				return err
-			}
-		}
-	}
+// managerFor builds a manager holding exactly these weights (zero weights
+// dropped).
+//
+// A FRESH MANAGER, NOT A DIFF APPLIED TO THE LIVE ONE. The old reconcile
+// mutated the manager consensus was sampling as it walked, so a failure
+// halfway through left a HALF-APPLIED validator set in place, and the next
+// refresh was an hour away. Building the new set separately makes a failure
+// leave the last-good one exactly as it was, and the swap is one store.
+func managerFor(weights map[ids.NodeID]uint64, subnetID ids.ID) (validators.Manager, error) {
+	m := validators.NewManager()
 	for id, w := range weights {
 		if w == 0 {
 			continue
 		}
 		if err := m.AddStaker(subnetID, id, nil, ids.Empty, w); err != nil {
-			return err
+			return nil, fmt.Errorf("add validator %s: %w", id, err)
 		}
 	}
-	return nil
+	if len(m.GetValidatorIDs(subnetID)) == 0 {
+		return nil, fmt.Errorf("no validator in the set carries any weight")
+	}
+	return m, nil
 }
 
-func (f *Fetcher) refreshValidators(ctx context.Context, vdrs validators.Manager) {
+func (f *Fetcher) refreshValidators(ctx context.Context, cnet *consensusNet) {
 	t := time.NewTicker(vdrRefreshInterval)
 	defer t.Stop()
 	for {
@@ -329,8 +333,11 @@ func (f *Fetcher) refreshValidators(ctx context.Context, vdrs validators.Manager
 			log.Printf("fetch: validator refresh failed (keeping last-good set): %v", err)
 			continue
 		}
-		if err := reconcileValidators(vdrs, weights, f.subnetID); err != nil {
-			log.Printf("fetch: validator reconcile failed: %v", err)
+		vdrs, err := managerFor(weights, f.subnetID)
+		if err != nil {
+			log.Printf("fetch: validator refresh built no usable set (keeping last-good): %v", err)
+			continue
 		}
+		cnet.vdrs.Store(vdrs)
 	}
 }

@@ -253,8 +253,13 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 				return nil // run connects to the floor checkpoint (or block 0)
 			}
 			raw, ok, err := f.store.GetByHeight(lo)
-			if err != nil || !ok {
+			if err != nil {
 				return fmt.Errorf("read stored container at height %d: %w", lo, err)
+			}
+			if !ok {
+				// Not an error with a nil cause: the index knew the height and
+				// the raw is gone, i.e. its raw bucket was retired by a seal.
+				return fmt.Errorf("stored container at height %d is not in staging: its raw bucket was retired by a seal", lo)
 			}
 			parsed, err := parseContainer(raw)
 			if err != nil {
@@ -301,8 +306,11 @@ func (f *Fetcher) getContainer(ctx context.Context, id ids.ID) (parsedContainer,
 		return parsedContainer{}, fmt.Errorf("container %s still missing after fetch", id)
 	}
 	raw, ok, err := f.store.GetByHeight(h)
-	if err != nil || !ok {
+	if err != nil {
 		return parsedContainer{}, fmt.Errorf("read fetched container %s: %w", id, err)
+	}
+	if !ok {
+		return parsedContainer{}, fmt.Errorf("fetched container %s (height %d) is not in staging: its raw bucket was retired by a seal", id, h)
 	}
 	return parseContainer(raw)
 }

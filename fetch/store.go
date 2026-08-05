@@ -3,8 +3,10 @@ package fetch
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -142,7 +144,11 @@ func (s *Store) rebuildSegment(bucket uint64) error {
 		return err
 	}
 	defer index.Close()
-	arrival, err := os.OpenFile(filepath.Join(s.dir, arrivalName(bucket)), os.O_RDWR|os.O_CREATE, 0o644)
+	// NOT O_CREATE. seg() writes the arrival file before the index and Retire
+	// deletes both, so an index sidecar with no arrival file is damage, not a
+	// state this store can be in. Creating one here would hand the scan an
+	// arrivalSize of 0 and truncate a whole segment's index away on the spot.
+	arrival, err := os.OpenFile(filepath.Join(s.dir, arrivalName(bucket)), os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
@@ -158,11 +164,17 @@ func (s *Store) rebuildSegment(bucket uint64) error {
 		good    int64
 		lastEnd uint64
 	)
-	r := io.Reader(index)
 	for {
-		if _, err := io.ReadFull(r, rec[:]); err != nil {
-			// io.EOF: clean end. ErrUnexpectedEOF: torn index record, drop it.
-			break
+		if _, err := io.ReadFull(index, rec[:]); err != nil {
+			// io.EOF is a clean end and ErrUnexpectedEOF is a torn tail
+			// record, which the truncation below drops. ANYTHING ELSE IS A
+			// READ FAILURE: an EIO taking this branch used to truncate both
+			// files to the last record read, i.e. permanently delete the rest
+			// of a 100k-block segment because a sector was unreadable once.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return fmt.Errorf("read index record %d: %w", good, err)
 		}
 		height := binary.BigEndian.Uint64(rec[0:8])
 		var id ids.ID
@@ -267,6 +279,35 @@ func (s *Store) closeSegment(bucket uint64) error {
 	return sg.index.Close()
 }
 
+// resync repairs a segment's write state after a failed write, and returns the
+// error that caused it.
+//
+// NEITHER FILE IS SAFE TO LEAVE ALONE. The arrival file is opened without
+// O_APPEND, so Write moves the descriptor by whatever it managed to put down
+// while the cached arrivalOff does not move at all: every later record in that
+// segment would then be indexed short by the failed record's length and decode
+// as garbage or into a neighbouring frame. A torn index record is the mirror
+// image: the next record is appended after it and misaligns the whole sidecar,
+// so it is truncated back to a record boundary, which is the same rule the
+// startup scan applies.
+func (sg *segment) resync(cause error) error {
+	off, err := sg.arrival.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("arrival offset unreadable: %w", err))
+	}
+	sg.arrivalOff = uint64(off)
+	fi, err := sg.index.Stat()
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("index size unreadable: %w", err))
+	}
+	if n := fi.Size() % indexRecSize; n != 0 {
+		if err := sg.index.Truncate(fi.Size() - n); err != nil {
+			return errors.Join(cause, fmt.Errorf("index realign: %w", err))
+		}
+	}
+	return cause
+}
+
 // flush fsyncs the arrival file before the index so a crash can only leave
 // the index behind the data, which the torn-tail rule already handles.
 func (sg *segment) flush() error {
@@ -302,7 +343,7 @@ func (s *Store) Append(p parsedContainer, raw []byte) error {
 	buf = append(buf, lenBuf[:n]...)
 	buf = append(buf, frame...)
 	if _, err := sg.arrival.Write(buf); err != nil {
-		return fmt.Errorf("arrival write: %w", err)
+		return sg.resync(fmt.Errorf("arrival write: %w", err))
 	}
 
 	var rec [indexRecSize]byte
@@ -312,11 +353,18 @@ func (s *Store) Append(p parsedContainer, raw []byte) error {
 	binary.BigEndian.PutUint64(rec[72:80], off)
 	binary.BigEndian.PutUint32(rec[80:84], uint32(len(frame)))
 	if _, err := sg.index.Write(rec[:]); err != nil {
-		return fmt.Errorf("index write: %w", err)
+		return sg.resync(fmt.Errorf("index write: %w", err))
 	}
 
 	sg.arrivalOff = off + uint64(len(frame))
 	sg.dirty = true
+	if old, ok := s.byHeight[p.blockNumber]; ok && old.id != p.containerID {
+		// Two containers claiming one height: a reorg the walk has not caught
+		// up with, or a peer fabricating. Last writer still wins (the index
+		// sidecar is append-only and the newer record is the one a rebuild
+		// keeps), but it is no longer silent.
+		log.Printf("fetch: height %d reassigned from container %s to %s", p.blockNumber, old.id, p.containerID)
+	}
 	s.byHeight[p.blockNumber] = heightRec{id: p.containerID, off: off, ln: uint32(len(frame))}
 	s.byID[p.containerID] = p.blockNumber
 	if !s.haveAny || p.blockNumber > s.head {
@@ -481,6 +529,9 @@ func (s *Store) Subscribe(ctx context.Context, fromBlock uint64) <-chan BlockEve
 		for {
 			raw, id, ok, err := s.readAt(next)
 			if err != nil {
+				// The channel closes either way, so without this line a read
+				// failure is indistinguishable from an ordinary cancellation.
+				log.Printf("fetch: subscribe stopped at height %d: %v", next, err)
 				return
 			}
 			if ok {

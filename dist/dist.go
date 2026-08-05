@@ -320,11 +320,32 @@ func (s *Store) Adopt(path string, d *Digest) (string, error) {
 }
 
 func (s *Store) writeSpool(hash string, b []byte) error {
-	tmp := s.SpoolPath(hash) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	return writeDurable(s.SpoolPath(hash), b)
+}
+
+// writeDurable lands b at path by tmp+FSYNC+rename. The fsync is the whole
+// durability claim: without it power loss can leave a renamed but zero-length
+// file, and neither an empty artifact nor an empty pointer value announces
+// itself as damaged (decodeLatest used to read an empty pointer as a valid
+// "this chain has no epochs").
+func writeDurable(path string, b []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.SpoolPath(hash))
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // putChunks publishes the artifact's per-chunk hash list, itself an ordinary
@@ -533,6 +554,13 @@ func (l Latest) encode() string {
 
 func decodeLatest(s string) (Latest, error) {
 	var l Latest
+	// An EMPTY VALUE IS NOT A POINTER. A torn write (or a bucket object
+	// truncated to nothing) would otherwise decode to a perfectly valid
+	// Latest{Epoch: ""}, i.e. "this chain has no epochs", which is the most
+	// destructive thing this file can say.
+	if strings.TrimSpace(s) == "" {
+		return l, fmt.Errorf("dist: latest pointer is empty")
+	}
 	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
 		f := strings.Fields(line)
 		if len(f) == 0 {
@@ -576,10 +604,7 @@ func (s *Store) SetPointer(name, value string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(p+".tmp", []byte(value), 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(p+".tmp", p); err != nil {
+	if err := writeDurable(p, []byte(value)); err != nil {
 		return err
 	}
 	if s.cas != nil {

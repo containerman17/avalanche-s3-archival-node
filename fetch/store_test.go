@@ -1,8 +1,10 @@
 package fetch
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -298,5 +300,102 @@ func TestResolveCheckpointsSkipsSealedHistory(t *testing.T) {
 	// nobody has is an error, not a shrug.
 	if _, err := f.ResolveAnchor(ctx, ids.GenerateTestID()); err == nil {
 		t.Fatal("a missing tip-override anchor resolved anyway")
+	}
+}
+
+// TestIndexSurvivesAReadFailure: the startup scan may only truncate on a
+// clean or torn END of the sidecar. An index whose arrival file is missing is
+// damage, and creating an empty one (which the O_CREATE open used to do) made
+// arrivalSize 0 and truncated a whole segment's index away on the spot.
+func TestIndexSurvivesAReadFailure(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []uint64{1, 2, 3} {
+		p, raw := fakeContainer(h, byte(h), 64)
+		if err := s.Append(p, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	idx := filepath.Join(dir, indexName(0))
+	before, err := os.Stat(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, arrivalName(0))); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := OpenStore(dir); err == nil {
+		s.Close()
+		t.Fatal("an index sidecar with no arrival file opened cleanly")
+	}
+	after, err := os.Stat(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("index truncated from %d to %d bytes by a failed open", before.Size(), after.Size())
+	}
+}
+
+// TestFailedIndexWriteKeepsTheArrivalOffsetHonest: the arrival file has no
+// O_APPEND, so a write moves the descriptor whether or not the record is
+// finished. When the index write then fails, the cached offset must catch up
+// with the descriptor, or every later record in the segment is indexed short
+// by the failed record's length and decodes as garbage.
+func TestFailedIndexWriteKeepsTheArrivalOffsetHonest(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p1, raw1 := fakeContainer(1, 0x11, 64)
+	if err := s.Append(p1, raw1); err != nil {
+		t.Fatal(err)
+	}
+
+	// A read-only descriptor for the sidecar: writes to it fail, the arrival
+	// write ahead of them does not. That is a full disk or an EIO on the
+	// sidecar, without needing either.
+	sg := s.segs[0]
+	ro, err := os.Open(filepath.Join(dir, indexName(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := sg.index
+	sg.index = ro
+	p2, raw2 := fakeContainer(2, 0x22, 64)
+	if err := s.Append(p2, raw2); err == nil {
+		t.Fatal("a write to a read-only sidecar reported success")
+	}
+	sg.index = good
+	ro.Close()
+
+	pos, err := sg.arrival.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sg.arrivalOff != uint64(pos) {
+		t.Fatalf("arrivalOff=%d but the descriptor is at %d", sg.arrivalOff, pos)
+	}
+
+	// The proof that matters: the next container is indexed where it really
+	// lands and reads back byte for byte.
+	p3, raw3 := fakeContainer(3, 0x33, 96)
+	if err := s.Append(p3, raw3); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetByHeight(3)
+	if err != nil || !ok {
+		t.Fatalf("GetByHeight(3)=%v,%v", ok, err)
+	}
+	if !bytes.Equal(got, raw3) {
+		t.Fatal("the container after a failed index write decoded to the wrong bytes")
 	}
 }

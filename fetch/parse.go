@@ -91,7 +91,8 @@ func parseContainer(raw []byte) (parsedContainer, error) {
 		return parsedContainer{}, fmt.Errorf("empty container")
 	}
 
-	if proposerBlk, err := proposerblock.ParseWithoutVerification(raw); err == nil {
+	proposerBlk, perr := proposerblock.ParseWithoutVerification(raw)
+	if perr == nil {
 		inner := new(ethtypes.Block)
 		if err := rlp.DecodeBytes(proposerBlk.Block(), inner); err != nil {
 			return parsedContainer{}, fmt.Errorf("decode inner eth block: %w", err)
@@ -107,15 +108,17 @@ func parseContainer(raw []byte) (parsedContainer, error) {
 	}
 
 	// Pre-ProposerVM: the raw bytes are the RLP-encoded eth block and the
-	// container ID equals the eth block hash.
+	// container ID equals the eth block hash. Both failures are reported
+	// together from here on: a corrupt ProposerVM block reaches this path too,
+	// and "decode pre-fork eth block" alone names the wrong decoder.
 	_, _, rest, err := rlp.Split(raw)
 	if err != nil {
-		return parsedContainer{}, fmt.Errorf("rlp split: %w", err)
+		return parsedContainer{}, fmt.Errorf("rlp split: %w (not a ProposerVM block either: %v)", err, perr)
 	}
 	blockBytes := raw[:len(raw)-len(rest)]
 	inner := new(ethtypes.Block)
 	if err := rlp.DecodeBytes(blockBytes, inner); err != nil {
-		return parsedContainer{}, fmt.Errorf("decode pre-fork eth block: %w", err)
+		return parsedContainer{}, fmt.Errorf("decode pre-fork eth block: %w (not a ProposerVM block either: %v)", err, perr)
 	}
 	return parsedContainer{
 		containerID: ids.ID(inner.Hash()),

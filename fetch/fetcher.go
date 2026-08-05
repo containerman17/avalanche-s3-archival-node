@@ -321,7 +321,10 @@ func dial(cfg Config) (*Fetcher, error) {
 		net.StartClose()
 		return nil, fmt.Errorf("connect peer: %w", err)
 	}
-	warmupPeers(ctx, dispatchErrCh, handler.connectedCh, peerIDs, defaultPeerWarmup)
+	if err := warmupPeers(ctx, dispatchErrCh, handler.connectedCh, peerIDs, defaultPeerWarmup); err != nil {
+		net.StartClose()
+		return nil, fmt.Errorf("peer warmup: %w", err)
+	}
 
 	// The C-chain's genesis container ID is computable offline and is the walk
 	// terminator there. An L1's genesis is not needed for that: no chain serves
@@ -573,8 +576,10 @@ func (p *peerPool) nonArchival(n int) []ids.NodeID {
 }
 
 // request sends one GetAncestors to peer and waits up to
-// defaultRequestTimeout for the answer. ok=false means error or timeout.
-func (f *Fetcher) request(ctx context.Context, peer ids.NodeID, tip ids.ID) (ancestorsResponse, bool) {
+// defaultRequestTimeout for the answer. ok=false means error or timeout;
+// local=true means the failure happened inside this process and the peer
+// never saw a message, so it must not be blamed for it.
+func (f *Fetcher) request(ctx context.Context, peer ids.NodeID, tip ids.ID) (resp ancestorsResponse, ok, local bool) {
 	reqID := f.reqIDCounter.Add(1)
 	ch := make(chan ancestorsResponse, 1)
 	f.handler.registerRoute(reqID, ch)
@@ -582,7 +587,8 @@ func (f *Fetcher) request(ctx context.Context, peer ids.NodeID, tip ids.ID) (anc
 
 	msg, err := f.creator.GetAncestors(f.chainID, reqID, defaultRequestTimeout, tip, p2p.EngineType_ENGINE_TYPE_CHAIN)
 	if err != nil {
-		return ancestorsResponse{}, false
+		logLocalBug("GetAncestors", err)
+		return ancestorsResponse{}, false, true
 	}
 
 	f.requestsSent.Add(1)
@@ -594,17 +600,31 @@ func (f *Fetcher) request(ctx context.Context, peer ids.NodeID, tip ids.ID) (anc
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
-		return ancestorsResponse{}, false
+		return ancestorsResponse{}, false, false
 	case <-t.C:
-		return ancestorsResponse{}, false
+		return ancestorsResponse{}, false, false
 	case resp := <-ch:
 		f.answersTotal.Add(1)
 		if len(resp.blocks) > 0 && len(resp.blocks[0]) > 0 {
 			f.answersNonEmpty.Add(1)
 		}
-		return resp, true
+		return resp, true, false
 	}
 }
+
+// logLocalBug reports a failure that is entirely ours ONCE per kind. Message
+// creation failing is deterministic, so logging it per request would bury the
+// log, and blaming the peer it was addressed to (which never saw anything)
+// demotes every peer in turn until archival drains to zero and the operator
+// chases a network problem that does not exist.
+func logLocalBug(op string, err error) {
+	if _, seen := localBugSeen.LoadOrStore(op, struct{}{}); seen {
+		return
+	}
+	log.Printf("fetch: BUG: %s could not be built locally, no peer is at fault: %v", op, err)
+}
+
+var localBugSeen sync.Map // op -> struct{}
 
 // nonEmpty reports whether resp carries at least one container.
 func nonEmpty(resp ancestorsResponse) bool {
@@ -633,8 +653,14 @@ func (f *Fetcher) fetchAncestors(ctx context.Context, tip ids.ID) (ancestorsResp
 			continue
 		}
 		start := time.Now()
-		resp, got := f.request(ctx, peer, tip)
+		resp, got, local := f.request(ctx, peer, tip)
 		f.pool.release(peer)
+		if local {
+			// Nothing left this process, so the peer keeps its standing. The
+			// pause keeps a deterministic local failure from spinning.
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		if !got || !nonEmpty(resp) {
 			f.pool.setArchival(peer, false)
 			continue
@@ -678,7 +704,7 @@ func (f *Fetcher) bootstrapRound(ctx context.Context, tip ids.ID) (ancestorsResp
 	results := make(chan outcome, len(peers))
 	for _, p := range peers {
 		go func(p ids.NodeID) {
-			resp, got := f.request(ctx, p, tip)
+			resp, got, _ := f.request(ctx, p, tip)
 			results <- outcome{peer: p, resp: resp, good: got && nonEmpty(resp)}
 		}(p)
 	}
@@ -719,7 +745,7 @@ func (f *Fetcher) probeLoop(ctx context.Context) {
 			wg.Add(1)
 			go func(p ids.NodeID) {
 				defer wg.Done()
-				if resp, got := f.request(ctx, p, tip); got && nonEmpty(resp) {
+				if resp, got, _ := f.request(ctx, p, tip); got && nonEmpty(resp) {
 					f.pool.setArchival(p, true)
 				}
 			}(p)
@@ -746,6 +772,7 @@ func (f *Fetcher) acceptedFrontier(ctx context.Context) (ids.ID, error) {
 			defer f.handler.unregisterFrontierRoute(reqID)
 			msg, err := f.creator.GetAcceptedFrontier(f.chainID, reqID, defaultRequestTimeout)
 			if err != nil {
+				logLocalBug("GetAcceptedFrontier", err)
 				results <- ids.Empty
 				return
 			}
@@ -895,17 +922,22 @@ func waitForPeer(ctx context.Context, errCh <-chan error, connCh <-chan ids.Node
 	}
 }
 
-func warmupPeers(ctx context.Context, errCh <-chan error, connCh <-chan ids.NodeID, allowed set.Set[ids.NodeID], window time.Duration) {
+// warmupPeers collects connections for window, and RETURNS THE DISPATCH ERROR
+// rather than eating it. errCh is buffered 1 and written exactly once, so a
+// receive here that threw the value away left every later select on it (the
+// walk, FollowTip, Follow) unable to ever fire: the node came up, ran against
+// a dead network forever, and the one error explaining why was gone.
+func warmupPeers(ctx context.Context, errCh <-chan error, connCh <-chan ids.NodeID, allowed set.Set[ids.NodeID], window time.Duration) error {
 	t := time.NewTimer(window)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-t.C:
-			return
-		case <-errCh:
-			return
+			return nil
+		case err := <-errCh:
+			return fmt.Errorf("network stopped: %w", err)
 		case <-connCh:
 		}
 	}

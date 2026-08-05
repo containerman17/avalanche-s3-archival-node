@@ -142,6 +142,8 @@ github.com/containerman17/casfs v0.0.0-20260804071024-334348680884 h1:RvGkaxYpc1
 github.com/containerman17/casfs v0.0.0-20260804071024-334348680884/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
 github.com/containerman17/casfs v0.0.0-20260804072752-0cf980ce9488 h1:RXakPHTuevvP2P2lda8YAoEQwFtCsQorXrpM2eeNzIk=
 github.com/containerman17/casfs v0.0.0-20260804072752-0cf980ce9488/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
+github.com/containerman17/casfs v0.0.0-20260805014044-49c8cebc742d h1:vbSKKe7bqhmfgoWK/17b7/QBu4n5uNQoZ+A45p+HAVo=
+github.com/containerman17/casfs v0.0.0-20260805014044-49c8cebc742d/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
 github.com/coreos/etcd v3.3.10+incompatible/go.mod h1:uF7uidLiAD3TWHmW31ZFd/JWoc32PjwdhPthX9715RE=
 github.com/coreos/go-etcd v2.0.0+incompatible/go.mod h1:Jez6KQU2B/sWsbdaef3ED8NzMklzPG4d5KIOhIy30Tk=
 github.com/coreos/go-semver v0.2.0/go.mod h1:nnelYz7RCh+5ahJtPPxZlU+153eP4D4r3EedlOD2RNk=

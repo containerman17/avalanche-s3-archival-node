@@ -100,9 +100,17 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 		if err != nil {
 			return
 		}
-		preferredAtHeight, err := ids.ToID(p.PreferredIdAtHeight)
-		if err != nil {
-			preferredAtHeight = preferred
+		// An EMPTY field is the compat shim: a peer that does not fill it in
+		// has no separate preference at the requested height, so its overall
+		// preference is the honest reading of its vote. A field that is
+		// present and malformed is a bad message and goes the way every other
+		// decode failure here goes, because substituting a value would deliver
+		// a vote to consensus that the peer never cast.
+		preferredAtHeight := preferred
+		if len(p.PreferredIdAtHeight) > 0 {
+			if preferredAtHeight, err = ids.ToID(p.PreferredIdAtHeight); err != nil {
+				return
+			}
 		}
 		accepted, err := ids.ToID(p.AcceptedId)
 		if err != nil {

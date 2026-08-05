@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -172,5 +173,14 @@ func TestLatestPointer(t *testing.T) {
 	// bucket: nothing about one chain's `latest` is visible to a sibling.
 	if _, err := s.Latest([32]byte{8}); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("a sibling chain's pointer: %v, want fs.ErrNotExist", err)
+	}
+
+	// A TORN POINTER IS NOT AN ANSWER. An empty value used to decode to a
+	// valid Latest{Epoch: ""}, which reads as "this chain has no epochs".
+	if err := os.WriteFile(filepath.Join(s.dir, LatestPointer(root)), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Latest(root); err == nil {
+		t.Fatal("an empty pointer value decoded as a chain with no epochs")
 	}
 }

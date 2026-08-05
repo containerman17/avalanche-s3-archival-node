@@ -114,8 +114,10 @@ type Config struct {
 	Parse func(raw []byte) (*Container, error)
 	// OnAnchor is called once, when the network's accepted anchor has been
 	// fetched and consensus goes live. The caller backfills the gap between
-	// its stored history and the anchor (the engine does not).
-	OnAnchor func(c *Container)
+	// its stored history and the anchor (the engine does not). A non-nil
+	// error is fatal, exactly as for OnAccept: an anchor the caller could not
+	// persist is one no backfill will ever start from.
+	OnAnchor func(c *Container) error
 	// OnAccept is called for every block consensus accepts, in height
 	// order, starting just above the anchor. A non-nil error is fatal.
 	OnAccept func(c *Container) error
@@ -520,7 +522,10 @@ func (e *Engine) goLive(anchor *Container) {
 	e.phase = phaseLive
 	log.Printf("consensus: live anchor_height=%d anchor=%s", anchor.Height, anchor.ID)
 	if e.cfg.OnAnchor != nil {
-		e.cfg.OnAnchor(anchor)
+		if err := e.cfg.OnAnchor(anchor); err != nil {
+			e.fail(err)
+			return
+		}
 	}
 	e.sendPoll()
 }
