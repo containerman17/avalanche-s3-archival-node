@@ -130,7 +130,7 @@ func TestPointersOutsideChunkCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache := cacheRoot(dir)
+	cache := CacheRoot(dir)
 	for _, name := range []string{LatestPointer([32]byte{5})} {
 		p := s.pointerPath(name)
 		if p == cache || strings.HasPrefix(p, cache+string(os.PathSeparator)) {

@@ -13,6 +13,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -137,7 +138,37 @@ var devCommands = map[string]func([]string){
 }
 
 func main() {
+	setGoMemLimit()
 	os.Exit(dispatch(os.Args[1:], os.Stderr))
+}
+
+// setGoMemLimit derives GOMEMLIMIT from the container's own ceiling, so a Go
+// heap that grows toward that ceiling COLLECTS HARDER instead of being killed
+// by the cgroup. It is the member-level half of the fleet memory rule (DESIGN
+// "The fleet memory budget"): the box-level slice bounds the sum, this keeps an
+// individual chain from spending its way to the top of its own limit.
+//
+// SEVEN TENTHS, because a third of what the container spends is invisible to
+// the Go runtime and no soft limit can reach it: Firewood's node cache is
+// DECODED nodes in Rust (up to 4GB by the 3% clamp), zstd holds encoder state
+// per seal, and thread stacks and the epoch mappings are outside the heap too.
+// A limit set at the full ceiling would therefore be no limit at all, and one
+// set far below it would spin the collector for nothing.
+//
+// An explicit GOMEMLIMIT in the environment always wins: the Go runtime has
+// already applied it, and an operator who typed a number meant it.
+func setGoMemLimit() {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	limit, ok := exec.CgroupMemoryLimit()
+	if !ok {
+		return
+	}
+	soft := int64(limit / 10 * 7)
+	debug.SetMemoryLimit(soft)
+	log.Printf("epochdb: GOMEMLIMIT %d MB (7/10 of this container's %d MB ceiling; Firewood's cgo cache is outside it)",
+		soft>>20, limit>>20)
 }
 
 // dispatch returns the process exit code for a command line that never reached
@@ -295,7 +326,7 @@ func bootstrapMain(args []string) {
 	}
 	log.Printf("bootstrap: %d epochs indexed, chain rooted at %x", epochs, chainRoot[:8])
 	if *frontier {
-		if err := buildFrontier(*dataDir, st, c); err != nil {
+		if err := buildFrontier(context.Background(), *dataDir, st, c); err != nil {
 			log.Fatalf("epochdb: bootstrap --frontier: %v", err)
 		}
 	}

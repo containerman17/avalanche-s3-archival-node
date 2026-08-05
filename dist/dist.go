@@ -169,7 +169,7 @@ func (s *sharedCas) close() error {
 	return s.Store.Close()
 }
 
-// cacheRoot is where the chunk cache lives, and it is THE ONLY THING SEVERAL
+// CacheRoot is where the chunk cache lives, and it is THE ONLY THING SEVERAL
 // CHAIN PROCESSES SHARE (RULING 2026-08-04: one process = one chain). Default
 // <data>/cache, i.e. self-contained; EPOCHDB_CACHE_DIR points N processes at
 // one directory and they then share one elastic LRU, with zero coordination:
@@ -179,7 +179,11 @@ func (s *sharedCas) close() error {
 // The SPOOL is deliberately NOT shared: it is one chain's durable, not-yet-
 // uploaded artifacts, and it stays at <data>/cas with the epoch markers and the
 // local `latest` that name them.
-func cacheRoot(dataDir string) string {
+// It is exported because it is also the fleet's one RENDEZVOUS POINT: the box
+// gate that keeps two frontier builds from running at once locks a file here,
+// for the same reason the cache is here, i.e. it is the only directory every
+// chain process on a box is already pointed at.
+func CacheRoot(dataDir string) string {
 	if dir := os.Getenv("EPOCHDB_CACHE_DIR"); dir != "" {
 		return dir
 	}
@@ -187,7 +191,7 @@ func cacheRoot(dataDir string) string {
 }
 
 // chainKey names this chain inside the chunk cache
-// (<cacheRoot>/<window>/<chainKey>/...). It is THE DATA DIRECTORY'S OWN NAME,
+// (<CacheRoot>/<window>/<chainKey>/...). It is THE DATA DIRECTORY'S OWN NAME,
 // which needs no plumbing at all and is already the right string: a chain's dir
 // is the one thing an operator names it by, so `du -sh <cache>/*/<dir>` and
 // `rm -r <cache>/*/<dir>` name a chain the way an operator already does. With
@@ -247,7 +251,7 @@ func Open(dataDir string) (*Store, error) {
 		}
 		fetchConc = n
 	}
-	cacheDir := cacheRoot(dataDir)
+	cacheDir := CacheRoot(dataDir)
 	os.RemoveAll(filepath.Join(dataDir, legacyCacheName))
 	// Empty keys are not an error: casfs falls back to the AWS default chain,
 	// which is what makes an SSO session or an instance role work with nothing

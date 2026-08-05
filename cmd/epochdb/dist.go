@@ -12,6 +12,7 @@ package main
 // without credentials the artifacts are already in the spool.
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -127,7 +128,7 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 // knows about a second, foreign or read-only bucket.
 //
 // build is the frontier seam (buildFrontier in production, a stub in tests).
-func joinChain(cfg nodeConfig, build func(dataDir string, st *dist.Store, c *chain.Chain) error) error {
+func joinChain(ctx context.Context, cfg nodeConfig, build func(ctx context.Context, dataDir string, st *dist.Store, c *chain.Chain) error) error {
 	st, err := dist.Open(cfg.DataDir)
 	if err != nil {
 		return fmt.Errorf("open artifact store: %w", err)
@@ -186,7 +187,7 @@ func joinChain(cfg nodeConfig, build func(dataDir string, st *dist.Store, c *cha
 	// (3) COLD: the chain is whole but this dir has no state of its own.
 	logf("join: chain intact but this dir has no execution state: merging %d sealed epochs into a state frontier."+
 		" This is minutes to hours; the RPC port is already bound and requests wait.", epochs)
-	if err := build(cfg.DataDir, st, cfg.Chain); err != nil {
+	if err := build(ctx, cfg.DataDir, st, cfg.Chain); err != nil {
 		return fmt.Errorf("build the state frontier: %w", err)
 	}
 	return nil
@@ -251,7 +252,18 @@ func checkLocalIndex(dir, latest string) (epochs int, covered uint64, err error)
 // The join seam passes its own artifact store; this takes the epoch set off
 // the state layer instead, so the merge and the executor that follows it share
 // one set (state.Store.Epochs).
-func buildFrontier(dataDir string, _ *dist.Store, c *chain.Chain) error {
+//
+// IT WAITS FOR A BOX SLOT FIRST (see heavy.go), because this is the largest
+// memory event on the box by an order of magnitude and a box runs one process
+// per chain: bounding each build was not enough, N of them at once is N times
+// the peak whatever each container's ceiling says. The wait happens before
+// HealTornFrontier so a queued chain touches nothing at all while it waits.
+func buildFrontier(ctx context.Context, dataDir string, _ *dist.Store, c *chain.Chain) error {
+	release, err := acquireHeavySlot(ctx, dist.CacheRoot(dataDir))
+	if err != nil {
+		return err
+	}
+	defer release()
 	if _, err := exec.HealTornFrontier(dataDir); err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -232,7 +233,7 @@ func TestJoinChain(t *testing.T) {
 	join := func(t *testing.T, dir string, c *chain.Chain) (int, error) {
 		t.Helper()
 		built := 0
-		err := joinChain(nodeConfig{DataDir: dir, Chain: c}, func(gotDir string, st *dist.Store, gotC *chain.Chain) error {
+		err := joinChain(context.Background(), nodeConfig{DataDir: dir, Chain: c}, func(_ context.Context, gotDir string, st *dist.Store, gotC *chain.Chain) error {
 			if gotDir != dir || gotC != c || st == nil {
 				t.Errorf("frontier build got (%s, %v, %v)", gotDir, st, gotC)
 			}

@@ -1,0 +1,98 @@
+# THE FLEET MEMORY BUDGET: one number for the whole box.
+#
+# WHY THIS FILE EXISTS. Docker `mem_limit` bounds ONE container, and it did its
+# job (2026-08-05: no container was OOM-killed). It says nothing about the SUM.
+# 22 chains, each legitimately under its own ceiling, still exhausted a 61 GiB
+# box collectively, and a kernel in global direct reclaim cannot schedule sshd,
+# which is how the box became unreachable with TCP/22 open and no banner. The
+# per-container ceilings are DELIBERATELY oversubscribed (~130 GB of ceilings on
+# 61 GiB) because a ceiling is not a reservation and a chain that needs to burst
+# should be able to; the missing instrument was a bound on the total.
+#
+# WHAT IT DOES. Every epochdb container runs inside this slice, so the kernel
+# accounts them as one. MemoryHigh is the fleet's working-set target: past it
+# the kernel reclaims the SLICE's own pages (the chunk-cache page cache and the
+# epoch mappings first, since they are clean file pages) and throttles the
+# slice's allocations. That is the required failure mode, DEGRADE BY SLOWING
+# DOWN: chains get slower and their reads get colder, and nothing dies.
+# MemoryMax is the backstop, and the important part is WHOSE backstop: hitting
+# it OOM-kills one container inside the slice (restart: unless-stopped brings it
+# back) instead of putting the whole box into global reclaim. Everything outside
+# this slice, sshd included, is never squeezed by the fleet at all.
+#
+# THE ARITHMETIC on the current box (i7i.2xlarge, 61.78 GiB usable, no swap):
+#
+#   MemoryHigh=44G   the fleet's target. Sized against the measured anon terms:
+#                    per chain, Firewood's cgo node cache (3% of its Firewood
+#                    dir, 64MB..4GB), the exec state cache (an eighth of the
+#                    container's ceiling since 2026-08-05), the per-block index
+#                    every open store pays over its unsealed tail (~182 B/block,
+#                    which is ~1.2 GB for a sparse L1 at the 8M-tx epoch
+#                    ceiling), and the epoch blooms, which are on the Go heap.
+#                    At 22 chains that totals ~30-35 GiB, and the rest of the
+#                    44G is the fleet's page cache.
+#   MemoryMax=52G    hard backstop: ~9.8 GiB of the box is never docker's.
+#   CPUWeight=50     the other half of "sshd always runs". Weights only bind
+#                    under contention (the box was at load 8.14 on 8 vCPU when
+#                    it stopped answering), and system.slice is idle almost
+#                    always, so this costs the fleet nothing in practice.
+#
+# RE-DERIVE BEFORE CHANGING THE BOX SIZE: high ~= 70% of RAM, max ~= 85%. Both
+# are box facts, not chain facts, so they do not change when chains are added.
+# Adding chains changes what happens INSIDE the budget, which is the point.
+#
+# CHECK FIRST, one command: `docker info --format '{{.CgroupDriver}}'` must say
+# `systemd` (the default on cgroup v2 hosts, which AL2023 is). On the cgroupfs
+# driver docker makes a literal directory of that name instead of asking systemd
+# for the slice, and these limits would not be applied to it; the fix is
+# "exec-opts": ["native.cgroupdriver=systemd"] in /etc/docker/daemon.json plus a
+# daemon restart.
+#
+# APPLY (nothing here is applied to a running box by anything but you). The unit
+# must exist BEFORE a container names the slice, or systemd creates a transient
+# one with no limits at all:
+#
+#   sudo install -m 0644 epochdb.slice /etc/systemd/system/epochdb.slice
+#   sudo systemctl daemon-reload
+#
+# Then put the containers in it, and do it PER SERVICE, in the compose file,
+# because that is the staggered path: recreating one chain at a time is the
+# normal procedure on this box, while the fleet-wide alternative below restarts
+# the docker daemon and therefore all 22 chains at once, which is the stampede
+# this budget exists to survive rather than to cause. In each service block:
+#
+#   services:
+#     mainnet-c:
+#       cgroup_parent: epochdb.slice     # <- the only new line
+#       mem_limit: 24g                   # unchanged: the member's own ceiling
+#       ...
+#
+#   cd /data/epochdb && docker compose up -d mainnet-c   # one chain, then next
+#   systemd-cgls /epochdb.slice | head                   # it really landed there
+#
+# FLEET-WIDE ALTERNATIVE, right on the next box build or after a reboot, where a
+# daemon restart is free and no future container can forget the line:
+# `{ "cgroup-parent": "epochdb.slice" }` in /etc/docker/daemon.json, then
+# `sudo systemctl restart docker`.
+#
+# WATCH IT WORK (see also DESIGN.md "The fleet memory budget"):
+#
+#   cat /sys/fs/cgroup/epochdb.slice/memory.current   # the fleet's total
+#   cat /sys/fs/cgroup/epochdb.slice/memory.events    # high=N is the budget
+#                                                     # holding; oom_kill>0 is
+#                                                     # the budget too tight
+#   cat /sys/fs/cgroup/epochdb.slice/memory.pressure  # some avg60 climbing is
+#                                                     # the throttle band
+#   free -g                                           # `available` must never
+#                                                     # approach zero again
+
+[Unit]
+Description=epochdb chain fleet (one process per chain, one budget for the box)
+Before=docker.service
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=44G
+MemoryMax=52G
+CPUAccounting=yes
+CPUWeight=50

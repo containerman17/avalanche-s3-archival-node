@@ -404,7 +404,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	// cannot assemble, and frontier-build if the dir has none of its own
 	// (joinChain, RULING 2026-08-03). An empty data dir with credentials joins
 	// the published chain here; there is no bootstrap step to remember.
-	if err := joinChain(cfg, buildFrontier); err != nil {
+	if err := joinChain(ctx, cfg, buildFrontier); err != nil {
 		return nil, err
 	}
 	// AFTER the join, because the join is what makes the epoch set nameable

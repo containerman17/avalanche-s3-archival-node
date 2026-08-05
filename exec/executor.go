@@ -369,7 +369,17 @@ func New(cfg Config) (*Executor, error) {
 	}
 
 	inner := backend.newStateDatabase(memdb, tdb)
-	wrapDB := wrapDatabase(inner, cfg.Store, cfg.StateCacheBytes, cfg.VerifyCache)
+	// THE SECOND ANON CLAMP, and it is the same rule as the Firewood one above:
+	// a per-chain grant written as a constant is multiplied by the chain count
+	// on a fleet box, so the state cache takes an eighth of the container's own
+	// ceiling when there is one (see clampStateCache).
+	limit, _ := CgroupMemoryLimit() // 0 when there is no container ceiling
+	stateCache := clampStateCache(cfg.StateCacheBytes, limit)
+	if stateCache != cfg.StateCacheBytes {
+		log.Printf("exec: state cache %d MB (an eighth of this container's %d MB ceiling, asked for %d MB)",
+			stateCache>>20, limit>>20, cfg.StateCacheBytes>>20)
+	}
+	wrapDB := wrapDatabase(inner, cfg.Store, stateCache, cfg.VerifyCache)
 
 	fwBackend, ok := tdb.Backend().(*firewood.TrieDB)
 	if !ok {
