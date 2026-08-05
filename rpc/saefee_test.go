@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"encoding/json"
 	"math/big"
 	"testing"
 	"time"
@@ -213,6 +214,12 @@ func newSAEEnv(t *testing.T) *saeEnv {
 	env.srv.EnableTxAPIs(
 		stubCandidates{at: map[common.Hash][]uint64{tx.Hash(): {saeAt(3)}}},
 		env.blocks, exec.ParseEthBlock)
+	// A live head, so a read AT the head takes the latest-state band instead of
+	// the cook index. Nothing here is cooked, and an executing read has to be
+	// able to run at all before it can be asked what BASEFEE returned.
+	env.srv.EnableLive(fakeLive{
+		live: saeAt(6), accepted: saeAt(6), settled: saeAt(6), target: saeAt(6),
+	})
 	return env
 }
 
@@ -434,5 +441,113 @@ func TestSAEProjectionAtTheHead(t *testing.T) {
 	// here) and no further: never above the fee block 6 itself paid.
 	if next.Cmp(env.want[6]) > 0 {
 		t.Fatalf("projection %s exceeds block 6's own base fee %s: elapsed time only lowers it", next, env.want[6])
+	}
+}
+
+// saeBaseFeeCode returns the current BASEFEE as its 32-byte return value:
+// BASEFEE, PUSH1 0, MSTORE, PUSH1 0x20, PUSH1 0, RETURN. It is the smallest
+// contract whose answer IS `block.basefee`.
+var saeBaseFeeCode = hexutil.Bytes{0x48, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}
+
+// saeRetVal decodes an eth_call result into the number it returned.
+func saeRetVal(t *testing.T, out any) *big.Int {
+	t.Helper()
+	raw, err := hexutil.Decode(out.(string))
+	if err != nil {
+		t.Fatalf("eth_call returned %v: %v", out, err)
+	}
+	return new(big.Int).SetBytes(raw)
+}
+
+// TestSAEBaseFeeOpcodeInExecutingReads: the executing reads build a block
+// context from a STORED header, so above the boundary BASEFEE returned zero to
+// every eth_call, eth_estimateGas, eth_createAccessList and tracer run, and a
+// contract that reads `block.basefee` gave a wrong answer a caller could not
+// tell from a right one. `vm.Config{NoBaseFee: true}` disables the fee CHECKS,
+// not the opcode's value.
+func TestSAEBaseFeeOpcodeInExecutingReads(t *testing.T) {
+	env := newSAEEnv(t)
+	at := common.HexToAddress("0xcccc000000000000000000000000000000000003")
+	want := env.want[6]
+	if want.Sign() <= 0 {
+		t.Fatal("fixture is degenerate: the head expects a zero base fee")
+	}
+	priced := map[string]any{
+		"to": at, "gas": hexutil.Uint64(100_000),
+		"gasPrice": (*hexutil.Big)(big.NewInt(1)),
+	}
+	override := map[string]any{at.Hex(): map[string]any{"code": saeBaseFeeCode}}
+	height := hexutil.EncodeUint64(saeAt(6))
+
+	out, rerr := env.srv.ethCall(mustParams(t, priced, height, override))
+	if rerr != nil {
+		t.Fatalf("eth_call above the boundary: %s", rerr.Message)
+	}
+	got := saeRetVal(t, out)
+	if got.Sign() == 0 {
+		t.Fatal("BASEFEE returned 0: the block context still took the header's absent base fee")
+	}
+	if got.Cmp(want) != 0 {
+		t.Fatalf("eth_call BASEFEE = %s, want the derived %s", got, want)
+	}
+
+	// debug_traceCall runs the same path under a tracer, through runCall, which
+	// used to drop the caller's gas price and could therefore never see a base
+	// fee at all.
+	res, rerr := env.srv.dispatch(&rpcRequest{
+		Method: "debug_traceCall",
+		Params: mustParams(t, priced, height, map[string]any{
+			"tracer": "callTracer", "stateOverrides": override,
+		}),
+	})
+	if rerr != nil {
+		t.Fatalf("debug_traceCall above the boundary: %s", rerr.Message)
+	}
+	var trace struct {
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(res.(json.RawMessage), &trace); err != nil {
+		t.Fatal(err)
+	}
+	if got := saeRetVal(t, trace.Output); got.Cmp(want) != 0 {
+		t.Fatalf("debug_traceCall BASEFEE = %s, want the derived %s", got, want)
+	}
+
+	// eth_createAccessList runs its own copy of the same construction.
+	if _, rerr := env.srv.dispatch(&rpcRequest{
+		Method: "eth_createAccessList", Params: mustParams(t, priced, height),
+	}); rerr != nil {
+		t.Fatalf("eth_createAccessList above the boundary: %s", rerr.Message)
+	}
+
+	// A block override still wins over the derived value: the derivation is
+	// the DEFAULT a caller may replace, not a new floor.
+	blockOv := map[string]any{"baseFee": (*hexutil.Big)(big.NewInt(7))}
+	out, rerr = env.srv.ethCall(mustParams(t, priced, height, override, blockOv))
+	if rerr != nil {
+		t.Fatal(rerr.Message)
+	}
+	if got := saeRetVal(t, out); got.Cmp(big.NewInt(7)) != 0 {
+		t.Fatalf("with a baseFee block override BASEFEE = %s, want 7", got)
+	}
+}
+
+// TestZeroPricedCallStillZeroesTheBaseFee pins UPSTREAM's rule, so nobody
+// "fixes" it into a divergence later: with NoBaseFee set and a zero gas price,
+// vm.NewEVM zeroes blockCtx.BaseFee itself, to keep geth's basefee <= feecap
+// invariant. That is what a real node answers a priceless eth_call at ANY
+// height, above or below the boundary, and it is not the SAE defect.
+func TestZeroPricedCallStillZeroesTheBaseFee(t *testing.T) {
+	env := newSAEEnv(t)
+	at := common.HexToAddress("0xcccc000000000000000000000000000000000003")
+	out, rerr := env.srv.ethCall(mustParams(t,
+		map[string]any{"to": at, "gas": hexutil.Uint64(100_000)},
+		hexutil.EncodeUint64(saeAt(6)),
+		map[string]any{at.Hex(): map[string]any{"code": saeBaseFeeCode}}))
+	if rerr != nil {
+		t.Fatal(rerr.Message)
+	}
+	if got := saeRetVal(t, out); got.Sign() != 0 {
+		t.Fatalf("priceless eth_call BASEFEE = %s, want 0 (vm.NewEVM zeroes it)", got)
 	}
 }

@@ -669,16 +669,9 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	raw, ok, err := s.hist.HeaderRLP(n)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("read header %d: %v", n, err)}
-	}
-	if !ok {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d is not in this node's history", n)}
-	}
-	var header types.Header
-	if err := rlp.DecodeBytes(raw, &header); err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	header, rerr := s.execHeader(n)
+	if rerr != nil {
+		return nil, rerr
 	}
 
 	st, rerr := s.stateAt(n)
@@ -718,7 +711,7 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 
 	backend := registeredVM()
 	cctx := captureHeaders(s.chainCtx)
-	blockCtx := backend.blockContext(&header, cctx)
+	blockCtx := backend.blockContext(header, cctx)
 	ov.blockDiff().apply(&blockCtx)
 	res, err := backend.applyMsg(s.chainCfg, blockCtx, st, msg, vm.Config{NoBaseFee: true})
 	if err != nil {

@@ -114,12 +114,48 @@ func (s *Server) headerBaseFee(h *types.Header) (*big.Int, *rpcError) {
 	return fee, nil
 }
 
+// setExecBaseFee stamps onto h the base fee EXECUTION saw, which above the
+// Helicon boundary is not the one h carries (it carries none). h MUST be a
+// header the caller owns: headerAt decodes a fresh one and blk.Header() is a
+// copy, so no stored or hashed header is touched.
+//
+// EVERY EXECUTING READ PATH DOES THIS BEFORE BUILDING A BLOCK CONTEXT.
+// `vm.Config{NoBaseFee: true}` disables the fee CHECKS, not the value: the
+// BASEFEE opcode still returns blockCtx.BaseFee, so a contract that reads
+// `block.basefee` answered zero to every eth_call, eth_estimateGas,
+// eth_createAccessList and tracer run above the boundary, and a caller could
+// not tell. saexec.Execute does the same substitution on its own header copy
+// before it builds the context, which is what makes this the executed value
+// rather than a plausible one.
+//
+// Below the boundary and on subnet-evm it writes back what was already there.
+func (s *Server) setExecBaseFee(h *types.Header) *rpcError {
+	base, rerr := s.headerBaseFee(h)
+	if rerr != nil {
+		return rerr
+	}
+	h.BaseFee = base
+	return nil
+}
+
+// execHeader is headerAt(n) ready to execute against: see setExecBaseFee.
+func (s *Server) execHeader(n uint64) (*types.Header, *rpcError) {
+	h, rerr := s.headerAt(n)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if rerr := s.setExecBaseFee(h); rerr != nil {
+		return nil, rerr
+	}
+	return h, nil
+}
+
 // runCall executes args as a message at height n with the given gas limit,
 // optionally under a tracer (debug_traceCall) and optionally with eth_call's
 // state/block overrides. Kept separate from server.go's ethCall (file
 // discipline); same semantics.
 func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer, ov *overrides) (*callResult, *rpcError) {
-	header, rerr := s.headerAt(n)
+	header, rerr := s.execHeader(n)
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -143,6 +179,14 @@ func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer, o
 	}
 	if args.Value != nil {
 		msg.Value = (*big.Int)(args.Value)
+	}
+	if args.GasPrice != nil {
+		// Dropped before, which ethCall never did: with NoBaseFee set, a ZERO
+		// gas price is what makes the EVM zero blockCtx.BaseFee (geth's
+		// basefee <= feecap invariant, vm.NewEVM), so ignoring the caller's
+		// price left GASPRICE and BASEFEE at 0 in every eth_estimateGas and
+		// debug_traceCall no matter what the caller asked for.
+		msg.GasPrice = (*big.Int)(args.GasPrice)
 	}
 	if args.Input != nil {
 		msg.Data = *args.Input

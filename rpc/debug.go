@@ -60,6 +60,9 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 	if n == 0 || n > s.hist.Head() {
 		return nil, errInvalid("block %d not traceable (head %d)", n, s.hist.Head())
 	}
+	if rerr := s.setExecBaseFee(header); rerr != nil {
+		return nil, rerr
+	}
 	// The parent state through the SAME band selection eth_call uses: the
 	// descent alone (hist.StateAt) answers zeroed accounts above the cooked
 	// watermark, so a trace on a following node used to come back as a
@@ -435,7 +438,7 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 	if n == 0 {
 		return nil, errInvalid("eth_createAccessList needs an executed block (>=1)")
 	}
-	header, rerr := s.headerAt(n)
+	header, rerr := s.execHeader(n)
 	if rerr != nil {
 		return nil, rerr
 	}
