@@ -122,24 +122,40 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 		return nil, revertError(res)
 	}
 
-	return hexutil.EncodeUint64(searchGas(ethparams.TxGas-1, hi, func(gas uint64) bool {
+	// A TRANSPORT OR STATE failure is not "not executable". Reading it as one
+	// pushed lo up exactly as an out-of-gas would and returned the cap as a
+	// confident estimate, which a wallet then builds a transaction around.
+	gas, rerr := searchGas(ethparams.TxGas-1, hi, func(gas uint64) (bool, *rpcError) {
 		res, rerr := s.runCall(&args, n, gas, nil, ov)
-		return rerr == nil && res.Err == nil
-	})), nil
+		if rerr != nil {
+			return false, rerr
+		}
+		return res.Err == nil, nil
+	})
+	if rerr != nil {
+		return nil, rerr
+	}
+	return hexutil.EncodeUint64(gas), nil
 }
 
 // searchGas returns the smallest gas in (lo, hi] for which executable
-// holds, assuming executable is monotonic and executable(hi) is true.
-func searchGas(lo, hi uint64, executable func(uint64) bool) uint64 {
+// holds, assuming executable is monotonic and executable(hi) is true. An
+// executable that ERRORS could not answer at all, and aborts the search:
+// there is no estimate to report, only a failure.
+func searchGas(lo, hi uint64, executable func(uint64) (bool, *rpcError)) (uint64, *rpcError) {
 	for lo+1 < hi {
 		mid := (lo + hi) / 2
-		if executable(mid) {
+		ok, rerr := executable(mid)
+		if rerr != nil {
+			return 0, rerr
+		}
+		if ok {
 			hi = mid
 		} else {
 			lo = mid // intrinsic-gas and execution errors both mean "too low"
 		}
 	}
-	return hi
+	return hi, nil
 }
 
 // gasOracle samples the gas prices of transactions in recent corpus blocks
@@ -147,13 +163,19 @@ func searchGas(lo, hi uint64, executable func(uint64) bool) uint64 {
 // With nothing to sample it falls back to the VM's own floor: a protocol
 // constant on the C-chain, the chain's configured minBaseFee on an L1 (see
 // rpcVM.minGasPrice).
-func (s *Server) gasOracle() *big.Int {
+//
+// A BLOCK IT CANNOT READ IS AN ERROR, not an empty sample. Falling through to
+// the floor answered 470 gwei on the C-chain and minBaseFee on an L1, the
+// latter far below the real price, so the caller's transaction never mines,
+// and eth_gasPrice / eth_maxPriorityFeePerGas / eth_suggestPriceOptions all
+// reported it as a confident number.
+func (s *Server) gasOracle() (*big.Int, *rpcError) {
 	var prices []*big.Int
 	n := s.hist.Head()
 	for scanned := 0; n > 0 && scanned < 20 && len(prices) < 100; n-- {
 		blk, rerr := s.blockAt(n)
 		if rerr != nil {
-			break
+			return nil, rerr
 		}
 		if len(blk.Transactions()) == 0 {
 			continue
@@ -164,10 +186,10 @@ func (s *Server) gasOracle() *big.Int {
 		}
 	}
 	if len(prices) == 0 {
-		return registeredVM().minGasPrice(s.chainCfg)
+		return registeredVM().minGasPrice(s.chainCfg), nil // no txs to sample
 	}
 	sort.Slice(prices, func(i, j int) bool { return prices[i].Cmp(prices[j]) < 0 })
-	return prices[len(prices)*60/100]
+	return prices[len(prices)*60/100], nil
 }
 
 // feeHistory serves the geth-shaped response from headers (and, when
@@ -295,9 +317,13 @@ func (s *Server) rewardRow(n uint64, header *types.Header, percentiles []float64
 		baseFee = new(big.Int)
 	}
 	for i, tx := range txs {
+		// A tx whose fee cap is under the block's base fee cannot have been
+		// mined in it. Reporting a 0 tip would put a made-up number in the
+		// percentile array as if it were sampled.
 		tip, err := tx.EffectiveGasTip(baseFee)
 		if err != nil {
-			tip = new(big.Int)
+			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
+				"block %d tx %x: effective tip against base fee %v: %v", n, tx.Hash(), baseFee, err)}
 		}
 		items[i] = tg{tip: tip, gas: receipts[i].GasUsed}
 	}

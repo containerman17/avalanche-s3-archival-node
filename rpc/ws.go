@@ -52,7 +52,7 @@ type wsSession struct {
 	polling bool
 
 	done     chan struct{} // closed to stop the poller
-	pollDone chan struct{} // closed BY the poller when it has returned
+	pollDone chan struct{} // closed BY the current poller when it has returned
 }
 
 // stop ends the poller and WAITS for it. The wait is the point: the poller
@@ -62,10 +62,10 @@ type wsSession struct {
 func (w *wsSession) stop() {
 	close(w.done)
 	w.mu.Lock()
-	polling := w.polling
+	polling, done := w.polling, w.pollDone
 	w.mu.Unlock()
 	if polling {
-		<-w.pollDone
+		<-done
 	}
 }
 
@@ -182,13 +182,20 @@ func (w *wsSession) subscribe(params []json.RawMessage) (any, *rpcError) {
 	w.mu.Lock()
 	w.subs[id] = sub
 	// A pending-tx-only connection needs no poller: nothing can ever fire.
+	// A poller that has ALREADY RETURNED (write error) leaves polling false,
+	// so this subscription starts a replacement instead of handing the client
+	// an id that can never fire. Each poller gets its own pollDone: stop()
+	// waits on the one that is running.
 	needPoll := !w.polling && kind != "newPendingTransactions"
+	var done chan struct{}
 	if needPoll {
 		w.polling = true
+		done = make(chan struct{})
+		w.pollDone = done
 	}
 	w.mu.Unlock()
 	if needPoll {
-		go w.poll()
+		go w.poll(done)
 	}
 	return id, nil
 }
@@ -210,8 +217,13 @@ func (w *wsSession) unsubscribe(params []json.RawMessage) (any, *rpcError) {
 
 // poll drives every head-driven subscription on this connection until the
 // connection closes. One goroutine per connection, not per subscription.
-func (w *wsSession) poll() {
-	defer close(w.pollDone)
+func (w *wsSession) poll(done chan struct{}) {
+	defer close(done)
+	defer func() {
+		w.mu.Lock()
+		w.polling = false
+		w.mu.Unlock()
+	}()
 	t := time.NewTicker(wsPollInterval)
 	defer t.Stop()
 	for {
@@ -231,9 +243,12 @@ func (w *wsSession) poll() {
 func (w *wsSession) tick() bool {
 	head := w.srv.hist.Head()
 
-	// Snapshot under the lock, and advance each cursor there, so a slow
-	// delivery cannot be started twice by the next tick. The deliveries
-	// themselves do disk reads and must not hold the lock.
+	// Snapshot under the lock; the deliveries themselves do disk reads and
+	// must not hold it. The cursor advances AFTER delivery, over the range
+	// that actually went out: a read error used to advance it anyway, so the
+	// blocks it covered were dropped with no retry and no notice, which a
+	// subscriber cannot tell apart from "no matching events". Only this
+	// goroutine ticks, so there is no second delivery to race with.
 	type job struct {
 		id       string
 		sub      wsSub
@@ -245,14 +260,18 @@ func (w *wsSession) tick() bool {
 		if sub.kind == "newPendingTransactions" || sub.last >= head {
 			continue
 		}
-		to := min(head, sub.last+wsMaxCatchup)
-		jobs = append(jobs, job{id: id, sub: *sub, from: sub.last + 1, to: to})
-		sub.last = to
+		jobs = append(jobs, job{id: id, sub: *sub, from: sub.last + 1, to: min(head, sub.last+wsMaxCatchup)})
 	}
 	w.mu.Unlock()
 
 	for _, j := range jobs {
-		if !w.deliver(j.id, &j.sub, j.from, j.to) {
+		delivered, alive := w.deliver(j.id, &j.sub, j.from, j.to)
+		w.mu.Lock()
+		if sub, ok := w.subs[j.id]; ok && delivered > sub.last {
+			sub.last = delivered
+		}
+		w.mu.Unlock()
+		if !alive {
 			return false
 		}
 	}
@@ -260,30 +279,34 @@ func (w *wsSession) tick() bool {
 }
 
 // deliver emits one subscription's notifications for blocks [from, to]. It
-// returns false only when the WRITE failed, which is the one condition that
-// ends the connection: a read error is transient (a cook gap, a container not
-// yet local) and must not tear down a client's subscriptions.
-func (w *wsSession) deliver(id string, sub *wsSub, from, to uint64) bool {
+// returns the highest block it fully delivered (from-1 for none), and false
+// only when the WRITE failed, which is the one condition that ends the
+// connection: a read error is transient (a cook gap, a container not yet
+// local), so it stops this batch and leaves the cursor where it was, and the
+// next tick retries from the same block.
+func (w *wsSession) deliver(id string, sub *wsSub, from, to uint64) (uint64, bool) {
 	switch sub.kind {
 	case "logs":
+		// runGetLogs answers the whole range or nothing, so a failure delivers
+		// nothing and the cursor does not move.
 		logs, rerr := w.srv.runGetLogs(from, to, sub.addrs, sub.topics)
 		if rerr != nil {
-			return true
+			return from - 1, true
 		}
 		for _, l := range logs {
 			if w.notify(id, l) != nil {
-				return false
+				return from - 1, false
 			}
 		}
 	default: // newHeads, newAcceptedTransactions
 		for n := from; n <= to; n++ {
 			blk, rerr := w.srv.blockAt(n)
 			if rerr != nil {
-				return true
+				return n - 1, true
 			}
 			if sub.kind == "newHeads" {
 				if w.notify(id, w.srv.marshalHeader(blk)) != nil {
-					return false
+					return n - 1, false
 				}
 				continue
 			}
@@ -297,10 +320,10 @@ func (w *wsSession) deliver(id string, sub *wsSub, from, to uint64) bool {
 						uint64(i), blk.BaseFee(), w.srv.chainCfg)
 				}
 				if w.notify(id, payload) != nil {
-					return false
+					return n - 1, false
 				}
 			}
 		}
 	}
-	return true
+	return to, true
 }

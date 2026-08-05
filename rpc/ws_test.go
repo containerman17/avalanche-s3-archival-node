@@ -12,6 +12,7 @@ package rpc
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,7 +21,11 @@ import (
 	"time"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/gorilla/websocket"
+
+	"github.com/containerman17/epochdb/exec"
+	"github.com/containerman17/epochdb/state"
 )
 
 type wsNotification struct {
@@ -222,6 +227,78 @@ func TestSubscriptionKinds(t *testing.T) {
 	}
 	if msg.Method == "eth_subscription" {
 		t.Fatalf("empty blocks produced a %s notification: %s", msg.Method, msg.Params.Result)
+	}
+}
+
+// gatedBlocks serves the tail containers and can make ONE height unreadable,
+// which is what a cook gap or a not-yet-local container looks like.
+type gatedBlocks struct {
+	mu     sync.Mutex
+	hidden uint64
+}
+
+func (g *gatedBlocks) hide(n uint64) {
+	g.mu.Lock()
+	g.hidden = n
+	g.mu.Unlock()
+}
+
+func (g *gatedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
+	g.mu.Lock()
+	hidden := g.hidden
+	g.mu.Unlock()
+	if n == hidden {
+		return nil, false, fmt.Errorf("container %d temporarily unreadable", n)
+	}
+	if n <= bhSealedEnd || n > bhTailEnd {
+		return nil, false, nil
+	}
+	raw, _ := bhBlock(n)
+	return raw, true, nil
+}
+
+// TestSubscriptionRetriesAfterReadError is the silent gap: the cursor used to
+// advance over the whole batch BEFORE delivery, so one unreadable block
+// dropped it and every block behind it in that batch, with no retry and no
+// notice. A subscriber cannot tell that apart from "no matching events".
+func TestSubscriptionRetriesAfterReadError(t *testing.T) {
+	env := newBlockHashEnv(t)
+	env.hist.SetHead(bhSealedEnd)
+	gate := &gatedBlocks{hidden: bhSealedEnd + 2} // block 10 unreadable
+	env.srv.EnableTxAPIs(
+		state.CombinedTxIndex{Epochs: env.hist.Epochs()},
+		SealedBlocks{Epochs: env.hist.Epochs(), Blocks: gate},
+		exec.ParseEthBlock,
+	)
+	conn, closeAll := wsDial(t, env)
+	defer closeAll()
+
+	if reply := wsCall(t, conn, 1, "eth_subscribe", "newHeads"); reply.Error != nil {
+		t.Fatalf("subscribe: %v", reply.Error)
+	}
+	env.hist.SetHead(bhTailEnd)
+
+	number := func() uint64 {
+		msg := wsRead(t, conn)
+		var head struct {
+			Number hexutil.Uint64 `json:"number"`
+		}
+		if err := json.Unmarshal(msg.Params.Result, &head); err != nil {
+			t.Fatal(err)
+		}
+		return uint64(head.Number)
+	}
+	if got := number(); got != bhSealedEnd+1 {
+		t.Fatalf("first notification is block %d, want %d", got, bhSealedEnd+1)
+	}
+	time.Sleep(4 * wsPollInterval) // the batch is stuck on the unreadable block
+	gate.hide(0)
+
+	// Every block from the failure on must still arrive, in order.
+	for n := uint64(bhSealedEnd + 2); n <= bhTailEnd; n++ {
+		if got := number(); got != n {
+			t.Fatalf("after the read error: got block %d, want %d (blocks were dropped)", got, n)
+		}
 	}
 }
 

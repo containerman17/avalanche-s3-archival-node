@@ -17,9 +17,14 @@ import (
 	"github.com/containerman17/epochdb/dist"
 )
 
-// WalkHeadersRange calls fn with the RLP header of every block in
+// WalkHeadersRange calls fn with the RLP header of EVERY block in
 // [from, to), decoding each zstd frame once. The byte slice is a view into
 // a per-frame decode buffer: copy to retain beyond the callback.
+//
+// COMPLETENESS IS PART OF THE CONTRACT: a frame holding fewer payloads than
+// its block group (a truncated or zero-length frame in a downloaded artifact)
+// is an error, never a quiet skip. A verifier callback that never runs would
+// otherwise be indistinguishable from one that ran and passed.
 func (e *Epoch) WalkHeadersRange(from, to uint64, fn func(n uint64, hdrRLP []byte) error) error {
 	return e.walkFramedRange(secHeaders, e.sec[secHeadersIdx], from, to, fn)
 }
@@ -33,6 +38,7 @@ func (e *Epoch) walkFramedRange(dataSec int, index *dist.View, from, to uint64, 
 	if from < e.Start || to > e.End()+1 || from >= to {
 		return fmt.Errorf("walk range [%d,%d) outside epoch [%d,%d]", from, to, e.Start, e.End())
 	}
+	want := from // the next block the walk still owes its caller
 	for f := (from - e.Start) / framedGroup; f*framedGroup < to-e.Start; f++ {
 		lo := vu64(index, f*8)
 		hi := vu64(index, (f+1)*8)
@@ -56,6 +62,10 @@ func (e *Epoch) walkFramedRange(dataSec int, index *dist.View, from, to uint64, 
 				break
 			}
 			if n >= from {
+				if n != want {
+					return e.shortWalk(dataSec, want, n)
+				}
+				want = n + 1
 				if err := fn(n, raw[pos:pos+int(ln)]); err != nil {
 					return err
 				}
@@ -63,7 +73,22 @@ func (e *Epoch) walkFramedRange(dataSec int, index *dist.View, from, to uint64, 
 			pos += int(ln)
 		}
 	}
+	if want != to {
+		return e.shortWalk(dataSec, want, to)
+	}
 	return nil
+}
+
+// shortWalk reports the blocks a framed walk never yielded. It is a hard
+// failure: the frames cover fewer payloads than the block range they index,
+// so every check the caller runs per block was skipped for these.
+func (e *Epoch) shortWalk(dataSec int, from, to uint64) error {
+	name := "headers"
+	if dataSec == secBodies {
+		name = "containers"
+	}
+	return fmt.Errorf("epoch_%d_%d %s: blocks [%d,%d) missing from the framed sections (short or empty frame): the artifact is truncated",
+		e.Start, e.Count, name, from, to)
 }
 
 // SpillDiffs re-sorts the epoch's SST rows from (key, block) to

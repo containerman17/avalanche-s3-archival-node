@@ -119,13 +119,18 @@ func (s *Server) marshalHeader(blk *types.Block) map[string]any {
 	return m
 }
 
-func fullTxFlag(params []json.RawMessage, idx int) bool {
+// fullTxFlag reads the optional fullTx parameter. A MALFORMED one is an
+// error: swallowing it meant false, so a caller that asked for full
+// transactions silently got hashes.
+func fullTxFlag(params []json.RawMessage, idx int) (bool, *rpcError) {
 	if len(params) <= idx {
-		return false
+		return false, nil
 	}
 	var b bool
-	json.Unmarshal(params[idx], &b)
-	return b
+	if err := json.Unmarshal(params[idx], &b); err != nil {
+		return false, errInvalid("bad fullTx flag: %v", err)
+	}
+	return b, nil
 }
 
 func (s *Server) getBlockByNumber(params []json.RawMessage) (any, *rpcError) {
@@ -142,11 +147,15 @@ func (s *Server) getBlockByNumber(params []json.RawMessage) (any, *rpcError) {
 	if s.live != nil && isTag(params[0], "pending") {
 		n = s.acceptedHead()
 	}
+	full, rerr := fullTxFlag(params, 1)
+	if rerr != nil {
+		return nil, rerr
+	}
 	blk, rerr := s.blockAt(n)
 	if rerr != nil {
 		return nil, rerr
 	}
-	return s.marshalBlock(blk, fullTxFlag(params, 1)), nil
+	return s.marshalBlock(blk, full), nil
 }
 
 // isTag reports whether a raw block-tag param is exactly the given tag.
@@ -166,11 +175,15 @@ func (s *Server) getBlockByHash(params []json.RawMessage) (any, *rpcError) {
 	if !ok {
 		return nil, nil
 	}
+	full, rerr := fullTxFlag(params, 1)
+	if rerr != nil {
+		return nil, rerr
+	}
 	blk, rerr := s.blockAt(n)
 	if rerr != nil {
 		return nil, rerr
 	}
-	return s.marshalBlock(blk, fullTxFlag(params, 1)), nil
+	return s.marshalBlock(blk, full), nil
 }
 
 func (s *Server) blockTxCount(params []json.RawMessage, byHash bool) (any, *rpcError) {

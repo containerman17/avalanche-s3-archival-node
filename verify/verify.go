@@ -50,14 +50,29 @@ type Verifier struct {
 }
 
 // New opens a fresh throwaway Firewood under tmpDir and anchors it at c's
-// genesis. c == nil = anchorless test mode: start from an empty trie and adopt
-// the first header's ParentHash as anchor.
+// genesis. THE CHAIN IS REQUIRED: an anchorless verifier adopts whatever
+// ParentHash the data claims as its anchor, which checks that the corpus is
+// self-consistent and NOT that it is this chain, so any internally consistent
+// forgery passes. Only the in-package tests may ask for that (newAnchorless).
 //
 // The VM kind comes off the descriptor and picks BOTH the libevm extras (which
 // decide how a header decodes and hashes) and the throwaway's state database,
 // exactly as exec does. Anchorless mode has no descriptor, so it takes whatever
 // kind the process already registered, and coreth when nothing has.
 func New(tmpDir string, c *chain.Chain, workers int) (*Verifier, error) {
+	if c == nil {
+		return nil, fmt.Errorf("verify: no resolved chain: verification without a genesis anchor only proves self-consistency")
+	}
+	return newVerifier(tmpDir, c, workers)
+}
+
+// newAnchorless is New's test-only mode: no genesis anchor, the first header's
+// ParentHash becomes the anchor.
+func newAnchorless(tmpDir string, workers int) (*Verifier, error) {
+	return newVerifier(tmpDir, nil, workers)
+}
+
+func newVerifier(tmpDir string, c *chain.Chain, workers int) (*Verifier, error) {
 	kind := fetch.RegisteredKind()
 	if c != nil {
 		kind = c.VMKind
@@ -122,6 +137,11 @@ func (v *Verifier) Next() uint64 { return v.next }
 // VerifyEpoch fully checks the next contiguous epoch: state roots by diff
 // application (sequential), txRoot + receiptsRoot per block (parallel),
 // header parent-hash chain. Any failure is fatal for the whole set.
+//
+// EVERY BLOCK MUST BE EARNED. Both halves count the blocks they actually
+// checked and must account for all e.Count of them: a check that could not run
+// is a failure, never a pass, and the PASS line reports the counted number
+// rather than the epoch's claimed block count.
 func (v *Verifier) VerifyEpoch(e *state.Epoch) error {
 	if e.Start != v.next {
 		return fmt.Errorf("epoch_%d_%d out of order: next expected block %d", e.Start, e.Count, v.next)
@@ -130,10 +150,11 @@ func (v *Verifier) VerifyEpoch(e *state.Epoch) error {
 
 	// Bodies + receipts: embarrassingly parallel chunk workers.
 	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		bodyErr  error
-		perChunk = (e.Count + uint64(v.workers) - 1) / uint64(v.workers)
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+		bodyErr    error
+		bodyBlocks uint64
+		perChunk   = (e.Count + uint64(v.workers) - 1) / uint64(v.workers)
 	)
 	for w := 0; w < v.workers; w++ {
 		from := e.Start + uint64(w)*perChunk
@@ -144,17 +165,17 @@ func (v *Verifier) VerifyEpoch(e *state.Epoch) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := checkBodies(e, from, to); err != nil {
-				mu.Lock()
-				if bodyErr == nil {
-					bodyErr = err
-				}
-				mu.Unlock()
+			done, err := checkBodies(e, from, to)
+			mu.Lock()
+			bodyBlocks += done
+			if err != nil && bodyErr == nil {
+				bodyErr = err
 			}
+			mu.Unlock()
 		}()
 	}
 
-	stateErr := v.verifyState(e)
+	stateBlocks, stateErr := v.verifyState(e)
 	wg.Wait()
 	if stateErr != nil {
 		return stateErr
@@ -162,29 +183,37 @@ func (v *Verifier) VerifyEpoch(e *state.Epoch) error {
 	if bodyErr != nil {
 		return bodyErr
 	}
+	if stateBlocks != e.Count {
+		return fmt.Errorf("epoch_%d_%d: state verification covered %d of %d blocks", e.Start, e.Count, stateBlocks, e.Count)
+	}
+	if bodyBlocks != e.Count {
+		return fmt.Errorf("epoch_%d_%d: body verification covered %d of %d blocks", e.Start, e.Count, bodyBlocks, e.Count)
+	}
 
 	v.next = e.End() + 1
-	v.blocks += e.Count
+	v.blocks += stateBlocks
 	dt := time.Since(t0)
 	log.Printf("verify: epoch_%d_%d PASS: %d blocks in %s (%.0f blk/s)",
-		e.Start, e.Count, e.Count, dt.Round(time.Second), float64(e.Count)/dt.Seconds())
+		e.Start, e.Count, stateBlocks, dt.Round(time.Second), float64(stateBlocks)/dt.Seconds())
 	return nil
 }
 
 // verifyState replays the epoch's per-block post-image diffs into the
 // throwaway Firewood, committing per block; every computed root must
 // equal header.Root. Also checks the header parent-hash chain (it walks
-// the headers anyway).
-func (v *Verifier) verifyState(e *state.Epoch) error {
+// the headers anyway). Returns the number of blocks it actually checked,
+// which the caller requires to be the whole epoch.
+func (v *Verifier) verifyState(e *state.Epoch) (uint64, error) {
 	cur, err := e.SpillDiffs(v.tmp)
 	if err != nil {
-		return fmt.Errorf("spill diffs: %w", err)
+		return 0, fmt.Errorf("spill diffs: %w", err)
 	}
 	defer cur.Close()
 	dBlk, dRows, dOK, err := cur.Next()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	var done uint64
 	lastLog := time.Now()
 	epochT0 := lastLog
 
@@ -231,6 +260,7 @@ func (v *Verifier) verifyState(e *state.Epoch) error {
 		}
 		v.parentRoot = hdr.Root
 		v.parentHash = hdrHash
+		done++
 
 		if time.Since(lastLog) >= 30*time.Second {
 			done := n - e.Start + 1
@@ -241,12 +271,16 @@ func (v *Verifier) verifyState(e *state.Epoch) error {
 		return nil
 	})
 	if walkErr != nil {
-		return walkErr
+		return done, walkErr
 	}
 	if dOK {
-		return fmt.Errorf("SST rows for block %d beyond the header walk", dBlk)
+		return done, fmt.Errorf("SST rows for block %d beyond the header walk", dBlk)
 	}
-	return nil
+	if done != e.Count {
+		return done, fmt.Errorf("epoch_%d_%d: header walk yielded %d of %d blocks: blocks [%d,%d] were never state-checked",
+			e.Start, e.Count, done, e.Count, e.Start+done, e.End())
+	}
+	return done, nil
 }
 
 // applyBlock proposes one block's diffs on top of parentRoot and commits
@@ -321,7 +355,13 @@ func applyRows(tr ethstate.Trie, rows []state.StateRow) error {
 // must hash to the stored header, txRoot recomputed from the verbatim
 // transactions must match, and receiptsRoot recomputed from receipts
 // reconstructed out of the stored logs + gasUsed/status must match.
-func checkBodies(e *state.Epoch, from, to uint64) error {
+//
+// It returns how many blocks it CHECKED. Unlike the state half there is no
+// continuity to fall over (each container is checked against its own header),
+// so a containers frame that yields fewer payloads than its block group would
+// otherwise skip every check here and still return nil: the count is what
+// makes that a failure.
+func checkBodies(e *state.Epoch, from, to uint64) (uint64, error) {
 	type hinfo struct{ hash, txHash, rcptHash common.Hash }
 	hs := make([]hinfo, to-from)
 	if err := e.WalkHeadersRange(from, to, func(n uint64, hdrRLP []byte) error {
@@ -332,9 +372,10 @@ func checkBodies(e *state.Epoch, from, to uint64) error {
 		hs[n-from] = hinfo{hdr.Hash(), hdr.TxHash, hdr.ReceiptHash}
 		return nil
 	}); err != nil {
-		return err
+		return 0, err
 	}
-	return e.WalkContainersRange(from, to, func(n uint64, raw []byte) error {
+	var done uint64
+	err := e.WalkContainersRange(from, to, func(n uint64, raw []byte) error {
 		blk, err := exec.ParseEthBlock(raw)
 		if err != nil {
 			return fmt.Errorf("parse container %d: %w", n, err)
@@ -357,8 +398,17 @@ func checkBodies(e *state.Epoch, from, to uint64) error {
 		if got := types.DeriveSha(receipts, trie.NewStackTrie(nil)); got != hi.rcptHash {
 			return fmt.Errorf("receipts root mismatch at block %d: computed %x, header %x", n, got, hi.rcptHash)
 		}
+		done++
 		return nil
 	})
+	if err != nil {
+		return done, err
+	}
+	if done != to-from {
+		return done, fmt.Errorf("epoch_%d_%d: container walk yielded %d of %d blocks: blocks [%d,%d) were never body-checked",
+			e.Start, e.Count, done, to-from, from+done, to)
+	}
+	return done, nil
 }
 
 // reconstructReceipts rebuilds block n's consensus receipts from the v2
@@ -435,11 +485,20 @@ func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (bloc
 	// with default upgrades would replay a DIFFERENT chain and only surface as
 	// a root mismatch somewhere in the middle, if at all. Epoch 1's prev-hash
 	// IS that root, so one comparison says it up front and by name.
-	if c != nil && eps[0].Start == 1 {
-		if root := c.Root(); eps[0].Prev != root {
-			return 0, 0, fmt.Errorf("epoch_%d_%d anchors at chain root %x, but %s resolves to %x: wrong chain, or a missing/edited upgrade.json (the chain root is sha256(genesisData || upgradeBytes))",
-				eps[0].Start, eps[0].Count, eps[0].Prev, st.Dir(), root)
-		}
+	//
+	// The anchor comparison is MANDATORY, not best-effort: it used to be
+	// skipped whenever it could not be made (no chain, or a set not starting
+	// at block 1), which silently downgraded the whole run to a
+	// self-consistency check.
+	if c == nil {
+		return 0, 0, fmt.Errorf("verify %s: no resolved chain, so the corpus cannot be anchored: verification would only prove self-consistency", st.Dir())
+	}
+	if eps[0].Start != 1 {
+		return 0, 0, fmt.Errorf("verify %s: epoch set starts at block %d, not 1: there is no chain root to anchor it to", st.Dir(), eps[0].Start)
+	}
+	if root := c.Root(); eps[0].Prev != root {
+		return 0, 0, fmt.Errorf("epoch_%d_%d anchors at chain root %x, but %s resolves to %x: wrong chain, or a missing/edited upgrade.json (the chain root is sha256(genesisData || upgradeBytes))",
+			eps[0].Start, eps[0].Count, eps[0].Prev, st.Dir(), root)
 	}
 	v, err := New(tmpDir, c, workers)
 	if err != nil {

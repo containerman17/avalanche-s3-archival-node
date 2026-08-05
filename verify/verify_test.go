@@ -1,7 +1,9 @@
 package verify
 
 import (
+	"encoding/binary"
 	"math/big"
+	"os"
 	"strings"
 	"testing"
 
@@ -297,7 +299,7 @@ func runVerify(t *testing.T, dir string) (*Verifier, error) {
 		t.Fatal(err)
 	}
 	defer set.Close()
-	v, err := New(t.TempDir(), nil, 2)
+	v, err := newAnchorless(t.TempDir(), 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,6 +380,24 @@ func TestVerifyCorruptions(t *testing.T) {
 		}
 	})
 
+	// THE ONE THAT USED TO PASS. A body frame that decodes to nothing (a
+	// truncated or zero-length frame in a downloaded artifact) skipped the
+	// container-hash, txRoot and receiptsRoot checks for every block it
+	// covered, and the run still reported "PASS: 12 blocks": nothing counted
+	// what the walk had actually visited.
+	t.Run("emptied body frame must fail, not silently skip the checks", func(t *testing.T) {
+		dir := t.TempDir()
+		sealEpochs(t, dir, blocks, nil)
+		emptyBodyFrame(t, dir, 7)
+		v, err := runVerify(t, dir)
+		if err == nil {
+			t.Fatalf("emptied body frame reported PASS after %d blocks", v.Blocks())
+		}
+		if !strings.Contains(err.Error(), "containers: blocks [") {
+			t.Fatalf("want the skipped container blocks named, got: %v", err)
+		}
+	})
+
 	t.Run("broken parent hash breaks the header chain", func(t *testing.T) {
 		dir := t.TempDir()
 		sealEpochs(t, dir, blocks, func(in *state.EpochInput) {
@@ -398,6 +418,48 @@ func TestVerifyCorruptions(t *testing.T) {
 			t.Fatalf("want header chain broken at block 9, got: %v", err)
 		}
 	})
+}
+
+// emptyBodyFrame zeroes the length of the first containers frame of the epoch
+// starting at block start, in place in the spool. The frame index still claims
+// the blocks, the frame decodes to zero payloads: exactly a truncated download
+// or a short-written artifact, and the one shape walkFramedRange used to treat
+// as "nothing to do here".
+func emptyBodyFrame(t *testing.T, dir string, start uint64) {
+	t.Helper()
+	st := testStore(t, dir)
+	set, err := state.OpenEpochSet(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var path string
+	var sizes map[string]uint64
+	for _, e := range set.All() {
+		if e.Start == start {
+			path, sizes = st.SpoolPath(e.Hash), e.SectionSizes()
+		}
+	}
+	set.Close()
+	if path == "" {
+		t.Fatalf("no epoch starting at block %d", start)
+	}
+	// Sections are written in file order, so bodiesIdx starts right after
+	// dict and bodies. Its layout is u64 LE frame offsets, nFrames+1.
+	off := sizes["dict"] + sizes["bodies"]
+	if sizes["bodiesIdx"] != 16 {
+		t.Fatalf("expected a single-frame epoch, bodiesIdx is %d bytes", sizes["bodiesIdx"])
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint64(raw[off+8:]) == 0 {
+		t.Fatal("frame 0 already empty: wrong offset")
+	}
+	binary.LittleEndian.PutUint64(raw[off+8:], 0) // frame 0 ends where it starts
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // testStore is a credential-free artifact store over dir: the spool is the

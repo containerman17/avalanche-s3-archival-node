@@ -106,7 +106,10 @@ func (s *Server) suggestPriceOptions() (any, *rpcError) {
 	if header.BaseFee == nil {
 		return nil, nil // pre-dynamic-fee head: coreth returns null too
 	}
-	estimate := s.gasOracle()
+	estimate, rerr := s.gasOracle()
+	if rerr != nil {
+		return nil, rerr
+	}
 	capped := math.BigMin(estimate, priceOptMaxTip)
 
 	slow := new(big.Int).Div(new(big.Int).Mul(capped, priceOptSlowPct), priceOptDenom)

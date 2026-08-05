@@ -108,10 +108,12 @@ func (s *Server) getFilterChanges(params []json.RawMessage) (any, *rpcError) {
 	}
 	head := s.hist.Head()
 	last := f.lastHead
-	f.lastHead = head
 	kind, from, to, addrs, topics := f.kind, f.from, f.to, f.addrs, f.topics
 	reg.mu.Unlock()
 
+	// The cursor moves ONLY once the changes are in hand. It used to move
+	// first, so one failed read consumed those blocks for the life of the
+	// filter: the client got a single error and the retry returned [].
 	switch kind {
 	case 'p':
 		return []string{}, nil // no mempool: never any pending txs
@@ -124,15 +126,32 @@ func (s *Server) getFilterChanges(params []json.RawMessage) (any, *rpcError) {
 			}
 			hashes = append(hashes, blk.Hash().Hex())
 		}
+		reg.advance(id, head)
 		return hashes, nil
 	default: // logs: new matches in (last, head], clipped to the criteria
 		lo := max(from, last+1)
 		hi := min(to, head)
 		if lo > hi {
+			reg.advance(id, head)
 			return []any{}, nil
 		}
-		return s.runGetLogs(lo, hi, addrs, topics)
+		logs, rerr := s.runGetLogs(lo, hi, addrs, topics)
+		if rerr != nil {
+			return nil, rerr
+		}
+		reg.advance(id, head)
+		return logs, nil
 	}
+}
+
+// advance moves a filter's cursor to head, if it still exists and has not
+// been moved further by a concurrent poll.
+func (r *filterReg) advance(id string, head uint64) {
+	r.mu.Lock()
+	if f, ok := r.m[id]; ok && head > f.lastHead {
+		f.lastHead = head
+	}
+	r.mu.Unlock()
 }
 
 func (s *Server) getFilterLogs(params []json.RawMessage) (any, *rpcError) {

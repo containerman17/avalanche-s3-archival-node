@@ -302,11 +302,13 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.getBlockReceipts(req.Params)
 	case "eth_estimateGas":
 		return s.estimateGas(req.Params)
-	case "eth_gasPrice":
-		return hexutil.EncodeBig(s.gasOracle()), nil
-	case "eth_maxPriorityFeePerGas":
+	case "eth_gasPrice", "eth_maxPriorityFeePerGas":
 		// Pre-London corpus: the whole gas price is the tip.
-		return hexutil.EncodeBig(s.gasOracle()), nil
+		price, rerr := s.gasOracle()
+		if rerr != nil {
+			return nil, rerr
+		}
+		return hexutil.EncodeBig(price), nil
 	case "eth_feeHistory":
 		return s.feeHistory(req.Params)
 	case "net_version":
