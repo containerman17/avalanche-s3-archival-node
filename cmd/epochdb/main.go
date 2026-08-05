@@ -133,6 +133,7 @@ var devCommands = map[string]func([]string){
 	"ab-bench-rpc":  benchRPCMain,
 	"ab-bench-logs": benchLogsMain,
 	"rpc-bench":     rpcBenchMain,
+	"probe":         probeMain,
 }
 
 func main() {
@@ -553,8 +554,8 @@ func fetchMain(args []string) {
 					gap = fmt.Sprintf(" gap=%d", missing)
 				}
 			}
-			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d archival=%d inflight=%d answers_nonempty=%.0f%%%s",
-				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, cur.Archival, cur.InFlight, pct, gap)
+			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d archival=%d inflight=%d answers_nonempty=%.0f%%%s%s",
+				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, cur.Archival, cur.InFlight, pct, gap, cur.DropSuffix())
 			prev, prevT = cur, now
 		}
 	}

@@ -3,6 +3,7 @@ package fetch
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
@@ -17,10 +18,29 @@ type ancestorsResponse struct {
 	blocks    [][]byte
 }
 
+// Drop counters. Dropping a malformed inbound message is RIGHT (it arrives
+// from an untrusted peer and nothing here can be reconstructed from it), but a
+// silent drop is indistinguishable from a timeout: after an avalanchego
+// protocol bump the symptom is polls_failed climbing with no cause. One
+// counter per reason is the whole difference between "the wire format moved"
+// and "the peer is slow".
+type dropCounts struct {
+	// badPayload: the message arrived under an op whose body it does not
+	// carry. That is a protocol mismatch, not a peer problem.
+	badPayload atomic.Uint64
+	// badID: a 32-byte ID field that is not 32 bytes.
+	badID atomic.Uint64
+	// noRoute: the answer arrived but its delivery channel was full, so the
+	// waiter will time out on a message that did reach this box.
+	noRoute atomic.Uint64
+}
+
 type inboundHandler struct {
 	connectedCh chan ids.NodeID
 	peers       set.Set[ids.NodeID]
 	pool        *peerPool
+
+	drops dropCounts
 
 	routeMu     sync.Mutex
 	routeMap    map[uint32]chan ancestorsResponse
@@ -76,7 +96,12 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 		h.cbMu.RLock()
 		cb := h.onContainer
 		h.cbMu.RUnlock()
-		if p, ok := msg.Message.(*p2p.Put); ok && cb != nil {
+		p, ok := msg.Message.(*p2p.Put)
+		if !ok {
+			h.drops.badPayload.Add(1)
+			return
+		}
+		if cb != nil {
 			cb(msg.NodeID, p.Container)
 		}
 		return
@@ -84,7 +109,12 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 		h.cbMu.RLock()
 		cb := h.onContainer
 		h.cbMu.RUnlock()
-		if p, ok := msg.Message.(*p2p.PushQuery); ok && cb != nil {
+		p, ok := msg.Message.(*p2p.PushQuery)
+		if !ok {
+			h.drops.badPayload.Add(1)
+			return
+		}
+		if cb != nil {
 			cb(msg.NodeID, p.Container)
 		}
 		return
@@ -93,11 +123,16 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 		cb := h.onChits
 		h.cbMu.RUnlock()
 		p, ok := msg.Message.(*p2p.Chits)
-		if !ok || cb == nil {
+		if !ok {
+			h.drops.badPayload.Add(1)
+			return
+		}
+		if cb == nil {
 			return
 		}
 		preferred, err := ids.ToID(p.PreferredId)
 		if err != nil {
+			h.drops.badID.Add(1)
 			return
 		}
 		// An EMPTY field is the compat shim: a peer that does not fill it in
@@ -109,11 +144,13 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 		preferredAtHeight := preferred
 		if len(p.PreferredIdAtHeight) > 0 {
 			if preferredAtHeight, err = ids.ToID(p.PreferredIdAtHeight); err != nil {
+				h.drops.badID.Add(1)
 				return
 			}
 		}
 		accepted, err := ids.ToID(p.AcceptedId)
 		if err != nil {
+			h.drops.badID.Add(1)
 			return
 		}
 		cb(msg.NodeID, p.RequestId, preferred, preferredAtHeight, accepted, p.AcceptedHeight)
@@ -123,10 +160,12 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 	if msg.Op == message.AcceptedFrontierOp {
 		payload, ok := msg.Message.(*p2p.AcceptedFrontier)
 		if !ok {
+			h.drops.badPayload.Add(1)
 			return
 		}
 		id, err := ids.ToID(payload.ContainerId)
 		if err != nil {
+			h.drops.badID.Add(1)
 			return
 		}
 		h.routeMu.Lock()
@@ -139,6 +178,7 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 			select {
 			case ch <- id:
 			default:
+				h.drops.noRoute.Add(1)
 			}
 		}
 		return
@@ -149,6 +189,7 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 	}
 	payload, ok := msg.Message.(*p2p.Ancestors)
 	if !ok {
+		h.drops.badPayload.Add(1)
 		return
 	}
 	resp := ancestorsResponse{
@@ -167,6 +208,7 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 		select {
 		case ch <- resp:
 		default:
+			h.drops.noRoute.Add(1)
 		}
 	}
 }

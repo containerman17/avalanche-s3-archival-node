@@ -594,7 +594,8 @@ func (f *Fetcher) request(ctx context.Context, peer ids.NodeID, tip ids.ID) (res
 	f.requestsSent.Add(1)
 	f.inFlight.Add(1)
 	defer f.inFlight.Add(-1)
-	f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, f.subnetID, subnets.NoOpAllower)
+	to := set.Of(peer)
+	noteSendGap("GetAncestors", to, f.net.Send(msg, avacommon.SendConfig{NodeIDs: to}, f.subnetID, subnets.NoOpAllower))
 
 	t := time.NewTimer(defaultRequestTimeout)
 	defer t.Stop()
@@ -625,6 +626,42 @@ func logLocalBug(op string, err error) {
 }
 
 var localBugSeen sync.Map // op -> struct{}
+
+// sendGapInterval throttles noteSendGap per op. A saturated outbound queue
+// fails every poll, so an unthrottled line would be one per poll.
+const sendGapInterval = 30 * time.Second
+
+var sendGapLast sync.Map // op -> *atomic.Int64 (unix nanos of the last line)
+
+// noteSendGap reports the peers a Send did not actually reach. Send returns
+// the set it really wrote to, and the difference against the set we asked for
+// is the difference between a request that went out and timed out on the wire
+// and one that NEVER LEFT THIS BOX (peer not connected, or its outbound queue
+// full). Without it the second case costs the full request timeout and then
+// demotes a peer that was never asked anything; in the consensus path it is
+// the difference between a poll that failed and a poll that was never sent.
+//
+// Diagnosis only: nothing here retries. A send that did not happen is already
+// handled by the timeout above it.
+func noteSendGap(op string, want, sent set.Set[ids.NodeID]) {
+	if sent.Len() >= want.Len() {
+		return
+	}
+	v, _ := sendGapLast.LoadOrStore(op, new(atomic.Int64))
+	last := v.(*atomic.Int64)
+	prev, now := last.Load(), time.Now().UnixNano()
+	if now-prev < int64(sendGapInterval) || !last.CompareAndSwap(prev, now) {
+		return
+	}
+	var missing []ids.NodeID
+	for id := range want {
+		if !sent.Contains(id) {
+			missing = append(missing, id)
+		}
+	}
+	log.Printf("fetch: %s reached %d/%d peers, the rest never left this box (not connected, or the outbound queue is full): %v",
+		op, sent.Len(), want.Len(), missing)
+}
 
 // nonEmpty reports whether resp carries at least one container.
 func nonEmpty(resp ancestorsResponse) bool {
@@ -776,7 +813,8 @@ func (f *Fetcher) acceptedFrontier(ctx context.Context) (ids.ID, error) {
 				results <- ids.Empty
 				return
 			}
-			f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(peer)}, f.subnetID, subnets.NoOpAllower)
+			to := set.Of(peer)
+			noteSendGap("GetAcceptedFrontier", to, f.net.Send(msg, avacommon.SendConfig{NodeIDs: to}, f.subnetID, subnets.NoOpAllower))
 			t := time.NewTimer(defaultRequestTimeout)
 			defer t.Stop()
 			select {

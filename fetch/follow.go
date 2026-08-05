@@ -104,8 +104,9 @@ func (f *Fetcher) Follow(ctx context.Context) error {
 			if s.PeerAcceptedMax > 0 {
 				lag = int64(s.PeerAcceptedMax) - int64(s.AcceptedHeight)
 			}
-			log.Printf("consensus: status live=%v accepted=%d lag=%d processing=%d polls_ok=%d polls_failed=%d parked=%d gets=%d stored=%d",
-				s.Live, s.AcceptedHeight, lag, s.Processing, s.PollsOK, s.PollsFailed, s.ParkedVotes, s.OutstandingGets, f.store.Count())
+			log.Printf("consensus: status live=%v accepted=%d lag=%d processing=%d polls_ok=%d polls_failed=%d parked=%d gets=%d stored=%d%s",
+				s.Live, s.AcceptedHeight, lag, s.Processing, s.PollsOK, s.PollsFailed, s.ParkedVotes, s.OutstandingGets, f.store.Count(),
+				f.Progress().DropSuffix())
 		}
 	}
 }
@@ -184,7 +185,8 @@ func (n *consensusNet) SendGet(nodeID ids.NodeID, requestID uint32, containerID 
 	if err != nil {
 		return err
 	}
-	n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(nodeID)}, n.f.subnetID, subnets.NoOpAllower)
+	to := set.Of(nodeID)
+	noteSendGap("Get", to, n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: to}, n.f.subnetID, subnets.NoOpAllower))
 	return nil
 }
 
@@ -193,7 +195,7 @@ func (n *consensusNet) SendPullQuery(nodeIDs set.Set[ids.NodeID], requestID uint
 	if err != nil {
 		return err
 	}
-	n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: nodeIDs}, n.f.subnetID, subnets.NoOpAllower)
+	noteSendGap("PullQuery", nodeIDs, n.f.net.Send(msg, avacommon.SendConfig{NodeIDs: nodeIDs}, n.f.subnetID, subnets.NoOpAllower))
 	return nil
 }
 

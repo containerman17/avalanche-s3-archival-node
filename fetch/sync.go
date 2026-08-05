@@ -378,6 +378,24 @@ type Progress struct {
 	ActiveWalks  int64
 	Archival     int   // current archival peer set size
 	InFlight     int64 // outstanding GetAncestors requests
+	// Inbound messages dropped at the trust boundary, by reason. See
+	// dropCounts: badPayload is a protocol mismatch, badID a malformed ID
+	// field, noRoute an answer whose waiter was not ready for it.
+	DropsBadPayload uint64
+	DropsBadID      uint64
+	DropsNoRoute    uint64
+}
+
+// DropSuffix is the drop counts as a log fragment, EMPTY when nothing has been
+// dropped, so the normal progress line is unchanged and any non-zero count is
+// visible where the operator already looks. Without it a protocol bump reads
+// as peers timing out.
+func (p Progress) DropSuffix() string {
+	if p.DropsBadPayload|p.DropsBadID|p.DropsNoRoute == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" drops=payload:%d,id:%d,route:%d",
+		p.DropsBadPayload, p.DropsBadID, p.DropsNoRoute)
 }
 
 func (f *Fetcher) Progress() Progress {
@@ -393,5 +411,9 @@ func (f *Fetcher) Progress() Progress {
 		ActiveWalks:  f.activeWalks.Load(),
 		Archival:     f.pool.archivalCount(),
 		InFlight:     f.inFlight.Load(),
+
+		DropsBadPayload: f.handler.drops.badPayload.Load(),
+		DropsBadID:      f.handler.drops.badID.Load(),
+		DropsNoRoute:    f.handler.drops.noRoute.Load(),
 	}
 }

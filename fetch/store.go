@@ -89,10 +89,16 @@ func indexName(bucket uint64) string   { return fmt.Sprintf("index_%05d.log", bu
 
 // BlockEvent is a single "block is present locally" notification emitted by
 // Subscribe. Raw is a fresh copy safe to retain.
+//
+// Err is the LAST event of a stream that ended badly, and it is the only one
+// with no block in it: the channel closes on a read failure exactly as it
+// closes on cancellation, so without this a corrupt container ends the block
+// stream and reads as completion. A consumer must check it.
 type BlockEvent struct {
 	BlockNumber uint64
 	ContainerID ids.ID
 	Raw         []byte
+	Err         error
 }
 
 // OpenStore opens the segment files in dir and rebuilds the RAM index from
@@ -514,7 +520,8 @@ func (s *Store) SessionRawBytes() uint64 { return s.sessionRawBytes.Load() }
 
 // Subscribe emits stored blocks in ascending height order starting at
 // fromBlock. The channel stays open across gaps: heights not yet stored are
-// polled until they land. Closed when ctx is canceled.
+// polled until they land. Closed when ctx is canceled, and closed after one
+// BlockEvent carrying Err when a read fails.
 //
 // ponytail: single poll loop instead of deforestationdb's two-phase
 // drain-then-poll; the RAM index makes each probe a map lookup + one ReadAt,
@@ -529,9 +536,15 @@ func (s *Store) Subscribe(ctx context.Context, fromBlock uint64) <-chan BlockEve
 		for {
 			raw, id, ok, err := s.readAt(next)
 			if err != nil {
-				// The channel closes either way, so without this line a read
-				// failure is indistinguishable from an ordinary cancellation.
+				// The channel closes either way, so the consumer gets the
+				// failure as a final event: a closed channel alone reads as a
+				// clean shutdown, which would make a corrupt container look
+				// like the end of the chain.
 				log.Printf("fetch: subscribe stopped at height %d: %v", next, err)
+				select {
+				case out <- BlockEvent{BlockNumber: next, Err: err}:
+				case <-ctx.Done():
+				}
 				return
 			}
 			if ok {

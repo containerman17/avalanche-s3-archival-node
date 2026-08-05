@@ -399,3 +399,47 @@ func TestFailedIndexWriteKeepsTheArrivalOffsetHonest(t *testing.T) {
 		t.Fatal("the container after a failed index write decoded to the wrong bytes")
 	}
 }
+
+// TestSubscribeReportsReadFailure: the poll goroutine returns on any read
+// error, closing the channel, which is exactly what a clean shutdown looks
+// like. A corrupt container would have ended the block stream and read as
+// "the chain stops here", so the failure has to arrive as an event.
+func TestSubscribeReportsReadFailure(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p1, raw1 := fakeContainer(1, 1, 32)
+	if err := s.Append(p1, raw1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// Garbage where the zstd frame was: the index still points at it, so the
+	// read gets that far and then cannot decompress it.
+	f, err := os.OpenFile(filepath.Join(dir, arrivalName(0)), os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{0xff}, 16), 0); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch := s.Subscribe(ctx, 1)
+	ev, ok := <-ch
+	if !ok {
+		t.Fatal("the channel closed with no event: a read failure is indistinguishable from a clean shutdown")
+	}
+	if ev.Err == nil {
+		t.Fatalf("event %+v carries no error", ev)
+	}
+	if _, ok := <-ch; ok {
+		t.Fatal("the error event is not the last one")
+	}
+}
