@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -280,10 +281,11 @@ func (w *wsSession) tick() bool {
 
 // deliver emits one subscription's notifications for blocks [from, to]. It
 // returns the highest block it fully delivered (from-1 for none), and false
-// only when the WRITE failed, which is the one condition that ends the
-// connection: a read error is transient (a cook gap, a container not yet
-// local), so it stops this batch and leaves the cursor where it was, and the
-// next tick retries from the same block.
+// when the connection must end: a failed WRITE, or a container this
+// subscription can never deliver truthfully. A read error is neither, being
+// transient (a cook gap, a container not yet local), so it stops this batch
+// and leaves the cursor where it was, and the next tick retries from the same
+// block.
 func (w *wsSession) deliver(id string, sub *wsSub, from, to uint64) (uint64, bool) {
 	switch sub.kind {
 	case "logs":
@@ -316,8 +318,18 @@ func (w *wsSession) deliver(id string, sub *wsSub, from, to uint64) (uint64, boo
 			for i, tx := range blk.Transactions() {
 				var payload any = tx.Hash()
 				if sub.fullTx {
-					payload = newRPCTransaction(tx, blk.Hash(), n, blk.Time(),
+					rt := newRPCTransaction(tx, blk.Hash(), n, blk.Time(),
 						uint64(i), blk.BaseFee(), w.srv.chainCfg)
+					if rt == nil {
+						// Nothing truthful can go out for this transaction:
+						// `null` in the stream is unreadable, and skipping it
+						// drops one the subscription promised to deliver. End
+						// the connection instead, and say why here, because
+						// the fault is in THIS node's copy of the container.
+						log.Printf("rpc: ws subscription %s ended: %s", id, errBadSender(tx, n).Message)
+						return n - 1, false
+					}
+					payload = rt
 				}
 				if w.notify(id, payload) != nil {
 					return n - 1, false

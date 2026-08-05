@@ -53,7 +53,13 @@ func (s *Server) heightByHash(raw json.RawMessage) (uint64, bool, *rpcError) {
 
 // marshalBlock duplicates coreth internal/ethapi RPCMarshalHeader/Block
 // (that package is not importable) so responses byte-match the public API.
-func (s *Server) marshalBlock(blk *types.Block, fullTx bool) map[string]any {
+//
+// It ERRORS when fullTx is set and a transaction's sender does not recover.
+// Marshalling the nil newRPCTransaction hands back would put `null` in the
+// transactions array, which a client cannot tell from a protocol quirk, and
+// the container is genuinely unusable: the same failure is an error on every
+// single-transaction path already.
+func (s *Server) marshalBlock(blk *types.Block, fullTx bool) (map[string]any, *rpcError) {
 	head := blk.Header()
 	fields := map[string]any{
 		"number":           (*hexutil.Big)(head.Number),
@@ -99,20 +105,26 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) map[string]any {
 	transactions := make([]any, len(txs))
 	for i, tx := range txs {
 		if fullTx {
-			transactions[i] = newRPCTransaction(tx, blk.Hash(), blk.NumberU64(), blk.Time(),
+			rt := newRPCTransaction(tx, blk.Hash(), blk.NumberU64(), blk.Time(),
 				uint64(i), blk.BaseFee(), s.chainCfg)
+			if rt == nil {
+				return nil, errBadSender(tx, blk.NumberU64())
+			}
+			transactions[i] = rt
 		} else {
 			transactions[i] = tx.Hash()
 		}
 	}
 	fields["transactions"] = transactions
-	return fields
+	return fields, nil
 }
 
 // marshalHeader is marshalBlock's header-only shape, shared by
-// eth_getHeaderBy* and the newHeads subscription.
+// eth_getHeaderBy* and the newHeads subscription. A header has no sender in
+// it, so the fullTx=false call below is marshalBlock's one branch that cannot
+// fail and this stays error-free.
 func (s *Server) marshalHeader(blk *types.Block) map[string]any {
-	m := s.marshalBlock(blk, false)
+	m, _ := s.marshalBlock(blk, false)
 	delete(m, "transactions")
 	delete(m, "uncles")
 	delete(m, "size")
@@ -155,7 +167,7 @@ func (s *Server) getBlockByNumber(params []json.RawMessage) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	return s.marshalBlock(blk, full), nil
+	return s.marshalBlock(blk, full)
 }
 
 // isTag reports whether a raw block-tag param is exactly the given tag.
@@ -183,7 +195,7 @@ func (s *Server) getBlockByHash(params []json.RawMessage) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	return s.marshalBlock(blk, full), nil
+	return s.marshalBlock(blk, full)
 }
 
 func (s *Server) blockTxCount(params []json.RawMessage, byHash bool) (any, *rpcError) {
@@ -214,7 +226,11 @@ func (s *Server) txByBlockAndIndex(params []json.RawMessage, byHash bool) (any, 
 	if i >= uint64(len(txs)) {
 		return nil, nil
 	}
-	return newRPCTransaction(txs[i], blk.Hash(), blk.NumberU64(), blk.Time(), i, blk.BaseFee(), s.chainCfg), nil
+	out := newRPCTransaction(txs[i], blk.Hash(), blk.NumberU64(), blk.Time(), i, blk.BaseFee(), s.chainCfg)
+	if out == nil {
+		return nil, errBadSender(txs[i], blk.NumberU64())
+	}
+	return out, nil
 }
 
 // blockParam resolves params[0] as either a block tag or a block hash.
@@ -268,7 +284,11 @@ func (s *Server) getBlockReceipts(params []json.RawMessage) (any, *rpcError) {
 	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
 	out := make([]any, len(receipts))
 	for i, r := range receipts {
-		out[i] = marshalReceipt(r, blk.Hash(), n, signer, blk.Transactions()[i], i)
+		m := marshalReceipt(r, blk.Hash(), n, signer, blk.Transactions()[i], i)
+		if m == nil {
+			return nil, errBadSender(blk.Transactions()[i], n)
+		}
+		out[i] = m
 	}
 	return out, nil
 }

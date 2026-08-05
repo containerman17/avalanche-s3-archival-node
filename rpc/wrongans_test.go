@@ -172,16 +172,42 @@ func TestUnrecoverableSenderIsNotTheZeroAddress(t *testing.T) {
 	bad := types.NewTx(&types.LegacyTx{Nonce: 0, To: &to, Gas: 21000, GasPrice: big.NewInt(1)}) // unsigned
 	env := newWrongAnswerEnv(t, map[uint64]types.Transactions{2: {bad}})
 	env.srv.EnableTxAPIs(
-		stubCandidates{at: map[common.Hash][]uint64{bad.Hash(): {2}}},
+		// The block hash resolves too, so the by-hash paths reach the same
+		// container rather than answering "unknown block".
+		stubCandidates{at: map[common.Hash][]uint64{bad.Hash(): {2}, env.hashes[2]: {2}}},
 		env.blocks, exec.ParseEthBlock,
 	)
 
-	res, rerr := env.srv.dispatch(&rpcRequest{Method: "eth_getTransactionByHash", Params: mustParams(t, bad.Hash())})
-	if rerr == nil {
-		t.Fatalf("unrecoverable sender marshalled as %+v", res)
+	// Every path that marshals this transaction, not only the per-tx ones:
+	// the BLOCK paths used to marshal the nil as JSON null, so a client saw a
+	// transactions array with a hole in it (or `"from": null`) and could not
+	// tell a corrupt container from a protocol quirk.
+	for _, c := range []struct {
+		method string
+		params []any
+	}{
+		{"eth_getTransactionByHash", []any{bad.Hash()}},
+		{"eth_getBlockByNumber", []any{"0x2", true}},
+		{"eth_getBlockByHash", []any{env.hashes[2], true}},
+		{"eth_getTransactionByBlockNumberAndIndex", []any{"0x2", "0x0"}},
+		{"eth_getTransactionByBlockHashAndIndex", []any{env.hashes[2], "0x0"}},
+	} {
+		res, rerr := env.srv.dispatch(&rpcRequest{Method: c.method, Params: mustParams(t, c.params...)})
+		if rerr == nil {
+			t.Fatalf("%s marshalled an unrecoverable sender as %+v", c.method, res)
+		}
+		if !strings.Contains(rerr.Message, "does not recover") {
+			t.Fatalf("%s: unexpected error: %v", c.method, rerr)
+		}
 	}
-	if !strings.Contains(rerr.Message, "does not recover") {
-		t.Fatalf("unexpected error: %v", rerr)
+
+	// The same block WITHOUT full transactions is still answerable: it names
+	// hashes only, so no sender is claimed and nothing is being hidden.
+	if _, rerr := env.srv.dispatch(&rpcRequest{Method: "eth_getBlockByNumber", Params: mustParams(t, "0x2", false)}); rerr != nil {
+		t.Fatalf("hashes-only block refused: %v", rerr)
+	}
+	if _, rerr := env.srv.dispatch(&rpcRequest{Method: "eth_getHeaderByNumber", Params: mustParams(t, "0x2")}); rerr != nil {
+		t.Fatalf("header refused: %v", rerr)
 	}
 }
 
