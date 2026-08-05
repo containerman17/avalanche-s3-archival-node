@@ -215,9 +215,14 @@ measurement**: Firewood 130-157 GB, ~14.5 GB of unsealed tail, ~7.7 GB of warm i
 published bucket tier of 500-690 GB. For a real datapoint at real scale, Fuji's 20-epoch published
 corpus (55.4M blocks) is 112.4 GB in the bucket.
 
-Sealed epochs compress **3.0x to 4.6x** whole-epoch across the chains we have sealed so far (mainnet
-C-chain, Fuji, L1s). On one mainnet epoch the trained dictionary was worth 4.62x against 3.72x
-without it. Sealed cost lands at 409-592 bytes per transaction depending on era.
+Sealed epochs compress **roughly 3x to 6.9x** whole-epoch, and this is a range rather than a headline
+number because it varies with chain density and era. The low end (~3.0-3.6x) is sparse chains and
+early small epochs; the high end is transaction-dense L1s filling whole 8M-transaction epochs, where
+the per-epoch trained dictionary has a lot of repetition to learn from (measured on one such chain:
+10,359.6 MB down to 1,594.2 MB, 6.50x, and 9,903.4 MB down to 1,530.9 MB, 6.47x). Mainnet C-chain
+sits in the middle at 4.2-4.6x. The dictionary is worth roughly a quarter on its own: on one mainnet
+epoch, 4.62x with it against 3.72x without. Sealed cost lands at 409-592 bytes per transaction
+depending on era.
 
 Epoch size is a pure function of the epoch index (`min(8M, 250k << i)` transactions) so that every
 honest builder cuts byte-identical boundaries with no configuration. There is no size knob.
