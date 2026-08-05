@@ -297,3 +297,45 @@ func TestSealedEpochCarriesADict(t *testing.T) {
 		t.Fatal("sealed epoch has an empty dict section (dict-less seal)")
 	}
 }
+
+// TestDictTrainerRequiresTheExactPinnedVersion. A zstd of the wrong version
+// diverges exactly as silently as no zstd at all: it trains a DIFFERENT
+// dictionary from the same samples, so the epoch gets a different hash while
+// every read still works. An exact pin is a hard system requirement (user
+// ruling 2026-08-05), so the check refuses anything but ZstdPinnedVersion and
+// says which version it found.
+func TestDictTrainerRequiresTheExactPinnedVersion(t *testing.T) {
+	fakeZstd := func(t *testing.T, banner string) {
+		t.Helper()
+		dir := t.TempDir()
+		script := "#!/bin/sh\necho '" + banner + "'\n"
+		if err := os.WriteFile(dir+"/zstd", []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", dir)
+	}
+	t.Run("wrong version", func(t *testing.T) {
+		fakeZstd(t, "*** Zstandard CLI (64-bit) v1.5.4, by Yann Collet ***")
+		err := CheckDictTrainer()
+		if err == nil {
+			t.Fatal("CheckDictTrainer accepted zstd v1.5.4")
+		}
+		for _, want := range []string{"1.5.4", ZstdPinnedVersion} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not name %q: %v", want, err)
+			}
+		}
+	})
+	t.Run("no version in banner", func(t *testing.T) {
+		fakeZstd(t, "not a zstd at all")
+		if err := CheckDictTrainer(); err == nil {
+			t.Fatal("CheckDictTrainer accepted a binary that printed no version")
+		}
+	})
+	t.Run("pinned version", func(t *testing.T) {
+		fakeZstd(t, "*** Zstandard CLI (64-bit) v"+ZstdPinnedVersion+", by Yann Collet ***")
+		if err := CheckDictTrainer(); err != nil {
+			t.Fatalf("CheckDictTrainer rejected the pinned version: %v", err)
+		}
+	})
+}

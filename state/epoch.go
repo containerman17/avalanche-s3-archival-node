@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 
 	"github.com/ava-labs/libevm/common"
@@ -33,11 +34,14 @@ import (
 // There is no opt-out env var. A deliberately dict-less deployment is not a
 // thing anyone wants, and a knob that re-enables divergence is the bug.
 const (
-	// zstdPinnedVersion is the trainer pin. Rebuilds on another version are
-	// not guaranteed bit-identical (decompression always is), so a wrong
-	// version diverges exactly as silently as a missing one and is refused
-	// the same way. Keep in step with the Dockerfile's ZSTD_VERSION.
-	zstdPinnedVersion = "1.5.7"
+	// ZstdPinnedVersion is THE pin, and this line is its single source of
+	// truth: the Dockerfile reads the version out of this file rather than
+	// repeating it, so the image and the binary cannot drift apart. An exact
+	// zstd is a HARD SYSTEM REQUIREMENT (user ruling 2026-08-05); rebuilds on
+	// another version are not guaranteed bit-identical (decompression always
+	// is), so a wrong version diverges exactly as silently as a missing one
+	// and is refused exactly the same way.
+	ZstdPinnedVersion = "1.5.7"
 
 	// dictMinSamples is zstd --train's own floor ("nb of samples too low"
 	// below 7, measured on v1.5.7). Checking it HERE keeps the dict-less
@@ -47,26 +51,37 @@ const (
 	dictMinSamples = 7
 )
 
-// dictTrainerHowTo is what an operator needs to hear, once, on the way out.
-const dictTrainerHowTo = "epochs carry a zstd dictionary trained at seal time by the zstd CLI " +
-	"(pinned v" + zstdPinnedVersion + "); sealing without it would publish a dict-less epoch whose bytes " +
-	"differ from every zstd-equipped builder's rebuild of the same blocks, so the seal refuses instead. " +
-	"Install zstd " + zstdPinnedVersion + ", or run an image that ships it"
+// dictTrainerHowTo is what an operator needs to hear, once, on the way out:
+// what is required, and the two ways to satisfy it.
+const dictTrainerHowTo = "epochs carry a zstd dictionary trained at seal time by the zstd CLI, " +
+	"and the artifact's bytes depend on the trainer, so zstd v" + ZstdPinnedVersion +
+	" EXACTLY is a system requirement: install that version, or run the published " +
+	"ghcr.io/containerman17/epochdb image, which ships it"
 
-// CheckDictTrainer reports whether this machine can seal. Call it at STARTUP,
-// so an operator learns at boot rather than hours later at the first epoch
-// boundary.
+// zstdBanner pulls the version out of `zstd --version`, whose banner reads
+// "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***". Older 1.5.x print a
+// different sentence around the same "vX.Y.Z", which is why this matches the
+// version token rather than the sentence.
+var zstdBanner = regexp.MustCompile(`v(\d+\.\d+\.\d+)`)
+
+// CheckDictTrainer reports whether this machine may seal. `serve` calls it at
+// STARTUP and dies on any error: an operator learns at boot, not hours later
+// at the first epoch boundary, and never after publishing a divergent epoch.
 func CheckDictTrainer() error {
 	if _, err := exec.LookPath("zstd"); err != nil {
 		return fmt.Errorf("zstd CLI not on PATH (%w): %s", err, dictTrainerHowTo)
 	}
 	out, err := exec.Command("zstd", "--version").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("zstd --version: %w: %s: %s", err, bytes.TrimSpace(out), dictTrainerHowTo)
+		return fmt.Errorf("zstd --version failed (%w: %s): %s", err, bytes.TrimSpace(out), dictTrainerHowTo)
 	}
-	if !bytes.Contains(out, []byte("v"+zstdPinnedVersion+",")) {
-		return fmt.Errorf("zstd is not the pinned v%s (%s): %s",
-			zstdPinnedVersion, bytes.TrimSpace(out), dictTrainerHowTo)
+	m := zstdBanner.FindSubmatch(out)
+	if m == nil {
+		return fmt.Errorf("zstd --version printed no version (%q): %s", bytes.TrimSpace(out), dictTrainerHowTo)
+	}
+	if got := string(m[1]); got != ZstdPinnedVersion {
+		return fmt.Errorf("zstd is v%s, this build requires v%s exactly: %s",
+			got, ZstdPinnedVersion, dictTrainerHowTo)
 	}
 	return nil
 }
