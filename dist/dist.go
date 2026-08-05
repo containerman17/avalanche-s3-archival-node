@@ -235,6 +235,18 @@ func Open(dataDir string) (*Store, error) {
 		}
 		maxAge = d
 	}
+	// A cold 4MB chunk comes down as parallel sub-ranges, and casfs bounds them
+	// store-wide. The knob is here because the right number is a property of
+	// the BOX (its NIC and its distance from the bucket), which is measured on
+	// the box rather than guessed at build time.
+	var fetchConc int
+	if v := os.Getenv("EPOCHDB_FETCH_CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("dist: EPOCHDB_FETCH_CONCURRENCY=%q is not a positive request count", v)
+		}
+		fetchConc = n
+	}
 	cacheDir := cacheRoot(dataDir)
 	os.RemoveAll(filepath.Join(dataDir, legacyCacheName))
 	// Empty keys are not an error: casfs falls back to the AWS default chain,
@@ -252,6 +264,8 @@ func Open(dataDir string) (*Store, error) {
 		Namespace:    chainKey(dataDir),
 		CacheMinFree: minFree,
 		CacheMaxAge:  maxAge,
+
+		FetchConcurrency: fetchConc,
 	})
 	if err != nil {
 		return nil, err
