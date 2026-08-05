@@ -208,14 +208,14 @@ func emptyTxPool(method string) any {
 // baseFee mirrors coreth's eth_baseFee: the current base fee. Pre-AP3
 // heads have none; report zero rather than an error.
 func (s *Server) baseFee() (any, *rpcError) {
-	header, rerr := s.headerAt(s.hist.Head())
+	base, rerr := s.baseFeeAt(s.hist.Head())
 	if rerr != nil {
 		return nil, rerr
 	}
-	if header.BaseFee == nil {
+	if base == nil {
 		return "0x0", nil
 	}
-	return hexutil.EncodeBig(header.BaseFee), nil
+	return hexutil.EncodeBig(base), nil
 }
 
 func (s *Server) getHeaderBy(params []json.RawMessage, byHash bool) (any, *rpcError) {
@@ -226,7 +226,11 @@ func (s *Server) getHeaderBy(params []json.RawMessage, byHash bool) (any, *rpcEr
 	if !ok {
 		return nil, nil
 	}
-	return s.marshalHeader(blk), nil
+	m, rerr := s.marshalHeader(blk)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return m, nil
 }
 
 func (s *Server) rawTxByHash(params []json.RawMessage) (any, *rpcError) {

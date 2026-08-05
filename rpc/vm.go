@@ -73,6 +73,17 @@ type callResult struct {
 	Err        error
 }
 
+// gasChain is the per-height corpus content the ACP-194 base fee derivation
+// reads (see saefee.go): a header, for its settlement markers, block time and
+// gas exponents, and the gas a block's execution ACTUALLY consumed, which is
+// the one input no header records. Server implements it; keeping it an
+// interface is what lets the derivation live behind the VM seam without the
+// backends knowing what a Server is.
+type gasChain interface {
+	headerFor(n uint64) (*types.Header, error)
+	gasConsumed(n uint64) (uint64, error)
+}
+
 // rpcVM is the seam: exactly the execution entry points that differ.
 type rpcVM interface {
 	// applyUpgrades is core.ApplyUpgrades at header's boundary. parentTime is
@@ -131,7 +142,28 @@ type rpcVM interface {
 	// height (pre-AP3, pre-SubnetEVM); that is an answer, not a failure. An
 	// error means the projection could not be made and the caller must not
 	// invent one.
-	nextBaseFee(cfg *params.ChainConfig, parent *types.Header) (*big.Int, error)
+	nextBaseFee(cfg *params.ChainConfig, parent *types.Header, c gasChain) (*big.Int, error)
+
+	// baseFees returns the base fee OF each block in [from, to], one entry per
+	// height, in order. It is the backward-looking twin of nextBaseFee and it
+	// exists because on ONE path the answer is not in the header: above the
+	// Helicon boundary a stored header carries no base fee at all, and the
+	// value has to be derived from the ACP-194 gas clock (saefee.go). Below the
+	// boundary, and on every subnet-evm chain, this is header.BaseFee verbatim
+	// and a nil entry means the chain genuinely had no base fee at that height.
+	//
+	// It takes a RANGE rather than a height because the derivation walks the
+	// clock forward: answering a whole range in one walk costs the range plus
+	// the settlement lag, where answering each height separately would cost the
+	// range TIMES the lag.
+	baseFees(cfg *params.ChainConfig, from, to uint64, c gasChain) ([]*big.Int, error)
+
+	// baseFeeOf is baseFees for ONE block whose header the caller already
+	// holds. It takes the header rather than a height so that the accepted tail
+	// answers too: `pending` is a container the executor has not reached, so no
+	// header of it is stored, while everything the derivation walks sits below
+	// it and is.
+	baseFeeOf(cfg *params.ChainConfig, h *types.Header, c gasChain) (*big.Int, error)
 }
 
 // isMergeTODO is coreth's and subnet-evm's params.IsMergeTODO, which is `true`

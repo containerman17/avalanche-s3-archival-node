@@ -97,7 +97,10 @@ func (e *bfEnv) deriveLogsRecord(n uint64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse %d: %w", n, err)
 	}
-	receipts, err := rpc.ReExecuteBlock(e.hist, e.chainCtx, e.cfg.Config, blk)
+	// nil base fee = the header's own. backfill-logs only ever runs below a
+	// corpus's logs.start, which is pre-SAE by construction (SAE-era blocks are
+	// captured live, with their logs), so there is no gas clock to derive here.
+	receipts, err := rpc.ReExecuteBlock(e.hist, e.chainCtx, e.cfg.Config, blk, nil)
 	if err != nil {
 		return nil, fmt.Errorf("re-execute %d: %w", n, err)
 	}

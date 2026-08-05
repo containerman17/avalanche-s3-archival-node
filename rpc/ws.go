@@ -3,6 +3,7 @@ package rpc
 import (
 	"encoding/json"
 	"log"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -307,7 +308,11 @@ func (w *wsSession) deliver(id string, sub *wsSub, from, to uint64) (uint64, boo
 				return n - 1, true
 			}
 			if sub.kind == "newHeads" {
-				if w.notify(id, w.srv.marshalHeader(blk)) != nil {
+				hdr, rerr := w.srv.marshalHeader(blk)
+				if rerr != nil {
+					return n - 1, true
+				}
+				if w.notify(id, hdr) != nil {
 					return n - 1, false
 				}
 				continue
@@ -315,11 +320,18 @@ func (w *wsSession) deliver(id string, sub *wsSub, from, to uint64) (uint64, boo
 			// newAcceptedTransactions: the txs of a block that just became
 			// visible. That is coreth's semantics (accepted, not pending),
 			// and it is exactly what an archival follower can answer.
+			var base *big.Int
+			if sub.fullTx && len(blk.Transactions()) > 0 {
+				var rerr *rpcError
+				if base, rerr = w.srv.headerBaseFee(blk.Header()); rerr != nil {
+					return n - 1, true
+				}
+			}
 			for i, tx := range blk.Transactions() {
 				var payload any = tx.Hash()
 				if sub.fullTx {
 					rt := newRPCTransaction(tx, blk.Hash(), n, blk.Time(),
-						uint64(i), blk.BaseFee(), w.srv.chainCfg)
+						uint64(i), base, w.srv.chainCfg)
 					if rt == nil {
 						// Nothing truthful can go out for this transaction:
 						// `null` in the stream is unreadable, and skipping it

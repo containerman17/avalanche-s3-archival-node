@@ -119,8 +119,12 @@ func (s *Server) getTransactionByHash(params []json.RawMessage) (any, *rpcError)
 	if !found {
 		return nil, nil // unknown tx: result null, like coreth
 	}
+	base, rerr := s.headerBaseFee(blk.Header())
+	if rerr != nil {
+		return nil, rerr
+	}
 	out := newRPCTransaction(blk.Transactions()[i], blk.Hash(), blk.NumberU64(), blk.Time(),
-		uint64(i), blk.BaseFee(), s.chainCfg)
+		uint64(i), base, s.chainCfg)
 	if out == nil {
 		return nil, errBadSender(blk.Transactions()[i], blk.NumberU64())
 	}
@@ -204,6 +208,10 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts decode for block %d: %d entries for %d txs: %v", n, len(entries), len(txs), err)}
 	}
 	header := blk.Header()
+	base, rerr := s.headerBaseFee(header)
+	if rerr != nil {
+		return nil, rerr
+	}
 	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
 	blockHash := blk.Hash()
 	receipts := make(types.Receipts, len(txs))
@@ -214,7 +222,7 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 			CumulativeGasUsed: entries[i].CumulativeGas,
 			GasUsed:           entries[i].GasUsed,
 			TxHash:            tx.Hash(),
-			EffectiveGasPrice: effectiveGasPrice(tx, blk.BaseFee()),
+			EffectiveGasPrice: effectiveGasPrice(tx, base),
 			Logs:              []*types.Log{},
 		}
 		if tx.To() == nil {
@@ -258,8 +266,20 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 // execute after regular txs, emit no EVM logs, and cannot affect these
 // receipts, so they are skipped entirely (matching the live capture's log
 // collection). chainCtx must be safe for the caller's concurrency.
-func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params.ChainConfig, blk *types.Block) (types.Receipts, error) {
+//
+// baseFee, when non-nil, REPLACES the header's own for the replay, and above
+// the Helicon boundary that is the only way to price it correctly: a stored
+// post-Helicon header carries no base fee, and replaying against the nil it
+// does carry charges every dynamic-fee sender its whole fee cap instead of
+// base+tip, so the balances (and therefore any state the txs read back) drift
+// from what really executed. It is the same substitution saexec.Execute makes
+// on its own header copy; blk.Header() is a copy, so the block is untouched.
+// nil means "the header's own", which is right everywhere below the boundary.
+func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params.ChainConfig, blk *types.Block, baseFee *big.Int) (types.Receipts, error) {
 	header := blk.Header()
+	if baseFee != nil {
+		header.BaseFee = baseFee
+	}
 	n := blk.NumberU64()
 	statedb, err := ethstate.New(common.Hash{}, hist.StateAt(n-1), nil)
 	if err != nil {

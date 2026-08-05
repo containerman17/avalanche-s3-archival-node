@@ -107,7 +107,18 @@ func (sevmRPC) minGasPrice(cfg *params.ChainConfig) *big.Int {
 // the window is parsed now, by subnet-evm's own estimator rather than by a
 // hand-rolled read of the layout. Nothing else changed: no execution path
 // reads a base fee this server computes.
-func (sevmRPC) nextBaseFee(cfg *params.ChainConfig, parent *types.Header) (*big.Int, error) {
+func (sevmRPC) nextBaseFee(cfg *params.ChainConfig, parent *types.Header, _ gasChain) (*big.Int, error) {
 	return sevmcustomheader.EstimateNextBaseFee(sevmparams.GetExtra(cfg), feeConfig(cfg),
 		parent, sevmcustomtypes.HeaderTimeMilliseconds(parent))
+}
+
+// baseFees is header.BaseFee, one entry per height. SAE is coreth-only and a
+// subnet-evm header has no settlement markers to read even in principle, so
+// there is nothing to derive here and never will be.
+func (sevmRPC) baseFees(_ *params.ChainConfig, from, to uint64, c gasChain) ([]*big.Int, error) {
+	return headerBaseFees(from, to, c)
+}
+
+func (sevmRPC) baseFeeOf(_ *params.ChainConfig, h *types.Header, _ gasChain) (*big.Int, error) {
+	return h.BaseFee, nil
 }

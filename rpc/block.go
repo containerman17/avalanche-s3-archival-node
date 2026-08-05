@@ -84,8 +84,14 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) (map[string]any, *r
 		// always 1), coreth reports 0.
 		"uncles": []common.Hash{},
 	}
-	if head.BaseFee != nil {
-		fields["baseFeePerGas"] = (*hexutil.Big)(head.BaseFee)
+	// NOT head.BaseFee: above the Helicon boundary the stored header carries
+	// none and the value comes from the ACP-194 gas clock (saefee.go).
+	base, rerr := s.headerBaseFee(head)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if base != nil {
+		fields["baseFeePerGas"] = (*hexutil.Big)(base)
 	}
 	// The optional Cancun header fields, emitted exactly as libevm's
 	// RPCMarshalHeader does (present iff non-nil). Both Avalanche VMs set them
@@ -106,7 +112,7 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) (map[string]any, *r
 	for i, tx := range txs {
 		if fullTx {
 			rt := newRPCTransaction(tx, blk.Hash(), blk.NumberU64(), blk.Time(),
-				uint64(i), blk.BaseFee(), s.chainCfg)
+				uint64(i), base, s.chainCfg)
 			if rt == nil {
 				return nil, errBadSender(tx, blk.NumberU64())
 			}
@@ -121,14 +127,18 @@ func (s *Server) marshalBlock(blk *types.Block, fullTx bool) (map[string]any, *r
 
 // marshalHeader is marshalBlock's header-only shape, shared by
 // eth_getHeaderBy* and the newHeads subscription. A header has no sender in
-// it, so the fullTx=false call below is marshalBlock's one branch that cannot
-// fail and this stays error-free.
-func (s *Server) marshalHeader(blk *types.Block) map[string]any {
-	m, _ := s.marshalBlock(blk, false)
+// it, so the sender branch below cannot fire; the base fee still can, because
+// above the Helicon boundary it is derived and the derivation reads the
+// corpus.
+func (s *Server) marshalHeader(blk *types.Block) (map[string]any, *rpcError) {
+	m, rerr := s.marshalBlock(blk, false)
+	if rerr != nil {
+		return nil, rerr
+	}
 	delete(m, "transactions")
 	delete(m, "uncles")
 	delete(m, "size")
-	return m
+	return m, nil
 }
 
 // fullTxFlag reads the optional fullTx parameter. A MALFORMED one is an
@@ -226,7 +236,11 @@ func (s *Server) txByBlockAndIndex(params []json.RawMessage, byHash bool) (any, 
 	if i >= uint64(len(txs)) {
 		return nil, nil
 	}
-	out := newRPCTransaction(txs[i], blk.Hash(), blk.NumberU64(), blk.Time(), i, blk.BaseFee(), s.chainCfg)
+	base, rerr := s.headerBaseFee(blk.Header())
+	if rerr != nil {
+		return nil, rerr
+	}
+	out := newRPCTransaction(txs[i], blk.Hash(), blk.NumberU64(), blk.Time(), i, base, s.chainCfg)
 	if out == nil {
 		return nil, errBadSender(txs[i], blk.NumberU64())
 	}

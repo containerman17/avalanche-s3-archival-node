@@ -12,6 +12,8 @@ import (
 	"github.com/ava-labs/libevm/eth/tracers"
 	ethparams "github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
+
+	"github.com/containerman17/epochdb/state"
 )
 
 // ClientVersion is returned by web3_clientVersion.
@@ -27,6 +29,89 @@ func (s *Server) headerAt(n uint64) (*types.Header, *rpcError) {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	return &h, nil
+}
+
+// headerFor is headerAt with the plain-error signature gasChain wants.
+func (s *Server) headerFor(n uint64) (*types.Header, error) {
+	h, rerr := s.headerAt(n)
+	if rerr != nil {
+		return nil, fmt.Errorf("%s", rerr.Message)
+	}
+	return h, nil
+}
+
+// gasConsumed is the gas block n's execution ACTUALLY consumed, which is what
+// the ACP-194 gas clock ticks by and what no header records: above the Helicon
+// boundary `header.GasUsed` is the WORST CASE, the sum of transaction gas
+// LIMITS plus end-of-block (atomic) op gas.
+//
+// Both halves are in the corpus. The real per-transaction gas is the stored
+// receipt-fields section, the same rows eth_getTransactionReceipt answers from
+// and never a re-execution. The op gas is recovered by SUBTRACTION, from the
+// worst-case identity the executor verifies on every single SAE block
+// (exec.checkSAEGasUsed): GasUsed == sum(tx limits) + op gas. That is why this
+// needs no atomic-transaction parse, and therefore no AVAX asset ID, which the
+// read server does not have.
+func (s *Server) gasConsumed(n uint64) (uint64, error) {
+	blk, rerr := s.blockAt(n)
+	if rerr != nil {
+		return 0, fmt.Errorf("%s", rerr.Message)
+	}
+	txs := blk.Transactions()
+	var limits uint64
+	for _, tx := range txs {
+		limits += tx.Gas()
+	}
+	if blk.GasUsed() < limits {
+		return 0, fmt.Errorf("block %d: header gas used %d is below the %d of transaction gas limits it must cover",
+			n, blk.GasUsed(), limits)
+	}
+	used := blk.GasUsed() - limits // end-of-block op gas
+	if len(txs) == 0 {
+		return used, nil
+	}
+	rcptRec, _, rerr := s.storedSections(n)
+	if rerr != nil {
+		return 0, fmt.Errorf("%s", rerr.Message)
+	}
+	entries, err := state.DecodeStoredReceipts(rcptRec)
+	if err != nil || len(entries) != len(txs) {
+		return 0, fmt.Errorf("stored receipts decode for block %d: %d entries for %d txs: %v", n, len(entries), len(txs), err)
+	}
+	return used + entries[len(entries)-1].CumulativeGas, nil
+}
+
+// baseFees is the base fee of every block in [from, to], through the per-VM
+// seam. A nil entry means the chain had no base fee at that height (pre-AP3,
+// pre-SubnetEVM), which is an answer; anything the seam cannot establish is an
+// ERROR, never a zero, because a zero base fee is a number a wallet acts on.
+func (s *Server) baseFees(from, to uint64) ([]*big.Int, *rpcError) {
+	fees, err := registeredVM().baseFees(s.chainCfg, from, to, s)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("base fee of blocks %d..%d: %v", from, to, err)}
+	}
+	return fees, nil
+}
+
+// baseFeeAt is baseFees for one stored height.
+func (s *Server) baseFeeAt(n uint64) (*big.Int, *rpcError) {
+	h, rerr := s.headerAt(n)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return s.headerBaseFee(h)
+}
+
+// headerBaseFee is baseFeeAt for a block already in hand. Every site that
+// holds one uses THIS, not baseFeeAt: it saves a header read, and it is the
+// only form that can answer for the accepted-but-unexecuted tail, whose header
+// is not in the store.
+func (s *Server) headerBaseFee(h *types.Header) (*big.Int, *rpcError) {
+	fee, err := registeredVM().baseFeeOf(s.chainCfg, h, s)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("base fee of block %d: %v", h.Number, err)}
+	}
+	return fee, nil
 }
 
 // runCall executes args as a message at height n with the given gas limit,
@@ -207,14 +292,14 @@ func (s *Server) suggestTip() (*big.Int, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	header, rerr := s.headerAt(s.hist.Head())
+	base, rerr := s.baseFeeAt(s.hist.Head())
 	if rerr != nil {
 		return nil, rerr
 	}
-	if header.BaseFee == nil {
+	if base == nil {
 		return price, nil
 	}
-	tip := new(big.Int).Sub(price, header.BaseFee)
+	tip := new(big.Int).Sub(price, base)
 	if tip.Sign() < 0 {
 		tip.SetInt64(0) // the sample sits below the current base fee
 	}
@@ -231,7 +316,7 @@ func (s *Server) nextBaseFee(n uint64) (*big.Int, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	bf, err := registeredVM().nextBaseFee(s.chainCfg, header)
+	bf, err := registeredVM().nextBaseFee(s.chainCfg, header, s)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("project the base fee above block %d: %v", n, err)}
 	}
@@ -244,11 +329,10 @@ func (s *Server) nextBaseFee(n uint64) (*big.Int, *rpcError) {
 func (s *Server) trailingBaseFee(n uint64) (*hexutil.Big, *rpcError) {
 	var next *big.Int
 	if n < s.hist.Head() {
-		header, rerr := s.headerAt(n + 1)
-		if rerr != nil {
+		var rerr *rpcError
+		if next, rerr = s.baseFeeAt(n + 1); rerr != nil {
 			return nil, rerr
 		}
-		next = header.BaseFee
 	} else {
 		var rerr *rpcError
 		if next, rerr = s.nextBaseFee(n); rerr != nil {
@@ -304,14 +388,21 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 		ratios   []float64
 		rewards  []any
 	)
+	// One walk for the whole range: above the Helicon boundary each entry is
+	// derived from the gas clock, and deriving them one at a time would repeat
+	// the settlement-lag walk per block.
+	fees, rerr := s.baseFees(oldest, newest)
+	if rerr != nil {
+		return nil, rerr
+	}
 	for n := oldest; n <= newest; n++ {
 		header, rerr := s.headerAt(n)
 		if rerr != nil {
 			return nil, rerr
 		}
 		bf := zero
-		if header.BaseFee != nil {
-			bf = (*hexutil.Big)(header.BaseFee)
+		if f := fees[n-oldest]; f != nil {
+			bf = (*hexutil.Big)(f)
 		}
 		baseFees = append(baseFees, bf)
 		ratio := 0.0
@@ -320,7 +411,7 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 		}
 		ratios = append(ratios, ratio)
 		if len(percentiles) > 0 {
-			row, rerr := s.rewardRow(n, header, percentiles)
+			row, rerr := s.rewardRow(n, header, (*big.Int)(bf), percentiles)
 			if rerr != nil {
 				return nil, rerr
 			}
@@ -357,7 +448,7 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 // rewardRow computes the effective-tip percentiles of one block, weighted
 // by per-tx gas used (geth's algorithm; gas weights come from one
 // re-execution).
-func (s *Server) rewardRow(n uint64, header *types.Header, percentiles []float64) ([]any, *rpcError) {
+func (s *Server) rewardRow(n uint64, header *types.Header, baseFee *big.Int, percentiles []float64) ([]any, *rpcError) {
 	row := make([]any, len(percentiles))
 	zero := (*hexutil.Big)(new(big.Int))
 	blk, rerr := s.blockAt(n)
@@ -375,7 +466,7 @@ func (s *Server) rewardRow(n uint64, header *types.Header, percentiles []float64
 	// cover the unsealed raw tail (incl. "latest"), which has no stored
 	// receipt-fields yet. Switch to the stored sections when the unified
 	// follower stores them for the tail too.
-	receipts, err := ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk)
+	receipts, err := ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk, baseFee)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}
 	}
@@ -384,7 +475,6 @@ func (s *Server) rewardRow(n uint64, header *types.Header, percentiles []float64
 		gas uint64
 	}
 	items := make([]tg, len(txs))
-	baseFee := header.BaseFee
 	if baseFee == nil {
 		baseFee = new(big.Int)
 	}

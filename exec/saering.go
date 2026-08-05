@@ -20,9 +20,13 @@ import (
 // Root is the post-execution root of the block it SETTLES, so (a) a block's
 // own root is only attested a few blocks later, which is what the ring is
 // consulted for, and (b) the crash-recovery walk-back can no longer read
-// "the root at height h" off header h. The gas clock is not derivable at
-// an arbitrary height at all: consensus only publishes it at settlement
-// points (hook.SettledGasTime), so it is persisted per block.
+// "the root at height h" off header h. Consensus publishes the gas clock
+// only at settlement points (hook.SettledGasTime), which skip most
+// heights; a READER reconstructs the ones in between by walking the clock
+// forward over the headers and stored receipts (rpc/saefee.go), but the
+// executor already holds it from execution and would otherwise have to
+// read back records of the very block it is executing, so it is persisted
+// per block here.
 //
 // Fixed size on purpose: the window only has to cover the crash walk-back
 // budget plus the settlement lag (a handful of blocks), and a growing
