@@ -68,8 +68,8 @@ func TestTipLiveness(t *testing.T) {
 	}
 	defer db.Close()
 
-	if got := db.Head(); got != 2 {
-		t.Fatalf("head at open = %d, want 2", got)
+	if got, err := db.Head(); err != nil || got != 2 {
+		t.Fatalf("head at open = %d err=%v, want 2", got, err)
 	}
 	if bal, err := db.Balance(addr, Latest); err != nil || bal.Uint64() != 100 {
 		t.Fatalf("cooked balance = %v err=%v, want 100", bal, err)
@@ -79,12 +79,16 @@ func TestTipLiveness(t *testing.T) {
 	write(3, frStorage(frAccount(nil, addr, accRLP(t, 2, 999)), addr, slot, []byte{0x7f}))
 
 	deadline := time.Now().Add(10 * time.Second)
-	for db.Head() < 3 {
-		if err := db.Err(); err != nil {
+	for {
+		head, err := db.Head()
+		if err != nil {
 			t.Fatalf("follower stopped: %v", err)
 		}
+		if head >= 3 {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("head still %d after 10s: the handle never saw the writer's block 3", db.Head())
+			t.Fatalf("head still %d after 10s: the handle never saw the writer's block 3", head)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

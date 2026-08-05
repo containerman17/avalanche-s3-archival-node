@@ -36,6 +36,7 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync"
@@ -170,8 +171,10 @@ func (d *DB) Err() error {
 }
 
 // Head is the writer's current executed head: the highest block this handle
-// answers for.
-func (d *DB) Head() uint64 { return d.hist.Head() }
+// answers for. It returns Err() like every other read: a dead tailing loop
+// freezes this number, and a caller polling it would otherwise see a healthy
+// chain that simply stopped producing blocks.
+func (d *DB) Head() (uint64, error) { return d.hist.Head(), d.Err() }
 
 // --- the tailing loop -------------------------------------------------------
 
@@ -218,7 +221,9 @@ func (d *DB) advance() error {
 		return err
 	}
 	for n := d.hist.Head() + 1; n <= head; n++ {
-		d.addHash(n)
+		if err := d.addHash(n); err != nil {
+			return err
+		}
 	}
 	// The executed label goes up FIRST: a read at Latest resolves the serving
 	// head and is then refused above the executed one, so publishing them the
@@ -248,12 +253,19 @@ func (d *DB) refresh(dir string) error {
 // window between the writer appending a block and its next cook folding that
 // block's hash into the raw tx index; everything below resolves through the
 // index itself.
-func (d *DB) addHash(n uint64) {
+// A header this handle cannot read is a block whose hash never enters the map,
+// so BlockByHash would answer "unknown hash" for a block the writer holds:
+// stop the loop instead, which makes every read return Err().
+func (d *DB) addHash(n uint64) error {
 	raw, ok, err := d.hist.HeaderRLP(n)
-	if err != nil || !ok {
-		return
+	if err != nil {
+		return fmt.Errorf("read header %d: %w", n, err)
+	}
+	if !ok {
+		return fmt.Errorf("header %d missing below the writer's header head", n)
 	}
 	d.reads.AddBlockHash(state.BlockHashFromHeaderRLP(raw), n)
+	return nil
 }
 
 // liveHead reports the height labels to the read paths. This handle only ever
@@ -269,27 +281,37 @@ func (l *liveHead) SyncTarget() uint64    { return l.n.Load() }
 // txIndex swaps the raw tx index as the writer's cook rebuilds it. Heap-only,
 // so a replaced one is just garbage.
 type txIndex struct {
-	mu  sync.RWMutex
-	cur state.CombinedTxIndex
+	mu   sync.RWMutex
+	cur  state.CombinedTxIndex
+	oerr error // why there is no index; nil once one is loaded
 }
 
 func (t *txIndex) WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if t.cur.Epochs == nil {
-		return nil
+		// Zero candidates would make TransactionByHash and BlockByHash answer
+		// "unknown hash" for EVERY hash on the chain, forever: only a cook
+		// watermark advance calls reopen again. The handle says why instead.
+		if t.oerr != nil {
+			return fmt.Errorf("tx index unavailable: %w", t.oerr)
+		}
+		return errors.New("tx index unavailable: never loaded")
 	}
 	return t.cur.WalkCandidates(hash, fn)
 }
 
 func (t *txIndex) reopen(dir string, epochs *state.EpochSet) {
 	raw, err := state.OpenTxIndex(dir)
-	if err != nil {
-		return // no cooked tx index yet: tx-by-hash says so, nothing else breaks
-	}
 	t.mu.Lock()
-	t.cur = state.CombinedTxIndex{Raw: raw, Epochs: epochs}
-	t.mu.Unlock()
+	defer t.mu.Unlock()
+	if err != nil {
+		if t.cur.Epochs == nil { // no previous index to keep serving from
+			t.oerr = err
+		}
+		return
+	}
+	t.cur, t.oerr = state.CombinedTxIndex{Raw: raw, Epochs: epochs}, nil
 }
 
 // --- state reads ------------------------------------------------------------

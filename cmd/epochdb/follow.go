@@ -830,26 +830,38 @@ func (s nodeStatus) serveStatus(chain string) serveStatus {
 // it. The index is heap-only (no mmap, no fds), so a replaced one is just
 // garbage.
 type txIndexHolder struct {
-	mu  sync.RWMutex
-	cur state.CombinedTxIndex
+	mu   sync.RWMutex
+	cur  state.CombinedTxIndex
+	oerr error // why there is no index; nil once one is loaded
 }
 
 func (t *txIndexHolder) WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if t.cur.Epochs == nil {
-		return nil
+		// Walking zero candidates would answer "no such tx" for EVERY hash on
+		// the chain, on a node reporting serving:true: null from
+		// eth_getTransactionByHash / eth_getTransactionReceipt /
+		// eth_getBlockByHash, "0x" from eth_getRawTransactionByHash. One
+		// corrupt txidx bucket must not read as an empty chain.
+		if t.oerr != nil {
+			return fmt.Errorf("tx index unavailable: %w", t.oerr)
+		}
+		return errors.New("tx index unavailable: never loaded")
 	}
 	return t.cur.WalkCandidates(hash, fn)
 }
 
 func (t *txIndexHolder) reopen(dir string, epochs *state.EpochSet) {
 	raw, err := state.OpenTxIndex(dir)
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if err != nil {
 		log.Printf("epochdb: raw tx index unavailable: %v", err)
+		if t.cur.Epochs == nil { // no previous index to keep serving from
+			t.oerr = err
+		}
 		return
 	}
-	t.mu.Lock()
-	t.cur = state.CombinedTxIndex{Raw: raw, Epochs: epochs}
-	t.mu.Unlock()
+	t.cur, t.oerr = state.CombinedTxIndex{Raw: raw, Epochs: epochs}, nil
 }

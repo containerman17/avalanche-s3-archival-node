@@ -7,7 +7,6 @@ import (
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
-	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/core/vm"
 	"github.com/ava-labs/libevm/crypto"
@@ -61,14 +60,23 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 	if n == 0 || n > s.hist.Head() {
 		return nil, errInvalid("block %d not traceable (head %d)", n, s.hist.Head())
 	}
-	statedb, err := ethstate.New(common.Hash{}, s.hist.StateAt(n-1), nil)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	// The parent state through the SAME band selection eth_call uses: the
+	// descent alone (hist.StateAt) answers zeroed accounts above the cooked
+	// watermark, so a trace on a following node used to come back as a
+	// complete, plausible, entirely fictional trace over the whole cook
+	// window. stateAt refuses instead, and says cook lag.
+	statedb, rerr := s.stateAt(n - 1)
+	if rerr != nil {
+		return nil, rerr
 	}
 	// Parent timestamp, not nil: nil re-activates every already-active
 	// precompile here, so every post-Durango trace carried a phantom
 	// SetNonce/SetCode the executor never performed (see exec runEVM).
-	parent := s.chainCtx.GetHeader(header.ParentHash, n-1)
+	cctx := captureHeaders(s.chainCtx)
+	parent := cctx.GetHeader(header.ParentHash, n-1)
+	if cctx.err != nil {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("parent header %d: %v", n-1, cctx.err)}
+	}
 	if parent == nil {
 		return nil, errInvalid("parent header %d missing", n-1)
 	}
@@ -76,7 +84,7 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 	if err := backend.applyUpgrades(s.chainCfg, parent.Time, header, statedb); err != nil {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("apply upgrades: %v", err)}
 	}
-	blockCtx := backend.blockContext(header, s.chainCtx)
+	blockCtx := backend.blockContext(header, cctx)
 	gasLeft := header.GasLimit
 	var (
 		usedGas uint64
@@ -90,7 +98,7 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 		vmCfg := vm.Config{}
 		var tracer tracers.Tracer
 		if target < 0 || i == target {
-			tracer, err = newTracer(cfg, &tracers.Context{
+			t, err := newTracer(cfg, &tracers.Context{
 				BlockHash:   blk.Hash(),
 				BlockNumber: header.Number,
 				TxIndex:     i,
@@ -99,13 +107,24 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 			if err != nil {
 				return nil, errInvalid("tracer: %v", err)
 			}
-			vmCfg.Tracer = tracer
+			tracer, vmCfg.Tracer = t, t
 		}
-		if _, err := backend.applyTx(
-			s.chainCfg, s.chainCtx, blockCtx, &gasLeft, statedb,
+		_, execErr := backend.applyTx(
+			s.chainCfg, cctx, blockCtx, &gasLeft, statedb,
 			header, tx, &usedGas, vmCfg,
-		); err != nil {
-			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("tx %d: %v", i, err)}
+		)
+		// The read failure FIRST, exactly as ReExecuteBlock does it: geth's
+		// getDeleteStateObject records the error and hands back an empty
+		// account, so a failed read surfaces as a nonsense "nonce too high"
+		// or, worse, as a complete trace over zeroed state.
+		if dbErr := statedb.Error(); dbErr != nil {
+			return nil, &rpcError{Code: -32000, Message: dbErr.Error()}
+		}
+		if cctx.err != nil {
+			return nil, &rpcError{Code: -32000, Message: cctx.err.Error()}
+		}
+		if execErr != nil {
+			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("tx %d: %v", i, execErr)}
 		}
 		if tracer != nil {
 			res, err := tracer.GetResult()
@@ -114,6 +133,12 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 			}
 			out = append(out, res)
 		}
+	}
+	if dbErr := statedb.Error(); dbErr != nil {
+		return nil, &rpcError{Code: -32000, Message: dbErr.Error()}
+	}
+	if cctx.err != nil {
+		return nil, &rpcError{Code: -32000, Message: cctx.err.Error()}
 	}
 	return out, nil
 }
@@ -453,6 +478,7 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 	// Geth's fixed-point loop: run with the previous round's list until
 	// the traced list stops changing (AccessListTracer.Equal).
 	backend := registeredVM()
+	cctx := captureHeaders(s.chainCtx)
 	prevTracer := logger.NewAccessListTracer(nil, from, to, precompiles)
 	if args.AccessList != nil {
 		prevTracer = logger.NewAccessListTracer(*args.AccessList, from, to, precompiles)
@@ -478,10 +504,15 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 		if args.Value != nil {
 			msg.Value = (*big.Int)(args.Value)
 		}
-		res, err := backend.applyMsg(s.chainCfg, backend.blockContext(header, s.chainCtx), st,
+		res, err := backend.applyMsg(s.chainCfg, backend.blockContext(header, cctx), st,
 			msg, vm.Config{Tracer: tracer, NoBaseFee: true})
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		// An unreadable BLOCKHASH header is 0x0 in the trace and absent from
+		// st.Error(), so the list would be a fiction of a different kind.
+		if cctx.err != nil {
+			return nil, &rpcError{Code: -32000, Message: cctx.err.Error()}
 		}
 		// A state read that failed (a coverage hole) makes the whole traced
 		// list and gasUsed fiction, exactly as in ethCall.

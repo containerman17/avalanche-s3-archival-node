@@ -144,15 +144,60 @@ func HistoryChainContext(hist *state.History) ChainContext {
 type histChainCtx struct{ hist *state.History }
 
 func (c histChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
+	h, _ := c.headerAt(n) // the error is only visible through captureHeaders
+	return h
+}
+
+// headerAt is GetHeader plus the error the ChainContext signature cannot
+// carry. (nil, nil) means the header is genuinely absent.
+func (c histChainCtx) headerAt(n uint64) (*types.Header, error) {
 	raw, ok, err := c.hist.HeaderRLP(n)
-	if err != nil || !ok {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("read header %d: %w", n, err)
+	}
+	if !ok {
+		return nil, nil
 	}
 	var h types.Header
 	if err := rlp.DecodeBytes(raw, &h); err != nil {
-		return nil
+		return nil, fmt.Errorf("decode header %d: %w", n, err)
 	}
-	return &h
+	return &h, nil
+}
+
+// headerErrSource is the optional half of ChainContext: a source that can say
+// WHY it has no header. The method is unexported, so a foreign ChainContext
+// (exec's, a test fake) still works, just without the diagnosis.
+type headerErrSource interface {
+	headerAt(n uint64) (*types.Header, error)
+}
+
+// captureCtx is a PER-REQUEST ChainContext that keeps the first header read
+// failure. GetHeader can only answer "header or nil" and both VMs turn a nil
+// into BLOCKHASH 0x0, which is a wrong answer no statedb.Error() catches, so
+// every path that executes wraps its context in one of these and checks err
+// afterwards. NOT goroutine-safe: one per request, never shared.
+type captureCtx struct {
+	ChainContext
+	src headerErrSource
+	err error
+}
+
+func captureHeaders(cc ChainContext) *captureCtx {
+	c := &captureCtx{ChainContext: cc}
+	c.src, _ = cc.(headerErrSource)
+	return c
+}
+
+func (c *captureCtx) GetHeader(hash common.Hash, n uint64) *types.Header {
+	if c.src == nil {
+		return c.ChainContext.GetHeader(hash, n)
+	}
+	h, err := c.src.headerAt(n)
+	if err != nil && c.err == nil {
+		c.err = err
+	}
+	return h
 }
 
 func NewServer(hist *state.History, chainCtx ChainContext, chainCfg *params.ChainConfig) *Server {
@@ -663,11 +708,17 @@ func (s *Server) ethCall(params []json.RawMessage) (any, *rpcError) {
 	}
 
 	backend := registeredVM()
-	blockCtx := backend.blockContext(&header, s.chainCtx)
+	cctx := captureHeaders(s.chainCtx)
+	blockCtx := backend.blockContext(&header, cctx)
 	ov.blockDiff().apply(&blockCtx)
 	res, err := backend.applyMsg(s.chainCfg, blockCtx, st, msg, vm.Config{NoBaseFee: true})
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	// A BLOCKHASH the header source could not read is 0x0 in the result and
+	// nothing in st.Error(): it has to be caught here or not at all.
+	if cctx.err != nil {
+		return nil, &rpcError{Code: -32000, Message: cctx.err.Error()}
 	}
 	if err := st.Error(); err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}

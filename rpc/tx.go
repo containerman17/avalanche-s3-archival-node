@@ -71,7 +71,12 @@ func (s *Server) findTx(hash common.Hash) (blk *types.Block, txIndex int, found 
 			return false, err
 		}
 		if !ok {
-			return false, nil // candidate block not (visibly) staged
+			// The index put a candidate HERE and the container cannot be
+			// read (a missing epoch, raw retired below a gap). "Not found"
+			// would be indistinguishable from an unknown tx, and the
+			// receipt path's coverage refusal never runs on that answer, so
+			// stop the walk with the truth instead.
+			return false, fmt.Errorf("container %d is a candidate for %s but is not readable on this node", h, hash)
 		}
 		b, err := s.parse(raw)
 		if err != nil {
@@ -114,8 +119,12 @@ func (s *Server) getTransactionByHash(params []json.RawMessage) (any, *rpcError)
 	if !found {
 		return nil, nil // unknown tx: result null, like coreth
 	}
-	return newRPCTransaction(blk.Transactions()[i], blk.Hash(), blk.NumberU64(), blk.Time(),
-		uint64(i), blk.BaseFee(), s.chainCfg), nil
+	out := newRPCTransaction(blk.Transactions()[i], blk.Hash(), blk.NumberU64(), blk.Time(),
+		uint64(i), blk.BaseFee(), s.chainCfg)
+	if out == nil {
+		return nil, errBadSender(blk.Transactions()[i], blk.NumberU64())
+	}
+	return out, nil
 }
 
 func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError) {
@@ -140,7 +149,11 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 	if rerr != nil {
 		return nil, rerr
 	}
-	return marshalReceipt(receipts[i], blk.Hash(), n, signer, blk.Transactions()[i], i), nil
+	out := marshalReceipt(receipts[i], blk.Hash(), n, signer, blk.Transactions()[i], i)
+	if out == nil {
+		return nil, errBadSender(blk.Transactions()[i], n)
+	}
+	return out, nil
 }
 
 // storedSections returns block n's receipt-fields and full-logs records: from
@@ -205,7 +218,12 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 			Logs:              []*types.Log{},
 		}
 		if tx.To() == nil {
-			from, _ := types.Sender(signer, tx)
+			// A sender that will not recover makes CreateAddress return a
+			// well-formed, entirely wrong contract address.
+			from, err := types.Sender(signer, tx)
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("recover sender of tx %s in block %d: %v", tx.Hash(), n, err)}
+			}
 			r.ContractAddress = crypto.CreateAddress(from, tx.Nonce())
 		}
 		receipts[i] = r
@@ -250,7 +268,11 @@ func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params
 	// Precompile activations at this block boundary write state before txs
 	// run (same call the verified executor makes, parent timestamp included:
 	// nil would re-activate every active precompile, see exec runEVM).
-	parent := chainCtx.GetHeader(header.ParentHash, n-1)
+	cctx := captureHeaders(chainCtx)
+	parent := cctx.GetHeader(header.ParentHash, n-1)
+	if cctx.err != nil {
+		return nil, fmt.Errorf("parent header %d: %w", n-1, cctx.err)
+	}
 	if parent == nil {
 		return nil, fmt.Errorf("parent header %d missing", n-1)
 	}
@@ -258,7 +280,7 @@ func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params
 	if err := backend.applyUpgrades(chainCfg, parent.Time, header, statedb); err != nil {
 		return nil, fmt.Errorf("apply upgrades: %w", err)
 	}
-	blockCtx := backend.blockContext(header, chainCtx)
+	blockCtx := backend.blockContext(header, cctx)
 	gasLeft := header.GasLimit
 	var (
 		usedGas  uint64
@@ -267,7 +289,7 @@ func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params
 	for i, tx := range blk.Transactions() {
 		statedb.SetTxContext(tx.Hash(), i)
 		receipt, err := backend.applyTx(
-			chainCfg, chainCtx, blockCtx, &gasLeft, statedb,
+			chainCfg, cctx, blockCtx, &gasLeft, statedb,
 			header, tx, &usedGas, vm.Config{},
 		)
 		// A statedb read failure is RECORDED, not returned: geth's
@@ -287,6 +309,11 @@ func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params
 	}
 	if dbErr := statedb.Error(); dbErr != nil {
 		return nil, dbErr
+	}
+	// Same class as a failed state read, different channel: an unreadable
+	// BLOCKHASH header is 0x0 in the EVM and nothing in statedb.Error().
+	if cctx.err != nil {
+		return nil, cctx.err
 	}
 	if err := receipts.DeriveFields(chainCfg, blk.Hash(), n, header.Time, header.BaseFee, nil, blk.Transactions()); err != nil {
 		return nil, fmt.Errorf("derive receipt fields: %w", err)
@@ -332,9 +359,17 @@ func effectiveGasPrice(tx *types.Transaction, baseFee *big.Int) *big.Int {
 	return fee
 }
 
+// newRPCTransaction marshals a mined tx, or NIL if the signature does not
+// recover: `"from": "0x000...0"` is an authoritative-looking lie a client
+// cannot detect, and a container whose signature will not recover is a real
+// failure (a corrupt body, or the wrong network's chain id). Every caller
+// must treat nil as an error, not as an empty transaction.
 func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber, blockTime, index uint64, baseFee *big.Int, config *params.ChainConfig) *rpcTransaction {
 	signer := types.MakeSigner(config, new(big.Int).SetUint64(blockNumber), blockTime)
-	from, _ := types.Sender(signer, tx)
+	from, err := types.Sender(signer, tx)
+	if err != nil {
+		return nil
+	}
 	v, r, sv := tx.RawSignatureValues()
 	result := &rpcTransaction{
 		Type:     hexutil.Uint64(tx.Type()),
@@ -385,8 +420,13 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 	return result
 }
 
+// marshalReceipt returns NIL on an unrecoverable sender, for the reason
+// newRPCTransaction does: `"from": "0x000...0"` reads as authoritative.
 func marshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber uint64, signer types.Signer, tx *types.Transaction, txIndex int) map[string]any {
-	from, _ := types.Sender(signer, tx)
+	from, err := types.Sender(signer, tx)
+	if err != nil {
+		return nil
+	}
 	fields := map[string]any{
 		"blockHash":         blockHash,
 		"blockNumber":       hexutil.Uint64(blockNumber),
@@ -414,4 +454,10 @@ func marshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber u
 		fields["contractAddress"] = receipt.ContractAddress
 	}
 	return fields
+}
+
+// errBadSender is what a nil from newRPCTransaction / marshalReceipt means.
+func errBadSender(tx *types.Transaction, n uint64) *rpcError {
+	return &rpcError{Code: -32000, Message: fmt.Sprintf(
+		"sender of tx %s in block %d does not recover (corrupt container, or this node's chain id is not the one it was signed for)", tx.Hash(), n)}
 }
