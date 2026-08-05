@@ -11,10 +11,13 @@ package rpc
 import (
 	"math/big"
 
+	"github.com/ava-labs/avalanchego/graft/subnet-evm/commontype"
 	sevmconsensus "github.com/ava-labs/avalanchego/graft/subnet-evm/consensus"
 	sevmdummy "github.com/ava-labs/avalanchego/graft/subnet-evm/consensus/dummy"
 	sevmcore "github.com/ava-labs/avalanchego/graft/subnet-evm/core"
 	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
+	sevmcustomheader "github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/customheader"
+	sevmcustomtypes "github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/customtypes"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/core/vm"
@@ -75,18 +78,36 @@ func (sevmRPC) applyMsg(cfg *params.ChainConfig, blockCtx vm.BlockContext, state
 	return &callResult{UsedGas: res.UsedGas, ReturnData: res.ReturnData, Revert: res.Revert(), Err: res.Err}, nil
 }
 
-// minGasPrice is the chain's OWN configured minimum base fee, which is the
-// honest floor on an L1: subnet-evm has no protocol-wide minimum gas price,
-// every chain sets its own in genesis feeConfig, and DefaultFeeConfig is what
-// exec's genesis parse falls back to when a genesis omits it. The live base
-// fee itself is never derived here: it is already in header.BaseFee (that is
-// what eth_baseFee and eth_feeHistory read), and the fee WINDOW in
-// header.Extra, which is only needed to project the NEXT block's base fee, is
-// deliberately never parsed.
-func (sevmRPC) minGasPrice(cfg *params.ChainConfig) *big.Int {
+// feeConfig is the chain's own genesis feeConfig, with subnet-evm's default
+// standing in when a genesis omits it (which is what exec's genesis parse
+// falls back to as well). Both fee answers below need it, and an L1 has no
+// protocol-wide constant to fall back on instead.
+func feeConfig(cfg *params.ChainConfig) commontype.FeeConfig {
 	fc := sevmparams.GetExtra(cfg).FeeConfig
 	if fc.MinBaseFee == nil {
-		fc = sevmparams.DefaultFeeConfig
+		return sevmparams.DefaultFeeConfig
 	}
-	return new(big.Int).Set(fc.MinBaseFee)
+	return fc
+}
+
+// minGasPrice is the chain's OWN configured minimum base fee, which is the
+// honest floor on an L1: subnet-evm has no protocol-wide minimum gas price,
+// every chain sets its own in genesis feeConfig. The base fee OF A BLOCK is
+// never derived here, it is already in header.BaseFee (that is what
+// eth_baseFee and eth_feeHistory read).
+func (sevmRPC) minGasPrice(cfg *params.ChainConfig) *big.Int {
+	return new(big.Int).Set(feeConfig(cfg).MinBaseFee)
+}
+
+// nextBaseFee slides subnet-evm's FEE WINDOW, which lives in header.Extra.
+//
+// That window used to be deliberately unparsed here, on the reasoning that it
+// exists only to derive the NEXT block's base fee and nothing needed one. That
+// reason expired the moment eth_feeHistory had to fill its trailing entry, so
+// the window is parsed now, by subnet-evm's own estimator rather than by a
+// hand-rolled read of the layout. Nothing else changed: no execution path
+// reads a base fee this server computes.
+func (sevmRPC) nextBaseFee(cfg *params.ChainConfig, parent *types.Header) (*big.Int, error) {
+	return sevmcustomheader.EstimateNextBaseFee(sevmparams.GetExtra(cfg), feeConfig(cfg),
+		parent, sevmcustomtypes.HeaderTimeMilliseconds(parent))
 }

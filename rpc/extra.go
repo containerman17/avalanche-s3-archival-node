@@ -91,22 +91,22 @@ var (
 	priceOptMinTip  = big.NewInt(1)
 )
 
-// suggestPriceOptions is coreth's wallet-facing fee suggestion.
-//
-// ONE DOCUMENTED DEVIATION: coreth doubles its estimate of the NEXT block's
-// base fee; this doubles the CURRENT head's base fee, because epochdb projects
-// no forward base fee on either VM kind (the same gap that leaves
-// eth_feeHistory's trailing entry at 0, DESIGN "subnet-evm scoping"). The
-// doubling is the margin that exists for exactly this drift.
+// suggestPriceOptions is coreth's wallet-facing fee suggestion, and it is
+// coreth's two inputs verbatim: the projected NEXT base fee (doubled, as the
+// margin against drift) and a suggested TIP. It shares both with the rest of
+// the fee surface, so it inherited both of that surface's errors: the estimate
+// fed in here used to be the whole sampled gas price rather than the tip, and
+// the base fee doubled used to be the CURRENT head's rather than the next
+// block's, since nothing projected one.
 func (s *Server) suggestPriceOptions() (any, *rpcError) {
-	header, rerr := s.headerAt(s.hist.Head())
+	base, rerr := s.nextBaseFee(s.hist.Head())
 	if rerr != nil {
 		return nil, rerr
 	}
-	if header.BaseFee == nil {
+	if base == nil {
 		return nil, nil // pre-dynamic-fee head: coreth returns null too
 	}
-	estimate, rerr := s.gasOracle()
+	estimate, rerr := s.suggestTip()
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -117,7 +117,7 @@ func (s *Server) suggestPriceOptions() (any, *rpcError) {
 	normal := new(big.Int).Set(capped)
 	fast := new(big.Int).Div(new(big.Int).Mul(estimate, priceOptFastPct), priceOptDenom)
 
-	base := new(big.Int).Lsh(header.BaseFee, 1)
+	base = new(big.Int).Lsh(base, 1)
 	price := func(tip *big.Int) *priceOption {
 		return &priceOption{
 			GasTip: (*hexutil.Big)(tip),

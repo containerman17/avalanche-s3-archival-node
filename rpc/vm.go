@@ -106,6 +106,32 @@ type rpcVM interface {
 	// answer in the fee surface: the C-chain's phase-0 minimum is a constant,
 	// an L1's is whatever its own genesis fee config says.
 	minGasPrice(cfg *params.ChainConfig) *big.Int
+
+	// nextBaseFee projects the base fee of the block that would be built on
+	// parent. It is the one FORWARD-LOOKING fee answer this server gives
+	// (eth_feeHistory's trailing baseFeePerGas entry and
+	// eth_suggestPriceOptions' maxFeePerGas), and it lives behind the seam
+	// because the fee algorithm itself is per-VM: coreth advances the
+	// ACP-176/AP3 fee state it keeps in parent.Extra, subnet-evm slides the
+	// fee window it keeps in parent.Extra against the chain's own feeConfig.
+	// Both VMs export the estimator, so neither side reimplements arithmetic
+	// a node already agrees on.
+	//
+	// THE TIMESTAMP IS THE PARENT'S OWN, not wall clock, and that is a
+	// deliberate difference from a validator: a validator projects for a
+	// block it is about to build NOW, while this server answers for a corpus
+	// whose head may be years old, where "now" decays the fee state to the
+	// floor and produces a confident number about a chain that stopped. At
+	// the tip the two differ by one block interval, and in the direction that
+	// is safe for the only thing a caller does with it: elapsed time only
+	// ever LOWERS the next base fee, so projecting at the parent's timestamp
+	// is an upper bound on what the next block will charge.
+	//
+	// A nil result with a nil error means the chain has NO base fee at that
+	// height (pre-AP3, pre-SubnetEVM); that is an answer, not a failure. An
+	// error means the projection could not be made and the caller must not
+	// invent one.
+	nextBaseFee(cfg *params.ChainConfig, parent *types.Header) (*big.Int, error)
 }
 
 // isMergeTODO is coreth's and subnet-evm's params.IsMergeTODO, which is `true`

@@ -30,6 +30,7 @@ import (
 	"strings"
 	"testing"
 
+	sevmconsensus "github.com/ava-labs/avalanchego/graft/subnet-evm/consensus"
 	sevmdummy "github.com/ava-labs/avalanchego/graft/subnet-evm/consensus/dummy"
 	sevmcore "github.com/ava-labs/avalanchego/graft/subnet-evm/core"
 	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
@@ -45,6 +46,7 @@ import (
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
+	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/triedb"
 
@@ -188,17 +190,24 @@ func referenceGenesis(t *testing.T, c *chain.Chain) *sevmcore.Genesis {
 	return g
 }
 
-// generateChain builds the reference blocks with subnet-evm's OWN builder,
-// which runs its own StateProcessor to fill every header.Root.
-func generateChain(t *testing.T, g *sevmcore.Genesis) []*types.Block {
-	t.Helper()
-	engine := sevmdummy.NewFakerWithMode(sevmdummy.Mode{
+// sevmEngine is the faker the reference builder runs under.
+func sevmEngine() sevmconsensus.Engine {
+	return sevmdummy.NewFakerWithMode(sevmdummy.Mode{
 		ModeSkipHeader: true, ModeSkipBlockFee: true, ModeSkipCoinbase: true,
 	})
+}
+
+// generateChain builds the reference blocks with subnet-evm's OWN builder,
+// which runs its own StateProcessor to fill every header.Root. It hands back
+// the builder's database too, so a test can ask that same builder for the
+// block it WOULD build next (TestFeeHistory's projection reference).
+func generateChain(t *testing.T, g *sevmcore.Genesis) (ethdb.Database, []*types.Block) {
+	t.Helper()
+	engine := sevmEngine()
 	chainID := g.Config.ChainID
 	contract := crypto.CreateAddress(fundedAddr(), 1) // nonce 1 = the deploy tx
 
-	_, blocks, _, err := sevmcore.GenerateChainWithGenesis(g, engine, headBlock, blockGap, func(i int, b *sevmcore.BlockGen) {
+	db, blocks, _, err := sevmcore.GenerateChainWithGenesis(g, engine, headBlock, blockGap, func(i int, b *sevmcore.BlockGen) {
 		sign := func(data types.TxData) *types.Transaction {
 			tx, err := types.SignNewTx(funded, b.Signer(), data)
 			if err != nil {
@@ -229,7 +238,7 @@ func generateChain(t *testing.T, g *sevmcore.Genesis) []*types.Block {
 	if err != nil {
 		t.Fatalf("generate reference chain: %v", err)
 	}
-	return blocks
+	return db, blocks
 }
 
 // source is exec.BlockSource / rpc.BlockSource over pre-ProposerVM raw block
@@ -268,6 +277,11 @@ type env struct {
 	blocks   []*types.Block
 	genesis  *exec.Genesis
 	contract common.Address
+
+	// ref and refDB are subnet-evm's own builder and its state, kept so a
+	// test can ask it for the block it would build NEXT.
+	ref   *sevmcore.Genesis
+	refDB ethdb.Database
 }
 
 func newEnv(t *testing.T) *env {
@@ -289,7 +303,7 @@ func newEnv(t *testing.T) *env {
 	if refRoot := ref.ToBlock().Root(); refRoot != g.Root {
 		t.Fatalf("genesis root: exec %x, subnet-evm's own parse %x", g.Root, refRoot)
 	}
-	blocks := generateChain(t, ref)
+	refDB, blocks := generateChain(t, ref)
 
 	src := source{}
 	for _, blk := range blocks {
@@ -348,7 +362,10 @@ func newEnv(t *testing.T) *env {
 	for _, blk := range blocks {
 		srv.AddBlockHash(blk.Hash(), blk.NumberU64())
 	}
-	return &env{srv: srv, blocks: blocks, genesis: g, contract: crypto.CreateAddress(fundedAddr(), 1)}
+	return &env{
+		srv: srv, blocks: blocks, genesis: g, ref: ref, refDB: refDB,
+		contract: crypto.CreateAddress(fundedAddr(), 1),
+	}
 }
 
 func (e *env) block(n uint64) *types.Block { return e.blocks[n-1] }
@@ -755,6 +772,25 @@ func TestFeeHistory(t *testing.T) {
 		}
 	}
 
+	// THE TRAILING ENTRY IS THE PROJECTION, and the reference is subnet-evm's
+	// OWN block builder asked for the block it would build on head at head's
+	// own timestamp (gap 0), which is exactly the block the trailing entry
+	// describes. That builder resolves the fee config from CHAIN STATE while
+	// the server reads it off the chain config, and it slides the fee window
+	// out of header.Extra, which this package deliberately never parsed until
+	// this entry needed it, so agreeing is a real check and not a restatement.
+	ref, _, err := sevmcore.GenerateChain(e.ref.Config, e.block(headBlock), sevmEngine(), e.refDB, 1, 0, nil)
+	if err != nil {
+		t.Fatalf("generate the reference next block: %v", err)
+	}
+	wantNext := ref[0].BaseFee()
+	if wantNext == nil || wantNext.Sign() == 0 {
+		t.Fatal("the reference next block carries no base fee, so this proves nothing")
+	}
+	if got := fh.BaseFeePerGas[3]; got != hexutil.EncodeBig(wantNext) {
+		t.Fatalf("trailing baseFeePerGas %s, want the next block's %s (0 means nothing was projected)", got, wantNext)
+	}
+
 	// eth_baseFee and eth_gasPrice read the same headers and must agree with
 	// them; the head block has txs, so the oracle samples rather than falling
 	// back to the chain's configured minimum.
@@ -763,6 +799,12 @@ func TestFeeHistory(t *testing.T) {
 	}
 	if got, want := decodeBig(t, e.mustCall(t, "eth_gasPrice")), e.block(headBlock).BaseFee(); got.Cmp(want) != 0 {
 		t.Fatalf("eth_gasPrice %s, want the sampled effective price %s", got, want)
+	}
+	// ...and eth_maxPriorityFeePerGas is the TIP, which on this chain is zero:
+	// every transaction bids GasTipCap 0 and GasFeeCap = the base fee. It used
+	// to answer the whole sampled price, i.e. the base fee itself.
+	if got := decodeBig(t, e.mustCall(t, "eth_maxPriorityFeePerGas")); got.Sign() != 0 {
+		t.Fatalf("eth_maxPriorityFeePerGas %s, want 0: every tx here bids a zero tip", got)
 	}
 }
 

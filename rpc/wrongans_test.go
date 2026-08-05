@@ -12,6 +12,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/trie"
 
+	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/state"
 )
@@ -51,8 +52,16 @@ type waEnv struct {
 
 func newWrongAnswerEnv(t *testing.T, txs map[uint64]types.Transactions) *waEnv {
 	t.Helper()
+	return newChainEnv(t, mustCChain(t, 1), txs)
+}
+
+// newChainEnv is the same three blocks on a CHOSEN chain, with an optional
+// hook that fills in header fields the caller cares about (fees_test.go needs
+// real base fees and fee state; a wrong-answer test needs neither).
+func newChainEnv(t *testing.T, c *chain.Chain, txs map[uint64]types.Transactions, hdr ...func(n uint64, h *types.Header)) *waEnv {
+	t.Helper()
 	dir := t.TempDir()
-	gm, err := exec.ChainGenesis(mustCChain(t, 1))
+	gm, err := exec.ChainGenesis(c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +79,9 @@ func newWrongAnswerEnv(t *testing.T, txs map[uint64]types.Transactions) *waEnv {
 			ParentHash: parent,
 			Difficulty: big.NewInt(1),
 			GasLimit:   8_000_000,
+		}
+		for _, fn := range hdr {
+			fn(n, h)
 		}
 		blk := types.NewBlock(h, txs[n], nil, nil, trie.NewStackTrie(nil))
 		raw, err := rlp.EncodeToBytes(blk)

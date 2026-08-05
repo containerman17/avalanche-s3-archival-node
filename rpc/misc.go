@@ -192,6 +192,75 @@ func (s *Server) gasOracle() (*big.Int, *rpcError) {
 	return prices[len(prices)*60/100], nil
 }
 
+// suggestTip is eth_maxPriorityFeePerGas (and the tip eth_suggestPriceOptions
+// builds its three speeds from): the part of the sampled gas price that sits
+// ABOVE the current base fee, floored at zero.
+//
+// IT IS THE TIP, NOT THE PRICE. Reporting the whole sampled price, which this
+// did, is not a rounding difference: a wallet sets maxPriorityFeePerGas to
+// what this returns and maxFeePerGas to base + tip, so the whole price coming
+// back as a "tip" makes it bid roughly twice the base fee as a priority fee
+// and pay it to the coinbase. On a pre-dynamic-fee head there is no base fee
+// to subtract and the whole price genuinely IS the tip.
+func (s *Server) suggestTip() (*big.Int, *rpcError) {
+	price, rerr := s.gasOracle()
+	if rerr != nil {
+		return nil, rerr
+	}
+	header, rerr := s.headerAt(s.hist.Head())
+	if rerr != nil {
+		return nil, rerr
+	}
+	if header.BaseFee == nil {
+		return price, nil
+	}
+	tip := new(big.Int).Sub(price, header.BaseFee)
+	if tip.Sign() < 0 {
+		tip.SetInt64(0) // the sample sits below the current base fee
+	}
+	return tip, nil
+}
+
+// nextBaseFee projects the base fee of the block that would be built on the
+// header at n, through the per-VM seam (rpcVM.nextBaseFee). A nil result is
+// "this chain has no base fee at that height", which is an answer; anything
+// the seam cannot project is an ERROR, never a plausible stand-in, because
+// every caller hands the number straight to a wallet.
+func (s *Server) nextBaseFee(n uint64) (*big.Int, *rpcError) {
+	header, rerr := s.headerAt(n)
+	if rerr != nil {
+		return nil, rerr
+	}
+	bf, err := registeredVM().nextBaseFee(s.chainCfg, header)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("project the base fee above block %d: %v", n, err)}
+	}
+	return bf, nil
+}
+
+// trailingBaseFee is eth_feeHistory's blockCount+1'th entry: the base fee of
+// the block after n. Below the head that block is READ, not estimated; at the
+// head it is projected.
+func (s *Server) trailingBaseFee(n uint64) (*hexutil.Big, *rpcError) {
+	var next *big.Int
+	if n < s.hist.Head() {
+		header, rerr := s.headerAt(n + 1)
+		if rerr != nil {
+			return nil, rerr
+		}
+		next = header.BaseFee
+	} else {
+		var rerr *rpcError
+		if next, rerr = s.nextBaseFee(n); rerr != nil {
+			return nil, rerr
+		}
+	}
+	if next == nil {
+		next = new(big.Int) // pre-AP3 / pre-SubnetEVM: there is no base fee
+	}
+	return (*hexutil.Big)(next), nil
+}
+
 // feeHistory serves the geth-shaped response from headers (and, when
 // reward percentiles are requested, per-block re-execution for tx weights).
 // ponytail: percentile rewards cap the range at 128 blocks; raise when a
@@ -258,19 +327,22 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 			rewards = append(rewards, row)
 		}
 	}
-	// geth's shape wants blockCount+1 entries, the last being the NEXT block's
-	// projected base fee. We do not project one on either VM kind.
+	// geth's shape wants blockCount+1 entries, the last describing the block
+	// AFTER the range. A wallet reads exactly that entry to set maxFeePerGas,
+	// so the 0 this used to append was the answer that makes a transaction
+	// never mine.
 	//
-	// ponytail: the trailing entry is 0. Per-block base fees above are exact
-	// on both kinds (header.BaseFee, which coreth fills from AP3 on and
-	// subnet-evm fills from its SubnetEVM timestamp on), so only this one
-	// forward-looking slot is unanswered. Projecting it means running the fee
-	// algorithm: coreth's dynamic fee over the parent window, or subnet-evm's
-	// fee window out of header.Extra, both of which also need a timestamp for
-	// a block nobody has built. Emit the real projection if a fee-estimating
-	// client ever needs it; nothing on the execution path reads a base fee at
-	// all (DESIGN, subnet-evm scoping).
-	baseFees = append(baseFees, zero)
+	// ON AN ARCHIVE MOST OF THOSE BLOCKS ARE NOT UNBUILT. Only a range ending
+	// at the head needs an estimate at all; anywhere below it the next block
+	// is a block this node HOLDS, and its header's own base fee is a fact
+	// rather than a projection. That is also exactly what a real node does
+	// (avalanchego's saevm gasprice estimator takes the trailing entry off
+	// block last+1 whenever last is not the accepted head).
+	next, rerr := s.trailingBaseFee(newest)
+	if rerr != nil {
+		return nil, rerr
+	}
+	baseFees = append(baseFees, next)
 	out := map[string]any{
 		"oldestBlock":   hexutil.EncodeUint64(oldest),
 		"baseFeePerGas": baseFees,

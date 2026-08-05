@@ -260,7 +260,12 @@ func TestNewlyServedMethods(t *testing.T) {
 		t.Fatalf("suggestPriceOptions returned a partial answer: %+v", opts)
 	}
 	slow, normal, fast := decodeBigStr(t, opts.Slow.Tip), decodeBigStr(t, opts.Normal.Tip), decodeBigStr(t, opts.Fast.Tip)
-	if slow.Cmp(normal) > 0 || normal.Cmp(fast) > 0 {
+	// The three are ordered, with coreth's one exception reproduced verbatim:
+	// slow is floored at 1 wei while normal is not, so on a chain whose
+	// transactions all bid a ZERO TIP (this one) slow is 1 and normal is 0.
+	// That ordering only looked total while the "tip" was the whole sampled
+	// gas price, which is the defect this chain now pins.
+	if normal.Cmp(fast) > 0 || (slow.Cmp(normal) > 0 && slow.Cmp(big.NewInt(1)) != 0) {
 		t.Fatalf("price options out of order: slow %v, normal %v, fast %v", slow, normal, fast)
 	}
 	if decodeBigStr(t, opts.Normal.Fee).Cmp(normal) <= 0 {
