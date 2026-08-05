@@ -90,7 +90,12 @@ func serveMain(args []string) {
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
 
-	// Bad flag values die before anything binds or dials.
+	// Bad flag values die before anything binds or dials. So does a machine
+	// that cannot train an epoch dictionary: serve seals on the cook tick, and
+	// finding that out at the first epoch boundary is hours too late.
+	if err := state.CheckDictTrainer(); err != nil {
+		log.Fatalf("epochdb: serve: %v", err)
+	}
 	var tip ids.ID
 	if *tipOverride != "" {
 		var err error

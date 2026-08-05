@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/ava-labs/libevm/common"
@@ -253,5 +254,46 @@ func TestSealStreamingMatchesGather(t *testing.T) {
 				t.Fatalf("%s: seal scratch %s left behind", d, en.Name())
 			}
 		}
+	}
+}
+
+// TestSealRefusesWithoutDictTrainer pins the OTHER half of byte-identity: not
+// that two builders agree, but that a builder which CANNOT agree refuses to
+// publish. A missing zstd used to log one line and seal dict-less, which is
+// how the published distroless image shipped ~24% larger, differently-hashed
+// epochs of the same mainnet blocks for weeks. The seal must fail instead.
+func TestSealRefusesWithoutDictTrainer(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // an empty dir: no zstd anywhere
+	if err := CheckDictTrainer(); err == nil {
+		t.Fatal("CheckDictTrainer accepted a PATH with no zstd on it")
+	}
+	dir := t.TempDir()
+	st := testStore(t, dir)
+	in := &EpochInput{Start: 1, TxHashes: map[uint64][][32]byte{}}
+	for i := 0; i < 64; i++ { // well over dictMinSamples
+		in.Containers = append(in.Containers, []byte(fmt.Sprintf("container-%d-aaaaaaaaaaaaaaaa", i)))
+		in.Headers = append(in.Headers, []byte(fmt.Sprintf("header-%d-bbbbbbbbbbbbbbbb", i)))
+	}
+	if _, err := BuildEpoch(st, in); err == nil {
+		t.Fatal("BuildEpoch sealed an epoch with no dictionary trainer available")
+	} else if !strings.Contains(err.Error(), "zstd") {
+		t.Fatalf("seal failed for the wrong reason: %v", err)
+	}
+}
+
+// TestSealedEpochCarriesADict pins the dict section's PRESENCE. Every other
+// section would still be there in a dict-less epoch, and every read would
+// still work, which is exactly why the divergence went unnoticed.
+func TestSealedEpochCarriesADict(t *testing.T) {
+	dir := t.TempDir()
+	st := testStore(t, dir)
+	_, hash := synthEpoch(t, st, 1)
+	e, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if n := e.SectionSizes()["dict"]; n == 0 {
+		t.Fatal("sealed epoch has an empty dict section (dict-less seal)")
 	}
 }

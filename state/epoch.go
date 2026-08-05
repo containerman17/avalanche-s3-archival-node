@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"math/bits"
 	"os"
 	"os/exec"
@@ -20,15 +19,72 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// trainDictCLI trains a zstd dictionary with the system zstd CLI (pinned:
-// v1.5.7; rebuilds on another version are not guaranteed bit-identical,
-// decompression always is). Returns nil when training is impossible
-// (missing binary or a corpus too small to train on): the epoch is then
-// written dict-less, which stays valid and deterministic.
-func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
+// The dictionary trainer is the zstd CLI, and its ABSENCE USED TO BE SILENT:
+// trainDictCLI logged one line and returned nil, so the epoch was written
+// dict-less. That is a differently-shaped artifact from the same chain
+// content, which is precisely what byte-identity across independent builders
+// forbids (DESIGN's core promise). It shipped: the published image is
+// distroless with no zstd, so every containerized seal diverged from every
+// host seal, ~24% larger and a different hash, and the only trace was one log
+// line nobody read. A trainer that cannot run is now a HARD SEAL ERROR. The
+// seal contract already handles that well: SEAL FAILED, history stays raw,
+// the chain keeps serving, the next tick retries.
+//
+// There is no opt-out env var. A deliberately dict-less deployment is not a
+// thing anyone wants, and a knob that re-enables divergence is the bug.
+const (
+	// zstdPinnedVersion is the trainer pin. Rebuilds on another version are
+	// not guaranteed bit-identical (decompression always is), so a wrong
+	// version diverges exactly as silently as a missing one and is refused
+	// the same way. Keep in step with the Dockerfile's ZSTD_VERSION.
+	zstdPinnedVersion = "1.5.7"
+
+	// dictMinSamples is zstd --train's own floor ("nb of samples too low"
+	// below 7, measured on v1.5.7). Checking it HERE keeps the dict-less
+	// case a property of the INPUT, so every builder skips the same corpora
+	// and still agrees byte for byte, and leaves every remaining training
+	// failure environmental and therefore fatal.
+	dictMinSamples = 7
+)
+
+// dictTrainerHowTo is what an operator needs to hear, once, on the way out.
+const dictTrainerHowTo = "epochs carry a zstd dictionary trained at seal time by the zstd CLI " +
+	"(pinned v" + zstdPinnedVersion + "); sealing without it would publish a dict-less epoch whose bytes " +
+	"differ from every zstd-equipped builder's rebuild of the same blocks, so the seal refuses instead. " +
+	"Install zstd " + zstdPinnedVersion + ", or run an image that ships it"
+
+// CheckDictTrainer reports whether this machine can seal. Call it at STARTUP,
+// so an operator learns at boot rather than hours later at the first epoch
+// boundary.
+func CheckDictTrainer() error {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		return fmt.Errorf("zstd CLI not on PATH (%w): %s", err, dictTrainerHowTo)
+	}
+	out, err := exec.Command("zstd", "--version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("zstd --version: %w: %s: %s", err, bytes.TrimSpace(out), dictTrainerHowTo)
+	}
+	if !bytes.Contains(out, []byte("v"+zstdPinnedVersion+",")) {
+		return fmt.Errorf("zstd is not the pinned v%s (%s): %s",
+			zstdPinnedVersion, bytes.TrimSpace(out), dictTrainerHowTo)
+	}
+	return nil
+}
+
+// trainDictCLI trains a zstd dictionary with the pinned zstd CLI. It returns
+// (nil, nil) ONLY for a corpus below the trainer's own sample floor, which is
+// deterministic and identical on every builder; every other failure is an
+// error that fails the seal.
+func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) ([]byte, error) {
+	if len(samples) < dictMinSamples {
+		return nil, nil
+	}
+	if err := CheckDictTrainer(); err != nil {
+		return nil, err
+	}
 	tmp, err := os.MkdirTemp("", "epochdict")
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer os.RemoveAll(tmp)
 	args := []string{"--train", "-q", "-o", filepath.Join(tmp, "dict.bin"),
@@ -37,19 +93,15 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 	for i, s := range samples {
 		p := filepath.Join(tmp, fmt.Sprintf("s%06d", i))
 		if err := os.WriteFile(p, s, 0o644); err != nil {
-			return nil
+			return nil, err
 		}
 		args = append(args, p)
 	}
 	if out, err := exec.Command("zstd", args...).CombinedOutput(); err != nil {
-		log.Printf("epoch: dict training skipped (%v: %s), sealing dict-less", err, bytes.TrimSpace(out))
-		return nil
+		return nil, fmt.Errorf("zstd --train (%d samples, dictID %d): %w: %s",
+			len(samples), dictID, err, bytes.TrimSpace(out))
 	}
-	d, err := os.ReadFile(filepath.Join(tmp, "dict.bin"))
-	if err != nil {
-		return nil
-	}
-	return d
+	return os.ReadFile(filepath.Join(tmp, "dict.bin"))
 }
 
 // Sealed epoch artifact, named by its own hex sha256 (the local index marker
@@ -58,8 +110,8 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) []byte {
 // Sections in write order, fixed-size footer last (reader seeks from EOF):
 //
 //	dict       zstd dictionary trained AT SEAL TIME on this epoch's raw
-//	           containers (klauspost dict.BuildZstdDict, pinned; determinism
-//	           via a start-block-derived dictionary ID)
+//	           containers (the pinned zstd CLI; determinism via a
+//	           start-block-derived dictionary ID)
 //	bodies     zstd frames of framedGroup containers, epoch dict
 //	bodiesIdx  u64 LE frame offsets (nFrames+1, end sentinel)
 //	headers    RLP headers, same framing
@@ -511,7 +563,10 @@ func buildEpoch(st *dist.Store, src *epochSrc) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	epochDict := trainDictCLI(samples, uint32(src.Start%0xfffffffe)+1, dictTargetSize)
+	epochDict, err := trainDictCLI(samples, uint32(src.Start%0xfffffffe)+1, dictTargetSize)
+	if err != nil {
+		return "", err
+	}
 
 	enc, err := newEpochEncoder(epochDict)
 	if err != nil {
@@ -1028,7 +1083,7 @@ func trainLogsDict(tmp string, src *epochSrc) ([]byte, error) {
 	}); err != nil {
 		return nil, err
 	}
-	return trainDictCLI(samples, uint32(src.Start%0xfffffffe)+2, logsDictTarget), nil
+	return trainDictCLI(samples, uint32(src.Start%0xfffffffe)+2, logsDictTarget)
 }
 
 // ---------- the tx and log indexes ----------
