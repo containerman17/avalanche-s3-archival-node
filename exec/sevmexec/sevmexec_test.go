@@ -144,6 +144,32 @@ func upgradeJSON() []byte {
 	}`, genesisTime+5*blockGap, genesisTime+3*blockGap))
 }
 
+// upgradeVariant is upgradeJSON with each of its two entries independently
+// re-timed or dropped: 0 omits the entry, any other value is its activation
+// timestamp. It is how every mutation in
+// TestSubnetEVMWrongUpgradeJSONDivergesAtActivation is expressed.
+func upgradeVariant(precompileAt, stateAt uint64) []byte {
+	var pre, st string
+	if precompileAt != 0 {
+		pre = fmt.Sprintf(`{"contractNativeMinterConfig": {"blockTimestamp": %d, "disable": true}}`, precompileAt)
+	}
+	if stateAt != 0 {
+		st = fmt.Sprintf(`{
+		  "blockTimestamp": %d,
+		  "accounts": {
+		    "0x00000000000000000000000000000000000000ff": {
+		      "balanceChange": "0x3e8",
+		      "storage": {
+		        "0x0000000000000000000000000000000000000000000000000000000000000001":
+		        "0x00000000000000000000000000000000000000000000000000000000000000aa"
+		      }
+		    }
+		  }
+		}`, stateAt)
+	}
+	return fmt.Appendf(nil, `{"precompileUpgrades": [%s], "stateUpgrades": [%s]}`, pre, st)
+}
+
 // nativeMinter is the NativeMinter precompile's fixed address: enabled in the
 // genesis above, disabled by the upgrade above.
 var nativeMinter = common.HexToAddress("0x0200000000000000000000000000000000000001")
@@ -381,6 +407,90 @@ func TestSubnetEVMRootMismatchStops(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "state root mismatch") {
 		t.Fatalf("stopped for the wrong reason: %v", err)
+	}
+}
+
+// TestSubnetEVMWrongUpgradeJSONDivergesAtActivation IS THE SAFETY NET FOR THE
+// SPECULATIVE-SYNC STRATEGY: we sync mainnet L1s whose upgrade.json we cannot
+// obtain, on the reasoning that a MISSING OR WRONG upgrade file cannot produce
+// a quietly wrong corpus, because execution diverges at that file's activation
+// height and the state-root check hard-stops there. Every chain added without
+// its config rests on exactly this, and nothing else pins it: the chain root is
+// sha256(genesisData) alone (chain.Chain.Root), so the anchor is BLIND to the
+// upgrade file by design and verify/sevmverify's
+// TestVerifyRefusesTheWrongChainAtTheAnchor pins only that blindness. This is
+// the execution half.
+//
+// TestSubnetEVMExecution above is the positive direction: with the correct
+// upgrade.json every reference header root reproduces. Here every wrong file
+// must FAIL, and fail AT THE ACTIVATION HEIGHT of the entry that was mutated,
+// not at some arbitrary later block:
+//
+//   - the state upgrade lands in block 3, so anything that moves or removes it
+//     diverges at block 3 (or at the block it was wrongly moved ONTO),
+//   - the precompile disable lands in block 5, so a file that keeps the state
+//     upgrade but loses the precompile entry executes blocks 1..4 CLEANLY and
+//     stops at 5. That is the sharp one: it proves the stop is caused by the
+//     missing upgrade rather than by the executor giving up early.
+//
+// If this test ever starts passing with a tolerant executor, the strategy is
+// unsafe and every chain synced without its upgrade.json is suspect.
+func TestSubnetEVMWrongUpgradeJSONDivergesAtActivation(t *testing.T) {
+	c := testChain(t)
+	// The reference chain is built with the CORRECT upgrade file, exactly as
+	// the real network built the blocks we would be replaying.
+	blocks := generateChain(t, referenceGenesis(t, c))
+	src := containers(t, blocks)
+
+	const (
+		stateAt      = genesisTime + 3*blockGap // block 3
+		precompileAt = genesisTime + 5*blockGap // block 5
+	)
+
+	for _, tc := range []struct {
+		name    string
+		upgrade []byte
+		block   uint64
+	}{
+		// The file we could not obtain at all: the case the strategy is about.
+		{"file absent", nil, 3},
+		{"file present but empty", []byte(`{}`), 3},
+		{"state upgrade entry removed", upgradeVariant(precompileAt, 0), 3},
+		{"state upgrade one block late", upgradeVariant(precompileAt, genesisTime+4*blockGap), 3},
+		// Wrong in the OTHER direction, and the one case where the stop is not
+		// at the activation height: block 2 is empty, so its header commits to
+		// its parent's root and executeBlock's empty-block fast path skips the
+		// EVM (and ApplyUpgrades with it) entirely. The wrongly-early entry is
+		// therefore never applied and the divergence surfaces at block 3, where
+		// the entry SHOULD have landed. That is still a hard stop and still
+		// safe, and it is only safe because the fast path is gated on the
+		// header's own root: it can never skip a block whose upgrade moved the
+		// reference root.
+		{"state upgrade one block early, into an empty block", upgradeVariant(precompileAt, genesisTime+2*blockGap), 3},
+		// Blocks 1..4 are right under this file; only block 5 can catch it.
+		{"precompile upgrade entry removed", upgradeVariant(0, stateAt), 5},
+		{"precompile upgrade two blocks late", upgradeVariant(genesisTime+7*blockGap, stateAt), 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := *c
+			bad.UpgradeJSON = tc.upgrade
+			// The anchor cannot see any of this, which is the reason the check
+			// has to be here: sha256(genesisData) is identical for every
+			// variant, correct file included.
+			if bad.Root() != c.Root() {
+				t.Fatalf("the chain root moved with the upgrade file; the anchor is no longer sha256(genesisData)")
+			}
+			_, err := runExecutor(t, &bad, src, nBlocks)
+			if err == nil {
+				t.Fatal("execution accepted a chain built with a DIFFERENT upgrade.json: speculative sync of an L1 whose config we lack is unsafe")
+			}
+			// Sharp on both halves: it must be the root check that stopped it,
+			// and it must have stopped at the activation height.
+			want := fmt.Sprintf("block %d: state root mismatch", tc.block)
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("want a %q, got: %v", want, err)
+			}
+		})
 	}
 }
 

@@ -481,6 +481,12 @@ func TestVerifySubnetEVMTeeth(t *testing.T) {
 // wrong upgrade file diverges at its activation height where the executor's
 // state-root check hard-stops on it, and a file that differs only in
 // FORMATTING executes identically and must not manufacture a different chain.
+//
+// "Diverges at its activation height" is the load-bearing half of that, and it
+// is pinned by exec/sevmexec's
+// TestSubnetEVMWrongUpgradeJSONDivergesAtActivation. Neither test is worth much
+// without the other: this one says the anchor is deliberately blind to the
+// upgrade file, that one says execution is not.
 func TestVerifyRefusesTheWrongChainAtTheAnchor(t *testing.T) {
 	c := testChain()
 	_, bs := buildChain(t, c)
