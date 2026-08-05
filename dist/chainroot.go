@@ -1,21 +1,42 @@
 package dist
 
-// The chain root, the anchor of the epoch hash chain (DESIGN.md rulings 5 and 6
-// of 2026-07-31). Epoch 1's footer carries it as its previous-file hash, so one
-// head hash authenticates all of a chain's history and there is no global
-// registry anywhere.
+// The chain root, the anchor of the epoch hash chain (DESIGN.md ruling 5 of
+// 2026-07-31 as amended 2026-08-05). Epoch 1's footer carries it as its
+// previous-file hash, so one head hash authenticates all of a chain's history
+// and there is no global registry anywhere.
 //
 // THE BYTE-EXACT RULE:
 //
-//	root = sha256(genesisData || upgradeBytes)
+//	root = sha256(genesisData)
 //
 // genesisData is the P-chain CreateChainTx `genesisData` field verbatim, for
 // the tx whose txID IS the blockchainID: canonical, on-chain, independently
-// verifiable by anyone with a P-chain endpoint, and immune to the whitespace
-// and key-order sensitivity of hashing a JSON string someone re-serialized.
-// upgradeBytes is the chain's upgrade.json verbatim, or nothing at all when the
-// chain has none. No separator, no length prefix, no normalization of either
-// side: the on-chain genesisData length fixes the split.
+// verifiable by ANYONE WITH A P-CHAIN ENDPOINT AND NOTHING ELSE, and immune to
+// the whitespace and key-order sensitivity of hashing a JSON string someone
+// re-serialized. No separator, no length prefix, no normalization.
+//
+// UPGRADE BYTES ARE NOT IN THE ANCHOR (amended 2026-08-05, user ruling), and
+// the decisive fact is upstream: subnet-evm's Genesis.toBlock
+// (core/genesis.go:314) calls ONLY ApplyPrecompileActivations, while STATE
+// upgrades run through ApplyUpgrades from core/state_processor.go:84,
+// miner/worker.go:232 and the tracer, every one of which takes a PARENT
+// timestamp. Upgrades therefore apply inside a block and never to genesis
+// ("In block processing and building, [ApplyUpgrades] is called instead which
+// also applies state upgrades", core/state_processor_ext.go:25), so genesis
+// state and the genesis block hash are a pure function of genesisData.
+//
+// The user's reasoning, verbatim (2026-08-05): correctness is enforced by the
+// STATE ROOT, not by the anchor. A semantically wrong upgrade.json diverges at
+// its activation height and the executor hard-stops, so a corpus built with the
+// wrong file cannot exist. A file that differs only in FORMATTING produces
+// byte-identical execution, so hashing it verbatim manufactures a divergence
+// where there is none, and makes the anchor depend on an off-chain file we
+// often cannot obtain. The residual case, two operators with different
+// FUTURE-dated upgrades producing identical corpora today, resolves itself
+// loudly when the timestamp arrives.
+//
+// upgrade.json is UNCHANGED in every other respect: still read verbatim at
+// every start, still drives execution, still lives at <data>/upgrade.json.
 
 import (
 	"bytes"
@@ -39,25 +60,18 @@ import (
 // hashing to b666bb65... on mainnet and ee55f14e... on Fuji, matching the
 // on-chain bytes exactly (see chainroot_test.go, which pins both). So the
 // C-chain follows the same rule as an L1 and needs no network call to do it:
-// the embedded string IS the canonical genesisData. The C-chain has no
-// upgrade.json, so its upgrade contribution is empty.
+// the embedded string IS the canonical genesisData.
 func ChainRoot(networkID uint32) ([32]byte, error) {
 	cfg := genesis.GetConfig(networkID)
 	if cfg == nil {
 		return [32]byte{}, fmt.Errorf("dist: no embedded genesis config for network %d", networkID)
 	}
-	return ChainRootFrom([]byte(cfg.CChainGenesis), nil), nil
+	return ChainRootFrom([]byte(cfg.CChainGenesis)), nil
 }
 
-// ChainRootFrom is the rule itself: sha256(genesisData || upgradeBytes), with
-// upgradeBytes nil for a chain that has no upgrade.json.
-func ChainRootFrom(genesisData, upgradeBytes []byte) [32]byte {
-	h := sha256.New()
-	h.Write(genesisData)
-	h.Write(upgradeBytes)
-	var out [32]byte
-	h.Sum(out[:0])
-	return out
+// ChainRootFrom is the rule itself, in full: sha256(genesisData).
+func ChainRootFrom(genesisData []byte) [32]byte {
+	return sha256.Sum256(genesisData)
 }
 
 // CreateChainTx fetches a chain's canonical genesis bytes and its subnetID

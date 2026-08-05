@@ -104,8 +104,8 @@ func genesisJSON(t *testing.T) []byte {
 	}`, testChainID, addr, addr[2:], genesisTime))
 }
 
-// upgradeJSON is the chain's upgrade.json, carrying BOTH halves of ruling 6's
-// off-chain operator input:
+// upgradeJSON is the chain's upgrade.json, carrying BOTH halves of the
+// off-chain operator input that drives EXECUTION (it is not in the chain root):
 //
 //   - a STATE UPGRADE, landing during block 3. If exec ignored UpgradeJSON,
 //     this account would not exist on our side and every root from block 3 on

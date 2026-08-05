@@ -149,10 +149,9 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) ([]byte, error) 
 //	keybloom   bloom over keys written in this epoch (bloomBitsPerKey)
 //
 // The footer carries the HASH CHAIN: epoch K's footer embeds epoch K-1's NAME,
-// and the first epoch of a chain embeds the chain root,
-// sha256(genesisData || upgradeBytes) over the chain's on-chain CreateChainTx
-// genesis and its upgrade.json if it has one (dist.ChainRoot). Prev-hash is chain
-// content like everything else here, so two honest builders still emit
+// and the first epoch of a chain embeds the chain root, sha256(genesisData)
+// over the chain's on-chain CreateChainTx genesis (dist.ChainRoot). Prev-hash is
+// chain content like everything else here, so two honest builders still emit
 // identical bytes, and one head hash authenticates every epoch below it.
 //
 // All hardcoded parameters below are pre-freeze tunables (user directive:

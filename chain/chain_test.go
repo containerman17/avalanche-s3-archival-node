@@ -59,8 +59,9 @@ func TestCChainDescriptor(t *testing.T) {
 }
 
 // TestResolveCached covers everything Resolve does without a network call: the
-// cached descriptor is the authority on the dir, upgrade.json enters the root
-// (ruling 6), "C" is the embedded C-chain, and nothing defaults to zero.
+// cached descriptor is the authority on the dir, upgrade.json is carried
+// verbatim but stays OUT of the root, "C" is the embedded C-chain, and nothing
+// defaults to zero.
 func TestResolveCached(t *testing.T) {
 	ctx := context.Background()
 	const (
@@ -108,22 +109,24 @@ func TestResolveCached(t *testing.T) {
 	if c.BlockchainID.String() != fifaChain || c.SubnetID.String() != fifaSubnet {
 		t.Errorf("ids not carried: %s / %s", c.BlockchainID, c.SubnetID)
 	}
-	if c.Root() != dist.ChainRootFrom(genesisData, nil) {
+	if c.Root() != dist.ChainRootFrom(genesisData) {
 		t.Errorf("root is not sha256(genesisData)")
 	}
 
-	// upgrade.json in the data dir, avalanchego's convention: verbatim into the
-	// root, no re-serialization.
+	// upgrade.json in the data dir, avalanchego's convention: carried verbatim
+	// for EXECUTION, and deliberately NOT in the anchor (amended 2026-08-05).
+	// Genesis state is a pure function of genesisData, so an upgrade file that
+	// differs only in formatting must not manufacture a different chain.
 	upgrade := []byte("{\"precompileUpgrades\":[]}\n")
 	cu, err := Resolve(ctx, fifaChain, avaconstants.MainnetID, dirWith(t, base, upgrade))
 	if err != nil {
 		t.Fatalf("resolve with upgrade: %v", err)
 	}
-	if cu.Root() != dist.ChainRootFrom(genesisData, upgrade) {
-		t.Error("root is not sha256(genesisData || upgradeBytes)")
+	if string(cu.UpgradeJSON) != string(upgrade) {
+		t.Error("upgrade bytes were not carried verbatim")
 	}
-	if cu.Root() == c.Root() {
-		t.Error("upgrade bytes did not change the chain root (ruling 6)")
+	if cu.Root() != c.Root() {
+		t.Error("upgrade bytes changed the chain root: the anchor must be sha256(genesisData) alone")
 	}
 
 	// "C" is the embedded C-chain and needs no cache file at all.

@@ -59,13 +59,11 @@ func TestGenesisDataFromCreateChainTx(t *testing.T) {
 	if hex.EncodeToString(sum[:]) != want {
 		t.Fatalf("genesisData hashes to %x, want %s", sum, want)
 	}
-	// Ruling 6: no upgrade.json means an empty contribution, so the root is
-	// exactly sha256(genesisData); an upgrade file must change it.
-	if root := ChainRootFrom(g, nil); root != sum {
-		t.Fatalf("root with no upgrade bytes %x, want %x", root, sum)
-	}
-	if ChainRootFrom(g, []byte("{}")) == sum {
-		t.Fatal("upgrade bytes did not change the chain root")
+	// THE ANCHOR IS PURELY ON-CHAIN (amended 2026-08-05): the root IS
+	// sha256(genesisData), with nothing else mixed in, so anyone with a P-chain
+	// endpoint reproduces it from the tx alone.
+	if root := ChainRootFrom(g); root != sum {
+		t.Fatalf("root %x, want sha256(genesisData) %x", root, sum)
 	}
 
 	if _, _, err := parseCreateChainTx([]byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"not found"},"id":1}`)); err == nil {

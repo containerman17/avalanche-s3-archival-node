@@ -480,11 +480,12 @@ func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (bloc
 	if len(eps) == 0 {
 		return 0, 0, fmt.Errorf("no sealed epochs indexed in %s", st.Dir())
 	}
-	// The chain root is sha256(genesisData || upgradeBytes), so a chain that
-	// ships an upgrade.json cannot be verified without it: parsing the genesis
-	// with default upgrades would replay a DIFFERENT chain and only surface as
-	// a root mismatch somewhere in the middle, if at all. Epoch 1's prev-hash
-	// IS that root, so one comparison says it up front and by name.
+	// The chain root is sha256(genesisData), so this comparison answers exactly
+	// one question, up front and by name: is this corpus the chain the caller
+	// resolved? A WRONG upgrade.json is NOT caught here and is not meant to be
+	// (amended 2026-08-05): upgrades apply inside blocks, never to genesis, so
+	// they cannot move the anchor, and a semantically wrong one diverges at its
+	// activation height where VerifyEpoch's state-root check hard-stops on it.
 	//
 	// The anchor comparison is MANDATORY, not best-effort: it used to be
 	// skipped whenever it could not be made (no chain, or a set not starting
@@ -497,7 +498,7 @@ func VerifySet(st *dist.Store, tmpDir string, c *chain.Chain, workers int) (bloc
 		return 0, 0, fmt.Errorf("verify %s: epoch set starts at block %d, not 1: there is no chain root to anchor it to", st.Dir(), eps[0].Start)
 	}
 	if root := c.Root(); eps[0].Prev != root {
-		return 0, 0, fmt.Errorf("epoch_%d_%d anchors at chain root %x, but %s resolves to %x: wrong chain, or a missing/edited upgrade.json (the chain root is sha256(genesisData || upgradeBytes))",
+		return 0, 0, fmt.Errorf("epoch_%d_%d anchors at chain root %x, but %s resolves to %x: WRONG CHAIN (the chain root is sha256(genesisData), the P-chain CreateChainTx field verbatim)",
 			eps[0].Start, eps[0].Count, eps[0].Prev, st.Dir(), root)
 	}
 	v, err := New(tmpDir, c, workers)

@@ -471,11 +471,17 @@ func TestVerifySubnetEVMTeeth(t *testing.T) {
 	}
 }
 
-// TestVerifySubnetEVMNeedsUpgradeBytes is ruling 6 with teeth. The chain root
-// is sha256(genesisData || upgradeBytes), so verifying this corpus with the
-// dir's upgrade.json missing must FAIL BY NAME rather than quietly verify
-// against default upgrades.
-func TestVerifySubnetEVMNeedsUpgradeBytes(t *testing.T) {
+// TestVerifyRefusesTheWrongChainAtTheAnchor is what survives of rulings 5 and
+// 6 after the 2026-08-05 amendment.
+//
+// The chain root is sha256(genesisData) ALONE, so a different genesis is a
+// DIFFERENT CHAIN and is refused at epoch 1's prev-hash, up front and by name.
+// A missing upgrade.json does NOT move it, and it is not the anchor's job to
+// catch one: upgrades apply inside blocks and never to genesis, a semantically
+// wrong upgrade file diverges at its activation height where the executor's
+// state-root check hard-stops on it, and a file that differs only in
+// FORMATTING executes identically and must not manufacture a different chain.
+func TestVerifyRefusesTheWrongChainAtTheAnchor(t *testing.T) {
 	c := testChain()
 	_, bs := buildChain(t, c)
 
@@ -485,11 +491,17 @@ func TestVerifySubnetEVMNeedsUpgradeBytes(t *testing.T) {
 
 	noUpgrade := *c
 	noUpgrade.UpgradeJSON = nil
-	if noUpgrade.Root() == c.Root() {
-		t.Fatal("upgrade bytes did not move the chain root")
+	if noUpgrade.Root() != c.Root() {
+		t.Fatal("upgrade bytes moved the chain root: the anchor must be sha256(genesisData) alone")
 	}
-	_, _, err := verify.VerifySet(st, t.TempDir(), &noUpgrade, 2)
-	if err == nil || !strings.Contains(err.Error(), "upgrade.json") {
-		t.Fatalf("want a chain-root refusal naming upgrade.json, got: %v", err)
+
+	other := *c
+	other.GenesisJSON = append(append([]byte(nil), c.GenesisJSON...), ' ')
+	if other.Root() == c.Root() {
+		t.Fatal("a different genesisData did not move the chain root")
+	}
+	_, _, err := verify.VerifySet(st, t.TempDir(), &other, 2)
+	if err == nil || !strings.Contains(err.Error(), "WRONG CHAIN") {
+		t.Fatalf("want an anchor refusal naming the wrong chain, got: %v", err)
 	}
 }

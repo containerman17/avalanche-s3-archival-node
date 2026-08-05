@@ -63,9 +63,13 @@ type Chain struct {
 	VMKind       VMKind
 }
 
-// Root is the anchor of this chain's epoch hash chain,
-// sha256(genesisData || upgradeBytes) per DESIGN rulings 5 and 6.
-func (c *Chain) Root() [32]byte { return dist.ChainRootFrom(c.GenesisJSON, c.UpgradeJSON) }
+// Root is the anchor of this chain's epoch hash chain, sha256(genesisData) per
+// DESIGN ruling 5 as amended 2026-08-05. UpgradeJSON drives EXECUTION and is
+// deliberately NOT in it: correctness is enforced by the state root, so a
+// semantically wrong upgrade file hard-stops the executor at its activation
+// height, while a file that differs only in formatting executes identically and
+// must not manufacture a different chain.
+func (c *Chain) Root() [32]byte { return dist.ChainRootFrom(c.GenesisJSON) }
 
 // CChain builds the descriptor for a primary-network C-chain out of
 // avalanchego's embedded config, exactly as every path did before the
@@ -158,7 +162,7 @@ func Resolve(ctx context.Context, spec string, networkID uint32, dataDir string)
 	if err != nil {
 		return nil, err
 	}
-	// Verbatim or absent: ChainRootFrom hashes these bytes as they are.
+	// Verbatim or absent, and never re-serialized: these bytes drive execution.
 	up, err := os.ReadFile(filepath.Join(dataDir, upgradeFile))
 	switch {
 	case err == nil:

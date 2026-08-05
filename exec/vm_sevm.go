@@ -54,8 +54,11 @@ func (sevmChainContext) Engine() sevmconsensus.Engine { return sevmdummy.NewFull
 // from coreth's are the chain's own fee config, its genesis precompiles, and
 // upgrade bytes: an L1's upgrade.json unmarshals into UpgradeConfig, which is
 // what puts BOTH its precompile upgrades AND its state upgrades in front of
-// ApplyUpgrades on every block. Those bytes are inside the chain root (DESIGN
-// ruling 6), so a chain that ships one cannot be replayed without it.
+// ApplyUpgrades on every block. They are NOT in the chain root (amended
+// 2026-08-05: ApplyUpgrades takes a parent timestamp, so upgrades apply inside
+// a block and never to genesis), and they are still mandatory to REPLAY a chain
+// that ships one: a missing or wrong file diverges at its activation height and
+// the state-root check hard-stops there.
 func (sevmVM) genesis(c *chain.Chain, snowCtx *snow.Context) (*Genesis, error) {
 	g := new(sevmcore.Genesis)
 	if err := json.Unmarshal(c.GenesisJSON, g); err != nil {
