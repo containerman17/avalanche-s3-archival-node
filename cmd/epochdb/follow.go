@@ -263,6 +263,17 @@ type serveStatus struct {
 	CacheRefused uint64 `json:"cacheRefusals,omitempty"`
 	CacheFree    int64  `json:"cacheFreeBytes,omitempty"`
 	CacheMinFree int64  `json:"cacheMinFreeBytes,omitempty"`
+	// The cache-plane failures, which are the ones that leave a node working
+	// and slow rather than broken: a fill that cannot land, an eviction that
+	// cannot run, a cached chunk that cannot be read. Every one of them still
+	// returns right bytes over the network, so this is the only place a node
+	// that has silently become an S3 passthrough can be told from a healthy
+	// one. All omitempty: a clean node's answer is byte-identical to what it
+	// always was.
+	CacheFillErrors  uint64 `json:"cacheFillErrors,omitempty"`
+	CacheEvictErrors uint64 `json:"cacheEvictErrors,omitempty"`
+	CacheReadErrors  uint64 `json:"cacheReadErrors,omitempty"`
+	CacheLastError   string `json:"cacheLastError,omitempty"`
 }
 
 // statusOf builds that answer. n is nil between the bind and the moment the
@@ -279,6 +290,8 @@ func statusOf(spec string, n *chainNode) serveStatus {
 		}
 		s.CacheEvicted, s.CacheRefused = cs.Evictions, cs.Refusals
 		s.CacheFree, s.CacheMinFree = cs.FreeBytes, cs.MinFree
+		s.CacheFillErrors, s.CacheEvictErrors = cs.FillErrors, cs.EvictErrors
+		s.CacheReadErrors, s.CacheLastError = cs.CacheReadErrors, cs.LastError
 	}
 	return s
 }
