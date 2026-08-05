@@ -310,11 +310,19 @@ func TestOpenEpochRefusesOldFormat(t *testing.T) {
 	st := testStore(t, t.TempDir())
 	_, hash := synthEpoch(t, st, 700)
 	raw, _ := readFileT(t, st.SpoolPath(hash))
-	binary.LittleEndian.PutUint32(raw[len(raw)-epochFooterSize+4:], 2)
+	// FROM THE LOGICAL LENGTH, NOT FROM EOF: the file on disk carries casfs's
+	// hash list and trailer past the epoch's footer.
+	b, err := st.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := b.Size()
+	b.Close()
+	binary.LittleEndian.PutUint32(raw[size-epochFooterSize+4:], 2)
 	if err := os.WriteFile(st.SpoolPath(hash), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := OpenEpoch(st, hash)
+	_, err = OpenEpoch(st, hash)
 	if err == nil || !strings.Contains(err.Error(), "format v2, unsupported") {
 		t.Fatalf("OpenEpoch on a v2 file: %v, want a format refusal", err)
 	}

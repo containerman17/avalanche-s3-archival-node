@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/containerman17/casfs"
 	"github.com/containerman17/epochdb/dist"
 )
 
@@ -715,5 +716,122 @@ func TestBloomsAreLoadedOnceOntoTheHeap(t *testing.T) {
 	}
 	if e.MayContainTx(1<<fpBits - 1) {
 		t.Fatal("tx bloom claims a fingerprint nothing wrote")
+	}
+}
+
+// TestEpochIsIdenticalThroughCasfsAndTheSpool pins the FORMAT COMMITMENT where
+// it can break the epoch reader: casfs stores an artifact as content + hash
+// list + trailer, so an epoch on disk no longer ends at its own footer. A
+// reader that seeks from EOF instead of from the LOGICAL length casfs reports
+// would read the hash list as a footer on one road and not the other.
+//
+// The same stored object is read both ways here: mmap'd out of the spool with
+// no credentials, and pulled chunk by chunk out of a bucket with them. Every
+// section must come back byte for byte identical, and so must the footer the
+// two roads parsed to find them.
+func TestEpochIsIdenticalThroughCasfsAndTheSpool(t *testing.T) {
+	local := testStore(t, t.TempDir()) // no credentials: the spool IS the storage
+	_, hash := chunkyEpoch(t, local, 1000)
+	obj, err := os.ReadFile(local.SpoolPath(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// THE ARTIFACT'S NAME REPRODUCES FROM ITS OWN HASH LIST. This is the check
+	// an operator runs by hand on a rebuilt epoch.
+	size, list, err := casfs.ReadTail(local.SpoolPath(hash), dist.ChunkSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum := sha256.Sum256(list); hex.EncodeToString(sum[:]) != hash {
+		t.Fatalf("the epoch's own chunk list names %x, the artifact is called %s", sum, hash)
+	}
+	if want := (int64(len(obj)) - int64(len(list)) - 16); size != want {
+		t.Fatalf("logical size %d, want %d bytes of content in a %d byte file", size, want, len(obj))
+	}
+
+	// The very same bytes, in a bucket, with the local copy gone.
+	dir := t.TempDir()
+	st, _ := credStore(t, dir, 0)
+	if err := os.WriteFile(st.SpoolPath(hash), obj, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(st.SpoolPath(hash)); err == nil {
+		t.Fatal("Sync must release the spool copy, or both roads read the same file")
+	}
+
+	a, err := OpenEpoch(local, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	if a.Start != b.Start || a.Count != b.Count || a.TxCount != b.TxCount || a.Prev != b.Prev {
+		t.Fatalf("footers differ: %+v vs %+v", a, b)
+	}
+	if a.off != b.off {
+		t.Fatal("section tables differ, so the two roads disagree about where the epoch ends")
+	}
+	for id := 0; id < epochNumSections; id++ {
+		x, err := a.read(id, 0, a.off[id][1])
+		if err != nil {
+			t.Fatalf("section %d from the spool: %v", id, err)
+		}
+		y, err := b.read(id, 0, b.off[id][1])
+		if err != nil {
+			t.Fatalf("section %d through casfs: %v", id, err)
+		}
+		if !bytes.Equal(x, y) {
+			t.Fatalf("section %d differs between the spool and casfs (%d vs %d bytes)", id, len(x), len(y))
+		}
+	}
+}
+
+// TestSubstitutedChunkFailsTheEpochRead is the claim DESIGN makes about the
+// bucket, at the level a node actually cares about: bytes swapped inside an
+// object, same name, same size, same offsets, must become a LOAD FAILURE and
+// never a state answer.
+func TestSubstitutedChunkFailsTheEpochRead(t *testing.T) {
+	dir := t.TempDir()
+	st, s3 := credStore(t, dir, 0)
+	in, hash := chunkyEpoch(t, st, 1000)
+	if err := st.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	wipeCache(t, dir) // nothing may be answered out of a warm cache
+
+	// Rewrite the bytes of one 4MB chunk in the middle of the object.
+	s3.mu.Lock()
+	obj := s3.objects[hash]
+	rand.New(rand.NewSource(99)).Read(obj[dist.ChunkSize : 2*dist.ChunkSize])
+	s3.mu.Unlock()
+
+	e, err := OpenEpoch(st, hash)
+	if err != nil {
+		if !strings.Contains(err.Error(), "REJECTED") {
+			t.Fatalf("open of a substituted artifact: %v, want the chunk rejection", err)
+		}
+		return // the substituted chunk was in a section opened eagerly
+	}
+	defer e.Close()
+	var failed bool
+	for i := range in.Containers {
+		if _, err := e.Container(in.Start + uint64(i)); err != nil {
+			if !strings.Contains(err.Error(), "REJECTED") {
+				t.Fatalf("container %d: %v, want the chunk rejection", i, err)
+			}
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatal("every container read succeeded over a substituted chunk: the bucket can rewrite state answers")
 	}
 }

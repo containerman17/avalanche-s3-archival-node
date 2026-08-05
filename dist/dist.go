@@ -1,10 +1,18 @@
 // Package dist is epochdb's artifact layer (DESIGN.md "Distribution").
 //
-// Sealed epochs are WHOLE FILES NAMED BY THEIR HEX SHA256. A
-// producer renames a finished file onto the casfs spool path for its own hash
-// and that rename is the entire registration; a ticker uploads whatever the
-// spool holds and unlinks the local copy once the bucket confirms it. Reads go
-// through one call, Open(hash).
+// A SEALED EPOCH IS NAMED BY SHA256 OF ITS OWN PER-CHUNK HASH LIST, which
+// casfs stores in a tail past the content and never shows anyone (see
+// casfs/chunked.go). A producer streams the epoch, appends that tail, and
+// renames the file onto the casfs spool path for the resulting name; the
+// rename is the entire registration. A ticker uploads whatever the spool holds
+// and unlinks the local copy once the bucket confirms it. Reads go through one
+// call, Open(hash), and every 4MB chunk they touch is verified against the
+// list before it is served.
+//
+// THE EPOCH FORMAT IS UNCHANGED BY ANY OF THAT. The tail is casfs's metadata,
+// so an epoch is still L bytes with its footer LAST: Blob.Size() is L on both
+// roads, and a reader seeking the footer seeks from L rather than from the end
+// of the file on disk.
 //
 // S3 CREDENTIALS ARE OPTIONAL and that is not a special case anywhere above
 // this file: with no endpoint configured there is no casfs store at all, the
@@ -32,12 +40,10 @@
 package dist
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -51,19 +57,18 @@ import (
 )
 
 const (
-	// ChunkSize is the granularity of both the casfs chunk cache and the
-	// published per-chunk hash lists. One number, so a hash list describes
+	// ChunkSize is the granularity of the casfs chunk cache and of the hash
+	// list an artifact's name commits to. One number, so the list describes
 	// exactly the ranges a downloader fetches.
 	ChunkSize = casfs.DefaultChunkSize
 
 	spoolName = "cas" // <data>/cas/<hash>: durable until uploaded
 	// cacheName is the casfs chunk cache, disposable, laid out as
 	// <data>/cache/<window>/<chain>/<hash>.<index>. It must NOT collide with a
-	// pointer name: casfs owns its cache directory and deletes everything in
-	// it that is not one of its own window directories, so a cache dir named
-	// "chunks" silently ate the chunk-list pointers at <data>/chunks/<hash>
-	// the moment a credentialed store opened. Nothing is published under
-	// "cache".
+	// pointer name: casfs owns its cache directory and deletes everything in it
+	// that is not one of its own window directories, so a cache dir sharing a
+	// name with a published pointer prefix eats that pointer the moment a
+	// credentialed store opens. Nothing is published under "cache".
 	cacheName = "cache"
 	// legacyCacheName was the same thing until 2026-08-03. It is deleted on
 	// sight rather than left to rot, because the cache is disposable by
@@ -295,46 +300,77 @@ func (s *Store) SpoolDir() string { return s.spool }
 
 // ---------- publishing ----------
 
-// Put stores b as an artifact and returns its hex sha256. The write is
-// tmp+rename onto the spool path, so a kill at any instant leaves either
+// Hasher builds an artifact's chunk hash list as its content streams past, and
+// with it the artifact's NAME. A producer writes content, calls Finish, and
+// appends the tail Finish returns; nothing about it is proportional to the
+// artifact (32 bytes per 4MB, 76KB for the largest epoch anyone here builds).
+type Hasher = casfs.Hasher
+
+// NewHasher starts a list at epochdb's one chunk size.
+func NewHasher() *Hasher { return casfs.NewHasher(ChunkSize) }
+
+// Put stores b as an artifact and returns its name. The write is
+// tmp+fsync+rename onto the spool path, so a kill at any instant leaves either
 // nothing or a complete, correctly named file.
 func (s *Store) Put(b []byte) (string, error) {
-	d := NewDigest()
-	d.Write(b)
-	hash, chunks := d.Sum()
-	if err := s.writeSpool(hash, b); err != nil {
+	h := NewHasher()
+	h.Write(b)
+	name, tail, err := h.Finish()
+	if err != nil {
 		return "", err
 	}
-	return hash, s.putChunks(hash, chunks)
+	return name, writeDurable(s.SpoolPath(name), b, tail)
 }
 
-// Adopt renames an already-written file into the spool under the hash its
-// digest accumulated while the file was being written. path must be on the
-// same filesystem as the spool (both live inside the data dir).
-func (s *Store) Adopt(path string, d *Digest) (string, error) {
-	hash, chunks := d.Sum()
-	if err := os.Rename(path, s.SpoolPath(hash)); err != nil {
+// Adopt seals an already-written file and renames it into the spool under the
+// name its Hasher accumulated while the file was being written: the hash list
+// and trailer are appended to what is on disk, and sha256 of that list is the
+// name. path must be on the same filesystem as the spool (both live inside the
+// data dir).
+//
+// NOTHING IS HELD IN MEMORY, which is the sealer's hard-won property: the tail
+// is kilobytes and the multi-GB content was never in RAM at all.
+func (s *Store) Adopt(path string, h *Hasher) (string, error) {
+	name, tail, err := h.Finish()
+	if err != nil {
 		return "", err
 	}
-	return hash, s.putChunks(hash, chunks)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return "", err
+	}
+	_, err = f.Write(tail)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(path, s.SpoolPath(name)); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
-func (s *Store) writeSpool(hash string, b []byte) error {
-	return writeDurable(s.SpoolPath(hash), b)
-}
-
-// writeDurable lands b at path by tmp+FSYNC+rename. The fsync is the whole
+// writeDurable lands parts at path by tmp+FSYNC+rename. The fsync is the whole
 // durability claim: without it power loss can leave a renamed but zero-length
 // file, and neither an empty artifact nor an empty pointer value announces
 // itself as damaged (decodeLatest used to read an empty pointer as a valid
 // "this chain has no epochs").
-func writeDurable(path string, b []byte) error {
+func writeDurable(path string, parts ...[]byte) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(b)
+	for _, p := range parts {
+		if _, err = f.Write(p); err != nil {
+			break
+		}
+	}
 	if err == nil {
 		err = f.Sync()
 	}
@@ -346,50 +382,6 @@ func writeDurable(path string, b []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
-}
-
-// putChunks publishes the artifact's per-chunk hash list, itself an ordinary
-// content-addressed artifact, and points at it from chunks/<hash>.
-//
-// WHY A POINTER AND NOT A FOOTER FIELD (resolved 2026-07-30): a list that
-// covers a file's own chunks cannot be referenced from inside that file, since
-// writing the reference changes the chunks the list describes. The list's
-// authority is therefore the whole-file sha256 the epoch chain already
-// carries: a lying list makes a downloader waste bytes, never accept wrong
-// ones.
-func (s *Store) putChunks(hash string, chunks []byte) error {
-	d := NewDigest()
-	d.Write(chunks)
-	lh, _ := d.Sum()
-	if err := s.writeSpool(lh, chunks); err != nil {
-		return err
-	}
-	return s.SetPointer(ChunkPointer(hash), lh)
-}
-
-// ChunkPointer names the pointer holding an artifact's chunk-list hash.
-func ChunkPointer(hash string) string { return "chunks/" + hash }
-
-// Chunks returns the per-chunk sha256 list published for hash (32 bytes per
-// ChunkSize chunk, in order).
-func (s *Store) Chunks(hash string) ([]byte, error) {
-	lh, err := s.GetPointer(ChunkPointer(hash))
-	if err != nil {
-		return nil, err
-	}
-	b, err := s.Open(lh)
-	if err != nil {
-		return nil, err
-	}
-	defer b.Close()
-	list, err := b.Read(0, b.Size())
-	if err != nil {
-		return nil, err
-	}
-	if len(list)%sha256.Size != 0 {
-		return nil, fmt.Errorf("dist: chunk list %s is %d bytes, not a multiple of %d", lh, len(list), sha256.Size)
-	}
-	return list, nil
 }
 
 // Sync uploads everything in the spool the bucket does not have yet and then
@@ -425,7 +417,7 @@ func (s *Store) Close() error {
 // filling it from the spool or a ranged GET.
 func (s *Store) Open(hash string) (*Blob, error) {
 	if s.cas == nil {
-		b, err := MmapBlob(s.SpoolPath(hash))
+		b, err := mmapArtifact(s.SpoolPath(hash))
 		if err != nil {
 			return nil, fmt.Errorf("dist: open %s: %w", hash, err)
 		}
@@ -453,26 +445,32 @@ type Blob struct {
 	f    *casfs.File // credentials: the chunk cache
 }
 
-// MmapBlob maps a plain file. Used for spool-resident artifacts and by tools
-// that hold a path rather than a hash.
-func MmapBlob(path string) (*Blob, error) {
+// mmapArtifact maps a spool-resident artifact's CONTENT, which is the
+// no-credentials read path in full.
+//
+// IT MAPS L BYTES, NOT THE FILE. The hash list and trailer sit past the
+// content, so mapping the file whole would hand the epoch reader a "file" whose
+// last bytes are casfs metadata and whose footer is nowhere near the end. The
+// logical length comes from casfs, and nothing above here knows the difference
+// between this road and the credentialed one.
+func mmapArtifact(path string) (*Blob, error) {
+	size, _, err := casfs.ReadTail(path, ChunkSize)
+	if err != nil {
+		return nil, err
+	}
+	if size == 0 {
+		return &Blob{}, nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	st, err := f.Stat()
+	mm, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, err
 	}
-	if st.Size() == 0 {
-		return &Blob{}, nil
-	}
-	mm, err := syscall.Mmap(int(f.Fd()), 0, int(st.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
-	if err != nil {
-		return nil, err
-	}
-	return &Blob{size: uint64(st.Size()), mm: mm}, nil
+	return &Blob{size: uint64(size), mm: mm}, nil
 }
 
 func (b *Blob) Size() uint64 { return b.size }
@@ -632,68 +630,6 @@ func (s *Store) GetPointer(name string) (string, error) {
 
 func (s *Store) pointerPath(name string) string {
 	return filepath.Join(s.dir, filepath.FromSlash(name))
-}
-
-// ---------- hashing ----------
-
-// Digest computes an artifact's whole-file sha256 and, in the same pass, the
-// per-chunk hash list that lets a downloader reject a bad ChunkSize range
-// without waiting for the whole file.
-type Digest struct {
-	full    hash.Hash
-	chunk   hash.Hash
-	inChunk int64
-	list    []byte
-}
-
-func NewDigest() *Digest {
-	return &Digest{full: sha256.New(), chunk: sha256.New()}
-}
-
-func (d *Digest) Write(p []byte) (int, error) {
-	n := len(p)
-	for len(p) > 0 {
-		room := int64(ChunkSize) - d.inChunk
-		take := int64(len(p))
-		if take > room {
-			take = room
-		}
-		d.full.Write(p[:take])
-		d.chunk.Write(p[:take])
-		d.inChunk += take
-		p = p[take:]
-		if d.inChunk == ChunkSize {
-			d.closeChunk()
-		}
-	}
-	return n, nil
-}
-
-func (d *Digest) closeChunk() {
-	d.list = d.chunk.Sum(d.list)
-	d.chunk.Reset()
-	d.inChunk = 0
-}
-
-// Sum finalizes the digest: the hex whole-file sha256 and the chunk list
-// (32 bytes per chunk, in order). Call it once.
-func (d *Digest) Sum() (string, []byte) {
-	if d.inChunk > 0 {
-		d.closeChunk()
-	}
-	return hex.EncodeToString(d.full.Sum(nil)), d.list
-}
-
-// VerifyChunk checks one downloaded chunk against a published list.
-func VerifyChunk(list []byte, idx int, data []byte) error {
-	if (idx+1)*sha256.Size > len(list) {
-		return fmt.Errorf("dist: chunk %d beyond a %d-chunk list", idx, len(list)/sha256.Size)
-	}
-	sum := sha256.Sum256(data)
-	if want := list[idx*sha256.Size : (idx+1)*sha256.Size]; !bytes.Equal(sum[:], want) {
-		return fmt.Errorf("dist: chunk %d hashes to %x, list says %x", idx, sum, want)
-	}
-	return nil
 }
 
 // ValidHash reports whether s is a lowercase hex sha256, the only name shape

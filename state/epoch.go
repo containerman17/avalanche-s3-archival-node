@@ -119,10 +119,13 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) ([]byte, error) 
 	return os.ReadFile(filepath.Join(tmp, "dict.bin"))
 }
 
-// Sealed epoch artifact, named by its own hex sha256 (the local index marker
+// Sealed epoch artifact, named by sha256 of its own per-chunk hash list, which
+// casfs keeps in a tail past the content (the local index marker
 // epoch_<startblock>_<blockcount>.cas carries that name). Immutable,
 // self-described, bit-identical when rebuilt from the same chain content.
-// Sections in write order, fixed-size footer last (reader seeks from EOF):
+// Sections in write order, fixed-size footer last. THE READER SEEKS FROM THE
+// LOGICAL LENGTH casfs reports, NOT FROM EOF: the file on disk carries casfs's
+// metadata past the footer, and nothing above dist ever sees it.
 //
 //	dict       zstd dictionary trained AT SEAL TIME on this epoch's raw
 //	           containers (the pinned zstd CLI; determinism via a
@@ -145,8 +148,8 @@ func trainDictCLI(samples [][]byte, dictID uint32, maxDict int) ([]byte, error) 
 //	logidx     posting lists addr->EF blocklist, topic->EF blocklist
 //	keybloom   bloom over keys written in this epoch (bloomBitsPerKey)
 //
-// The footer carries the HASH CHAIN: epoch K's footer embeds sha256 of epoch
-// K-1's whole file, and the first epoch of a chain embeds the chain root,
+// The footer carries the HASH CHAIN: epoch K's footer embeds epoch K-1's NAME,
+// and the first epoch of a chain embeds the chain root,
 // sha256(genesisData || upgradeBytes) over the chain's on-chain CreateChainTx
 // genesis and its upgrade.json if it has one (dist.ChainRoot). Prev-hash is chain
 // content like everything else here, so two honest builders still emit
@@ -328,7 +331,7 @@ type EpochInput struct {
 	Logs       []LogRec
 	TxCount    uint64
 
-	// Prev is the hash-chain link: sha256 of epoch K-1's file, or the chain
+	// Prev is the hash-chain link: epoch K-1's artifact NAME, or the chain
 	// root (dist.ChainRoot) for a chain's first epoch.
 	Prev [32]byte
 
@@ -665,8 +668,8 @@ func sampleContainers(src *epochSrc) ([][]byte, error) {
 
 // ---------- the artifact file ----------
 
-// epochOut is the artifact under construction: a file in the spool, its
-// running sha256 + chunk list, and the section table. It replaces a
+// epochOut is the artifact under construction: a file in the spool, the
+// running chunk hash list that will NAME it, and the section table. It replaces a
 // bytes.Buffer that held the WHOLE epoch (7.2 GB on Fuji's epoch 11, plus a
 // doubling copy whenever it grew) and is why the sealed size no longer shows
 // up in the sealer's resident set at all.
@@ -675,7 +678,7 @@ type epochOut struct {
 	path string
 	f    *os.File
 	w    *bufio.Writer
-	d    *dist.Digest
+	d    *dist.Hasher
 	off  uint64
 	tab  [epochNumSections][2]uint64 // off, len per section
 }
@@ -687,7 +690,7 @@ func newEpochOut(st *dist.Store) (*epochOut, error) {
 	}
 	return &epochOut{
 		st: st, path: f.Name(), f: f,
-		w: bufio.NewWriterSize(f, 1<<20), d: dist.NewDigest(),
+		w: bufio.NewWriterSize(f, 1<<20), d: dist.NewHasher(),
 	}, nil
 }
 
@@ -804,8 +807,9 @@ func (o *epochOut) storedFrames(id int, enc *zstd.Encoder, start uint64, walk fu
 }
 
 // finish writes the footer (magic, version, start, count, txs, the hash-chain
-// link, the section table) and adopts the file into the spool under its own
-// hash. Returns that hash.
+// link, the section table) and adopts the file into the spool under the name
+// its chunk hash list produces. Returns that name. The footer is the last thing
+// in the CONTENT; Adopt appends casfs's own tail after it.
 func (o *epochOut) finish(src *epochSrc) (string, error) {
 	var ft [epochFooterSize]byte
 	copy(ft[0:4], epochMagic[:])

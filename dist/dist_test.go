@@ -13,39 +13,64 @@ import (
 	"testing"
 )
 
-// TestDigestChunks pins the two things the whole artifact layer rests on: the
-// name is the sha256 of the bytes, and the chunk list is the sha256 of each
-// aligned ChunkSize range, tail included.
-func TestDigestChunks(t *testing.T) {
+// TestArtifactNameIsTheChunkList pins what the whole artifact layer rests on:
+// an artifact's NAME is sha256 of the per-chunk hash list over its content,
+// the last chunk short, and the file on disk carries that list past the
+// content where no consumer sees it.
+func TestArtifactNameIsTheChunkList(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	body := make([]byte, 2*ChunkSize+1234)
 	rng.Read(body)
 
-	d := NewDigest()
+	h := NewHasher()
 	// written in awkward pieces on purpose: chunk boundaries must not depend
 	// on how the producer happened to call Write.
 	for off := 0; off < len(body); off += 7919 {
-		end := min(off+7919, len(body))
-		d.Write(body[off:end])
+		h.Write(body[off:min(off+7919, len(body))])
 	}
-	hash, list := d.Sum()
+	name, tail, err := h.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	if want := sha256.Sum256(body); hash != hex.EncodeToString(want[:]) {
-		t.Fatalf("whole-file hash %s, want %x", hash, want)
+	var want []byte
+	for off := 0; off < len(body); off += ChunkSize {
+		sum := sha256.Sum256(body[off:min(off+ChunkSize, len(body))])
+		want = append(want, sum[:]...)
 	}
-	if len(list) != 3*sha256.Size {
-		t.Fatalf("chunk list is %d bytes, want 3 chunks", len(list)/sha256.Size)
+	if len(want) != 3*sha256.Size {
+		t.Fatalf("built a %d chunk list, want 3", len(want)/sha256.Size)
 	}
-	for i := 0; i < 3; i++ {
-		end := min((i+1)*ChunkSize, len(body))
-		if err := VerifyChunk(list, i, body[i*ChunkSize:end]); err != nil {
-			t.Fatal(err)
-		}
+	if sum := sha256.Sum256(want); name != hex.EncodeToString(sum[:]) {
+		t.Fatalf("name %s, want sha256 of the chunk list %x", name, sum)
 	}
-	bad := append([]byte(nil), body[:ChunkSize]...)
-	bad[0] ^= 0xff
-	if err := VerifyChunk(list, 0, bad); err == nil {
-		t.Fatal("a corrupt chunk must not verify")
+	if !bytes.HasPrefix(tail, want) {
+		t.Fatal("the tail does not open with the chunk list")
+	}
+
+	// And a store round-trips it with the tail invisible: L bytes, not L+tail.
+	s, err := Local(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := s.Put(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != name {
+		t.Fatalf("Put named it %s, the list names it %s", hash, name)
+	}
+	b, err := s.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if b.Size() != uint64(len(body)) {
+		t.Fatalf("Size() = %d, want the logical %d with no tail in it", b.Size(), len(body))
+	}
+	got, err := b.Read(0, b.Size())
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("read back differed: %v", err)
 	}
 }
 
@@ -87,13 +112,6 @@ func TestStoreLocalRoundtrip(t *testing.T) {
 		t.Fatalf("view: %v", err)
 	}
 	v.Close()
-	list, err := s.Chunks(hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := VerifyChunk(list, 0, body); err != nil {
-		t.Fatal(err)
-	}
 	// Sync is a no-op without credentials: the spool IS the durable copy.
 	if err := s.Sync(); err != nil {
 		t.Fatal(err)
@@ -113,7 +131,7 @@ func TestPointersOutsideChunkCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache := cacheRoot(dir)
-	for _, name := range []string{LatestPointer([32]byte{5}), ChunkPointer(hex.EncodeToString(bytes.Repeat([]byte{3}, 32)))} {
+	for _, name := range []string{LatestPointer([32]byte{5})} {
 		p := s.pointerPath(name)
 		if p == cache || strings.HasPrefix(p, cache+string(os.PathSeparator)) {
 			t.Fatalf("pointer %q lands at %s, inside the casfs chunk cache %s", name, p, cache)
