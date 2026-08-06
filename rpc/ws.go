@@ -131,17 +131,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 		default:
 			result, rerr = s.dispatch(&req)
 		}
-		id := req.ID
-		if id == nil {
-			id = json.RawMessage("null")
-		}
-		reply := map[string]any{"jsonrpc": "2.0", "id": id}
-		if rerr != nil {
-			reply["error"] = rerr
-		} else {
-			reply["result"] = result
-		}
-		if sess.send(reply) != nil {
+		if sess.send(replyObject(req.ID, result, rerr)) != nil {
 			return
 		}
 	}

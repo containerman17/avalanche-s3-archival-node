@@ -1,13 +1,13 @@
-// Package rpc is a minimal JSON-RPC HTTP server over the historical
-// overlay: eth_chainId, eth_blockNumber, eth_getBalance,
-// eth_getTransactionCount, eth_getCode, eth_getStorageAt, eth_call. No
-// websockets, no subscriptions, single requests only (a JSON array gets a
-// polite error).
+// Package rpc is the JSON-RPC server over the historical overlay: the eth_,
+// debug_, net_, web3_ and txpool_ namespaces, over HTTP (single requests and
+// batches) and over WebSocket (which additionally carries subscriptions).
 package rpc
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"strings"
@@ -222,22 +222,106 @@ func errInvalid(format string, args ...any) *rpcError {
 	return &rpcError{Code: -32602, Message: fmt.Sprintf(format, args...)}
 }
 
+// MaxBatchSize caps how many requests one JSON-RPC batch may carry, and
+// MaxRequestBytes caps the whole HTTP body. Both exist so a batch cannot be
+// used to exhaust the server: without them one body can queue an unbounded
+// number of eth_call or tracer runs, each of which is real EVM execution.
+// The numbers are geth's own defaults (--rpc.batch-request-limit,
+// --rpc.batch-response-max-size), so tooling calibrated against a stock node
+// fits without tuning: ethers batches 100 by default, well inside 1000.
+// OVER THE CAP IS A NAMED ERROR, never a silent truncation, because a caller
+// who gets 1000 of 1500 answers back has no way to notice the other 500.
+const (
+	MaxBatchSize    = 1000
+	MaxRequestBytes = 10 << 20
+)
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if websocket.IsWebSocketUpgrade(r) {
 		s.serveWS(w, r)
 		return
 	}
+	// Read the body whole rather than streaming it: the batch/single decision
+	// is the first non-space byte, and the cap has to be enforced before any
+	// of it is parsed. One byte over the cap is enough to know.
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBytes+1))
+	if err != nil {
+		writeReply(w, nil, nil, &rpcError{Code: -32700, Message: "read request body: " + err.Error()})
+		return
+	}
+	if len(body) > MaxRequestBytes {
+		writeReply(w, nil, nil, &rpcError{Code: -32600, Message: fmt.Sprintf(
+			"request body exceeds the %d-byte limit", MaxRequestBytes)})
+		return
+	}
+	if trimmed := bytes.TrimLeft(body, " \t\r\n"); len(trimmed) > 0 && trimmed[0] == '[' {
+		s.serveBatch(w, trimmed)
+		return
+	}
 	var req rpcRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeReply(w, nil, nil, &rpcError{Code: -32700, Message: "parse error (no batching)"})
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeReply(w, nil, nil, &rpcError{Code: -32700, Message: "parse error: " + err.Error()})
 		return
 	}
 	result, rerr := s.dispatch(&req)
 	writeReply(w, req.ID, result, rerr)
 }
 
-func writeReply(w http.ResponseWriter, id json.RawMessage, result any, rerr *rpcError) {
+// serveBatch runs a JSON-RPC 2.0 batch: N requests in, N responses out, each
+// carrying its own id (order is not required to match and is not promised).
+// Elements run SEQUENTIALLY, in one goroutine, exactly as a single request is
+// served today: the head is free to move between elements, which is what every
+// other node does too, but no element ever sees state torn across itself.
+func (s *Server) serveBatch(w http.ResponseWriter, body []byte) {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(body, &elems); err != nil {
+		writeReply(w, nil, nil, &rpcError{Code: -32700, Message: "parse error: " + err.Error()})
+		return
+	}
+	switch {
+	case len(elems) == 0:
+		writeReply(w, nil, nil, &rpcError{Code: -32600, Message: "invalid request: empty batch"})
+		return
+	case len(elems) > MaxBatchSize:
+		writeReply(w, nil, nil, &rpcError{Code: -32600, Message: fmt.Sprintf(
+			"batch of %d requests exceeds the limit of %d", len(elems), MaxBatchSize)})
+		return
+	}
+	replies := make([]map[string]any, 0, len(elems))
+	for _, raw := range elems {
+		var req rpcRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			// One bad element is one error object, never a failure of the whole
+			// batch: the sibling requests are valid and have answers.
+			replies = append(replies, replyObject(nil, nil, &rpcError{
+				Code: -32600, Message: "invalid request: " + err.Error()}))
+			continue
+		}
+		if req.Method == "" {
+			replies = append(replies, replyObject(nil, nil, &rpcError{
+				Code: -32600, Message: "invalid request: no method"}))
+			continue
+		}
+		result, rerr := s.dispatch(&req)
+		if req.ID == nil {
+			continue // notification: the work runs, the answer is not sent
+		}
+		replies = append(replies, replyObject(req.ID, result, rerr))
+	}
+	if len(replies) == 0 {
+		// Every element was a notification, so the spec says return nothing.
+		// An empty 200 rather than a 204: it is what geth answers, and a client
+		// that treats any non-200 as a transport failure (a common HTTP wrapper
+		// habit) then sees a success it can ignore instead of an error.
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(replies)
+}
+
+// replyObject builds one JSON-RPC response object. Shared by the HTTP single,
+// HTTP batch and WebSocket paths, so the wire shape has one definition.
+func replyObject(id json.RawMessage, result any, rerr *rpcError) map[string]any {
 	if id == nil {
 		id = json.RawMessage("null")
 	}
@@ -247,7 +331,12 @@ func writeReply(w http.ResponseWriter, id json.RawMessage, result any, rerr *rpc
 	} else {
 		reply["result"] = result
 	}
-	json.NewEncoder(w).Encode(reply)
+	return reply
+}
+
+func writeReply(w http.ResponseWriter, id json.RawMessage, result any, rerr *rpcError) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(replyObject(id, result, rerr))
 }
 
 func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {

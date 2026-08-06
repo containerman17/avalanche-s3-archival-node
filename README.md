@@ -212,10 +212,22 @@ real and fire. Historical `eth_call`, `eth_getBalance`, `eth_getCode` and `eth_g
 **any** height, per block, with no snapshot interval and no pruning floor. The chain answers on one
 port at `/`, at `/ext/bc/<blockchainID>/rpc` and at `/ext/bc/<blockchainID>/ws`.
 
-Two shapes that differ from a stock node and will bite an integrator: **JSON-RPC batching is not
-supported** (an array body is a parse error), and `eth_getLogs` refuses the `blockHash` filter form.
-`newPendingTransactions` subscriptions and `eth_newPendingTransactionFilter` install and then never
-fire, which is correct rather than broken: with no mempool, nothing is ever pending.
+**JSON-RPC batching works**, with the standard semantics: an array of N requests gets an array of N
+responses each carrying its own id, an element with no id is a notification and gets no entry, a
+batch of nothing but notifications gets an empty 200, an empty array is `-32600`, and one malformed
+element errors on its own rather than failing the batch. Elements run sequentially in one goroutine,
+so the head can move between them (as on any node) but no single element sees torn state. Two caps,
+both refused by name rather than silently truncated: **1000 requests per batch** and a **10 MiB**
+body, which are geth's own defaults, so tooling calibrated against a stock node needs no tuning.
+
+`eth_getLogs` takes the `blockHash` filter form (logs of exactly that block), mutually exclusive with
+`fromBlock`/`toBlock`; an unknown hash is an error naming it rather than an empty array, since `[]`
+would say the block exists and has no matching logs. A stored filter (`eth_newFilter`) still refuses
+`blockHash`, because a filter is a moving range.
+
+The one shape that differs from a stock node: `newPendingTransactions` subscriptions and
+`eth_newPendingTransactionFilter` install and then never fire, which is correct rather than broken:
+with no mempool, nothing is ever pending.
 
 `debug_getModifiedAccountsByNumber`/`ByHash` work at any height straight from the per-block write
 capture, where a normal node needs both boundary states live in its trie database. Caveats: the range

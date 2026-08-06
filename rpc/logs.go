@@ -34,6 +34,9 @@ func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 	if err := json.Unmarshal(params[0], &f); err != nil {
 		return nil, errInvalid("bad filter: %v", err)
 	}
+	if f.BlockHash != nil {
+		return s.getLogsAtHash(&f)
+	}
 	from, to, addrs, topics, rerr := s.parseFilterCriteria(&f)
 	if rerr != nil {
 		return nil, rerr
@@ -41,11 +44,44 @@ func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 	return s.runGetLogs(from, to, addrs, topics)
 }
 
+// getLogsAtHash is the blockHash filter form: the logs of EXACTLY one block,
+// addresses and topics applying exactly as they do on the range form. The
+// 10k-block range cap is irrelevant here by construction.
+//
+// AN UNKNOWN HASH IS AN ERROR NAMING IT, never an empty array: `[]` says "that
+// block has no matching logs", which is a different answer and a wrong one.
+func (s *Server) getLogsAtHash(f *logsFilter) (any, *rpcError) {
+	if hasBound(f.FromBlock) || hasBound(f.ToBlock) {
+		return nil, errInvalid("blockHash is mutually exclusive with fromBlock/toBlock")
+	}
+	n, ok, err := s.HeightByHash(*f.BlockHash)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	if !ok {
+		return nil, &rpcError{Code: -32000, Message: "unknown block hash " + f.BlockHash.Hex()}
+	}
+	addrs, topics, rerr := parseLogMatchers(f)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if n == 0 {
+		return []*types.Log{}, nil // genesis: no transactions, so no logs record
+	}
+	return s.runGetLogs(n, n, addrs, topics)
+}
+
+// hasBound reads a range bound: an absent key and an explicit JSON null both
+// mean "no bound", which is how geth's own filter decoder reads them.
+func hasBound(raw json.RawMessage) bool { return len(raw) > 0 && string(raw) != "null" }
+
 // parseFilterCriteria resolves and validates a logs filter object, shared
 // between eth_getLogs and the filter API.
 func (s *Server) parseFilterCriteria(f *logsFilter) (from, to uint64, addrs []common.Address, topics [][]common.Hash, _ *rpcError) {
+	// A STORED filter is a moving range, so a single fixed block has no
+	// meaning here; eth_getLogs serves that form directly (getLogsAtHash).
 	if f.BlockHash != nil {
-		return 0, 0, nil, nil, errInvalid("blockHash filter unsupported")
+		return 0, 0, nil, nil, errInvalid("blockHash filter is for eth_getLogs, not for a stored filter over a range")
 	}
 	from, rerr := s.blockNumber(f.FromBlock)
 	if rerr != nil {
