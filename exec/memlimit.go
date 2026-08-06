@@ -103,6 +103,23 @@ const (
 // sized by accident is the failure this whole function exists to end. An
 // override above the container's ceiling is allowed and logged, because an
 // operator who typed a number meant it.
+// FirewoodCacheBytes sizes a node cache for a Firewood with NO DIRECTORY TO
+// MEASURE: verify's throwaway starts empty and grows as it replays, so the disk
+// term is 0 by construction and only the container term is real. Same rule and
+// same EPOCHDB_FIREWOOD_CACHE override as the executor's, so an operator tunes
+// one variable rather than discovering a second hardcoded one.
+//
+// Without a container ceiling it yields the 4GB this path used to hardcode.
+func FirewoodCacheBytes() (uint64, string, error) {
+	limit, _ := CgroupMemoryLimit()
+	if limit == 0 {
+		// The pseudo-ceiling whose eighth is the historical constant, so the
+		// override above still applies and there is one formula, not two.
+		limit = fwCacheDiskCap * fwCacheShare
+	}
+	return firewoodCacheBytes(0, limit)
+}
+
 func firewoodCacheBytes(dirBytes, limit uint64) (uint64, string, error) {
 	if v := os.Getenv("EPOCHDB_FIREWOOD_CACHE"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 64)

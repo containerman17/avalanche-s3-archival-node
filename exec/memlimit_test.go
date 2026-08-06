@@ -127,3 +127,17 @@ func TestFirewoodCacheOverride(t *testing.T) {
 		}
 	}
 }
+
+// TestFirewoodCacheNoCeilingKeepsThe4GBDefault: verify's throwaway has no
+// directory to measure, so where there is also no container ceiling the shared
+// helper must still land on the 4GB that path used to hardcode. Pins the
+// relationship between the two constants that makes the substitution safe.
+func TestFirewoodCacheNoCeilingKeepsThe4GBDefault(t *testing.T) {
+	got, _, err := firewoodCacheBytes(0, fwCacheDiskCap*fwCacheShare)
+	if err != nil || got != fwCacheDiskCap {
+		t.Fatalf("no-ceiling throwaway cache = %d, %v; want %d", got, err, uint64(fwCacheDiskCap))
+	}
+	if fwCacheDiskCap != 4<<30 {
+		t.Fatalf("the historical default moved: fwCacheDiskCap = %d, want %d", uint64(fwCacheDiskCap), uint64(4<<30))
+	}
+}

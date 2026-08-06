@@ -112,8 +112,16 @@ func newVerifier(tmpDir string, c *chain.Chain, workers int) (*Verifier, error) 
 
 func newThrowawayFirewood(tmpDir string) (*triedb.Database, *firewood.TrieDB, ethstate.Database, error) {
 	fwCfg := firewood.DefaultConfig(tmpDir)
-	// ponytail: fixed 4GB node cache, exec's proven value on this box.
-	fwCfg.CacheSizeBytes = 4 << 30
+	// Sized by the same rule (and the same override) as the executor's, so a
+	// verify run in a small container does not quietly claim a cache the
+	// container cannot hold. Was a fixed 4GB, which is what this still yields
+	// where there is no ceiling to read.
+	fwSize, fwWhy, err := exec.FirewoodCacheBytes()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	fwCfg.CacheSizeBytes = uint(fwSize)
+	log.Printf("verify: firewood node cache %d MB (%s)", fwSize>>20, fwWhy)
 	memdb := rawdb.NewMemoryDatabase()
 	tdb := triedb.NewDatabase(memdb, &triedb.Config{DBOverride: fwCfg.BackendConstructor})
 	fw, ok := tdb.Backend().(*firewood.TrieDB)
