@@ -228,10 +228,17 @@ func (f *Fetcher) SyncTarget() uint64 { return f.syncTarget.Load() }
 // The sealed end (SetFloor) is a floor for every walk, whatever its caller
 // passed: those blocks are durable in the epochs and their raw is gone, so a
 // walk that descended past it would re-download history this node already has.
+//
+// The retained-staging ceiling (SetCeiling) is the symmetric bound at the other
+// end, and it is enforced here for the same reason: this loop IS the walk, so
+// one check at the top of it covers every block any caller stages.
 func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 	floor = max(floor, f.floor.Load())
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := f.awaitStagingRoom(ctx); err != nil {
 			return err
 		}
 		select {

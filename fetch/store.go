@@ -53,6 +53,12 @@ type Store struct {
 	enc *zstd.Encoder
 	dec *zstd.Decoder
 
+	// staged is StagedBytes: the on-disk size of every bucket the seal has not
+	// retired. Mutated under mu, read lock-free, because the walk's ceiling
+	// check reads it per block.
+	staged      atomic.Int64
+	bucketBytes map[uint64]int64 // bucket -> its share of staged
+
 	useCounter      uint64
 	sessionBytes    atomic.Uint64 // compressed + index bytes written
 	sessionRawBytes atomic.Uint64 // container bytes before compression
@@ -117,12 +123,13 @@ func OpenStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:      dir,
-		segs:     make(map[uint64]*segment),
-		byHeight: make(map[uint64]heightRec),
-		byID:     make(map[ids.ID]uint64),
-		enc:      enc,
-		dec:      dec,
+		dir:         dir,
+		segs:        make(map[uint64]*segment),
+		byHeight:    make(map[uint64]heightRec),
+		byID:        make(map[ids.ID]uint64),
+		bucketBytes: make(map[uint64]int64),
+		enc:         enc,
+		dec:         dec,
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -204,7 +211,21 @@ func (s *Store) rebuildSegment(bucket uint64) error {
 	if err := index.Truncate(good * indexRecSize); err != nil {
 		return err
 	}
-	return arrival.Truncate(int64(lastEnd))
+	if err := arrival.Truncate(int64(lastEnd)); err != nil {
+		return err
+	}
+	// The retained size of this bucket AFTER the torn-tail truncation, which is
+	// what is actually on disk. A restart therefore starts with the true staging
+	// figure instead of counting only what this session appends.
+	s.addBucketBytes(bucket, int64(lastEnd)+good*indexRecSize)
+	return nil
+}
+
+// addBucketBytes folds a bucket's on-disk delta into the staging total. Caller
+// holds s.mu (or is still building the store).
+func (s *Store) addBucketBytes(bucket uint64, delta int64) {
+	s.bucketBytes[bucket] += delta
+	s.staged.Add(delta)
 }
 
 // seg returns the open segment pair for bucket, opening it (and LRU-closing
@@ -379,6 +400,7 @@ func (s *Store) Append(p parsedContainer, raw []byte) error {
 	}
 	s.sessionBytes.Add(uint64(len(buf) + indexRecSize))
 	s.sessionRawBytes.Add(uint64(len(raw)))
+	s.addBucketBytes(p.blockNumber/SegmentBlocks, int64(len(buf)+indexRecSize))
 	return nil
 }
 
@@ -478,7 +500,41 @@ func (s *Store) Retire(sealedEnd uint64) error {
 			firstErr = err
 		}
 	}
+	// And the accounting, over every known bucket rather than only the open
+	// ones: the seal has just unlinked these files, so their bytes are the
+	// space that came back and StagedBytes must stop counting them.
+	for b, n := range s.bucketBytes {
+		if (b+1)*SegmentBlocks-1 > sealedEnd {
+			continue
+		}
+		s.staged.Add(-n)
+		delete(s.bucketBytes, b)
+	}
 	return firstErr
+}
+
+// StagedBytes is the raw staging RETAINED ON DISK right now: the arrival and
+// index files of every bucket the seal has not yet retired.
+//
+// RETAINED, NOT FETCHED-MINUS-EXECUTED. Sealing is what actually returns the
+// space, and it lags execution by up to a whole epoch, so the executed point
+// says nothing about how full the disk is. This counter only falls when files
+// are unlinked (Retire), which is the same event.
+//
+// ARRIVAL IS THE ONLY RAW FAMILY THAT CAN RUN AWAY, which is why bounding it
+// bounds the disk: writelog/headers/logs/rcpt are the EXECUTOR's output, so
+// they only ever span exec head minus sealed end, which the seal holds inside
+// an epoch, while the arrival log spans FETCH head minus sealed end, which is
+// the 15:1 gap between the two.
+//
+// Kept incrementally because the walk reads it before every block; a stat over
+// hundreds of segment files per block would not survive that.
+func (s *Store) StagedBytes() uint64 {
+	n := s.staged.Load()
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
 }
 
 // Head returns the highest stored block height, ok=false if empty.

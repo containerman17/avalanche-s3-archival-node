@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ava-labs/avalanchego/api/info"
@@ -128,6 +131,11 @@ type Fetcher struct {
 	// below it is ever requested. See SetFloor.
 	floor atomic.Uint64
 
+	// ceiling is the retained-staging budget in bytes, 0 = unbounded, and
+	// paused is the log latch of a walk stalled on it. See SetCeiling.
+	ceiling atomic.Uint64
+	paused  atomic.Bool
+
 	// syncTarget is the ceiling of a bounded backfill (SyncTo's highest
 	// anchor), 0 while following or before the anchors resolve. REPORTING
 	// ONLY: nothing in the walk reads it. It exists because the store's head
@@ -159,6 +167,11 @@ func New(cfg Config) (*Fetcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
+	ceiling, err := stagingCeiling(cfg.DataDir)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
 
 	f, err := dial(cfg)
 	if err != nil {
@@ -167,7 +180,49 @@ func New(cfg Config) (*Fetcher, error) {
 	}
 	f.cfg = cfg
 	f.store = store
+	f.SetCeiling(ceiling)
+	if ceiling > 0 {
+		log.Printf("fetch: staging ceiling %d MB, retained now %d MB (walks pause above the ceiling until sealing drains it)",
+			ceiling>>20, store.StagedBytes()>>20)
+	}
 	return f, nil
+}
+
+// stagingFreeShare is the fraction of the data dir's FREE SPACE the default
+// ceiling takes. A quarter: the arrival log is the only raw family a runaway
+// walk grows, but the executor's families and the chunk cache live on the same
+// filesystem, so three quarters stay theirs.
+const stagingFreeShare = 4
+
+// stagingCeiling derives the default retained-staging budget from free space,
+// following the chunk cache's precedent (DESIGN: a byte budget nobody can set
+// is the wrong instrument, so admission control measures the filesystem). Safe
+// on a small disk because it is a fraction OF that disk, and invisible on a big
+// one: 1.5 TB free gives a 375 GB ceiling, tens of hours of executor runway,
+// against the single epoch a node at the tip retains.
+//
+// EPOCHDB_MAX_STAGING overrides it in bytes; 0 disables the bound outright.
+//
+// ponytail: measured once, at open. A live statfs would shrink as our own
+// staging grows, so the bound would tighten against itself; the rest of the
+// disk is the chunk cache's own live watermark to defend.
+func stagingCeiling(dir string) (uint64, error) {
+	if v := os.Getenv("EPOCHDB_MAX_STAGING"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("EPOCHDB_MAX_STAGING=%q is not a byte count (0 disables the bound)", v)
+		}
+		return n, nil
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		// An unreadable filesystem is not a full one. Fail OPEN and say so:
+		// pausing a walk that has no reason to pause would be the worse guess.
+		log.Printf("fetch: free space of %s unreadable (%v), staging is UNBOUNDED", dir, err)
+		return 0, nil
+	}
+	// f_bavail, not f_bfree: the reserved blocks are not ours.
+	return uint64(st.Bavail) * uint64(st.Bsize) / stagingFreeShare, nil
 }
 
 // dial performs the network-only part of New: bootstrap RPC, P2P dial,
@@ -397,6 +452,82 @@ func (f *Fetcher) Store() *Store { return f.store }
 // caller sets it at startup from the sealed epoch set and again after every
 // seal. Monotonic, and written by one goroutine (the cook loop).
 func (f *Fetcher) SetFloor(sealedEnd uint64) { f.floor.Store(max(sealedEnd, f.floor.Load())) }
+
+// SetCeiling bounds the RETAINED STAGING every walk may hold: once the raw
+// staging on disk (Store.StagedBytes, i.e. what the seal has not retired)
+// reaches this many bytes, walks PAUSE until sealing has drained it back under.
+// 0 disables the bound. Set from the environment at New; nothing raises it
+// later.
+//
+// THE FLOOR'S SYMMETRIC TWIN. The floor stops a walk descending into history
+// the seal has already made durable; the ceiling stops it running so far ahead
+// of the executor that the raw it stages fills the disk. Fetch runs ~1,650
+// blk/s against the executor's ~105 on mainnet, so an unbounded walk to the
+// live tip finishes all 91.7M blocks in ~15 hours with execution ~5M blocks in,
+// leaving ~86M blocks staged at once: 1-2 TB at the ~28 KB/block of epoch 9
+// (15,798 MB for 564,413 blocks), against 1.5 TB free. Same shape on DFK
+// (~410 GB just to stage) and Bnry, so it gates every giant.
+//
+// EXCEEDING IT IS NORMAL OPERATION ON A BIG CHAIN, not an error: the walk
+// stalls, logs once, and resumes by itself as the cook loop's seal retires the
+// staging behind the executed point.
+func (f *Fetcher) SetCeiling(bytes uint64) { f.ceiling.Store(bytes) }
+
+// StagedBytes, StagingCeiling and Paused are what the node's status line and
+// /status report, so a stalled walk is visible without grepping the log.
+func (f *Fetcher) StagedBytes() uint64    { return f.store.StagedBytes() }
+func (f *Fetcher) StagingCeiling() uint64 { return f.ceiling.Load() }
+func (f *Fetcher) Paused() bool           { return f.paused.Load() }
+
+// stagingPollInterval is how often a paused walk re-checks whether sealing has
+// drained enough to continue. Slow on purpose: draining an epoch is minutes to
+// hours, and the pause must cost nothing while it lasts. A var only so tests
+// need not wait it out.
+var stagingPollInterval = 5 * time.Second
+
+// awaitStagingRoom is the ceiling's enforcement point: every walk calls it
+// before every step, so nothing can add to staging without passing here. The
+// fast path is one atomic load and a comparison, which is what makes it
+// affordable per block.
+//
+// IT HOLDS NO LOCK AND WAITS ON NOTHING OF OURS. The cook loop, the seal and
+// the executor are other goroutines and they are exactly what frees the space,
+// so a paused walk must not be in their way; it sleeps on a timer and on ctx,
+// so a stopped executor costs one idle goroutine (no spin) and a SIGINT still
+// returns immediately. A node that has paused fetching and keeps executing and
+// serving RPC is healthy.
+//
+// NOT ON THE TIP PATH. Consensus acceptance appends through appendContainer,
+// which never comes here: a node at the tip stages a handful of blocks a second
+// against a ceiling sized in hundreds of gigabytes, and is never throttled by
+// this even if a backfill walk beside it is paused.
+func (f *Fetcher) awaitStagingRoom(ctx context.Context) error {
+	ceiling := f.ceiling.Load()
+	if ceiling == 0 || f.store.StagedBytes() < ceiling {
+		return nil
+	}
+	// Once per pause, not per block: with 16 concurrent walks all stalling on
+	// the same ceiling, a line per walk per block IS the log.
+	if !f.paused.Swap(true) {
+		log.Printf("fetch: PAUSED, %d MB of raw staging retained against a %d MB ceiling; "+
+			"execution and sealing keep running and the walk resumes as they drain it (EPOCHDB_MAX_STAGING overrides)",
+			f.store.StagedBytes()>>20, ceiling>>20)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(stagingPollInterval):
+		}
+		if staged := f.store.StagedBytes(); staged < ceiling {
+			if f.paused.Swap(false) {
+				log.Printf("fetch: resumed, %d MB of raw staging retained against a %d MB ceiling",
+					staged>>20, ceiling>>20)
+			}
+			return nil
+		}
+	}
+}
 
 // WalkFrom walks backward from an arbitrary container ID down to block 0
 // (short-circuiting over already-stored contiguous runs), storing every

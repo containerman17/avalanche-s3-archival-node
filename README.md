@@ -104,6 +104,10 @@ EPOCHDB_CACHE_MIN_FREE    bytes of free space the cache stops filling at (defaul
 EPOCHDB_CACHE_MAX_AGE     a cached chunk's ceiling age, Go duration (default 720h)
 EPOCHDB_FETCH_CONCURRENCY parallel sub-range GETs per cold chunk; a property of your NIC
 EPOCHDB_HEAVY_SLOTS       concurrent frontier builds allowed per box (default 1)
+EPOCHDB_MAX_STAGING       bytes of raw staging the backfill walk may retain before it PAUSES
+                          and waits for sealing to drain it (default 25% of the data dir's
+                          free space; 0 disables the bound). Catch-up only: a node at the
+                          tip is never throttled by it.
 EPOCHDB_NEW_CHAIN         set to 1 only to start a NEW chain in a prefix that already holds
                           other chains' objects. See "Joining a published chain".
 GOMEMLIMIT                honoured if you set it; otherwise derived as 7/10 of the container ceiling
