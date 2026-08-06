@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/libevm/common"
@@ -281,6 +282,9 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 			return run, nil
 		}
 		epochTxs := epochTxsAt(idx)
+		// THE FIRST SIGN A SEAL IS HAPPENING used to be the sealtmp directory
+		// appearing on disk, and the scan alone is minutes on a big epoch.
+		log.Printf("seal: epoch %d: scanning from block %d toward %d txs (exec head %d)", idx, next, epochTxs, execHead)
 		s, full, err := scanEpoch(store, reader, next, execHead, epochTxs)
 		if err != nil {
 			return run, err
@@ -291,6 +295,11 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 			break
 		}
 		t0 := time.Now()
+		// The block range and tx count are known exactly here and nowhere
+		// earlier: the scan is what finds the boundary. (The raw byte totals are
+		// NOT yet: only the container and header families have been walked.)
+		log.Printf("seal: epoch %d: building blocks %d..%d (%d blocks, %d txs, raw bodies+headers %.1fMB)",
+			idx, s.start, s.start+s.count-1, s.count, s.txs, float64(s.raw.containers+s.raw.headers)/1e6)
 		src := s.src()
 		src.Prev = prev
 		hash, err := buildEpoch(out, src)
@@ -423,6 +432,10 @@ type epochStream struct {
 func scanEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uint64) (*epochStream, bool, error) {
 	s := &epochStream{store: store, reader: reader, start: start, code: map[common.Hash]struct{}{}}
 	var hashes []common.Hash
+	var atBlock, txs atomic.Uint64
+	defer LogProgress("seal: scan", func() string {
+		return fmt.Sprintf("block %d of %d..%d, %d of %d txs", atBlock.Load(), start, execHead, txs.Load(), epochTxs)
+	})()
 	for n := start; n <= execHead; n++ {
 		container, ok, err := reader.GetByHeight(n)
 		if err != nil {
@@ -443,6 +456,7 @@ func scanEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uin
 			return s, false, fmt.Errorf("seal: header %d is missing from the raw headers family while sealing %d..%d: the corpus has a hole below its readable head, resync it", n, start, execHead)
 		}
 		s.count++
+		atBlock.Store(n)
 		s.raw.containers += uint64(len(container))
 		s.raw.headers += uint64(len(headerRLP))
 		s.pairs = append(s.pairs, txPair{fp: txFingerprint(BlockHashFromHeaderRLP(headerRLP)), blk: n - start})
@@ -455,6 +469,7 @@ func scanEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uin
 			s.pairs = append(s.pairs, txPair{fp: txFingerprint(h), blk: n - start})
 		}
 		s.txs += uint64(len(hashes))
+		txs.Store(s.txs)
 
 		// THE NO-RECORDS RULE: the stored sections are a byte copy of the
 		// executor's live capture. A tx-bearing block without one cannot be

@@ -47,6 +47,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/graft/evm/firewood"
@@ -128,6 +129,7 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	}
 
 	t0 := time.Now()
+	log.Printf("exec: frontier: merging the SST rows of %d epochs to block %d", len(epochs.All()), target)
 	var (
 		batch              []ffi.BatchOp
 		root               ffi.Hash
@@ -137,8 +139,13 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		lastAddr           common.Address
 		lastAddrHash       common.Hash
 		haveAddr           bool
-		nRows, nBatches    uint64
+		// Atomic because the progress line reads them from the ticker
+		// goroutine; the merge itself is single-threaded as before.
+		nRows, nBatches atomic.Uint64
 	)
+	defer state.LogProgress("exec: frontier", func() string {
+		return fmt.Sprintf("%d rows merged, %d batches committed", nRows.Load(), nBatches.Load())
+	})()
 	addrHash := func(a common.Address) common.Hash {
 		if !haveAddr || a != lastAddr {
 			lastAddr, lastAddrHash, haveAddr = a, crypto.Keccak256Hash(a[:]), true
@@ -153,12 +160,13 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 		if err != nil {
 			return fmt.Errorf("build frontier: firewood update: %w", err)
 		}
-		root, batch, nBatches = r, batch[:0], nBatches+1
+		root, batch = r, batch[:0]
+		nBatches.Add(1)
 		return nil
 	}
 
 	err = state.MergeFrontier(epochs.All(), target, func(r state.FrontierRow) error {
-		nRows++
+		nRows.Add(1)
 		addr := common.Address(r.Key[1:21])
 		switch r.Key[0] {
 		case 'a':
@@ -212,7 +220,7 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	}
 	if got := common.Hash(root); got != attest.Root {
 		return fmt.Errorf("build frontier: merged root at %d is %x, but header(%d).Root commits to %x (%d accounts, %d slots, %d deletes over %d rows)",
-			target, got, h, attest.Root, nAcct, nSlot, nDel, nRows)
+			target, got, h, attest.Root, nAcct, nSlot, nDel, nRows.Load())
 	}
 
 	// The headers just below the frontier come out of the epochs into the
@@ -278,7 +286,7 @@ func (e *Executor) BuildFrontier(epochs *state.EpochSet) error {
 	}
 	dt := time.Since(t0)
 	log.Printf("exec: frontier built at %d root=%x from %d epochs: %d rows -> %d accounts, %d slots, %d deletes, %d batches in %s (%.0f rows/s)",
-		target, common.Hash(root), len(epochs.All()), nRows, nAcct, nSlot, nDel, nBatches, dt.Round(time.Second), float64(nRows)/dt.Seconds())
+		target, common.Hash(root), len(epochs.All()), nRows.Load(), nAcct, nSlot, nDel, nBatches.Load(), dt.Round(time.Second), float64(nRows.Load())/dt.Seconds())
 	return nil
 }
 

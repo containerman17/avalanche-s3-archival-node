@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/rlp"
@@ -263,6 +264,15 @@ const (
 )
 
 var epochMagic = [4]byte{'E', 'P', 'O', 'C'}
+
+// sectionPhase names the STREAMED sections in the seal's progress lines (the
+// only sections written by a walk long enough to be worth reporting).
+var sectionPhase = map[int]string{
+	secBodies:   "bodies",
+	secHeaders:  "headers",
+	secFullLogs: "storedlogs",
+	secRcpt:     "rcpt",
+}
 
 // ---------- builder input ----------
 
@@ -581,7 +591,11 @@ func buildEpoch(st *dist.Store, src *epochSrc) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	stopDict := LogProgress("seal: dict", func() string {
+		return fmt.Sprintf("zstd --train on %d container samples", len(samples))
+	})
 	epochDict, err := trainDictCLI(samples, uint32(src.Start%0xfffffffe)+1, dictTargetSize)
+	stopDict()
 	if err != nil {
 		return "", err
 	}
@@ -655,6 +669,11 @@ func sampleContainers(src *epochSrc) ([][]byte, error) {
 	if src.Count > dictMaxSamples {
 		step = src.Count / dictMaxSamples
 	}
+	want := (src.Count + step - 1) / step
+	var got atomic.Uint64
+	defer LogProgress("seal: dict", func() string {
+		return fmt.Sprintf("%d of %d containers sampled", got.Load(), want)
+	})()
 	out := make([][]byte, 0, min(src.Count, dictMaxSamples+1))
 	for i := uint64(0); i < src.Count; i += step {
 		c, err := src.Container(i)
@@ -662,6 +681,7 @@ func sampleContainers(src *epochSrc) ([][]byte, error) {
 			return nil, err
 		}
 		out = append(out, c)
+		got.Add(1)
 	}
 	return out, nil
 }
@@ -735,11 +755,16 @@ func (o *epochOut) framed(id int, enc *zstd.Encoder, walk func(func([]byte) erro
 	var payload, frame []byte
 	offs := binary.LittleEndian.AppendUint64(nil, 0)
 	n := 0
+	var nIn, nBytes atomic.Uint64
+	defer LogProgress("seal: "+sectionPhase[id], func() string {
+		return fmt.Sprintf("%d entries in, %.1fMB compressed out", nIn.Load(), float64(nBytes.Load())/1e6)
+	})()
 	flush := func() error {
 		frame = enc.EncodeAll(payload, frame[:0])
 		if err := o.write(frame); err != nil {
 			return err
 		}
+		nBytes.Add(uint64(len(frame)))
 		offs = binary.LittleEndian.AppendUint64(offs, o.off-base)
 		payload, n = payload[:0], 0
 		return nil
@@ -747,6 +772,7 @@ func (o *epochOut) framed(id int, enc *zstd.Encoder, walk func(func([]byte) erro
 	if err := walk(func(b []byte) error {
 		payload = binary.AppendUvarint(payload, uint64(len(b)))
 		payload = append(payload, b...)
+		nIn.Add(1)
 		if n++; n == framedGroup {
 			return flush()
 		}
@@ -779,11 +805,16 @@ func (o *epochOut) storedFrames(id int, enc *zstd.Encoder, start uint64, walk fu
 		frameNo, n              uint32
 	)
 	offs := binary.LittleEndian.AppendUint64(nil, 0)
+	var nIn, nBytes atomic.Uint64
+	defer LogProgress("seal: "+sectionPhase[id], func() string {
+		return fmt.Sprintf("%d records in, %.1fMB compressed out", nIn.Load(), float64(nBytes.Load())/1e6)
+	})()
 	flush := func() error {
 		frame = enc.EncodeAll(payload, frame[:0])
 		if err := o.write(frame); err != nil {
 			return err
 		}
+		nBytes.Add(uint64(len(frame)))
 		offs = binary.LittleEndian.AppendUint64(offs, o.off-base)
 		payload, inFrame = payload[:0], 0
 		frameNo++
@@ -796,6 +827,7 @@ func (o *epochOut) storedFrames(id int, enc *zstd.Encoder, start uint64, walk fu
 		payload = binary.AppendUvarint(payload, uint64(len(rec)))
 		payload = append(payload, rec...)
 		n++
+		nIn.Add(1)
 		if inFrame++; inFrame == framedGroup {
 			return flush()
 		}
@@ -892,6 +924,10 @@ type sstWriter struct {
 	o    *epochOut
 	base uint64 // artifact offset the sst section starts at
 
+	// Progress counters, read by the seal's phase line from another
+	// goroutine (state/progress.go); everything else here is single-writer.
+	nRows, nBytes atomic.Uint64
+
 	sstIdx   []byte
 	deletes  []byte
 	keys     *bufio.Writer
@@ -914,6 +950,7 @@ func (w *sstWriter) flush() error {
 	if err := w.o.write(w.frame); err != nil {
 		return err
 	}
+	w.nBytes.Add(uint64(len(w.frame)))
 	w.raw = w.raw[:0]
 	w.firstKey = nil
 	return nil
@@ -935,6 +972,7 @@ func (w *sstWriter) add(key []byte, block uint64, val []byte) error {
 		w.firstKey = append([]byte(nil), key...)
 		w.firstBlk = block
 	}
+	w.nRows.Add(1)
 	w.raw = append(w.raw, key...)
 	w.raw = binary.BigEndian.AppendUint64(w.raw, block)
 	w.raw = binary.AppendUvarint(w.raw, uint64(len(val)))
@@ -952,13 +990,18 @@ func (w *sstWriter) add(key []byte, block uint64, val []byte) error {
 func writeSST(o *epochOut, tmp string, enc *zstd.Encoder, src *epochSrc) (keysPath string, nKeys uint64, err error) {
 	rows := newExtSort(tmp, "rows", sstRecKeySize)
 	var rec []byte
-	if err := src.Rows(func(r StateRow) error {
+	stopRows := LogProgress("seal: rows", func() string {
+		return fmt.Sprintf("%d write rows read, %d chunks spilled", rows.recs.Load(), rows.chunks.Load())
+	})
+	err = src.Rows(func(r StateRow) error {
 		rec = append(rec[:0], r.Key[:]...)
 		rec = binary.BigEndian.AppendUint64(rec, r.Block)
 		rec = binary.BigEndian.AppendUint32(rec, uint32(r.Seq))
 		rec = append(rec, r.Value...)
 		return rows.add(rec)
-	}); err != nil {
+	})
+	stopRows()
+	if err != nil {
 		return "", 0, err
 	}
 	hashes, getCode, err := src.Code()
@@ -976,6 +1019,15 @@ func writeSST(o *epochOut, tmp string, enc *zstd.Encoder, src *epochSrc) (keysPa
 
 	o.begin(secSST)
 	w := &sstWriter{enc: enc, o: o, base: o.off, keys: bufio.NewWriterSize(kf, 1<<20)}
+	// The merge phase: the sorted rows come back out, deduped, with the code
+	// rows folded in, and go into the artifact compressed. "of N sorted" is the
+	// input count, so the written count lands below it by however much the
+	// dedupe removed.
+	stopSST := LogProgress("seal: sst", func() string {
+		return fmt.Sprintf("%d rows written of %d sorted, %.1fMB compressed out",
+			w.nRows.Load(), rows.recs.Load(), float64(w.nBytes.Load())/1e6)
+	})
+	defer stopSST()
 	emit := func(r []byte) error {
 		key := r[:sortedKeySize]
 		if err := cc.upTo(w, key); err != nil {
@@ -1084,6 +1136,9 @@ func writeStored(o *epochOut, tmp string, enc *zstd.Encoder, src *epochSrc) erro
 // records themselves are gigabytes.
 func trainLogsDict(tmp string, src *epochSrc) ([]byte, error) {
 	recs := newExtSort(tmp, "logsdict", 0)
+	defer LogProgress("seal: logsdict", func() string {
+		return fmt.Sprintf("%d stored-logs records sorted, %d chunks spilled", recs.recs.Load(), recs.chunks.Load())
+	})()
 	n := 0
 	if err := src.Stored(func(_ uint64, logs, _ []byte) error {
 		if len(logs) == 0 {
@@ -1151,8 +1206,13 @@ func writeTxidx(o *epochOut, src *epochSrc) error {
 func buildEpochTxidx(walk func(func(fp, blk uint64) error) error, count, hint uint64) (idx, bloom []byte, err error) {
 	type pair struct{ fp, blk uint64 }
 	pairs := make([]pair, 0, hint)
+	var got atomic.Uint64
+	defer LogProgress("seal: txidx", func() string {
+		return fmt.Sprintf("%d of %d fingerprints (tx + block hashes)", got.Load(), hint)
+	})()
 	if err := walk(func(fp, blk uint64) error {
 		pairs = append(pairs, pair{fp: fp, blk: blk})
+		got.Add(1)
 		return nil
 	}); err != nil {
 		return nil, nil, err
@@ -1202,7 +1262,12 @@ func buildEpochTxidx(walk func(func(fp, blk uint64) error) error, count, hint ui
 func buildLogidx(walk func(func(LogRec) error) error, start, count uint64) ([]byte, error) {
 	addrBlocks := map[[20]byte][]uint64{}
 	topicBlocks := map[[32]byte][]uint64{}
+	var blocks atomic.Uint64
+	defer LogProgress("seal: logidx", func() string {
+		return fmt.Sprintf("%d log-bearing blocks of the epoch's %d indexed", blocks.Load(), count)
+	})()
 	if err := walk(func(lr LogRec) error {
+		blocks.Add(1)
 		rel := lr.Block - start
 		for _, a := range lr.Addrs {
 			addrBlocks[a] = append(addrBlocks[a], rel)
@@ -1345,11 +1410,16 @@ func buildBloomFile(path string, nKeys uint64) ([]byte, error) {
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
 	var key [sortedKeySize]byte
+	var done atomic.Uint64
+	defer LogProgress("seal: keybloom", func() string {
+		return fmt.Sprintf("%d of %d keys hashed", done.Load(), nKeys)
+	})()
 	for i := uint64(0); i < nKeys; i++ {
 		if _, err := io.ReadFull(r, key[:]); err != nil {
 			return nil, fmt.Errorf("epoch bloom: key %d of %d: %w", i, nKeys, err)
 		}
 		bloomSet(words, m, bloomHashes, key[:])
+		done.Store(i + 1)
 	}
 	return encodeBloom(m, bloomHashes, words), nil
 }

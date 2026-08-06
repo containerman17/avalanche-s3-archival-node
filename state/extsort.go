@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 )
 
 // The seal's bounded sort. Records go in in any order and come back out in
@@ -37,6 +38,11 @@ type extSort struct {
 	buf   []byte  // records back to back
 	offs  []int32 // record starts in buf (+ end sentinel while sorting)
 	files []string
+
+	// Progress counters, and the only fields another goroutine may read (the
+	// seal's periodic phase lines, state/progress.go). O(1), like everything
+	// else this sort keeps.
+	recs, chunks atomic.Uint64
 }
 
 func newExtSort(dir, name string, keyLen int) *extSort {
@@ -47,6 +53,7 @@ func newExtSort(dir, name string, keyLen int) *extSort {
 func (s *extSort) add(rec []byte) error {
 	s.offs = append(s.offs, int32(len(s.buf)))
 	s.buf = append(s.buf, rec...)
+	s.recs.Add(1)
 	if len(s.buf) >= extSortBudget {
 		return s.spill()
 	}
@@ -109,6 +116,7 @@ func (s *extSort) spill() error {
 		return err
 	}
 	s.files = append(s.files, path)
+	s.chunks.Store(uint64(len(s.files)))
 	s.buf, s.offs = s.buf[:0], s.offs[:0]
 	return nil
 }

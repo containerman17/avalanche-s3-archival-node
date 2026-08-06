@@ -1,11 +1,14 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
@@ -254,6 +257,108 @@ func TestSealStreamingMatchesGather(t *testing.T) {
 				t.Fatalf("%s: seal scratch %s left behind", d, en.Name())
 			}
 		}
+	}
+}
+
+// TestSealProgressSaysWhatItIsDoingAndCannotReachTheBytes covers the whole of
+// the 2026-08-06 observability fix in one corpus: a seal announces itself, a
+// seal announces what it FINISHED, it reports periodically in between, and
+// none of that changes a byte of the artifact. The last one is the constraint
+// that matters: the same corpus is sealed twice, once at the production
+// cadence (where no phase line fires at all) and once at 1ms (where every
+// phase hook fires repeatedly), and the epoch hashes must be identical.
+func TestSealProgressSaysWhatItIsDoingAndCannotReachTheBytes(t *testing.T) {
+	dir := t.TempDir()
+	writeSparseCorpus(t, dir, 2600)
+	fixedEpochTxs(t, 1000) // 1.2 txs/block: epochs of ~834 blocks
+
+	seal := func(t *testing.T) []string {
+		t.Helper()
+		out := testStore(t, t.TempDir())
+		if _, err := sealEpochs(context.Background(), dir, out, [32]byte{9}, func(uint64) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		set, err := OpenEpochSet(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer set.Close()
+		var hashes []string
+		for _, e := range set.All() {
+			hashes = append(hashes, e.Hash)
+		}
+		return hashes
+	}
+
+	quiet := seal(t)
+	if len(quiet) < 2 {
+		t.Fatalf("sealed %d epochs, want at least 2", len(quiet))
+	}
+
+	// Every phase hook fires many times per epoch at this cadence. Capturing
+	// the log is safe because LogProgress's stop waits for its goroutine, so
+	// nothing is still writing once sealEpochs has returned.
+	old := progressEvery
+	progressEvery = time.Millisecond
+	t.Cleanup(func() { progressEvery = old })
+	var logged bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logged)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) })
+
+	loud := seal(t)
+
+	log.SetOutput(oldOut)
+	log.SetFlags(oldFlags)
+	lines := strings.Split(logged.String(), "\n")
+
+	if len(loud) != len(quiet) {
+		t.Fatalf("loud seal cut %d epochs, quiet seal cut %d", len(loud), len(quiet))
+	}
+	for i := range quiet {
+		if loud[i] != quiet[i] {
+			t.Fatalf("epoch %d: hash %s with progress logging, %s without: LOGGING CHANGED THE ARTIFACT", i, loud[i], quiet[i])
+		}
+	}
+
+	has := func(sub string) bool {
+		for _, l := range lines {
+			if strings.Contains(l, sub) {
+				return true
+			}
+		}
+		return false
+	}
+	// The start of a seal: the scan, then the build with its exact range.
+	for _, want := range []string{
+		"seal: epoch 0: scanning from block 1",
+		"seal: epoch 0: building blocks 1..",
+		"blocks=", "txs=", // the completion line, unchanged
+	} {
+		if !has(want) {
+			t.Errorf("no log line contains %q", want)
+		}
+	}
+	// ...and the periodic phase lines in between. Not every phase of a 2600
+	// block corpus outlasts a 1ms tick, but the scan of the first epoch does.
+	phases := map[string]int{}
+	example := map[string]string{}
+	for _, l := range lines {
+		if _, rest, ok := strings.Cut(l, "seal: "); ok {
+			if name, _, ok := strings.Cut(rest, ": "); ok {
+				phases[name]++
+				if _, seen := example[name]; !seen {
+					example[name] = l
+				}
+			}
+		}
+	}
+	if phases["scan"] == 0 {
+		t.Errorf("no periodic scan progress line in %d log lines: %q", len(lines), logged.String())
+	}
+	for name, n := range phases {
+		t.Logf("%s x%d: %s", name, n, example[name])
 	}
 }
 
