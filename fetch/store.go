@@ -653,11 +653,30 @@ func (s *Store) Head() (uint64, bool) {
 // returns the lowest height of the contiguous stored run containing it,
 // never scanning below floor (callers that only care whether the run
 // reaches their floor pass it to avoid an O(history) scan).
+//
+// THE RESULT IS A SHORTCUT, NOT AN ANSWER, so it is allowed to stop early and
+// the scan is bounded to one bucket. walkSpan uses it to skip past stored
+// history: it reads the block at the returned height, takes that block's
+// parent, and short-circuits again on the next turn of the loop. Returning a
+// height ABOVE the true lowest therefore costs one extra block read per bucket
+// and nothing else.
+//
+// Unbounded it was O(stored history) UNDER s.mu: on mainnet C, ~46M map lookups
+// in one call, seconds during which every Append and every read blocked. It is
+// also what made bounding byHeight impossible, since a bounded index would have
+// had to stream every bucket off disk to answer one call.
+//
+// Stopping early is also the right behaviour now that byHeight is a cache with
+// holes (dropIndex): a miss that is really a retired bucket and a miss that is
+// really a gap both mean "do not claim this run goes further", which is the
+// conservative direction.
+const maxContiguousScan = SegmentBlocks
+
 func (s *Store) LowestContiguous(from, floor uint64) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := from
-	for h > floor {
+	for budget := maxContiguousScan; h > floor && budget > 0; budget-- {
 		if _, ok := s.byHeight[h-1]; !ok {
 			break
 		}

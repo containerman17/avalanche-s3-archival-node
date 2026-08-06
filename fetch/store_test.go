@@ -535,3 +535,41 @@ func TestByHeightIsACacheNotTheOnlyRecord(t *testing.T) {
 		t.Fatalf("retired bucket: ok=%v err=%v; want false, nil", ok, err)
 	}
 }
+
+// TestLowestContiguousIsBounded: the scan must not be O(stored history) under
+// the store mutex. It is a shortcut for walkSpan, which reads the returned
+// height and short-circuits again from that block's parent, so stopping early
+// is correct and costs one extra block read per bucket.
+func TestLowestContiguousIsBounded(t *testing.T) {
+	s, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// A contiguous run two buckets long, entered directly: appending 200k real
+	// containers would make this a benchmark, not a test.
+	const runLen = 2 * SegmentBlocks
+	s.mu.Lock()
+	for h := uint64(1); h <= runLen; h++ {
+		s.byHeight[h] = heightRec{off: 0, ln: 1}
+	}
+	s.mu.Unlock()
+
+	got := s.LowestContiguous(runLen, 0)
+	if got < runLen-maxContiguousScan {
+		t.Fatalf("scanned to %d, i.e. more than %d entries below %d: the scan is unbounded", got, maxContiguousScan, runLen)
+	}
+	if got > runLen {
+		t.Fatalf("returned %d, above the starting height %d", got, runLen)
+	}
+	// Bounded, but still a useful shortcut: it must cover a whole bucket.
+	if runLen-got != maxContiguousScan {
+		t.Fatalf("skipped %d heights, want a full bucket (%d)", runLen-got, maxContiguousScan)
+	}
+
+	// The floor still wins over the budget.
+	if got := s.LowestContiguous(runLen, runLen-10); got != runLen-10 {
+		t.Fatalf("floor ignored: got %d, want %d", got, runLen-10)
+	}
+}
