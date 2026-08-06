@@ -150,8 +150,10 @@ func main() {
 //
 // SEVEN TENTHS, because a third of what the container spends is invisible to
 // the Go runtime and no soft limit can reach it: Firewood's node cache is
-// DECODED nodes in Rust (up to 4GB by the 3% clamp), zstd holds encoder state
-// per seal, and thread stacks and the epoch mappings are outside the heap too.
+// DECODED nodes in Rust (an eighth of this same ceiling, see
+// exec.firewoodCacheBytes), zstd holds encoder state per seal, and thread
+// stacks and the epoch mappings are outside the heap too. 7/10 + 1/8 = 82.5%
+// of the ceiling written down, and the residue is deliberate.
 // A limit set at the full ceiling would therefore be no limit at all, and one
 // set far below it would spin the collector for nothing.
 //

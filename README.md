@@ -108,6 +108,11 @@ EPOCHDB_MAX_STAGING       bytes of raw staging the backfill walk may retain befo
                           and waits for sealing to drain it (default 25% of the data dir's
                           free space; 0 disables the bound). Catch-up only: a node at the
                           tip is never throttled by it.
+EPOCHDB_FIREWOOD_CACHE    bytes of Firewood node cache (default an eighth of the container's
+                          own memory.max, or 3% of the Firewood dir when there is no
+                          container). Raise it when `exec: split` shows fw dominating the
+                          wall clock and the container has headroom. A value below the
+                          64MB floor, or one with a size suffix, refuses to start.
 EPOCHDB_NEW_CHAIN         set to 1 only to start a NEW chain in a prefix that already holds
                           other chains' objects. See "Joining a published chain".
 GOMEMLIMIT                honoured if you set it; otherwise derived as 7/10 of the container ceiling

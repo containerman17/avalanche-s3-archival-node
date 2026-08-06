@@ -60,3 +60,70 @@ func TestStateCacheClampsToTheContainer(t *testing.T) {
 		t.Fatalf("no container limit must leave the flag alone, got %d", got)
 	}
 }
+
+// TestFirewoodCacheDefault pins the derivation at the points that matter: a
+// fresh dir, the mid-sync mainnet-c that measured the collapse (6.5GB of dir in
+// a 34GiB container, where the old 3%-of-disk rule bought 194MB), and a full
+// mainnet state, whose 157GB no longer buys anything because the container is
+// the budget. Plus the invariant no path may break.
+func TestFirewoodCacheDefault(t *testing.T) {
+	const gib = 1 << 30
+	for _, tc := range []struct {
+		name  string
+		dir   uint64
+		limit uint64
+		want  uint64
+	}{
+		{name: "fresh dir, no container", want: fwCacheFloor},
+		{name: "fresh dir in a container", limit: 34 * gib, want: 34 * gib / 8},
+		{name: "mid-sync mainnet-c", dir: 6492 << 20, limit: 34 * gib, want: 34 * gib / 8},
+		{name: "full mainnet, same container", dir: 157 * gib, limit: 34 * gib, want: 34 * gib / 8},
+		{name: "the ceiling that OOMed", dir: 6492 << 20, limit: 24 * gib, want: 3 * gib},
+		{name: "no cgroup keeps the dir formula", dir: 6492 << 20, want: (6492 << 20) * 3 / 100},
+		{name: "no cgroup still caps at 4GB", dir: 157 * gib, want: fwCacheDiskCap},
+		{name: "absurdly small container takes the floor", limit: 128 << 20, want: fwCacheFloor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, why, err := firewoodCacheBytes(tc.dir, tc.limit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("firewoodCacheBytes(%d, %d) = %d, want %d", tc.dir, tc.limit, got, tc.want)
+			}
+			if why == "" {
+				t.Fatal("every size must say where it came from")
+			}
+			// Never below the floor, and never above the ceiling the operator
+			// wrote down (a container too small to run the binary excepted).
+			if got < fwCacheFloor {
+				t.Fatalf("%d is below the %d floor", got, uint64(fwCacheFloor))
+			}
+			if tc.limit >= fwCacheFloor*fwCacheShare && got > tc.limit {
+				t.Fatalf("%d exceeds the container's own %d ceiling", got, tc.limit)
+			}
+		})
+	}
+}
+
+// TestFirewoodCacheOverride pins that the knob wins over both derivations and
+// that a bad value refuses to start instead of silently falling back, which is
+// the whole point of having it.
+func TestFirewoodCacheOverride(t *testing.T) {
+	t.Setenv("EPOCHDB_FIREWOOD_CACHE", "8589934592")
+	got, why, err := firewoodCacheBytes(157<<30, 34<<30)
+	if err != nil || got != 8<<30 {
+		t.Fatalf("override = %d, %v; want %d", got, err, uint64(8<<30))
+	}
+	if why != "EPOCHDB_FIREWOOD_CACHE override" {
+		t.Fatalf("the source must name the override, got %q", why)
+	}
+	// "512" and "67108863" are the units mistake: a number that meant megabytes,
+	// or one just under the floor. Both are refused rather than run slowly.
+	for _, bad := range []string{"4GB", "-1", "0", "67108863", "512"} {
+		t.Setenv("EPOCHDB_FIREWOOD_CACHE", bad)
+		if _, _, err := firewoodCacheBytes(0, 34<<30); err == nil {
+			t.Fatalf("EPOCHDB_FIREWOOD_CACHE=%q was accepted", bad)
+		}
+	}
+}

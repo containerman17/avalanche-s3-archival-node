@@ -339,18 +339,17 @@ func New(cfg Config) (*Executor, error) {
 	// well under saturation. A real node cache keeps the hot trie
 	// interior resident.
 	//
-	// SIZED BY FORMULA since the fleet ruling (DESIGN "THE FLEET"), and still
-	// right now that the fleet is N processes instead of N goroutines, because a
-	// hardcoded 4GB is a per-chain grant and a box runs many chains: the
-	// cache holds DECODED nodes, so it is anon memory, and anon is the one
-	// thing the kernel cannot evict under pressure. The measured-good C-chain
-	// point was 4GB against 157GB of Firewood, i.e. 2.5%, so the calibrated
-	// ratio is 3% of what this chain actually has on disk, clamped to
-	// [64MB, 4GB]. A fresh directory gets the floor and grows into its share.
+	// SIZED AGAINST THE CONTAINER, not the directory, and not a constant: see
+	// firewoodCacheBytes for why the dir formula under-provisioned a
+	// mid-sync chain and why an eighth of `memory.max` is the number.
+	limit, _ := CgroupMemoryLimit() // 0 when there is no container ceiling
 	fwBytes := dirBytes(filepath.Join(cfg.DataDir, firewood.Directory))
-	fwCfg.CacheSizeBytes = uint(min(max(fwBytes*3/100, 64<<20), 4<<30))
-	log.Printf("exec: firewood node cache %d MB (3%% of %d MB on disk, clamped to [64MB, 4GB])",
-		fwCfg.CacheSizeBytes>>20, fwBytes>>20)
+	fwSize, fwWhy, err := firewoodCacheBytes(fwBytes, limit)
+	if err != nil {
+		return nil, err
+	}
+	fwCfg.CacheSizeBytes = uint(fwSize)
+	log.Printf("exec: firewood node cache %d MB (%s)", fwSize>>20, fwWhy)
 
 	ethdbKV := cfg.Store.EthDB()
 	memdb := rawdb.NewDatabase(ethdbKV)
@@ -373,7 +372,6 @@ func New(cfg Config) (*Executor, error) {
 	// a per-chain grant written as a constant is multiplied by the chain count
 	// on a fleet box, so the state cache takes an eighth of the container's own
 	// ceiling when there is one (see clampStateCache).
-	limit, _ := CgroupMemoryLimit() // 0 when there is no container ceiling
 	stateCache := clampStateCache(cfg.StateCacheBytes, limit)
 	if stateCache != cfg.StateCacheBytes {
 		log.Printf("exec: state cache %d MB (an eighth of this container's %d MB ceiling, asked for %d MB)",
