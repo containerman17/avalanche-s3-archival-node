@@ -488,6 +488,13 @@ func (s *Store) readAt(n uint64) ([]byte, ids.ID, bool, error) {
 // deleted. Same reason as state.Store.RetireBuckets: the arrival log is the
 // biggest raw family there is, and an unlinked file this process still holds
 // open frees no disk at all.
+//
+// THE CALLER MUST RAISE THE FETCH FLOOR TO sealedEnd FIRST. Retire now also
+// drops the by-height index of every retired bucket (see dropIndex), so after
+// it returns this store can no longer answer for a height at or below
+// sealedEnd, while byID still reports that the container exists. Only the floor
+// keeps a walk from taking the "I have this stored" branch and then finding no
+// raw behind it. serve does the two on adjacent lines, floor first.
 func (s *Store) Retire(sealedEnd uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -509,8 +516,42 @@ func (s *Store) Retire(sealedEnd uint64) error {
 		}
 		s.staged.Add(-n)
 		delete(s.bucketBytes, b)
+		s.dropIndex(b)
 	}
 	return firstErr
+}
+
+// dropIndex forgets the BY-HEIGHT index of one retired bucket.
+//
+// byHeight grew with the FETCH head and nothing ever shrank it: the only
+// eviction was readAt's one-entry lazy delete, which fires solely if a read
+// happens to land on a retired segment, and for a backfill walking DOWN that
+// read never comes. Measured on mainnet C at 58.5M staged blocks byHeight held
+// ~6.7-8.2GB of live heap, which is the whole Firewood node cache again, and
+// Firewood misses are what actually bound throughput. A height below the sealed
+// end answers nothing here: its segment is unlinked, so readAt already returns
+// "not here" for it. This just stops waiting for a read that never comes.
+//
+// byID IS DELIBERATELY KEPT. It is the smaller map and it is the ONLY local
+// record that a container ID sits inside sealed history: ResolveCheckpoints
+// asks HeightOf so it can skip a sealed checkpoint WITHOUT a network fetch,
+// which is the 2026-08-04 mainnet fix (TestResolveCheckpointsSkipsSealedHistory).
+// Dropping it too would trade that fix for the smaller half of the memory.
+//
+// This bounds GROWTH, it does not hand memory back today: Go never returns a
+// map's table to the allocator, so the win is that the freed slots absorb the
+// next buckets instead of the map expanding again. Reclaiming the peak needs
+// the index to be bucket-scoped and LRU-bounded, the way fetch/reader.go
+// already does it for readers.
+//
+// Scoped to the retired bucket's own height range, NOT a scan of byHeight: at
+// 58.5M entries a full scan per seal would cost seconds under s.mu, which the
+// walk takes for every block.
+func (s *Store) dropIndex(bucket uint64) {
+	lo := bucket * SegmentBlocks
+	for h := lo; h < lo+SegmentBlocks; h++ {
+		delete(s.byHeight, h)
+	}
 }
 
 // StagedBytes is the raw staging RETAINED ON DISK right now: the arrival and

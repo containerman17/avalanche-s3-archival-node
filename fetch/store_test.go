@@ -443,3 +443,47 @@ func TestSubscribeReportsReadFailure(t *testing.T) {
 		t.Fatal("the error event is not the last one")
 	}
 }
+
+// TestRetireDropsTheByHeightIndex: the RAM index of a retired bucket is dead
+// weight that nothing used to reclaim, and on mainnet C it reached ~6.7-8.2GB
+// while the Firewood cache that actually bounds throughput had 8GB. Retire must
+// drop it. byID must SURVIVE: it is what lets ResolveCheckpoints skip a sealed
+// checkpoint without a network fetch (TestResolveCheckpointsSkipsSealedHistory).
+func TestRetireDropsTheByHeightIndex(t *testing.T) {
+	s, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// One block in bucket 0 (retired below) and one in bucket 1 (kept).
+	sealedID, liveID := ids.GenerateTestID(), ids.GenerateTestID()
+	if err := s.Append(parsedContainer{containerID: sealedID, blockHash: sealedID, blockNumber: 1}, []byte("raw")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(parsedContainer{containerID: liveID, blockHash: liveID, blockNumber: SegmentBlocks + 1}, []byte("raw")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.byHeight[1]; !ok {
+		t.Fatal("height 1 was never indexed; the test proves nothing")
+	}
+
+	// Seal everything in bucket 0.
+	if err := s.Retire(SegmentBlocks - 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := s.byHeight[1]; ok {
+		t.Error("byHeight kept a height inside sealed history: the index still grows without bound")
+	}
+	if _, ok := s.byHeight[SegmentBlocks+1]; !ok {
+		t.Error("byHeight dropped a height ABOVE the sealed end; the walk needs that one")
+	}
+	// The whole point of keeping byID.
+	if h, ok := s.HeightOf(sealedID); !ok || h != 1 {
+		t.Errorf("HeightOf(sealed) = %d, %v; want 1, true. ResolveCheckpoints needs this to skip sealed checkpoints offline", h, ok)
+	}
+	if h, ok := s.HeightOf(liveID); !ok || h != SegmentBlocks+1 {
+		t.Errorf("HeightOf(live) = %d, %v", h, ok)
+	}
+}

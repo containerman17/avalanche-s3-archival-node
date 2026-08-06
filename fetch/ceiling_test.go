@@ -66,7 +66,12 @@ func TestWalkPausesOverTheCeilingAndResumesOnDrain(t *testing.T) {
 		t.Fatal("walk is stalled but does not report itself paused")
 	}
 
-	// The seal, as serve calls it: raw unlinked, staging accounted for again.
+	// The seal, as serve calls it: floor raised FIRST, then raw unlinked and
+	// staging accounted for again (cmd/epochdb/follow.go, adjacent lines). The
+	// order is the invariant Retire relies on, so the test has to keep it: once
+	// a bucket is retired its by-height index is gone, and only the floor stops
+	// a walk from asking for a height that no longer has raw behind it.
+	f.SetFloor(SegmentBlocks - 1)
 	if err := s.Retire(SegmentBlocks - 1); err != nil {
 		t.Fatal(err)
 	}
