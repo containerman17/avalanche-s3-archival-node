@@ -159,20 +159,46 @@ func TestPausedWalkExitsOnContext(t *testing.T) {
 // silently ignored.
 func TestStagingCeilingDefaultAndOverride(t *testing.T) {
 	dir := t.TempDir()
-	n, err := stagingCeiling(dir)
+	n, err := stagingCeiling(dir, 0)
 	if err != nil || n == 0 {
 		t.Fatalf("default ceiling for %s: %d, %v", dir, n, err)
 	}
 	t.Setenv("EPOCHDB_MAX_STAGING", "12345")
-	if n, err := stagingCeiling(dir); err != nil || n != 12345 {
+	if n, err := stagingCeiling(dir, 0); err != nil || n != 12345 {
 		t.Fatalf("override: %d, %v", n, err)
 	}
 	t.Setenv("EPOCHDB_MAX_STAGING", "0") // the explicit opt-out
-	if n, err := stagingCeiling(dir); err != nil || n != 0 {
+	if n, err := stagingCeiling(dir, 0); err != nil || n != 0 {
 		t.Fatalf("opt-out: %d, %v", n, err)
 	}
 	t.Setenv("EPOCHDB_MAX_STAGING", "400GB")
-	if _, err := stagingCeiling(dir); err == nil {
+	if _, err := stagingCeiling(dir, 0); err == nil {
 		t.Fatal("a bad EPOCHDB_MAX_STAGING was accepted")
+	}
+}
+
+// TestStagingCeilingDoesNotRatchetDown: restarting with staging already on disk
+// must not shrink the budget. Free space at that point is the disk minus our own
+// staging, so counting only free space makes every restart tighten the bound by
+// whatever we were holding, until the walk pauses forever. Retained bytes are
+// space sealing gives back, so they belong in the pool the share divides.
+func TestStagingCeilingDoesNotRatchetDown(t *testing.T) {
+	dir := t.TempDir()
+	cold, err := stagingCeiling(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A restart holding `retained` sees free space lower by exactly that much.
+	const retained = 200 << 30
+	warm, err := stagingCeiling(dir, retained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warm <= cold {
+		t.Fatalf("restart with %d B staged gave ceiling %d, not above the cold %d: the bound ratchets down",
+			uint64(retained), warm, cold)
+	}
+	if got := warm - cold; got != retained/stagingFreeShare {
+		t.Fatalf("retained %d B moved the ceiling by %d, want %d", uint64(retained), got, retained/stagingFreeShare)
 	}
 }

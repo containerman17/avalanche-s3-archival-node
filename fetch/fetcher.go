@@ -167,7 +167,7 @@ func New(cfg Config) (*Fetcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	ceiling, err := stagingCeiling(cfg.DataDir)
+	ceiling, err := stagingCeiling(cfg.DataDir, store.StagedBytes())
 	if err != nil {
 		store.Close()
 		return nil, err
@@ -206,7 +206,14 @@ const stagingFreeShare = 4
 // ponytail: measured once, at open. A live statfs would shrink as our own
 // staging grows, so the bound would tighten against itself; the rest of the
 // disk is the chunk cache's own live watermark to defend.
-func stagingCeiling(dir string) (uint64, error) {
+//
+// retained is what our staging already holds. It counts toward the pool the
+// share divides because sealing gives it back: free space alone is the disk
+// MINUS our own staging, so deriving the bound from it lets every restart
+// ratchet the bound down by whatever we were holding (observed on mainnet C:
+// 392 -> 335 -> 319 -> 304 GB across four restarts, each one tightening the
+// budget that produced it).
+func stagingCeiling(dir string, retained uint64) (uint64, error) {
 	if v := os.Getenv("EPOCHDB_MAX_STAGING"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
@@ -222,7 +229,7 @@ func stagingCeiling(dir string) (uint64, error) {
 		return 0, nil
 	}
 	// f_bavail, not f_bfree: the reserved blocks are not ours.
-	return uint64(st.Bavail) * uint64(st.Bsize) / stagingFreeShare, nil
+	return (uint64(st.Bavail)*uint64(st.Bsize) + retained) / stagingFreeShare, nil
 }
 
 // dial performs the network-only part of New: bootstrap RPC, P2P dial,
