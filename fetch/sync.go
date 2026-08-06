@@ -248,8 +248,7 @@ func (f *Fetcher) SyncTarget() uint64 { return f.syncTarget.Load() }
 // The retained-staging ceiling (SetCeiling) is the symmetric bound at the other
 // end, and it is enforced here for the same reason: this loop IS the walk, so
 // one check at the top of it covers every block any caller stages.
-func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
-	floor = max(floor, f.floor.Load())
+func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, spanFloor uint64) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -262,6 +261,17 @@ func (f *Fetcher) walkSpan(ctx context.Context, id ids.ID, floor uint64) error {
 			return fmt.Errorf("network stopped: %w", err)
 		default:
 		}
+		// RE-READ THE FLOOR EVERY BLOCK, and AFTER awaitStagingRoom, not once
+		// at entry. A walk runs for hours and a seal raises the floor under it
+		// every epoch, so a floor captured at entry goes stale mid-walk and the
+		// walk keeps descending into heights whose raw the seal has just
+		// unlinked. The pause above is exactly where that staleness is worst:
+		// it is the walk parked for as long as sealing takes, and sealing is
+		// the thing that moves the floor. That is what the "its raw bucket was
+		// retired by a seal" error below is: not a corrupt store, a walk using
+		// a floor from before the last seal. One atomic load per block, the
+		// same cost as the ceiling check above it.
+		floor := max(spanFloor, f.floor.Load())
 		if id == f.genesisID {
 			return nil
 		}
