@@ -96,6 +96,13 @@ func serveMain(args []string) {
 	if err := state.CheckDictTrainer(); err != nil {
 		log.Fatalf("epochdb: serve: %v", err)
 	}
+	// Before the port, before the dial, before a byte of this dir is opened:
+	// this process is now the dir's one writer, or it does not run.
+	release, lockErr := lockDataDir(*dataDir)
+	if lockErr != nil {
+		log.Fatalf("epochdb: serve: %v", lockErr)
+	}
+	defer release()
 	var tip ids.ID
 	if *tipOverride != "" {
 		var err error

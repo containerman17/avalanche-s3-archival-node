@@ -238,7 +238,7 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 		return run, err
 	}
 	defer reader.Close()
-	sweepSealScratch(out)
+	SweepSealScratch(out)
 
 	// THE MARKERS, NOT THE EPOCHS. Everything this needs is in the local index
 	// (how many epochs exist, where the last one ends, what it hashes to), and
@@ -691,18 +691,28 @@ func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
 	return lr, nil
 }
 
-// sweepSealScratch drops what a KILLED build left behind. The external sorts
+// SweepSealScratch drops what a KILLED build left behind. The external sorts
 // spill into a scratch directory in the data dir, and the artifact itself is
 // built as a file in the spool; a finished build removes both, an OOM kill
 // (three of those on this corpus in 24h) removes neither, and a multi-GB stray
-// per kill is exactly what a crunch cannot afford.
+// per kill is exactly what a crunch cannot afford (19.9 GB across seven chains
+// after the outages of 2026-08-05).
 //
-// The data dir belongs to this seal alone (single-caller by contract), so its
-// scratch goes unconditionally. The spool is this chain's alone since 2026-08-04, but a
-// half-written artifact still goes only once it is a day old and therefore
-// cannot belong to a live build (a second tool over the same dir) (an epoch takes ~2h at the worst
-// size the schedule allows).
-func sweepSealScratch(out *dist.Store) {
+// UNCONDITIONAL, NO AGE TEST (user ruling 2026-08-06, verbatim: "if we do not
+// share the spool between the chains, then sweeping on the start makes sense,
+// because if you're starting, who needs this?"). The 24-hour guard it replaces
+// was written for the FLEET, where one spool held many chains' builds and a
+// stray `.tmp` could be a sibling's work in progress. One process owns the data
+// dir now, enforced by the lock the process takes over it, so the only build
+// that can own an `epoch-*.tmp` here is one of OURS, and liveEpochBuilds names
+// those exactly. Everything else is provably dead, whatever its mtime: a killed
+// build never got a hash name, so the sync ticker cannot see it and nothing
+// else will ever remove it.
+//
+// Called at STARTUP (the serve path's join, before the frontier build) as well
+// as before each seal, because reclaiming that disk matters most at the moment
+// a container restarts, which is exactly when the box is short of it.
+func SweepSealScratch(out *dist.Store) {
 	dirs, _ := filepath.Glob(filepath.Join(out.Dir(), sealTmpPrefix+"*"))
 	for _, d := range dirs {
 		if err := os.RemoveAll(d); err == nil {
@@ -711,8 +721,7 @@ func sweepSealScratch(out *dist.Store) {
 	}
 	files, _ := filepath.Glob(filepath.Join(out.SpoolDir(), "epoch-*.tmp"))
 	for _, f := range files {
-		st, err := os.Stat(f)
-		if err != nil || time.Since(st.ModTime()) < 24*time.Hour {
+		if _, live := liveEpochBuilds.Load(f); live {
 			continue
 		}
 		if err := os.Remove(f); err == nil {

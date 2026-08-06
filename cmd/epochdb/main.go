@@ -244,6 +244,7 @@ func cookMain(args []string) {
 	fs := flag.NewFlagSet("cook-index", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	fs.Parse(args)
+	defer mustLockDataDir("cook-index", *dataDir)()
 	if err := state.CookIndex(*dataDir); err != nil {
 		log.Fatalf("epochdb: cook-index: %v", err)
 	}
@@ -258,6 +259,7 @@ func sealMain(args []string) {
 	outDir := fs.String("out", "", "directory the sealed epochs are published into (default --data; a separate dir rebuilds them from the same raws)")
 	_, resolveChain := chainFlags(fs)
 	fs.Parse(args)
+	defer mustLockDataDir("seal", *dataDir)()
 	if *outDir == "" {
 		*outDir = *dataDir
 	} else if err := os.MkdirAll(*outDir, 0o755); err != nil {
@@ -289,6 +291,7 @@ func cookTxMain(args []string) {
 	fs := flag.NewFlagSet("cook-txindex", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "shared data directory")
 	fs.Parse(args)
+	defer mustLockDataDir("cook-txindex", *dataDir)()
 	if err := state.CookTxIndex(*dataDir); err != nil {
 		log.Fatalf("epochdb: cook-txindex: %v", err)
 	}
@@ -311,6 +314,7 @@ func bootstrapMain(args []string) {
 	doVerify := fs.Bool("verify", false, "after the walk, run the no-execution verification over the whole indexed set (pulls every byte)")
 	workers := fs.Int("workers", 0, "body/receipt verification workers (0 = GOMAXPROCS)")
 	fs.Parse(args)
+	defer mustLockDataDir("bootstrap", *dataDir)()
 	c := resolveChain(*dataDir)
 	fetch.RegisterExtras(c.VMKind)
 
@@ -387,6 +391,7 @@ func execMain(args []string) {
 	commitEvery := fs.Int("commit-every", 1000, "blocks per Firewood proposal (root verification at batch boundaries, per-block bisect on mismatch; 1 = classic per-block)")
 	stopAt := fs.Uint64("stop", 0, "stop after executing this height (0 = follow staging forever)")
 	fs.Parse(args)
+	defer mustLockDataDir("exec", *dataDir)()
 
 	if *pprofAddr != "" {
 		go func() { log.Printf("epochdb: pprof: %v", http.ListenAndServe(*pprofAddr, nil)) }()
@@ -492,6 +497,7 @@ func fetchMain(args []string) {
 	follow := fs.Bool("follow", false, "consensus-verified tip following: real snowman polls against the weighted validator set (replaces --from-tip's frontier voting)")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set (--follow); default: --node URI only, with a warning")
 	fs.Parse(args)
+	defer mustLockDataDir("fetch", *dataDir)()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

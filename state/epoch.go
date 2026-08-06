@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"sync"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/rlp"
@@ -682,11 +683,19 @@ type epochOut struct {
 	tab  [epochNumSections][2]uint64 // off, len per section
 }
 
+// liveEpochBuilds names the spool files THIS process is currently writing, and
+// it is the whole of the sweep's exclusion rule: the data dir has one writer
+// (enforced by the process's lock on it), so an `epoch-*.tmp` that is not in
+// here belongs to a build that is dead. Keyed by path; entries live from
+// CreateTemp to Adopt or discard.
+var liveEpochBuilds sync.Map
+
 func newEpochOut(st *dist.Store) (*epochOut, error) {
 	f, err := os.CreateTemp(st.SpoolDir(), "epoch-*.tmp")
 	if err != nil {
 		return nil, err
 	}
+	liveEpochBuilds.Store(f.Name(), struct{}{})
 	return &epochOut{
 		st: st, path: f.Name(), f: f,
 		w: bufio.NewWriterSize(f, 1<<20), d: dist.NewHasher(),
@@ -839,6 +848,7 @@ func (o *epochOut) finish(src *epochSrc) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	liveEpochBuilds.Delete(o.path)
 	o.path = "" // adopted: not ours to remove any more
 	return hash, nil
 }
@@ -852,6 +862,7 @@ func (o *epochOut) discard() {
 	}
 	if o.path != "" {
 		os.Remove(o.path)
+		liveEpochBuilds.Delete(o.path)
 		o.path = ""
 	}
 }

@@ -35,6 +35,7 @@ func publishMain(args []string) {
 	fs := flag.NewFlagSet("publish", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "directory whose spool is uploaded")
 	fs.Parse(args)
+	defer mustLockDataDir("publish", *dataDir)()
 	st, err := dist.Open(*dataDir)
 	if err != nil {
 		log.Fatalf("epochdb: publish: %v", err)
@@ -134,6 +135,13 @@ func joinChain(ctx context.Context, cfg nodeConfig, build func(ctx context.Conte
 		return fmt.Errorf("open artifact store: %w", err)
 	}
 	defer st.Close()
+	// FIRST THING THE START DOES WITH THIS DIR: give back the disk a killed
+	// build is holding. This process now owns the dir (lockDataDir), so nothing
+	// here can be someone's work in progress, and the moment of a restart is
+	// exactly when the box is short of disk, with the frontier build below
+	// about to want more of it (19.9 GB of `epoch-*.tmp` across seven chains
+	// after the outages of 2026-08-05).
+	state.SweepSealScratch(st)
 	root := cfg.Chain.Root()
 	ptr := dist.LatestPointer(root)
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,6 +41,57 @@ import (
 // that never blocks, which is the right answer there: one chain per dir is one
 // build.
 const heavyLockPrefix = "heavy."
+
+// THE DATA DIR HAS EXACTLY ONE WRITER, AND THIS IS WHAT MAKES IT TRUE. One
+// chain per process has been the rule since 2026-08-04 and the serve process is
+// the sole writer and sole owner of its dir, but until now that was a
+// CONVENTION with nothing enforcing it: two writers on one dir both append to
+// the raw families, both truncate a torn tail at open, and both want Firewood's
+// exclusive handle, i.e. silent corruption in exchange for a typo. It is also
+// the premise the unconditional scratch sweep rests on (state.SweepSealScratch):
+// if nobody else can be building here, every stray `epoch-*.tmp` this process
+// did not open is dead.
+//
+// Same mechanism as the heavy gate above and for the same reason: flock is held
+// by the process, so a kill -9 leaves no stale lock to clean up. It FAILS,
+// never waits: a second writer has nothing to wait for.
+const dataDirLockFile = ".epochdb.lock"
+
+// lockDataDir takes the dir's exclusive writer lock for the life of the
+// process. The returned closer releases it; dropping it on the floor is fine
+// too, since exiting does the same thing.
+//
+// READ-ONLY OPENERS DO NOT CALL THIS and must not: state.OpenReadOnly, the SDK
+// and `dev probe` read a live chain's dir beside its writer on purpose.
+func lockDataDir(dir string) (func(), error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	name := filepath.Join(dir, dataDirLockFile)
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("data dir %s is already held by another epochdb process (%s is flocked): one process writes one data dir."+
+			" Stop that process (or point this one at another --data dir) and start again;"+
+			" read-only users (the SDK, `epochdb dev probe`) need no lock and work beside it", dir, name)
+	}
+	return func() { f.Close() }, nil
+}
+
+// mustLockDataDir is lockDataDir for the dev stages, which write the dir and so
+// take the same lock `serve` does: DESIGN warns that no dev stage may run
+// beside a live serve, and this is that warning with teeth. One line per stage,
+// `defer mustLockDataDir("seal", *dataDir)()`.
+func mustLockDataDir(stage, dir string) func() {
+	release, err := lockDataDir(dir)
+	if err != nil {
+		log.Fatalf("epochdb: %s: %v", stage, err)
+	}
+	return release
+}
 
 // heavySlotPoll is how often a waiting build re-sweeps the slots. A build runs
 // for minutes to hours, so seconds of latency on the handover cost nothing, and

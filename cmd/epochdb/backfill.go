@@ -125,6 +125,7 @@ func backfillLogsMain(args []string) {
 		go func() { log.Println(http.ListenAndServe(*pprofAddr, nil)) }()
 	}
 
+	defer mustLockDataDir("backfill-logs", *dataDir)()
 	env, cleanup := openBfEnv(*dataDir, mustCChain(*network))
 	defer cleanup()
 	bf, err := state.OpenLogsBackfill(*dataDir)

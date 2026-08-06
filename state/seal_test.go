@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/containerman17/epochdb/dist"
 )
 
 // synthRcpt is a stand-in for the executor's live capture: nTxs receipt
@@ -209,5 +211,49 @@ func TestTailRcptFraming(t *testing.T) {
 	}
 	if _, _, err := DecodeTailRcpt([]byte{9}); err == nil {
 		t.Fatal("a record claiming 9 log bytes it does not have was accepted")
+	}
+}
+
+// TestSweepSealScratchAtStartup is the unconditional sweep: an abandoned
+// artifact goes whatever its age (a killed build's file is minutes old at a
+// restart, and the 24h guard it replaced left 19.9 GB behind), while the file
+// the LIVE build in this process owns is the one thing it must not touch.
+func TestSweepSealScratchAtStartup(t *testing.T) {
+	st, err := dist.Local(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead, err := os.CreateTemp(st.SpoolDir(), "epoch-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead.Close()
+	scratch := filepath.Join(st.Dir(), sealTmpPrefix+"12345")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	live, err := newEpochOut(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.discard()
+
+	SweepSealScratch(st)
+
+	if _, err := os.Stat(dead.Name()); !os.IsNotExist(err) {
+		t.Fatalf("abandoned %s survived the sweep (err=%v)", dead.Name(), err)
+	}
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("stale scratch dir survived the sweep (err=%v)", err)
+	}
+	mine := live.path
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("the live build's own file was swept: %v", err)
+	}
+
+	// Once the build is over the file is nobody's, so the next sweep takes it.
+	live.discard()
+	if _, still := liveEpochBuilds.Load(mine); still {
+		t.Fatal("a finished build is still registered as live")
 	}
 }
