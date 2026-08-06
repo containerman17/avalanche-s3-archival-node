@@ -30,6 +30,10 @@ const vdrRefreshInterval = time.Hour
 // every accepted container is appended to the staging store, and the gap
 // between stored history and the anchor is backfilled by the regular
 // archival-pool walk.
+// followBackfillWalks is the concurrency of the anchor backfill, matching the
+// --walks default of the tip-override path: the two do the same work.
+const followBackfillWalks = 16
+
 func (f *Fetcher) Follow(ctx context.Context) error {
 	weights, err := crossCheckedWeights(ctx, f.vdrSources(), f.subnetID)
 	if err != nil {
@@ -59,9 +63,24 @@ func (f *Fetcher) Follow(ctx context.Context) error {
 				return fmt.Errorf("store anchor at height %d: %w", c.Height, err)
 			}
 			go func() {
-				f.activeWalks.Add(1)
-				defer f.activeWalks.Add(-1)
-				if err := f.walkSpan(ctx, c.ID, 0); err != nil && ctx.Err() == nil {
+				// SEED FROM THE CHECKPOINTS, like SyncTo does. One walk from the
+				// anchor down to genesis is serial: measured at 139 blk/s on
+				// mainnet C, which is a 6.8-day stall with the executor idle
+				// behind it. The embedded checkpoints split the same history into
+				// spans that walk concurrently. An L1 has none, so anchors is
+				// just the tip there and this is exactly the old behaviour.
+				anchors, err := f.ResolveCheckpoints(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					// Not fatal: one serial walk is slow, not wrong.
+					log.Printf("fetch: anchor backfill: checkpoints unresolved (%v), falling back to a single serial walk", err)
+					anchors = nil
+				}
+				anchors = append(anchors, Anchor{ID: c.ID, Height: c.Height})
+				log.Printf("fetch: anchor backfill height=%d spans=%d walks=%d", c.Height, len(anchors), followBackfillWalks)
+				if err := f.walkSpans(ctx, anchors, followBackfillWalks); err != nil && ctx.Err() == nil {
 					log.Printf("fetch: anchor backfill walk: %v", err)
 					return
 				}

@@ -185,6 +185,26 @@ func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error
 	f.syncTarget.Store(anchors[0].Height)
 	log.Printf("fetch: sync-to height=%d anchors=%d walks=%d", anchors[0].Height, len(anchors), walks)
 
+	if err := f.walkSpans(ctx, anchors, walks); err != nil {
+		return err
+	}
+	log.Printf("fetch: sync-to complete, %d spans", len(anchors))
+	return nil
+}
+
+// walkSpans splits history at the anchors and runs one backward walk per span,
+// `walks` at a time. Each walk stops at the next lower anchor's height; the
+// lowest walks to genesis. Sorts anchors descending in place.
+//
+// Shared by SyncTo (tip override) and the follow-mode anchor backfill, because
+// the difference between the two is only WHERE the top anchor comes from. Doing
+// it in one place is what keeps follow mode from regressing to a single serial
+// walk, which is a days-long stall on a big chain.
+func (f *Fetcher) walkSpans(ctx context.Context, anchors []Anchor, walks int) error {
+	if walks < 1 {
+		walks = 1
+	}
+	sort.Slice(anchors, func(i, j int) bool { return anchors[i].Height > anchors[j].Height })
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(walks)
 	// Launch lowest spans first: a forward consumer (exec) follows the
@@ -202,11 +222,7 @@ func (f *Fetcher) SyncTo(ctx context.Context, anchors []Anchor, walks int) error
 			return f.walkSpan(gctx, a.ID, floor)
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return err
-	}
-	log.Printf("fetch: sync-to complete, %d spans", len(anchors))
-	return nil
+	return g.Wait()
 }
 
 // SyncTarget is the ceiling of the bounded backfill this fetcher is running
