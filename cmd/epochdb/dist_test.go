@@ -94,6 +94,73 @@ func TestBootstrapChainWalk(t *testing.T) {
 	}
 }
 
+// TestOfflineSealPublishesItsPointerWhenCredentialsArrive is the handover: a
+// chain sealed with NO credentials, then restarted WITH them, and the thing
+// being pinned is that its `latest` pointer reaches the bucket on the very next
+// sync, with NOTHING NEW SEALED. It used to wait for the next seal, which on a
+// slow chain is weeks, and until then the bucket held every artifact and no
+// pointer, which reads to a joining node as a chain nobody ever published.
+func TestOfflineSealPublishesItsPointerWhenCredentialsArrive(t *testing.T) {
+	s3 := newFakeS3(t)
+	c := testChain("a-chain-that-sealed-with-no-credentials")
+	root := c.Root()
+	dir := t.TempDir()
+
+	// The offline producer: no EPOCHDB_S3_* anywhere, so there is no casfs at
+	// all. It seals its epochs and writes its pointer, and Sync is a no-op.
+	local, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, h2 := buildLinkedEpochs(t, local, root)
+	if err := local.SetLatest(root, dist.Latest{Epoch: h2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The credentials arrive and the same dir is restarted. NOTHING IS SEALED
+	// from here on: this is one Sync, exactly what the ticker and `dev publish`
+	// do.
+	t.Setenv("EPOCHDB_S3_ENDPOINT", s3.URL)
+	t.Setenv("EPOCHDB_S3_BUCKET", "epochs")
+	t.Setenv("EPOCHDB_S3_ACCESS_KEY", "ak")
+	t.Setenv("EPOCHDB_S3_SECRET_KEY", "sk")
+	st, err := dist.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := string(s3.object(dist.LatestPointer(root))); got != "epoch "+h2+"\n" {
+		t.Fatalf("bucket pointer = %q, want the value the offline producer sealed", got)
+	}
+	if s3.object(h2) == nil {
+		t.Fatal("the epoch the pointer names is not in the bucket")
+	}
+
+	// The whole point of the pointer: a node that has never seen this chain
+	// joins it from the bucket alone.
+	joined := t.TempDir()
+	built := 0
+	if err := joinChain(context.Background(), nodeConfig{DataDir: joined, Chain: c},
+		func(context.Context, string, *dist.Store, *chain.Chain) error { built++; return nil }); err != nil {
+		t.Fatalf("a fresh node could not join the published chain: %v", err)
+	}
+	if built != 1 {
+		t.Fatalf("frontier built %d times, want 1", built)
+	}
+}
+
 // ---------- a bucket, in process ----------
 
 // fakeS3 is a single-bucket S3 good enough for HEAD, PUT, GET and ranged GET,
@@ -119,6 +186,10 @@ func newFakeS3(t *testing.T) *fakeS3 {
 func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	f.reqs.Add(1)
 	key := strings.TrimPrefix(r.URL.Path, "/epochs/")
+	if r.URL.Query().Get("list-type") == "2" {
+		f.serveList(w, r.URL.Query().Get("prefix"))
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		body, err := io.ReadAll(r.Body)
@@ -156,6 +227,25 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveList is ListObjectsV2, one key at most, which is all the "has anybody
+// published here" probe asks for.
+func (f *fakeS3) serveList(w http.ResponseWriter, prefix string) {
+	f.mu.Lock()
+	var found string
+	for k := range f.objects {
+		if strings.HasPrefix(k, prefix) {
+			found = k
+			break
+		}
+	}
+	f.mu.Unlock()
+	fmt.Fprint(w, "<ListBucketResult>")
+	if found != "" {
+		fmt.Fprintf(w, "<Contents><Key>%s</Key></Contents>", found)
+	}
+	fmt.Fprint(w, "</ListBucketResult>")
+}
+
 // take removes one object (an operator's typo, a lifecycle rule, a botched
 // copy) and hands it back so a subtest can put it right again.
 func (f *fakeS3) take(key string) []byte {
@@ -164,6 +254,12 @@ func (f *fakeS3) take(key string) []byte {
 	obj := f.objects[key]
 	delete(f.objects, key)
 	return obj
+}
+
+func (f *fakeS3) object(key string) []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.objects[key]
 }
 
 func (f *fakeS3) restore(key string, obj []byte) {
@@ -289,11 +385,40 @@ func TestJoinChain(t *testing.T) {
 		}
 	})
 
-	// (c) No pointer anywhere for this chain root: a genuinely fresh chain,
-	// which is the from-scratch path and not an error.
-	t.Run("no pointer starts from scratch", func(t *testing.T) {
+	// (c) NO POINTER OVER A PREFIX THAT HOLDS OBJECTS. This is the ambiguous
+	// case and it is the expensive one: it looks exactly like a fresh chain, so
+	// the node used to start a full re-execution from genesis and log one line
+	// about it. A prefix with content in it is a prefix somebody published to,
+	// so it is refused BY NAME instead.
+	t.Run("objects but no pointer refuses to start", func(t *testing.T) {
 		dir := t.TempDir()
 		built, err := join(t, dir, testChain("a-chain-nobody-ever-published"))
+		if err == nil {
+			t.Fatal("a missing pointer over a populated prefix silently started from genesis")
+		}
+		for _, want := range []string{"REFUSING TO START", "ALREADY HOLDS OBJECTS", "EPOCHDB_NEW_CHAIN=1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("the refusal does not say %q: %v", want, err)
+			}
+		}
+		if built != 0 {
+			t.Fatalf("the refused chain still reached the frontier build")
+		}
+
+		// And the escape is the one an operator is told about, for a genuinely
+		// new chain sharing a prefix with the chains already in it.
+		t.Setenv("EPOCHDB_NEW_CHAIN", "1")
+		if _, err := join(t, t.TempDir(), testChain("a-chain-nobody-ever-published")); err != nil {
+			t.Fatalf("EPOCHDB_NEW_CHAIN=1 did not let a new chain start: %v", err)
+		}
+	})
+
+	// (c2) A genuinely fresh chain over an EMPTY prefix: the first publisher,
+	// and it must stay frictionless. No flag, no variable, no refusal.
+	t.Run("an empty prefix starts from scratch", func(t *testing.T) {
+		t.Setenv("EPOCHDB_S3_PREFIX", "a-prefix-nobody-has-published-to/")
+		dir := t.TempDir()
+		built, err := join(t, dir, testChain("the-very-first-chain-in-this-prefix"))
 		if err != nil {
 			t.Fatalf("an unpublished chain refused to start from scratch: %v", err)
 		}

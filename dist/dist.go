@@ -615,6 +615,17 @@ func (s *Store) SetLatest(chainRoot [32]byte, l Latest) error {
 // uploads it on a later Sync, after that pass's content. NOTHING HERE TOUCHES
 // THE NETWORK, which is what lets a seal publish an epoch on a node whose
 // credentials expired hours ago.
+//
+// THE SPOOL COPY IS WRITTEN WHETHER OR NOT THERE ARE CREDENTIALS, and that is
+// the whole reason this is not two lines. Publishing a pointer used to depend on
+// there being a casfs at the moment of the write, and the one caller
+// (setLatestEpoch, inside the seal loop) runs once per epoch: a dir that sealed
+// everything offline and restarted WITH keys uploaded its artifacts and no
+// pointer, and the pointer then waited for the next seal, which is weeks away on
+// a slow chain. casfs's own constructor rebuilds its dirty set by scanning the
+// spool's pointer directory, so a value left there while offline is picked up by
+// the next credentialed process and uploaded on its first Sync, still last and
+// still only after that pass's content went up cleanly.
 func (s *Store) SetPointer(name, value string) error {
 	p := s.pointerPath(name)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -624,9 +635,24 @@ func (s *Store) SetPointer(name, value string) error {
 		return err
 	}
 	if s.cas != nil {
-		return s.cas.SetPointer(name, value)
+		return s.cas.SetPointer(name, value) // also marks it dirty for this process
 	}
-	return nil
+	return casfs.WriteSpoolPointer(s.spool, name, value)
+}
+
+// PrefixHasObjects reports whether the configured bucket prefix holds ANY
+// object. False without credentials, where there is no bucket to ask.
+//
+// It answers one question and it is the join's: a `latest` pointer that is
+// missing over a prefix somebody has already published content to is a BROKEN
+// PUBLISH, while the same missing pointer over an empty prefix is a chain nobody
+// has started yet. Nothing else can tell those apart, because content is named
+// by hash and carries no chain.
+func (s *Store) PrefixHasObjects() (bool, error) {
+	if s.cas == nil {
+		return false, nil
+	}
+	return s.cas.PrefixHasObjects()
 }
 
 // GetPointer reads a pointer, local copy first: a producer's own pointer is

@@ -104,6 +104,8 @@ EPOCHDB_CACHE_MIN_FREE    bytes of free space the cache stops filling at (defaul
 EPOCHDB_CACHE_MAX_AGE     a cached chunk's ceiling age, Go duration (default 720h)
 EPOCHDB_FETCH_CONCURRENCY parallel sub-range GETs per cold chunk; a property of your NIC
 EPOCHDB_HEAVY_SLOTS       concurrent frontier builds allowed per box (default 1)
+EPOCHDB_NEW_CHAIN         set to 1 only to start a NEW chain in a prefix that already holds
+                          other chains' objects. See "Joining a published chain".
 GOMEMLIMIT                honoured if you set it; otherwise derived as 7/10 of the container ceiling
 ```
 
@@ -156,6 +158,10 @@ The one thing you lose is joining a published corpus, because the join needs a p
 credential-less node either syncs the chain itself from the network or is seeded by copying a data
 directory.
 
+Credentials can also arrive later, which is how a chain synced on one box is handed to another: a
+node that sealed offline still recorded its `latest` pointer, so restarting that same directory with
+credentials publishes the artifacts **and** the pointer on the next sync, with nothing re-sealed.
+
 The client hand-rolls SigV4 with path-style addressing and accepts `auto` as a region, so it is not
 AWS-specific: Cloudflare R2, MinIO, DigitalOcean Spaces, Backblaze B2 and Hetzner object storage are
 the same code path, and for real external traffic their egress pricing is the reason to prefer them.
@@ -171,6 +177,14 @@ state section into a local frontier at the last sealed block, and starts executi
 there. Anything missing or inconsistent is a hard error that names the artifact and refuses to start.
 It never silently falls back to re-executing from genesis, because a typo'd `EPOCHDB_S3_PREFIX`
 quietly doing that is the most expensive failure in the system.
+
+A *missing* pointer is refused on the same grounds. Content is named by its hash and says nothing
+about which chain it belongs to, but a prefix that holds objects is a prefix somebody has published
+to, so no pointer over one is a broken publish, not a fresh chain, and the node says so and stops.
+An **empty** prefix is the first publisher and starts with no friction at all: that check is one
+list request, and there is nothing to set. The one case the node cannot tell apart is a genuinely
+new chain going into a prefix that other chains already publish into; start that one with
+`EPOCHDB_NEW_CHAIN=1`, and unset it once the chain has sealed its first epoch.
 
 Two measured joins, each on a machine that had never seen the chain:
 

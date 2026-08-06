@@ -102,8 +102,11 @@ func bootstrapChain(st *dist.Store, chainRoot [32]byte) (epochs int, err error) 
 // runs it before anything opens the data dir,
 // and the whole decision is these four cases:
 //
-//  1. No `latest` pointer, locally or in the bucket -> a genuinely fresh chain.
-//     Fetch from genesis and execute, the path that always existed.
+//  1. No `latest` pointer, locally or in the bucket, AND nothing published under
+//     the bucket prefix -> a genuinely fresh chain. Fetch from genesis and
+//     execute, the path that always existed. No pointer over a prefix that DOES
+//     hold objects is a broken publish and a hard error, see checkReallyFresh:
+//     it is the same disaster as case 2, reached by a different door.
 //  2. A pointer exists but the chain it names cannot be walked -> HARD ERROR,
 //     refuse to start. NEVER fall back to from-scratch: a typo'd
 //     EPOCHDB_S3_PREFIX would silently make a provider re-replay weeks of
@@ -149,6 +152,9 @@ func joinChain(ctx context.Context, cfg nodeConfig, build func(ctx context.Conte
 	// is local-first with a bucket fallback, so this really does mean nowhere.
 	l, err := st.Latest(root)
 	if errors.Is(err, fs.ErrNotExist) {
+		if err := checkReallyFresh(st, cfg.DataDir, ptr); err != nil {
+			return err
+		}
 		logf("join: no `%s` pointer locally or in the bucket: fresh chain, starting from genesis", ptr)
 		return nil
 	} else if err != nil {
@@ -199,6 +205,73 @@ func joinChain(ctx context.Context, cfg nodeConfig, build func(ctx context.Conte
 		return fmt.Errorf("build the state frontier: %w", err)
 	}
 	return nil
+}
+
+// checkReallyFresh is THE ONLY GUARD ON THE ONE SILENT OUTCOME OF THE JOIN.
+// Case 1 above (no pointer anywhere) starts a full re-execution from genesis
+// and logs one line, so an operator whose publish is broken, whose prefix has a
+// typo in it or whose `--chain` names the wrong chain gets a node that looks
+// like it is working while it re-replays weeks of history. DESIGN's rule is
+// HARD ERROR OVER SILENT RE-REPLAY, ALWAYS, and it covered only the case where a
+// pointer exists; arriving at the fresh-chain branch by accident was uncovered.
+//
+// THE EVIDENCE IS THE PREFIX ITSELF, because it is the one signal that needs no
+// knowledge from the operator (DESIGN: "a second command to remember is a second
+// thing to get wrong at 3am"). Content is named by hash and says nothing about
+// which chain it belongs to, but a prefix that holds ANY object is a prefix
+// somebody has published to, and a missing pointer over one is a broken publish.
+// An EMPTY prefix is the first publisher and stays completely frictionless: no
+// flag, no variable, one list request that finds nothing.
+//
+// Three cases pass without asking the bucket anything:
+//   - no credentials at all: there is no bucket to be wrong about.
+//   - this dir has executed before (exec head above 0): its own history is the
+//     evidence, and it is a producer that has simply not sealed its first epoch
+//     yet, which on a slow chain is days of restarts.
+//   - EPOCHDB_NEW_CHAIN=1: the deliberate "yes, a new chain, into a prefix that
+//     already holds another one's objects", which is legal (pointers are
+//     qualified by chain root precisely so N chains can share a prefix) and
+//     which nothing else can distinguish from the failure. It is logged loudly.
+//
+// A LIST THAT FAILS IS A REFUSAL, not a shrug: it needs s3:ListBucket, and
+// "cannot tell" resolves the same way everything else here does.
+func checkReallyFresh(st *dist.Store, dataDir, ptr string) error {
+	if !st.Remote() {
+		return nil
+	}
+	if head, _, err := state.ExecHead(dataDir); err != nil {
+		return err
+	} else if head > 0 {
+		return nil
+	}
+	prefix := os.Getenv("EPOCHDB_S3_PREFIX")
+	if os.Getenv("EPOCHDB_NEW_CHAIN") == "1" {
+		logf("join: EPOCHDB_NEW_CHAIN=1, so starting a new chain from genesis into prefix %q WITHOUT checking"+
+			" whether anything is published there. Unset it once this chain has sealed its first epoch.", prefix)
+		return nil
+	}
+	has, err := st.PrefixHasObjects()
+	if err != nil {
+		return fmt.Errorf("this dir has no history and there is no `%s` pointer, so the bucket prefix %q had to be"+
+			" checked for a broken publish, and listing it failed: %w"+
+			"\nREFUSING TO START rather than re-executing this chain from genesis on a guess."+
+			" Grant s3:ListBucket, or set EPOCHDB_NEW_CHAIN=1 if this really is a chain nobody has published yet",
+			ptr, prefix, err)
+	}
+	if !has {
+		return nil // an empty prefix: the normal first publisher, no friction
+	}
+	return fmt.Errorf("there is no `%s` pointer anywhere, but the bucket prefix %q ALREADY HOLDS OBJECTS."+
+		"\nREFUSING TO START. A prefix with content in it is a prefix somebody published to, so this is a broken or"+
+		" mis-typed publish, not a fresh chain, and starting anyway would silently re-execute the whole chain from"+
+		" genesis. Check, in this order:"+
+		"\n  1. EPOCHDB_S3_ENDPOINT/BUCKET/PREFIX name this chain's own corpus (a typo in the prefix lands exactly here)"+
+		"\n  2. --chain and --network name the chain that was published there: the pointer is named after the chain"+
+		" root, and this node is looking for `%s`"+
+		"\n  3. the producer really published its pointer. A chain that sealed WITHOUT credentials keeps it at"+
+		" <data>/latest-<root> only; on the producer, copy it into <data>/cas/.pointers/ and let it sync."+
+		"\nIf this genuinely is a new chain sharing a prefix with other chains, set EPOCHDB_NEW_CHAIN=1.",
+		ptr, prefix, ptr)
 }
 
 // checkLocalIndex is the warm start's whole validation, and it touches NOTHING
