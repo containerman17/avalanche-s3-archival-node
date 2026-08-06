@@ -163,8 +163,9 @@ func probeMain(args []string) {
 			out.AvgBytes = round1(float64(r.SampleBytes) / float64(r.Sampled))
 			out.AvgTxs = round2(float64(r.SampleTxs) / float64(r.Sampled))
 			blocks := float64(r.TipHeight) + 1
-			out.EstRawBytes = uint64(out.AvgBytes * blocks)
-			out.EstTxs = uint64(out.AvgTxs * blocks)
+			out.TipLocalRawBytes = uint64(out.AvgBytes * blocks)
+			out.TipLocalTxs = uint64(out.AvgTxs * blocks)
+			out.Coverage, out.SampleWarning = coverage(r.Sampled, r.TipHeight)
 		}
 	}
 	if perr != nil {
@@ -283,12 +284,26 @@ type probeOut struct {
 	SampleLowHeight uint64  `json:"sampledLowHeight"`
 	AvgBytes        float64 `json:"avgBytesPerContainer"`
 	AvgTxs          float64 `json:"avgTxsPerBlock"`
-	// Est* extrapolate the sample over every block. The sample is a contiguous
-	// run below the TIP (p2p has no get-by-height, so anything else means
-	// walking there), i.e. the busiest history there is, so on a chain whose
-	// traffic grew these are upper bounds.
-	EstRawBytes uint64 `json:"estRawBytesFromSample"`
-	EstTxs      uint64 `json:"estTxsFromSample"`
+	// Coverage is what fraction of the chain the sample actually saw. It is
+	// the number that makes the two below readable, and it is routinely on the
+	// order of 0.01%: the sample is a CONTIGUOUS RUN IMMEDIATELY BELOW THE TIP
+	// (p2p has no get-by-height, so reaching an arbitrary height means walking
+	// there one GetAncestors round at a time), i.e. the last few hours of a
+	// chain that may be years old.
+	Coverage float64 `json:"sampleCoverageFraction"`
+	// TipLocal* multiply the tip-local density by every block in the chain.
+	// They are NOT counts, they are "what this chain would hold if it had
+	// always run at today's rate", and no chain is required to have done that.
+	// Measured errors in BOTH directions, 2026-08-06: Bnry read ~66M txs
+	// against a real >1B (15x LOW, a chain that was busy and went quiet) and
+	// blockticity read 20.6 tx/blk at the tip against 1.72 over a uniform
+	// height sweep (12x HIGH). Do not admit a chain on these.
+	TipLocalRawBytes uint64 `json:"tipLocalRawBytesExtrapolated"`
+	TipLocalTxs      uint64 `json:"tipLocalTxsExtrapolated"`
+	// SampleWarning spells the caveat out in the output itself, because the
+	// coverage ratio was always derivable from sampledLowHeight and nobody
+	// derived it.
+	SampleWarning string `json:"sampleWarning,omitempty"`
 
 	Genesis genesisSniff `json:"genesis"`
 
@@ -393,8 +408,36 @@ func weightShape(w []uint64) string {
 	return fmt.Sprintf("skewed, top=%.0f%% max/min=%.1fx", top, float64(sorted[0])/float64(max(sorted[len(sorted)-1], 1)))
 }
 
-// Size rule (the user's): a chain is worth syncing under ~10M blocks and under
-// ~100M transactions. Both, not either: 10M fat blocks is not a small corpus.
+// coverage reports what fraction of the chain the sample saw, and the warning
+// that fraction earns. Split out so the threshold is one place and testable.
+//
+// 1% is generous: three GetAncestors rounds is ~1-2k containers (avalanchego
+// caps a response at 2000 containers / 2 MiB), so anything past a ~200k-block
+// chain is already below it, and a multi-million-block chain is at ~0.01%.
+const trustworthyCoverage = 0.01
+
+func coverage(sampled int, tipHeight uint64) (float64, string) {
+	blocks := float64(tipHeight) + 1
+	c := float64(sampled) / blocks
+	if c >= trustworthyCoverage {
+		return c, ""
+	}
+	return c, fmt.Sprintf("the sample is %.4f%% of the chain and sits entirely at the tip: "+
+		"tipLocal* assume this chain always ran at today's rate. Do NOT admit a chain on them; "+
+		"use tipHeight (exact) or a get-by-height sweep over a public RPC.", c*100)
+}
+
+// Size rule (the user's, amended 2026-08-06): the real bound is ~100M
+// transactions, and the ~10M block cutoff is the PROXY for it at roughly 10
+// tx/block. A known transaction count therefore wins over the block count.
+//
+// The catch, learned on Bnry the same day: the probe does not KNOW a
+// transaction count. It knows the density of the last ~2k blocks. Bnry
+// extrapolated to ~66M from the tip and really holds over a billion, so the
+// block rule was the one that caught it and the tx extrapolation was the one
+// that would have let it in. Hence maxTxs only ever REJECTS here; it never
+// rescues a chain that is over maxBlocks. Overriding the block rule is a human
+// call backed by a real count, which is exactly how the user made it.
 const (
 	maxBlocks = 10_000_000
 	maxTxs    = 100_000_000
@@ -417,13 +460,13 @@ func verdict(o probeOut) (string, string) {
 	case !o.TipDecoded:
 		return "UNKNOWN", "frontier container did not decode as a subnet-evm block"
 	case o.TipHeight > maxBlocks:
-		return "TOO BIG", fmt.Sprintf("%d blocks > %d", o.TipHeight, maxBlocks)
-	case o.EstTxs > maxTxs:
-		return "TOO BIG", fmt.Sprintf("~%d txs (estimated) > %d", o.EstTxs, maxTxs)
+		return "TOO BIG", fmt.Sprintf("%d blocks > %d (a real tx count under %d can overrule this, a tip-local extrapolation cannot)", o.TipHeight, maxBlocks, maxTxs)
+	case o.TipLocalTxs > maxTxs:
+		return "TOO BIG", fmt.Sprintf("~%d txs extrapolated from tip-local density > %d", o.TipLocalTxs, maxTxs)
 	case o.Archival == 0:
 		return "SYNC", "within the size rule, but no peer answered GetAncestors: history may be pruned"
 	}
-	return "SYNC", fmt.Sprintf("%d blocks, ~%d txs, %d/%d validators serving", o.TipHeight, o.EstTxs, o.Archival, o.Validators)
+	return "SYNC", fmt.Sprintf("%d blocks (exact), %d/%d validators serving; tip-local density extrapolates to ~%d txs but see sampleWarning", o.TipHeight, o.Archival, o.Validators, o.TipLocalTxs)
 }
 
 func round1(f float64) float64 { return float64(int64(f*10+0.5)) / 10 }
