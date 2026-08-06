@@ -487,3 +487,51 @@ func TestRetireDropsTheByHeightIndex(t *testing.T) {
 		t.Errorf("HeightOf(live) = %d, %v", h, ok)
 	}
 }
+
+// TestByHeightIsACacheNotTheOnlyRecord: freeing the in-RAM index must never
+// turn a stored block into a missing one. The index sidecar is the durable
+// copy, so a miss re-reads it; a bucket the seal retired has no sidecar and
+// correctly stays missing.
+func TestByHeightIsACacheNotTheOnlyRecord(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	p, raw := fakeContainer(7, 0xd0, 128)
+	if err := s.Append(p, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reclaim the whole map, the way a bounded index would.
+	s.mu.Lock()
+	s.byHeight = make(map[uint64]heightRec)
+	s.mu.Unlock()
+
+	got, ok, err := s.GetByHeight(7)
+	if err != nil {
+		t.Fatalf("read after releasing the index: %v", err)
+	}
+	if !ok {
+		t.Fatal("a released index made a stored block look missing; the sidecar fallback did not fire")
+	}
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("re-read %d bytes, want the %d appended", len(got), len(raw))
+	}
+
+	// Retired history: the seal unlinks both files, so there is nothing to
+	// fall back to and "not here" is the right answer rather than an error.
+	s.mu.Lock()
+	s.byHeight = make(map[uint64]heightRec)
+	s.mu.Unlock()
+	for _, n := range []string{arrivalName(0), indexName(0)} {
+		if err := os.Remove(filepath.Join(dir, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok, err := s.GetByHeight(7); err != nil || ok {
+		t.Fatalf("retired bucket: ok=%v err=%v; want false, nil", ok, err)
+	}
+}

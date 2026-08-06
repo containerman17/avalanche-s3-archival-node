@@ -460,7 +460,20 @@ func (s *Store) readAt(n uint64) ([]byte, ids.ID, bool, error) {
 	defer s.mu.Unlock()
 	rec, ok := s.byHeight[n]
 	if !ok {
-		return nil, ids.Empty, false, nil
+		// A MISS IS A CACHE MISS, NOT AN ANSWER. byHeight is no longer the only
+		// record of what is staged: dropIndex retires whole buckets' worth of it
+		// to keep the map from growing with the fetch head, and the index
+		// sidecar on disk still holds every record. Re-read that bucket and
+		// retry once. A RETIRED bucket has no sidecar to read, so this still
+		// reports "not here" for sealed history, which is the answer that
+		// matters. Without this fallback, freeing memory would silently turn
+		// stored blocks into missing ones.
+		if err := s.loadBucketIndex(n / SegmentBlocks); err != nil {
+			return nil, ids.Empty, false, err
+		}
+		if rec, ok = s.byHeight[n]; !ok {
+			return nil, ids.Empty, false, nil
+		}
 	}
 	sg, err := s.seg(n/SegmentBlocks, false)
 	if err != nil {
@@ -482,6 +495,57 @@ func (s *Store) readAt(n uint64) ([]byte, ids.ID, bool, error) {
 		return nil, ids.Empty, false, fmt.Errorf("decompress container at height %d: %w", n, err)
 	}
 	return raw, rec.id, true, nil
+}
+
+// loadBucketIndex repopulates byHeight for one bucket from its index sidecar,
+// which is the durable copy of exactly what the map caches. Called only on a
+// miss, so a warm bucket costs nothing.
+//
+// A MISSING SIDECAR IS NOT AN ERROR: that is a bucket the seal retired and
+// unlinked, and "no entries" is the correct answer for it. Only a real I/O
+// failure is reported, because silently treating an unreadable disk as an empty
+// bucket is how a walk decides history it already has is missing and re-fetches
+// it (recovery_scans_must_stop_only_on_a_clean_eof).
+//
+// Records are fixed width and validated against the arrival file's length the
+// same way rebuild does it, so a torn tail is skipped rather than trusted.
+// Caller holds s.mu.
+func (s *Store) loadBucketIndex(bucket uint64) error {
+	index, err := os.Open(filepath.Join(s.dir, indexName(bucket)))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // retired, or never written
+		}
+		return fmt.Errorf("open index for bucket %d: %w", bucket, err)
+	}
+	defer index.Close()
+	ast, err := os.Stat(filepath.Join(s.dir, arrivalName(bucket)))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // index without arrival: same as retired
+		}
+		return fmt.Errorf("stat arrival for bucket %d: %w", bucket, err)
+	}
+	arrivalSize := uint64(ast.Size())
+
+	buf := make([]byte, indexRecSize)
+	for off := int64(0); ; off += indexRecSize {
+		if _, err := index.ReadAt(buf, off); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return fmt.Errorf("read index record for bucket %d: %w", bucket, err)
+		}
+		height := binary.BigEndian.Uint64(buf[0:8])
+		var id ids.ID
+		copy(id[:], buf[8:40])
+		recOff := binary.BigEndian.Uint64(buf[72:80])
+		ln := binary.BigEndian.Uint32(buf[80:84])
+		if recOff+uint64(ln) > arrivalSize {
+			return nil // torn tail: the container bytes never landed
+		}
+		s.byHeight[height] = heightRec{id: id, off: recOff, ln: ln}
+	}
 }
 
 // Retire drops this store's handles on the staging segments a seal has just
