@@ -573,3 +573,52 @@ func TestLowestContiguousIsBounded(t *testing.T) {
 		t.Fatalf("floor ignored: got %d, want %d", got, runLen-10)
 	}
 }
+
+// TestByHeightIndexIsBoundedToRecentBuckets: the staging ceiling bounds bytes
+// on DISK and never bounded this map, so a walk far ahead of the executor grew
+// it with the fetch head (6.7-8.2GB measured on mainnet C). It is now an LRU
+// over buckets, and an evicted bucket must still READ correctly via the sidecar.
+func TestByHeightIndexIsBoundedToRecentBuckets(t *testing.T) {
+	s, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// One container in each of maxIndexBuckets+1 distinct buckets.
+	const nBuckets = maxIndexBuckets + 1
+	raws := make([][]byte, nBuckets)
+	for i := range nBuckets {
+		h := uint64(i)*SegmentBlocks + 1
+		p, raw := fakeContainer(h, byte(0xe0+i), 64)
+		if err := s.Append(p, raw); err != nil {
+			t.Fatal(err)
+		}
+		raws[i] = raw
+	}
+
+	s.mu.Lock()
+	cached := len(s.idxUse)
+	entries := len(s.byHeight)
+	s.mu.Unlock()
+	if cached > maxIndexBuckets {
+		t.Fatalf("%d buckets cached, bound is %d: the index is still unbounded", cached, maxIndexBuckets)
+	}
+	if entries > maxIndexBuckets {
+		t.Fatalf("%d byHeight entries for %d buckets; an eviction did not drop its records", entries, cached)
+	}
+
+	// Bucket 0 is the least recently used, so it was evicted. Reading it must
+	// still work: the sidecar is the durable copy.
+	got, ok, err := s.GetByHeight(1)
+	if err != nil || !ok {
+		t.Fatalf("evicted bucket unreadable: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(got, raws[0]) {
+		t.Fatal("evicted bucket read back the wrong container")
+	}
+	// And the newest bucket is still served.
+	if _, ok, err := s.GetByHeight(uint64(nBuckets-1)*SegmentBlocks + 1); err != nil || !ok {
+		t.Fatalf("newest bucket: ok=%v err=%v", ok, err)
+	}
+}

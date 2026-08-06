@@ -47,8 +47,13 @@ type Store struct {
 
 	byHeight map[uint64]heightRec
 	byID     map[ids.ID]uint64 // containerID -> height
-	head     uint64
-	haveAny  bool
+	// idxUse is the LRU clock for byHeight, one entry per bucket whose records
+	// are currently cached. byHeight is bounded through it; byID is NOT and is
+	// deliberately complete (see dropIndex).
+	idxUse  map[uint64]uint64 // bucket -> last use
+	idxTick uint64
+	head    uint64
+	haveAny bool
 
 	enc *zstd.Encoder
 	dec *zstd.Decoder
@@ -201,6 +206,7 @@ func (s *Store) rebuildSegment(bucket uint64) error {
 		}
 		s.byHeight[height] = heightRec{id: id, off: off, ln: ln}
 		s.byID[id] = height
+		s.touchIndexBucket(height / SegmentBlocks)
 		if !s.haveAny || height > s.head {
 			s.head = height
 			s.haveAny = true
@@ -394,6 +400,7 @@ func (s *Store) Append(p parsedContainer, raw []byte) error {
 	}
 	s.byHeight[p.blockNumber] = heightRec{id: p.containerID, off: off, ln: uint32(len(frame))}
 	s.byID[p.containerID] = p.blockNumber
+	s.touchIndexBucket(p.blockNumber / SegmentBlocks)
 	if !s.haveAny || p.blockNumber > s.head {
 		s.head = p.blockNumber
 		s.haveAny = true
@@ -510,6 +517,48 @@ func (s *Store) readAt(n uint64) ([]byte, ids.ID, bool, error) {
 // Records are fixed width and validated against the arrival file's length the
 // same way rebuild does it, so a torn tail is skipped rather than trusted.
 // Caller holds s.mu.
+// maxIndexBuckets caps how many buckets' worth of by-height records stay in
+// RAM. The walk descends one bucket at a time and the executor does not use
+// this map at all (it reads staging through fetch.Reader, which has its own
+// LRU), so a handful is plenty; it mirrors maxOpenSegments for the same reason.
+//
+// THIS IS THE BOUND THE STAGING CEILING NEVER WAS. That ceiling limits BYTES ON
+// DISK and says nothing about RAM, so a walk 15:1 ahead of the executor grew
+// byHeight with the FETCH head: measured 6.7-8.2GB on mainnet C at 58.5M staged
+// blocks, on a box where the Firewood node cache it competes with is 8GB and
+// cache misses are what bound throughput.
+//
+// Safe only because of three things that had to land first: byHeight is a cache
+// over the index sidecar so a miss re-reads rather than lying (c8ad0f3),
+// LowestContiguous scans at most one bucket so an eviction cannot make it
+// stream history off disk (19977bf), and nothing iterates byHeight.
+const maxIndexBuckets = 8
+
+// touchIndexBucket marks a bucket used and evicts the least recently used one
+// once the cache is over its bound. Caller holds s.mu.
+func (s *Store) touchIndexBucket(bucket uint64) {
+	if s.idxUse == nil {
+		s.idxUse = make(map[uint64]uint64)
+	}
+	s.idxTick++
+	s.idxUse[bucket] = s.idxTick
+	for len(s.idxUse) > maxIndexBuckets {
+		var (
+			oldest    uint64
+			oldestUse = ^uint64(0)
+		)
+		for b, use := range s.idxUse {
+			if use < oldestUse {
+				oldest, oldestUse = b, use
+			}
+		}
+		if oldest == bucket {
+			return // never evict what we just populated
+		}
+		s.dropIndex(oldest)
+	}
+}
+
 func (s *Store) loadBucketIndex(bucket uint64) error {
 	index, err := os.Open(filepath.Join(s.dir, indexName(bucket)))
 	if err != nil {
@@ -545,6 +594,7 @@ func (s *Store) loadBucketIndex(bucket uint64) error {
 			return nil // torn tail: the container bytes never landed
 		}
 		s.byHeight[height] = heightRec{id: id, off: recOff, ln: ln}
+		s.touchIndexBucket(bucket)
 	}
 }
 
@@ -616,6 +666,7 @@ func (s *Store) dropIndex(bucket uint64) {
 	for h := lo; h < lo+SegmentBlocks; h++ {
 		delete(s.byHeight, h)
 	}
+	delete(s.idxUse, bucket)
 }
 
 // StagedBytes is the raw staging RETAINED ON DISK right now: the arrival and
