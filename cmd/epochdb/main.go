@@ -441,9 +441,24 @@ func execMain(args []string) {
 // heights come from the fetched container over p2p, so nothing here depends on
 // an archive RPC, on the ProposerVM activation constant, or on a checkpoint
 // happening to sit at the right height (RULING 2026-08-01).
+// tipAnchorTimeout bounds the wait for the override container itself.
+// getContainer RETRIES UNTIL IT ARRIVES, which never happens for an ID from
+// another network, and the failure is silent: the fleet ran 28 chains with a
+// MAINNET container ID as their --tip-override and every one sat in "waiting
+// for block 1 to land in staging" forever, looking merely slow. A seed nobody
+// can serve is a typo, not a slow peer, so bound it and name the likely cause.
+// Generous because peer warmup precedes it; the checkpoints that follow keep
+// the caller's unbounded ctx, since 86 real fetches legitimately take a while.
+const tipAnchorTimeout = 5 * time.Minute
+
 func resolveTipOverride(ctx context.Context, f *fetch.Fetcher, id ids.ID) []fetch.Anchor {
-	tip, err := f.ResolveAnchor(ctx, id)
+	actx, cancel := context.WithTimeout(ctx, tipAnchorTimeout)
+	defer cancel()
+	tip, err := f.ResolveAnchor(actx, id)
 	if err != nil {
+		if ctx.Err() == nil && actx.Err() != nil {
+			log.Fatalf("epochdb: --tip-override %s: no peer served this container in %s. Is it an ID from a DIFFERENT NETWORK than --network?", id, tipAnchorTimeout)
+		}
 		log.Fatalf("epochdb: --tip-override: %v", err)
 	}
 	anchors := []fetch.Anchor{tip}
