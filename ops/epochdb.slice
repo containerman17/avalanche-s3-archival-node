@@ -22,7 +22,26 @@
 #
 # THE ARITHMETIC on the current box (i7i.2xlarge, 61.78 GiB usable, no swap):
 #
-#   MemoryHigh=44G   the fleet's target. Sized against the measured anon terms:
+# MemoryHigh MUST STAY ABOVE THE SUM OF THE MEMBERS' ANON WORKING SETS, not just
+# above "most of the box". 2026-08-07, one giant chain (mainnet C) plus one small
+# one sat at 47.88 GB against a 47.24 GB MemoryHigh, i.e. PERMANENTLY over it, so
+# the kernel reclaimed the slice continuously: memory PSI full avg10 64.85%,
+# mainnet at 83.7 mgas/s. Raising MemoryHigh to 49G stopped it dead (the `high`
+# counter in memory.events froze) and PSI fell to 0.4%. The throttle band is a
+# band to pass THROUGH under burst, not a line to live on: when the steady state
+# is above MemoryHigh there is no "degrade by slowing down", only degrade.
+#
+# THE MEMBER CEILING MUST ALSO LEAVE ROOM FOR PAGE CACHE, and this is the part
+# that is easy to get wrong because `docker stats` does not separate it. Read
+# memory.stat: mainnet's ANON alone was 43.97 GB (40.9 GiB) against a 44 GiB
+# mem_limit, so ~2 GiB was left for file pages and every Firewood read went to
+# disk. Raising that one container to 48g gave it ~7.3 GB of page cache and
+# measured +30% throughput (27 -> 35 blk/s, 83.7 -> 133.5 mgas/s), no code change
+# and no restart (`docker update --memory`, which GOMEMLIMIT ignores because the
+# process read its ceiling at startup). Size a member as anon + its cache, never
+# anon alone.
+#
+#   MemoryHigh=49G   the fleet's target. Sized against the measured anon terms:
 #                    per chain, Firewood's cgo node cache (3% of its Firewood
 #                    dir, 64MB..4GB), the exec state cache (an eighth of the
 #                    container's ceiling since 2026-08-05), the per-block index
@@ -30,7 +49,7 @@
 #                    which is ~1.2 GB for a sparse L1 at the 8M-tx epoch
 #                    ceiling), and the epoch blooms, which are on the Go heap.
 #                    At 22 chains that totals ~30-35 GiB, and the rest of the
-#                    44G is the fleet's page cache.
+#                    49G is the fleet's page cache.
 #   MemoryMax=52G    hard backstop: ~9.8 GiB of the box is never docker's.
 #   CPUWeight=50     the other half of "sshd always runs". Weights only bind
 #                    under contention (the box was at load 8.14 on 8 vCPU when
@@ -92,7 +111,7 @@ Before=docker.service
 
 [Slice]
 MemoryAccounting=yes
-MemoryHigh=44G
+MemoryHigh=49G
 MemoryMax=52G
 CPUAccounting=yes
 CPUWeight=50
