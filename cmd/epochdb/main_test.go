@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"log"
+	"os"
 	"regexp"
 	"runtime/debug"
 	"strings"
@@ -145,5 +147,34 @@ func TestSetGoGCIsBelowTheGoDefaultAndYieldsToTheOperator(t *testing.T) {
 	setGoGC()
 	if got := debug.SetGCPercent(123); got != 123 {
 		t.Fatalf("GC percent moved to %d while GOGC was set in the environment", got)
+	}
+}
+
+// TestWarnIfHeapPagesAreKept: the warning must fire exactly when the runtime
+// will hold freed heap pages resident. It is easy to lose madvdontneed=1 by
+// accident because docker REPLACES GODEBUG rather than merging, and the
+// symptom (page cache shrinking as the heap high-water mark grows) is
+// invisible in both `docker stats` and gctrace.
+func TestWarnIfHeapPagesAreKept(t *testing.T) {
+	for _, tc := range []struct {
+		godebug string
+		warn    bool
+	}{
+		{"", true},                          // unset: Go's MADV_FREE default
+		{"gctrace=1", true},                 // the accidental replacement
+		{"madvdontneed=1", false},           // what the image ships
+		{"gctrace=1,madvdontneed=1", false}, // operator kept it
+		{"madvdontneed=0", true},            // explicitly turned back off
+	} {
+		var buf bytes.Buffer
+		log.SetOutput(&buf)
+		t.Setenv("GODEBUG", tc.godebug)
+		warnIfHeapPagesAreKept()
+		log.SetOutput(os.Stderr)
+
+		warned := strings.Contains(buf.String(), "madvdontneed")
+		if warned != tc.warn {
+			t.Errorf("GODEBUG=%q: warned=%v, want %v", tc.godebug, warned, tc.warn)
+		}
 	}
 }

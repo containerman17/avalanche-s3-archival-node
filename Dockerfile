@@ -46,4 +46,19 @@ COPY --from=build /zstd /usr/local/bin/zstd
 # exec.Command("zstd", ...) resolves through PATH; distroless sets one, but the
 # trainer is load-bearing enough to state rather than inherit.
 ENV PATH=/usr/local/bin:/usr/bin:/bin
+# GO RETURNS FREED HEAP PAGES LAZILY BY DEFAULT (MADV_FREE): they stay RESIDENT
+# until the kernel reclaims them, so the arena ratchets to its high-water mark
+# and never gives the ground back. This node's speed comes from the page cache,
+# so that ground is exactly what it cannot spare. Measured on mainnet C: the
+# arena held 18.4GB RSS against a live heap oscillating 12-13GB, and switching
+# to MADV_DONTNEED moved container anon 35.34 -> 21.83GB, page cache
+# 20.24 -> 24.45GB, and mgas 229.6 -> 302.7.
+#
+# It has to be an env var: `//go:debug madvdontneed=1` is rejected (not a
+# versioned setting) and the runtime reads GODEBUG before main() runs.
+#
+# WARNING: docker/compose `environment: GODEBUG=...` REPLACES this wholesale
+# rather than merging, so any operator value must repeat madvdontneed=1.
+# epochdb logs a loud line at startup when it is missing.
+ENV GODEBUG=madvdontneed=1
 ENTRYPOINT ["/usr/local/bin/epochdb"]

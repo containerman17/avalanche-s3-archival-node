@@ -140,7 +140,33 @@ var devCommands = map[string]func([]string){
 func main() {
 	setGoMemLimit()
 	setGoGC()
+	warnIfHeapPagesAreKept()
 	os.Exit(dispatch(os.Args[1:], os.Stderr))
+}
+
+// warnIfHeapPagesAreKept says so when the runtime will hold freed heap pages
+// resident instead of handing them back.
+//
+// Go's default is MADV_FREE: a freed page stays in RSS until the kernel wants
+// it, so the heap arena ratchets to its HIGH-WATER MARK and never comes down.
+// On a node whose throughput comes from the page cache that is the worst
+// possible trade, and it is invisible in `docker stats` (the total looks
+// steady) and invisible in gctrace (the LIVE heap really is small). Measured on
+// mainnet C: an 18.4GB arena against a live heap oscillating 12-13GB, and
+// MADV_DONTNEED moved container anon 35.34 -> 21.83GB, page cache
+// 20.24 -> 24.45GB, mgas 229.6 -> 302.7.
+//
+// The image sets GODEBUG=madvdontneed=1, but docker REPLACES that variable
+// wholesale when a compose file names it, so an operator adding gctrace can
+// silently drop this. Warn rather than fail: the node still runs, just slower,
+// and the line names the fix.
+func warnIfHeapPagesAreKept() {
+	if strings.Contains(os.Getenv("GODEBUG"), "madvdontneed=1") {
+		return
+	}
+	log.Printf("epochdb: WARNING GODEBUG lacks madvdontneed=1, so the Go heap will keep freed pages RESIDENT " +
+		"and the page cache this node reads through will shrink as the heap's high-water mark grows. " +
+		"Set GODEBUG=madvdontneed=1 (add it to any GODEBUG you set, docker replaces the variable rather than merging).")
 }
 
 // defaultGOGC is deliberately below Go's own 100.
