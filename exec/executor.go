@@ -337,7 +337,34 @@ func New(cfg Config) (*Executor, error) {
 	// deferred count to revisions-1, i.e. persist every batch. Measured over 8
 	// 100k-op batches: 1483MB retained at 128 revisions, 688MB at 2, and the
 	// per-batch cost keeps falling instead of staying linear.
-	if cfg.FrontierBuild {
+	// AND THE SAME APPLIES TO SERVING, which nobody carried across. A retained
+	// revision holds its trie deltas in RUST memory, outside GOMEMLIMIT and
+	// outside the Go heap entirely, so none of the Go-side tuning reaches it.
+	// Measured on mainnet C 2026-08-08: the Go arena stayed FLAT at 15-16GB
+	// while non-arena anon grew ~2.6 GB/h to 12.3GB in under three hours, and
+	// that growth is what squeezes the page cache until Firewood reads start
+	// missing and throughput halves. 128 revisions is the only unbounded term
+	// left on this path.
+	//
+	// NOTHING READS A HISTORICAL REVISION HERE. Every Firewood read in this
+	// process opens the CURRENT head root (the executor's parentRoot, the
+	// batch's start root, SAE's parent root); rpc.Server is constructed with
+	// no Firewood handle at all and Overlay.TrieDB() returns nil precisely so
+	// that a served read reaching a triedb fails loudly; historical state
+	// comes from the sealed epochs plus the overlay. Nor is there a rollback:
+	// reconcile re-executes FORWARD from the durable root by walking headers
+	// on disk, and HealTornFrontier WIPES rather than rewinds. The backward
+	// budget is in headers, never revisions.
+	//
+	// GATED ON CommitEvery, because graft upholds
+	// DeferredCommitInterval < RevisionsInMemory by clamping the former. At
+	// CommitEvery > 1 the block above has already set the deferred interval to
+	// 1, so 2 revisions changes nothing about persistence. At CommitEvery == 1
+	// the interval is still Firewood's default 64, and 2 revisions would
+	// silently clamp it to 1, i.e. an fsync per block. serve runs 64 and the
+	// standalone exec defaults to 1000, so both take this path and lose
+	// nothing.
+	if cfg.FrontierBuild || cfg.CommitEvery > 1 {
 		fwCfg.RevisionsInMemory = 2
 	}
 	// The default 1MB node cache collapses once state outgrows it: at

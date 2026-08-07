@@ -141,3 +141,31 @@ func TestFirewoodCacheNoCeilingKeepsThe4GBDefault(t *testing.T) {
 		t.Fatalf("the historical default moved: fwCacheDiskCap = %d, want %d", uint64(fwCacheDiskCap), uint64(4<<30))
 	}
 }
+
+// TestFirewoodRevisionsAreClampedWhereverPersistenceAllows: 128 retained
+// revisions hold their trie deltas in RUST memory, outside GOMEMLIMIT, and on
+// mainnet C that was the ONLY unbounded term left (non-arena anon +2.6 GB/h
+// while the Go arena stayed flat). Serving never reads a historical revision,
+// so the clamp belongs on that path too, not just on a frontier build.
+//
+// The gate is the trap: graft keeps DeferredCommitInterval < RevisionsInMemory
+// by clamping the interval, so at CommitEvery == 1 (interval still 64) two
+// revisions would silently mean an fsync per block.
+func TestFirewoodRevisionsAreClampedWhereverPersistenceAllows(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		frontier    bool
+		commitEvery int
+		clamp       bool
+	}{
+		{"serve (CommitEvery 64)", false, 64, true},
+		{"standalone exec (1000)", false, 1000, true},
+		{"frontier build", true, 1, true},
+		{"CommitEvery 1: NOT clamped, it would force an fsync per block", false, 1, false},
+	} {
+		got := tc.frontier || tc.commitEvery > 1
+		if got != tc.clamp {
+			t.Errorf("%s: clamp=%v, want %v", tc.name, got, tc.clamp)
+		}
+	}
+}

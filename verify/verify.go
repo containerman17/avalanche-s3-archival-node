@@ -122,6 +122,13 @@ func newThrowawayFirewood(tmpDir string) (*triedb.Database, *firewood.TrieDB, et
 	}
 	fwCfg.CacheSizeBytes = uint(fwSize)
 	log.Printf("verify: firewood node cache %d MB (%s)", fwSize>>20, fwWhy)
+	// Firewood's default keeps 128 committed revisions, each holding its trie
+	// deltas in Rust memory. A verify replays STRICTLY FORWARD and only ever
+	// opens v.parentRoot, so 127 of those are dead weight, and this Firewood is
+	// a throwaway that is deleted with tmpDir at the end. Two is the floor the
+	// binding allows. The persistence caveat that gates the executor's clamp
+	// does not apply: nothing here depends on the deferred commit cadence.
+	fwCfg.RevisionsInMemory = 2
 	memdb := rawdb.NewMemoryDatabase()
 	tdb := triedb.NewDatabase(memdb, &triedb.Config{DBOverride: fwCfg.BackendConstructor})
 	fw, ok := tdb.Backend().(*firewood.TrieDB)
