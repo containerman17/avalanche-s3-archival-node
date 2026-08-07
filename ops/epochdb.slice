@@ -22,6 +22,30 @@
 #
 # THE ARITHMETIC on the current box (i7i.2xlarge, 61.78 GiB usable, no swap):
 #
+# TUNE GOGC DOWN ON A BIG CHAIN, IT IS THE LARGEST SINGLE LEVER HERE.
+#
+# This process's speed comes from FILE-BACKED READS (Firewood through the page
+# cache), and Go's pacer knows nothing about that: GOGC=100 targets a heap 2x
+# the live set, and every byte of that headroom is a byte the kernel cannot use
+# for page cache. Measured on mainnet C 2026-08-07 with GODEBUG=gctrace=1:
+#
+#   gc 54: 16054->16062->9004 MB, 17731 MB goal     <- LIVE only ~9GB
+#
+# i.e. ~8GB of held garbage sitting where the cache needed to be. GOGC=40
+# (target ~1.4x live) moved container anon 32.70 -> 23.21GB and page cache
+# 17.53 -> 26.72GB, and block rate 56 -> 80. GC cost 0% CPU BEFORE AND AFTER
+# (46-128ms every ~50s), so the trade was free: GC was never the bottleneck.
+#
+# Set GOGC in the service environment, with GOMEMLIMIT as the backstop. GOGC is
+# the better PRIMARY control because it tracks the live set, so it keeps scaling
+# as chain state grows, while a fixed GOMEMLIMIT needs re-tuning. Symptom that
+# you need this: block rate decays over ~90 min while `anon` climbs and `file`
+# falls in memory.stat, with no seal running.
+#
+# DIAGNOSE BEFORE TUNING. One restart with GODEBUG=gctrace=1 gives the live heap
+# outright; two rounds of guessing (a co-tenant chain, then GOMEMLIMIT) cost
+# hours and were both wrong.
+#
 # MemoryHigh MUST STAY ABOVE THE SUM OF THE MEMBERS' ANON WORKING SETS, not just
 # above "most of the box". 2026-08-07, one giant chain (mainnet C) plus one small
 # one sat at 47.88 GB against a 47.24 GB MemoryHigh, i.e. PERMANENTLY over it, so
