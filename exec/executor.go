@@ -109,6 +109,13 @@ type Executor struct {
 	headNum     uint64
 	headTime    uint64 // timestamp of headNum: the transitionvm boundary test
 	totalGas    uint64 // session gas, for mgas/s
+	// totalTxs is the session transaction count, for tx/s. blk/s alone is
+	// a poor progress metric on this chain: block density swings by an
+	// order of magnitude between eras (measured 19.99 txs/block around
+	// height 14.3M against ~1 in the light era just above it), so the same
+	// work reads as 4x the blocks. tx/s tracks the work; mgas/s is still
+	// the truest of the three.
+	totalTxs uint64
 
 	// SAE (ACP-194) side, live only above the Helicon boundary. ring
 	// records our own post-execution roots and gas clocks, which
@@ -634,7 +641,7 @@ func (e *Executor) Head() uint64 { return e.headNum }
 func (e *Executor) Run(ctx context.Context) (err error) {
 	start := time.Now()
 	lastLog := start
-	lastGas, lastBlocks := uint64(0), uint64(0)
+	lastGas, lastBlocks, lastTxs := uint64(0), uint64(0), uint64(0)
 	blocksDone := uint64(0)
 	lastWait := time.Time{}
 
@@ -781,9 +788,10 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			if hits+misses > 0 {
 				hitPct = 100 * float64(hits) / float64(hits+misses)
 			}
-			log.Printf("exec: height=%d blk/s=%.0f mgas/s=%.2f writelog=%.1fMB logs=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
+			log.Printf("exec: height=%d blk/s=%.0f tx/s=%.0f mgas/s=%.2f writelog=%.1fMB logs=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
 				e.headNum,
 				float64(blocksDone-lastBlocks)/dt,
+				float64(e.totalTxs-lastTxs)/dt,
 				float64(e.totalGas-lastGas)/dt/1e6,
 				float64(e.cfg.Store.WritelogBytes())/1e6,
 				float64(e.cfg.Store.LogsBytes())/1e6,
@@ -801,7 +809,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 					e.sae.settledHeight, e.sae.lagMin, e.sae.lagMax, e.sae.settlements)
 			}
 			lastLog = time.Now()
-			lastGas, lastBlocks = e.totalGas, blocksDone
+			lastGas, lastBlocks, lastTxs = e.totalGas, blocksDone, e.totalTxs
 		}
 	}
 }
@@ -859,6 +867,7 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	}
 	e.headTime = blk.Time()
 	e.totalGas += blk.GasUsed()
+	e.totalTxs += uint64(len(blk.Transactions()))
 	// Mid-batch (--commit-every > 1) the head root has no Firewood revision
 	// yet, so the frontier only advances at batch boundaries. serve
 	// pins CommitEvery=1, which makes that every block.
