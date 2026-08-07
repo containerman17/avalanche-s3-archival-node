@@ -139,7 +139,43 @@ var devCommands = map[string]func([]string){
 
 func main() {
 	setGoMemLimit()
+	setGoGC()
 	os.Exit(dispatch(os.Args[1:], os.Stderr))
+}
+
+// defaultGOGC is deliberately below Go's own 100.
+//
+// THIS PROCESS RUNS ON THE PAGE CACHE, and the Go pacer does not know that.
+// GOGC=100 sizes the heap at twice the live set, and on a node whose speed
+// comes from file-backed reads (Firewood's trie, the epoch mappings, the
+// arrival log) every byte of that headroom is a byte the kernel cannot hold
+// those files in. The collector optimises the wrong resource here.
+//
+// MEASURED ON MAINNET C, 2026-08-07, with GODEBUG=gctrace=1:
+//
+//	gc 54: 16054->16062->9004 MB, 17731 MB goal
+//
+// i.e. a LIVE heap of ~9GB while the runtime grew to ~17.4GB before collecting.
+// Dropping to 40 moved the container's anon 32.7 -> 23.2GB and its page cache
+// 17.5 -> 26.7GB, and the block rate 56 -> 80. The trade cost nothing: GC ran
+// 46-128ms every ~50s at 0% of CPU both before and after, because collection
+// was never this workload's bottleneck. Chain state only grows, so the gap
+// this closes grows with it.
+//
+// 50 rather than the 40 measured there: 40 is tuned for the largest chain we
+// run and is set explicitly for it, while this default also covers small L1s
+// whose heaps are a few hundred MB and which gain little from the last step.
+// GOGC in the environment always wins, and an operator who typed a number
+// meant it.
+const defaultGOGC = 50
+
+func setGoGC() {
+	if os.Getenv("GOGC") != "" {
+		return
+	}
+	prev := debug.SetGCPercent(defaultGOGC)
+	log.Printf("epochdb: GOGC %d (Go's default is %d): heap headroom is page cache this node reads through, and GC is not its bottleneck",
+		defaultGOGC, prev)
 }
 
 // setGoMemLimit derives GOMEMLIMIT from the container's own ceiling, so a Go

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"testing"
 )
@@ -125,5 +126,24 @@ func TestRetiredNamesFailLoudly(t *testing.T) {
 		if !strings.Contains(buf.String(), name) {
 			t.Fatalf("dev usage does not list %q:\n%s", name, buf.String())
 		}
+	}
+}
+
+// TestSetGoGCIsBelowTheGoDefaultAndYieldsToTheOperator: the whole point of the
+// lower default is that heap headroom is page cache this node reads through
+// (measured on mainnet C: live heap ~9GB, runtime grown to ~17.4GB, and giving
+// that back moved the block rate 56 -> 80). But an operator who set GOGC meant
+// it, so the runtime must be left alone then.
+func TestSetGoGCIsBelowTheGoDefaultAndYieldsToTheOperator(t *testing.T) {
+	if defaultGOGC >= 100 {
+		t.Fatalf("defaultGOGC = %d, not below Go's 100; it would give the page cache nothing back", defaultGOGC)
+	}
+	orig := debug.SetGCPercent(123)
+	t.Cleanup(func() { debug.SetGCPercent(orig) })
+
+	t.Setenv("GOGC", "77")
+	setGoGC()
+	if got := debug.SetGCPercent(123); got != 123 {
+		t.Fatalf("GC percent moved to %d while GOGC was set in the environment", got)
 	}
 }
