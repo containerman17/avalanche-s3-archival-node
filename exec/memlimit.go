@@ -97,7 +97,7 @@ const (
 // the OOM. The disk formula survives only where there is no ceiling to read.
 //
 // EPOCHDB_FIREWOOD_CACHE, in bytes, wins over both. Plain bytes with no size
-// suffix, matching EPOCHDB_MAX_STAGING and EPOCHDB_CACHE_MIN_FREE. A value that
+// suffix, matching EPOCHDB_CACHE_MIN_FREE. A value that
 // is not a byte count, or one below the floor (the shape of a "512" that meant
 // megabytes), REFUSES TO START rather than falling back silently: a cache
 // sized by accident is the failure this whole function exists to end. An

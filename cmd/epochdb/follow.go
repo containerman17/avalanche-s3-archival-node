@@ -281,14 +281,9 @@ type serveStatus struct {
 	CacheEvictErrors uint64 `json:"cacheEvictErrors,omitempty"`
 	CacheReadErrors  uint64 `json:"cacheReadErrors,omitempty"`
 	CacheLastError   string `json:"cacheLastError,omitempty"`
-	// The retained raw staging and the ceiling the walk pauses at
-	// (fetch.SetCeiling). FetchPaused true is a NODE THAT IS WORKING: it is
-	// still executing, sealing and serving, and it has stopped fetching only
-	// until the seal has drained the staging behind the executed point. It is
-	// the one field that says why `stored` has stopped moving.
-	StagingBytes   uint64 `json:"stagingBytes,omitempty"`
-	StagingCeiling uint64 `json:"stagingCeilingBytes,omitempty"`
-	FetchPaused    bool   `json:"fetchPaused,omitempty"`
+	// The retained raw staging the seal has not yet drained. Unbounded by
+	// design: staging drains as sealing retires it, and the disk is the budget.
+	StagingBytes uint64 `json:"stagingBytes,omitempty"`
 }
 
 // statusOf builds that answer. n is nil between the bind and the moment the
@@ -807,8 +802,6 @@ type nodeStatus struct {
 	entries  int
 	bytes    uint64
 	staging  uint64 // raw staging retained on disk
-	ceiling  uint64 // the ceiling the walk pauses at; 0 = unbounded
-	paused   bool   // the walk is stalled on that ceiling
 }
 
 func (n *chainNode) snapshot() nodeStatus {
@@ -822,8 +815,6 @@ func (n *chainNode) snapshot() nodeStatus {
 		entries:  entries,
 		bytes:    size,
 		staging:  n.fetcher.StagedBytes(),
-		ceiling:  n.fetcher.StagingCeiling(),
-		paused:   n.fetcher.Paused(),
 	}
 	if s.backfill {
 		// Count, not a contiguous-run scan: the run above the exec head is
@@ -848,21 +839,15 @@ func (s nodeStatus) status() string {
 	}
 	line := fmt.Sprintf("%s executed=%d served=%d cooked=%d settled=%d exec_lag=%s tail=%d/%.1fMB",
 		lead, s.executed, s.served, s.cooked, s.settled, lag, s.entries, float64(s.bytes)/1e6)
-	// staging is what the fetch ceiling is measured against, so it is only
-	// printed where there is a ceiling to measure against. FETCH-PAUSED means
-	// the walk is waiting for the seal, not that anything is wrong.
-	if s.ceiling > 0 {
-		line += fmt.Sprintf(" staging=%.1f/%.0fGB", float64(s.staging)/1e9, float64(s.ceiling)/1e9)
-		if s.paused {
-			line += " FETCH-PAUSED"
-		}
+	if s.staging > 0 {
+		line += fmt.Sprintf(" staging=%.1fGB", float64(s.staging)/1e9)
 	}
 	return line
 }
 
 func (s nodeStatus) serveStatus(chain string) serveStatus {
 	out := serveStatus{Chain: chain, Serving: true, Executed: s.executed, Cooked: s.cooked,
-		StagingBytes: s.staging, StagingCeiling: s.ceiling, FetchPaused: s.paused}
+		StagingBytes: s.staging}
 	if s.backfill {
 		out.Target, out.Stored = s.head, s.stored
 	} else {
