@@ -102,4 +102,10 @@ func TestSQLOrderByMustBeIndexOrder(t *testing.T) {
 			t.Fatalf("row %d is block %d, want %d", i, got, want)
 		}
 	}
+	// An alias is the same index order. Every join writes one, and refusing
+	// it would take keyset pagination away from exactly those queries.
+	rows = sqlRows(t, srv, "SELECT b.number FROM blocks b WHERE b.number < 5 ORDER BY b.number DESC LIMIT 2", 5)
+	if len(rows) != 2 || rows[0][0].(uint64) != 4 {
+		t.Fatalf("aliased keyset page = %v, want blocks 4 and 3", rows)
+	}
 }
