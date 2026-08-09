@@ -176,6 +176,7 @@ type batchItem struct {
 	hasFrame  bool
 	logsRec   []byte // nil = no logs in this block
 	rcptRec   []byte // nil = no transactions in this block
+	itxRec    []byte // nil = no transactions in this block (call frames)
 }
 
 // chainContext is the minimal coreth ChainContext for
@@ -276,7 +277,6 @@ func New(cfg Config) (*Executor, error) {
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("config: Store required")
 	}
-	frameSamplerInst = initFrameSampler(cfg.DataDir)
 	// The crash walk-back re-reads containers from staging, and both raw
 	// deleters (seal, and the pruning node's fold) retire whole 100k-block
 	// buckets behind the sealed/folded end. If the budget can reach past one
@@ -816,13 +816,14 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			if hits+misses > 0 {
 				hitPct = 100 * float64(hits) / float64(hits+misses)
 			}
-			log.Printf("exec: height=%d blk/s=%.0f tx/s=%.0f mgas/s=%.2f writelog=%.1fMB logs=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
+			log.Printf("exec: height=%d blk/s=%.0f tx/s=%.0f mgas/s=%.2f writelog=%.1fMB logs=%.1fMB frames=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
 				e.headNum,
 				float64(blocksDone-lastBlocks)/dt,
 				float64(e.totalTxs-lastTxs)/dt,
 				float64(e.totalGas-lastGas)/dt/1e6,
 				float64(e.cfg.Store.WritelogBytes())/1e6,
 				float64(e.cfg.Store.LogsBytes())/1e6,
+				float64(e.cfg.Store.ItxBytes())/1e6,
 				e.cfg.Store.CodeCount(),
 				hitPct,
 				float64(e.wrapDB.cacheSize)/1e6,
@@ -832,9 +833,6 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				e.spl.fw.Seconds(), e.spl.fsync.Seconds(),
 				time.Duration(e.flushBusyNs.Swap(0)).Seconds(), dt)
 			e.spl = struct{ read, evm, hash, fw, fsync time.Duration }{}
-			if fl := FrameCountLine(); fl != "" {
-				log.Printf("exec: %s", fl)
-			}
 			if e.sae != nil && e.sae.settledSeen {
 				log.Printf("sae: settled=%d (lag %d..%d over %d settlements)",
 					e.sae.settledHeight, e.sae.lagMin, e.sae.lagMax, e.sae.settlements)
@@ -995,6 +993,7 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("open statedb: %w", err)
 	}
+	frames.begin()
 	receipts, err := e.runEVM(blk, statedb)
 	if err != nil {
 		return common.Hash{}, err
@@ -1032,6 +1031,11 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	}
 	if rec := storedTailRecord(receipts); rec != nil {
 		if err := e.cfg.Store.AppendRcpt(blockNum, rec); err != nil {
+			return common.Hash{}, err
+		}
+	}
+	if rec := frames.record(); rec != nil {
+		if err := e.cfg.Store.AppendItx(blockNum, rec); err != nil {
 			return common.Hash{}, err
 		}
 	}
@@ -1097,6 +1101,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 			e.wrapDB.setFrame(nil)
 			return fmt.Errorf("open statedb: %w", err)
 		}
+		frames.begin()
 		receipts, err := e.runEVM(blk, statedb)
 		if err != nil {
 			e.wrapDB.setFrame(nil)
@@ -1117,6 +1122,7 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 			frame: frame.buf, hasFrame: true,
 			logsRec: encodeLogsFrame(receiptLogs(receipts)),
 			rcptRec: storedTailRecord(receipts),
+			itxRec:  frames.record(),
 		})
 	}
 
@@ -1176,6 +1182,11 @@ func (e *Executor) flushBatch() error {
 		}
 		if it.rcptRec != nil {
 			if err := e.cfg.Store.AppendRcpt(it.num, it.rcptRec); err != nil {
+				return err
+			}
+		}
+		if it.itxRec != nil {
+			if err := e.cfg.Store.AppendItx(it.num, it.itxRec); err != nil {
 				return err
 			}
 		}

@@ -17,6 +17,7 @@ import (
 //	headers_NNNNN.log  (+_idx_) RLP headers, one per executed block
 //	logs_NNNNN.log     (+_idx_) per-block unique event-log addrs+topics
 //	rcpt_NNNNN.log     (+_idx_) per-block receipts + full logs, epoch encoding
+//	itx_NNNNN.log      (+_idx_) per-block call frames + address participants
 //	code.log                    every contract code blob, by hash
 //	misc.log                    the few non-code rawdb keys
 //	exechead                    executorHead: last group-fsynced height
@@ -32,6 +33,7 @@ type Store struct {
 	hd   *bucketLog
 	lg   *bucketLog
 	rc   *bucketLog
+	ix   *bucketLog
 	code *codeStore
 	misc *miscStore
 
@@ -65,6 +67,11 @@ const (
 	// are the epoch stored sections verbatim (see state/storedlogs.go), so
 	// serving the unsealed tail and sealing an epoch read the same bytes.
 	rcptPrefix = "rcpt"
+
+	// itxPrefix names the live call-frames tail family (V2). Its frames half
+	// is the epoch stored-frames encoding verbatim; its participants half is
+	// the address index's input and never reaches an epoch.
+	itxPrefix = "itx"
 )
 
 // Open opens (or creates) the state layer inside dir.
@@ -98,12 +105,21 @@ func Open(dir string) (*Store, error) {
 		lg.Close()
 		return nil, fmt.Errorf("open receipts: %w", err)
 	}
+	ix, err := openBucketLog(dir, itxPrefix)
+	if err != nil {
+		wl.Close()
+		hd.Close()
+		lg.Close()
+		rc.Close()
+		return nil, fmt.Errorf("open frames: %w", err)
+	}
 	code, err := openCodeStore(dir)
 	if err != nil {
 		wl.Close()
 		hd.Close()
 		lg.Close()
 		rc.Close()
+		ix.Close()
 		return nil, fmt.Errorf("open code store: %w", err)
 	}
 	misc, err := openMiscStore(dir)
@@ -112,10 +128,11 @@ func Open(dir string) (*Store, error) {
 		hd.Close()
 		lg.Close()
 		rc.Close()
+		ix.Close()
 		code.Close()
 		return nil, fmt.Errorf("open misc store: %w", err)
 	}
-	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
+	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, ix: ix, code: code, misc: misc}
 	head, ok, err := ExecHead(dir)
 	if err != nil {
 		s.Close()
@@ -161,7 +178,7 @@ func (s *Store) Close() error {
 		s.epochs.Close()
 		s.epochs = nil
 	}
-	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.rc.Close, s.code.Close, s.misc.Close, s.cas.Close} {
+	for _, c := range []func() error{s.wl.Close, s.hd.Close, s.lg.Close, s.rc.Close, s.ix.Close, s.code.Close, s.misc.Close, s.cas.Close} {
 		if err := c(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -194,7 +211,7 @@ func ExecHead(dir string) (uint64, bool, error) {
 // blocks stay allocated for the life of the process.
 func (s *Store) RetireBuckets(sealedEnd uint64) error {
 	var firstErr error
-	for _, l := range []*bucketLog{s.wl, s.hd, s.lg, s.rc} {
+	for _, l := range []*bucketLog{s.wl, s.hd, s.lg, s.rc, s.ix} {
 		if err := l.retire(sealedEnd); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -205,7 +222,7 @@ func (s *Store) RetireBuckets(sealedEnd uint64) error {
 // FlushAndSetExecHead fsyncs every dirty file (writelog, headers, code,
 // misc) and only then persists executorHead = n via tmp+rename.
 func (s *Store) FlushAndSetExecHead(n uint64) error {
-	for _, f := range []func() error{s.wl.Sync, s.hd.Sync, s.lg.Sync, s.rc.Sync, s.code.Sync, s.misc.Sync} {
+	for _, f := range []func() error{s.wl.Sync, s.hd.Sync, s.lg.Sync, s.rc.Sync, s.ix.Sync, s.code.Sync, s.misc.Sync} {
 		if err := f(); err != nil {
 			return err
 		}
@@ -317,6 +334,18 @@ func (s *Store) RcptRecord(block uint64) ([]byte, bool, error) { return s.rc.Get
 
 // RcptBytes returns total captured receipt+logs payload bytes on disk.
 func (s *Store) RcptBytes() uint64 { return s.rc.Bytes() }
+
+// AppendItx stores block's call-frames + participants record (EncodeTailItx).
+// Blocks with no transactions get no record. Idempotent per block.
+func (s *Store) AppendItx(block uint64, rec []byte) error { return s.ix.Append(block, rec) }
+
+// ItxRecord returns block's captured frames+participants record. ok=false
+// means the block had no transactions, or predates frame capture entirely
+// (a V1 corpus); seal tells the two apart by the block's tx count.
+func (s *Store) ItxRecord(block uint64) ([]byte, bool, error) { return s.ix.Get(block) }
+
+// ItxBytes returns total captured frame payload bytes on disk.
+func (s *Store) ItxBytes() uint64 { return s.ix.Bytes() }
 
 // LogsBytes returns total logs payload bytes on disk.
 func (s *Store) LogsBytes() uint64 { return s.lg.Bytes() }

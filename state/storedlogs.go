@@ -158,3 +158,44 @@ func DecodeTailRcpt(rec []byte) (logsRec, rcptRec []byte, err error) {
 	}
 	return rec[pos : pos+int(n)], rec[pos+int(n):], nil
 }
+
+// EncodeTailItx packs one block's CALL FRAMES record and its address
+// PARTICIPANTS record into the single `itx` tail-family record, same framing
+// as EncodeTailRcpt. The frames half is the epoch encoding verbatim (seal
+// copies it); the participants half feeds the address index and is dropped
+// once the epoch is sealed. See exec/frames.go for both encodings.
+func EncodeTailItx(framesRec, partsRec []byte) []byte {
+	return EncodeTailRcpt(framesRec, partsRec)
+}
+
+// DecodeTailItx splits an `itx` tail record back into its two halves.
+func DecodeTailItx(rec []byte) (framesRec, partsRec []byte, err error) {
+	f, p, err := DecodeTailRcpt(rec)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tail frames: bad framing")
+	}
+	return f, p, nil
+}
+
+// DecodeParticipants walks a participants record, calling yield once per
+// TRANSACTION in tx order with that transaction's addresses. The group's
+// position is its tx index, so every transaction has a group, possibly empty.
+func DecodeParticipants(rec []byte, yield func(addrs [][20]byte)) error {
+	var addrs [][20]byte
+	for pos := 0; pos < len(rec); {
+		n, k := binary.Uvarint(rec[pos:])
+		if k <= 0 || pos+k+int(n)*20 > len(rec) {
+			return fmt.Errorf("participants: truncated at %d", pos)
+		}
+		pos += k
+		addrs = addrs[:0]
+		for i := uint64(0); i < n; i++ {
+			var a [20]byte
+			copy(a[:], rec[pos:pos+20])
+			addrs = append(addrs, a)
+			pos += 20
+		}
+		yield(addrs)
+	}
+	return nil
+}

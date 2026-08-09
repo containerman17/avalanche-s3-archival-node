@@ -230,6 +230,11 @@ func (e *Executor) executeSAEBlock(blk *types.Block) error {
 
 	frame := &blockFrame{}
 	e.wrapDB.setFrame(frame)
+	// saexec.Execute hardcodes vm.Config{} at this pin, so no frame capture
+	// happens below the seam. begin() still runs so a stale block's frames
+	// can never leak into an SAE block's record; seal REFUSES a tx-bearing
+	// block with no frames record, which is how that hole stays loud.
+	frames.begin()
 	res, err := saexec.Execute(
 		b, e, math.MaxInt, nil, e.sae.hooks,
 		e.chainCfg, saeChainContext{e}, &saexec.NullReceiptStore{}, logging.NoLog{},
@@ -284,6 +289,11 @@ func (e *Executor) executeSAEBlock(blk *types.Block) error {
 	}
 	if rec := storedTailRecord(res.Receipts); rec != nil {
 		if err := e.cfg.Store.AppendRcpt(blockNum, rec); err != nil {
+			return err
+		}
+	}
+	if rec := frames.record(); rec != nil {
+		if err := e.cfg.Store.AppendItx(blockNum, rec); err != nil {
 			return err
 		}
 	}

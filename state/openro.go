@@ -66,12 +66,21 @@ func OpenReadOnly(dir string) (*Store, error) {
 		lg.Close()
 		return nil, fmt.Errorf("open receipts ro: %w", err)
 	}
+	ix, err := openBucketLogRO(dir, itxPrefix)
+	if err != nil {
+		wl.Close()
+		hd.Close()
+		lg.Close()
+		rc.Close()
+		return nil, fmt.Errorf("open frames ro: %w", err)
+	}
 	code, err := openCodeStoreRO(dir)
 	if err != nil {
 		wl.Close()
 		hd.Close()
 		lg.Close()
 		rc.Close()
+		ix.Close()
 		return nil, fmt.Errorf("open code store ro: %w", err)
 	}
 	misc, err := openMiscStoreRO(dir)
@@ -80,6 +89,7 @@ func OpenReadOnly(dir string) (*Store, error) {
 		hd.Close()
 		lg.Close()
 		rc.Close()
+		ix.Close()
 		code.Close()
 		return nil, fmt.Errorf("open misc store ro: %w", err)
 	}
@@ -89,11 +99,12 @@ func OpenReadOnly(dir string) (*Store, error) {
 		hd.Close()
 		lg.Close()
 		rc.Close()
+		ix.Close()
 		code.Close()
 		misc.Close()
 		return nil, err
 	}
-	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, code: code, misc: misc}
+	s := &Store{dir: dir, cas: cas, wl: wl, hd: hd, lg: lg, rc: rc, ix: ix, code: code, misc: misc}
 	s.execHead, s.execHeadOK = head, headOK
 	if err := s.loadLogsStart(); err != nil {
 		s.Close()
@@ -121,7 +132,7 @@ func OpenReadOnly(dir string) (*Store, error) {
 // exactly that reason: it is what keeps the header snapshot the oldest of the
 // four, and therefore what makes the sentence above true.
 func (s *Store) RescanRO() error {
-	for _, l := range []*bucketLog{s.hd, s.wl, s.lg, s.rc} {
+	for _, l := range []*bucketLog{s.hd, s.wl, s.lg, s.rc, s.ix} {
 		if err := l.rescanRO(); err != nil {
 			return err
 		}
