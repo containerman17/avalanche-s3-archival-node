@@ -152,59 +152,74 @@ func (s *Server) runGetLogs(from, to uint64, addrs []common.Address, topics [][]
 
 	out := []*types.Log{}
 	for _, n := range candidates {
-		// Sealed epoch below, live capture above: one encoding, so the tail
-		// answers with the same full log payloads as a sealed epoch does.
-		var rec []byte
-		if e, inEpoch := s.hist.Epochs().At(n); inEpoch {
-			var err error
-			rec, _, err = e.StoredLogsRecord(n)
-			if err != nil {
-				return nil, &rpcError{Code: -32000, Message: err.Error()}
-			}
-		} else {
-			logsRec, _, ok, err := s.hist.StoredTail(n)
-			if err != nil {
-				return nil, &rpcError{Code: -32000, Message: err.Error()}
-			}
-			if !ok {
-				return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
-					"no stored logs for block %d: it is not in a sealed epoch and this node captured none (it never executed that block)", n)}
-			}
-			rec = logsRec
+		logs, rerr := s.logsOfBlock(n)
+		if rerr != nil {
+			return nil, rerr
 		}
-		if len(rec) == 0 {
-			continue
-		}
-		stored, err := state.DecodeStoredLogs(rec)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		// txHash/blockHash are derived from the block body at read time.
-		raw, ok, err := s.blocks.GetByHeight(n)
-		if err != nil || !ok {
-			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("container %d: ok=%v err=%v", n, ok, err)}
-		}
-		blk, err := s.parse(raw)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		blockHash := blk.Hash()
-		txs := blk.Transactions()
-		for pos, sl := range stored {
-			l := &types.Log{
-				Address:     sl.Address,
-				Topics:      sl.Topics,
-				Data:        sl.Data,
-				BlockNumber: n,
-				TxHash:      txs[sl.TxIndex].Hash(),
-				TxIndex:     sl.TxIndex,
-				BlockHash:   blockHash,
-				Index:       uint(pos),
-			}
+		for _, l := range logs {
 			if logMatches(l, addrs, topics) {
 				out = append(out, l)
 			}
 		}
+	}
+	return out, nil
+}
+
+// logsOfBlock is every stored log of block n, fully addressed (tx hash, block
+// hash, positional indexes), with no filter applied. It is the one place the
+// stored-logs sections are turned into types.Log, shared by eth_getLogs and
+// the /sql logs table.
+func (s *Server) logsOfBlock(n uint64) ([]*types.Log, *rpcError) {
+	// Sealed epoch below, live capture above: one encoding, so the tail
+	// answers with the same full log payloads as a sealed epoch does.
+	var rec []byte
+	if e, inEpoch := s.hist.Epochs().At(n); inEpoch {
+		var err error
+		rec, _, err = e.StoredLogsRecord(n)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+	} else {
+		logsRec, _, ok, err := s.hist.StoredTail(n)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		if !ok {
+			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
+				"no stored logs for block %d: it is not in a sealed epoch and this node captured none (it never executed that block)", n)}
+		}
+		rec = logsRec
+	}
+	if len(rec) == 0 {
+		return nil, nil
+	}
+	stored, err := state.DecodeStoredLogs(rec)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	// txHash/blockHash are derived from the block body at read time.
+	raw, ok, err := s.blocks.GetByHeight(n)
+	if err != nil || !ok {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("container %d: ok=%v err=%v", n, ok, err)}
+	}
+	blk, err := s.parse(raw)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	blockHash := blk.Hash()
+	txs := blk.Transactions()
+	out := make([]*types.Log, 0, len(stored))
+	for pos, sl := range stored {
+		out = append(out, &types.Log{
+			Address:     sl.Address,
+			Topics:      sl.Topics,
+			Data:        sl.Data,
+			BlockNumber: n,
+			TxHash:      txs[sl.TxIndex].Hash(),
+			TxIndex:     sl.TxIndex,
+			BlockHash:   blockHash,
+			Index:       uint(pos),
+		})
 	}
 	return out, nil
 }

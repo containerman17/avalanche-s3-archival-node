@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/gorilla/websocket"
 
 	"github.com/ava-labs/libevm/common"
@@ -54,6 +55,10 @@ type Server struct {
 	// live is the in-process executor (serve); nil before EnableLive
 	// serve, where every read is historical.
 	live Live
+
+	// the /sql door's engine (rpc/sql.go), built on first query.
+	sqlOnce sync.Once
+	sqlEng  *sqle.Engine
 }
 
 // Live is the in-process executor view that serve wires in: the height

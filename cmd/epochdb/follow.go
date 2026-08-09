@@ -209,6 +209,11 @@ func serveMain(args []string) {
 		// itself.
 		mux.Handle("/ext/bc/"+id+"/rpc", n.srv)
 		mux.Handle("/ext/bc/"+id+"/ws", n.srv)
+		// THE SECOND API SURFACE (user ruling 2026-08-09: one /rpc, one /sql).
+		// POST the query to /sql; GET /sql/schema is the published description
+		// of the tables, which is how a client discovers them.
+		mux.Handle("/sql", n.srv.SQLHandler())
+		mux.Handle("/sql/schema", n.srv.SQLHandler())
 		mux.Handle("/", n.srv)
 		log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc), executed=%d cooked=%d chainId=%s (cook every %s)",
 			id, *port, id, n.e.LiveHead(), n.hist.StateHead(), n.chainID, *cookEvery)
