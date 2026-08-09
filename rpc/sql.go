@@ -150,18 +150,35 @@ type sqlScan struct {
 type sqlQuery struct {
 	head  uint64
 	scans map[string]*sqlScan
+	// alias maps a query alias back to the table it names. Every column
+	// reference in an analyzed plan carries the ALIAS, so without this a
+	// `FROM logs l` silently narrows nothing and scans from block 1.
+	alias map[string]string
 	left  int64
 }
 
 type sqlQueryKey struct{}
 
-func (q *sqlQuery) scan(table string) *sqlScan {
-	sc, ok := q.scans[table]
+// scan is the per-table narrowing, keyed by real table name. Two aliases of
+// one table share it, which is conservative in the only direction that is
+// safe: the engine's Filter node still decides what a row means.
+func (q *sqlQuery) scan(name string) *sqlScan {
+	if t, ok := q.alias[name]; ok {
+		name = t
+	}
+	sc, ok := q.scans[name]
 	if !ok {
 		sc = &sqlScan{from: 1, to: q.head}
-		q.scans[table] = sc
+		q.scans[name] = sc
 	}
 	return sc
+}
+
+func (q *sqlQuery) table(name string) string {
+	if t, ok := q.alias[name]; ok {
+		return t
+	}
+	return name
 }
 
 func sqlQueryOf(ctx context.Context) *sqlQuery {
@@ -219,7 +236,7 @@ func (s *Server) RunSQL(ctx context.Context, query string, budget int64) ([]stri
 	if s.blocks == nil {
 		return nil, nil, fmt.Errorf("the /sql door needs the container source (tx APIs enabled)")
 	}
-	q := &sqlQuery{head: s.hist.Head(), scans: map[string]*sqlScan{}, left: budget}
+	q := &sqlQuery{head: s.hist.Head(), scans: map[string]*sqlScan{}, alias: map[string]string{}, left: budget}
 	sctx := gsql.NewContext(context.WithValue(ctx, sqlQueryKey{}, q),
 		gsql.WithSession(gsql.NewBaseSession()))
 	sctx.SetCurrentDatabase(SQLDatabase)
@@ -286,6 +303,14 @@ func (s *Server) sqlEngine() *sqle.Engine {
 // the narrowing conjuncts off every Filter, and either deletes a servable
 // ORDER BY or refuses it.
 func sqlRewrite(node gsql.Node, q *sqlQuery) (gsql.Node, error) {
+	transform.Inspect(node, func(n gsql.Node) bool {
+		if ta, ok := n.(*plan.TableAlias); ok {
+			if rt, ok := ta.Child.(*plan.ResolvedTable); ok {
+				q.alias[strings.ToLower(ta.Name())] = strings.ToLower(rt.Name())
+			}
+		}
+		return true
+	})
 	var bad error
 	out, _, err := transform.Node(node, func(n gsql.Node) (gsql.Node, transform.TreeIdentity, error) {
 		switch t := n.(type) {
@@ -339,8 +364,8 @@ func sqlOrderBy(fields gsql.SortFields, q *sqlQuery) error {
 			return fmt.Errorf("ORDER BY mixes ASC and DESC, which no index order serves")
 		}
 		if table == "" {
-			table = strings.ToLower(gf.Table())
-		} else if strings.ToLower(gf.Table()) != table {
+			table = q.table(strings.ToLower(gf.Table()))
+		} else if q.table(strings.ToLower(gf.Table())) != table {
 			return fmt.Errorf("ORDER BY spans two tables, which no index order serves")
 		}
 		names = append(names, strings.ToLower(gf.Name()))
@@ -395,7 +420,7 @@ func sqlNarrow(c gsql.Expression, q *sqlQuery) {
 	case *expression.LessThanOrEqual:
 		sqlBound(e.Left(), e.Right(), q, "<=")
 	case *expression.Between:
-		if gf, ok := e.Val.(*expression.GetField); ok && sqlIsHeight(gf) {
+		if gf, ok := e.Val.(*expression.GetField); ok && sqlIsHeight(q, gf) {
 			if lo, ok := sqlUint(sqlLit(e.Lower)); ok {
 				sqlRaiseFrom(q, gf, lo)
 			}
@@ -430,16 +455,16 @@ func sqlLit(e gsql.Expression) any {
 
 // sqlIsHeight reports whether this column is the table's block height, which
 // is the one column every table's range narrowing runs on.
-func sqlIsHeight(gf *expression.GetField) bool {
+func sqlIsHeight(q *sqlQuery, gf *expression.GetField) bool {
 	n := strings.ToLower(gf.Name())
-	return n == "block_number" || (n == "number" && strings.EqualFold(gf.Table(), "blocks"))
+	return n == "block_number" || (n == "number" && q.table(strings.ToLower(gf.Table())) == "blocks")
 }
 
 // sqlBound applies one inequality on a height column, turning it into the
 // inclusive range every read path here takes.
 func sqlBound(l, r gsql.Expression, q *sqlQuery, op string) {
 	gf, v, ok := sqlSides(l, r)
-	if !ok || !sqlIsHeight(gf) {
+	if !ok || !sqlIsHeight(q, gf) {
 		return
 	}
 	n, ok := sqlUint(v)
@@ -486,10 +511,10 @@ func sqlLowerTo(q *sqlQuery, gf *expression.GetField, n uint64) {
 
 // sqlEq records an equality (or IN list) on a column an index can serve.
 func sqlEq(gf *expression.GetField, vals []any, q *sqlQuery) {
-	table, col := strings.ToLower(gf.Table()), strings.ToLower(gf.Name())
+	table, col := q.table(strings.ToLower(gf.Table())), strings.ToLower(gf.Name())
 	sc := q.scan(table)
 	switch {
-	case sqlIsHeight(gf):
+	case sqlIsHeight(q, gf):
 		if len(vals) != 1 {
 			return
 		}
@@ -648,7 +673,12 @@ logs    WHERE address = / topic0 = over a SEALED range is served by the epoch
         posting lists, which are supersets; the exact filter runs on the rows.
         The unsealed tail is scanned per block, so a range that reaches the
         tail is capped at 10000 blocks, and so is any range with no address or
-        topic to narrow it.
+        topic to narrow it. The posting lists name BLOCKS, not log positions,
+        so every log of a matching block is read and spends budget.
+
+BINARY COLUMNS: compare them whole (address = 0x..). HEX(col) is right, but
+LEFT/SUBSTRING/LENGTH over a binary column go through a character set and
+come back mangled, so slice bytes on your side, not in the query.
 
 NOT HERE YET, and known: no wallet history by address (the address index does
 not exist), no token balances or holdings, no internal calls or traces (frames
@@ -706,7 +736,7 @@ type sqlTable struct {
 func (t sqlTable) Name() string                { return t.name }
 func (t sqlTable) String() string              { return t.name }
 func (t sqlTable) Schema() gsql.Schema         { return sqlSchemas[t.name] }
-func (t sqlTable) Collation() gsql.CollationID { return gsql.Collation_Default }
+func (t sqlTable) Collation() gsql.CollationID { return gsql.Collation_binary }
 
 type sqlPartition struct{}
 
