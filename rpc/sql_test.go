@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -14,7 +15,7 @@ import (
 
 func sqlRows(t *testing.T, s *Server, q string, budget int64) [][]any {
 	t.Helper()
-	_, rows, err := s.RunSQL(context.Background(), q, budget)
+	_, rows, err := s.RunSQL(context.Background(), q, nil, budget)
 	if err != nil {
 		t.Fatalf("%s: %v", q, err)
 	}
@@ -23,7 +24,7 @@ func sqlRows(t *testing.T, s *Server, q string, budget int64) [][]any {
 
 func sqlErr(t *testing.T, s *Server, q string, budget int64) string {
 	t.Helper()
-	_, _, err := s.RunSQL(context.Background(), q, budget)
+	_, _, err := s.RunSQL(context.Background(), q, nil, budget)
 	if err == nil {
 		t.Fatalf("%s: expected an error, got none", q)
 	}
@@ -54,7 +55,7 @@ func TestSQLDeadline(t *testing.T) {
 	srv := newBlockHashEnv(t).srv
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, _, err := srv.RunSQL(ctx, "SELECT number FROM blocks WHERE number = 3", SQLRowBudget); err == nil {
+	if _, _, err := srv.RunSQL(ctx, "SELECT number FROM blocks WHERE number = 3", nil, SQLRowBudget); err == nil {
 		t.Fatal("a cancelled query returned rows")
 	}
 }
@@ -108,4 +109,102 @@ func TestSQLOrderByMustBeIndexOrder(t *testing.T) {
 	if len(rows) != 2 || rows[0][0].(uint64) != 4 {
 		t.Fatalf("aliased keyset page = %v, want blocks 4 and 3", rows)
 	}
+}
+
+// TestSQLParamsAndPlanCache is the one thing a plan cache can get wrong: the
+// cached plan must be everything the query TEXT decides and nothing the
+// PARAMETERS decide. Two executions of one text with different values must
+// read different rows, and the ORDER BY the first execution stripped off the
+// plan must still be honoured by the second.
+func TestSQLParamsAndPlanCache(t *testing.T) {
+	srv := newBlockHashEnv(t).srv
+
+	const q = "SELECT number FROM blocks WHERE number = ?"
+	for _, want := range []uint64{3, 5, 3, 11} {
+		rows := sqlRowsP(t, srv, q, []any{want}, 5)
+		if len(rows) != 1 || rows[0][0].(uint64) != want {
+			t.Fatalf("param %d returned %v", want, rows)
+		}
+	}
+	// A stale cached NARROWING is invisible in the rows above only if the
+	// engine's Filter saves it, so check the read was narrowed too: the same
+	// text under a budget of one row can only pass if it read one block.
+	if rows := sqlRowsP(t, srv, q, []any{7}, 1); len(rows) != 1 || rows[0][0].(uint64) != 7 {
+		t.Fatalf("narrowed lookup under a 1-row budget returned %v", rows)
+	}
+
+	// The ORDER BY is deleted from the cached plan (the rows already arrive in
+	// index order), so the direction has to be restored from the cache on every
+	// later execution or the second page comes back ascending.
+	const desc = "SELECT number FROM blocks WHERE number < ? ORDER BY number DESC LIMIT 3"
+	for _, lt := range []uint64{10, 7} {
+		rows := sqlRowsP(t, srv, desc, []any{lt}, 5)
+		if len(rows) != 3 {
+			t.Fatalf("keyset page below %d: %v", lt, rows)
+		}
+		for i := range rows {
+			if got, want := rows[i][0].(uint64), lt-1-uint64(i); got != want {
+				t.Fatalf("page below %d row %d is %d, want %d", lt, i, got, want)
+			}
+		}
+	}
+
+	// A parameter count that does not match the placeholders is an error, not
+	// a plan with an unbound variable in it.
+	if _, _, err := srv.RunSQL(context.Background(), q, nil, 5); err == nil {
+		t.Fatal("a missing parameter was accepted")
+	}
+	if _, _, err := srv.RunSQL(context.Background(), q, []any{1, 2}, 5); err == nil {
+		t.Fatal("a surplus parameter was accepted")
+	}
+
+	// The raw-SQL body still works beside the JSON one, and both reach RunSQL
+	// with the same query.
+	if q, p, err := sqlParseBody([]byte("SELECT 1")); err != nil || q != "SELECT 1" || p != nil {
+		t.Fatalf("raw body: %q %v %v", q, p, err)
+	}
+	q2, p2, err := sqlParseBody([]byte(`{"query":"SELECT ?","params":[7]}`))
+	if err != nil || q2 != "SELECT ?" || len(p2) != 1 {
+		t.Fatalf("json body: %q %v %v", q2, p2, err)
+	}
+	if _, _, err := sqlParseBody([]byte(`{"nope":1}`)); err == nil {
+		t.Fatal("a JSON body with no query was accepted")
+	}
+}
+
+// TestSQLPlanCacheConcurrent: one cached plan, many goroutines, each with its
+// own parameters. Under -race this is what catches a plan tree being mutated
+// in place instead of bound into a private copy.
+func TestSQLPlanCacheConcurrent(t *testing.T) {
+	srv := newBlockHashEnv(t).srv
+	var wg sync.WaitGroup
+	for w := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			want := uint64(w%bhTailEnd) + 1
+			for range 20 {
+				_, rows, err := srv.RunSQL(context.Background(),
+					"SELECT number FROM blocks WHERE number = ?", []any{want}, 5)
+				if err != nil {
+					t.Errorf("param %d: %v", want, err)
+					return
+				}
+				if len(rows) != 1 || rows[0][0].(uint64) != want {
+					t.Errorf("param %d returned %v", want, rows)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func sqlRowsP(t *testing.T, s *Server, q string, params []any, budget int64) [][]any {
+	t.Helper()
+	_, rows, err := s.RunSQL(context.Background(), q, params, budget)
+	if err != nil {
+		t.Fatalf("%s %v: %v", q, params, err)
+	}
+	return rows
 }

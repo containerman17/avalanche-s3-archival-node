@@ -56,9 +56,11 @@ type Server struct {
 	// serve, where every read is historical.
 	live Live
 
-	// the /sql door's engine (rpc/sql.go), built on first query.
-	sqlOnce sync.Once
-	sqlEng  *sqle.Engine
+	// the /sql door's engine (rpc/sql.go), built on first query, plus the
+	// analyzed-plan LRU keyed on the placeholder query text.
+	sqlOnce  sync.Once
+	sqlEng   *sqle.Engine
+	sqlPlans sqlPlanCache
 }
 
 // Live is the in-process executor view that serve wires in: the height

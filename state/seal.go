@@ -99,6 +99,7 @@ func (h *History) SealTail(ctx context.Context, chainRoot [32]byte, onEpoch func
 			return err
 		}
 		h.dropSealedBuckets(end)
+		h.RetireTailLogs(end)
 		if err := h.store.RetireBuckets(end); err != nil {
 			return err
 		}

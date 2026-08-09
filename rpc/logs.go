@@ -291,17 +291,32 @@ func (s *Server) logCandidates(from, to uint64, addrs []common.Address, topics [
 		}
 	}
 
-	// raw tail via the captured per-block records
-	for n := max(from, sealedEnd+1); n <= to; n++ {
-		rec, ok, err := s.hist.LogTuples(n)
+	// unsealed tail via the hot-tail log index, which covers everything up to
+	// the logs family's max block; above that (the handful of blocks the
+	// executor appended since) the per-block records answer, as they always did.
+	tailFrom := max(from, sealedEnd+1)
+	if tailFrom <= to {
+		blocks, covered, matched, err := s.hist.TailLogCandidates(tailFrom, to, addrBytes(addrs), topicBytes(topics))
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
-		if !ok {
-			continue // no logs in this block
+		if matched {
+			for _, b := range blocks {
+				inSet[b] = true
+			}
+			tailFrom = max(tailFrom, covered+1)
 		}
-		if recMatches(rec, addrs, topics) {
-			inSet[n] = true
+		for n := tailFrom; n <= to; n++ {
+			rec, ok, err := s.hist.LogTuples(n)
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: err.Error()}
+			}
+			if !ok {
+				continue // no logs in this block
+			}
+			if recMatches(rec, addrs, topics) {
+				inSet[n] = true
+			}
 		}
 	}
 
@@ -405,6 +420,37 @@ func recMatches(rec state.LogRec, addrs []common.Address, topics [][]common.Hash
 		}
 	}
 	return true
+}
+
+// addrBytes/topicBytes drop common.Address/common.Hash for the raw arrays the
+// state package's index keys on. A nil topic position stays nil (wildcard).
+func addrBytes(addrs []common.Address) [][20]byte {
+	if len(addrs) == 0 {
+		return nil
+	}
+	out := make([][20]byte, len(addrs))
+	for i, a := range addrs {
+		out[i] = a
+	}
+	return out
+}
+
+func topicBytes(topics [][]common.Hash) [][][32]byte {
+	if len(topics) == 0 {
+		return nil
+	}
+	out := make([][][32]byte, len(topics))
+	for i, want := range topics {
+		if want == nil {
+			continue
+		}
+		pos := make([][32]byte, len(want))
+		for j, t := range want {
+			pos[j] = t
+		}
+		out[i] = pos
+	}
+	return out
 }
 
 func sortUint64(v []uint64) {

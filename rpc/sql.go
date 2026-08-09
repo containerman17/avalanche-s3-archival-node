@@ -33,8 +33,19 @@ package rpc
 // the query, and the query fails by name when it runs out. Pagination is
 // keyset only: OFFSET is refused, because it is O(n) and drains exactly the
 // page cache the memory design defends.
+//
+// PARAMETERS AND THE PLAN CACHE. A query may carry `?` placeholders and a JSON
+// body {"query": "...", "params": [...]}; the values are bound through the
+// engine's own bindvar path, never substituted into the text. That splits a
+// query in two: the ANALYZED PLAN plus the ORDER BY rewrite, which depend only
+// on the placeholder text and are cached in a small LRU, and the NARROWING,
+// which reads the bound literals and is redone on every execution. Caching the
+// narrowing too would be the stale-plan bug: the same plan text with a
+// different address would read the previous address's posting list.
 
 import (
+	"bytes"
+	"container/list"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -45,6 +56,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -188,10 +200,10 @@ func sqlQueryOf(ctx context.Context) *sqlQuery {
 
 // --- HTTP -------------------------------------------------------------------
 
-// SQLHandler serves POST /sql (the query, as a plain-text body) and
-// GET /sql/schema (the published schema description). The schema is a served
-// file, not a versioned contract: a client that starts getting errors re-reads
-// it (user ruling 2026-08-09).
+// SQLHandler serves POST /sql (the query, as a plain-text body or as
+// {"query": "... ? ...", "params": [...]}) and GET /sql/schema (the published
+// schema description). The schema is a served file, not a versioned contract:
+// a client that starts getting errors re-reads it (user ruling 2026-08-09).
 func (s *Server) SQLHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/schema") {
@@ -208,6 +220,11 @@ func (s *Server) SQLHandler() http.Handler {
 			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		query, params, err := sqlParseBody(body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		budget := int64(SQLRowBudget)
 		if v := r.URL.Query().Get("budget"); v != "" {
 			n, err := strconv.ParseInt(v, 10, 64)
@@ -219,7 +236,7 @@ func (s *Server) SQLHandler() http.Handler {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), SQLTimeout)
 		defer cancel()
-		cols, rows, err := s.RunSQL(ctx, string(body), budget)
+		cols, rows, err := s.RunSQL(ctx, query, params, budget)
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -230,26 +247,37 @@ func (s *Server) SQLHandler() http.Handler {
 	})
 }
 
-// RunSQL runs one query under the given row-scan budget and returns the
-// column names and the rows, byte values rendered as 0x-hex.
-func (s *Server) RunSQL(ctx context.Context, query string, budget int64) ([]string, [][]any, error) {
+// RunSQL runs one query under the given row-scan budget and returns the column
+// names and the rows, byte values rendered as 0x-hex. params bind the query's
+// `?` placeholders, in order; a query without placeholders takes nil.
+func (s *Server) RunSQL(ctx context.Context, query string, params []any, budget int64) ([]string, [][]any, error) {
 	if s.blocks == nil {
 		return nil, nil, fmt.Errorf("the /sql door needs the container source (tx APIs enabled)")
 	}
-	q := &sqlQuery{head: s.hist.Head(), scans: map[string]*sqlScan{}, alias: map[string]string{}, left: budget}
+	q := &sqlQuery{head: s.hist.Head(), scans: map[string]*sqlScan{}, left: budget}
 	sctx := gsql.NewContext(context.WithValue(ctx, sqlQueryKey{}, q),
 		gsql.WithSession(gsql.NewBaseSession()))
 	sctx.SetCurrentDatabase(SQLDatabase)
 
 	eng := s.sqlEngine()
-	node, err := eng.AnalyzeQuery(sctx, query)
+	pl, err := s.sqlPlanFor(sctx, eng, query)
 	if err != nil {
 		return nil, nil, err
 	}
-	node, err = sqlRewrite(node, q)
-	if err != nil {
-		return nil, nil, err
+	// The cached plan carries only what the placeholder text decides. The
+	// narrowing is derived from the BOUND tree below, every single execution.
+	q.alias = pl.alias
+	for table, desc := range pl.desc {
+		q.scan(table).desc = desc
 	}
+	node := pl.node
+	if pl.vars > 0 || len(params) > 0 {
+		if node, err = sqlBind(pl, params); err != nil {
+			return nil, nil, err
+		}
+	}
+	sqlNarrowPlan(node, q)
+
 	schema, iter, _, err := eng.PrepQueryPlanForExecution(sctx, query, node, nil)
 	if err != nil {
 		return nil, nil, err
@@ -297,16 +325,211 @@ func (s *Server) sqlEngine() *sqle.Engine {
 	return s.sqlEng
 }
 
+// --- the plan cache ---------------------------------------------------------
+
+// sqlPlan is everything about a query the PLACEHOLDER TEXT alone decides: the
+// analyzed plan with its ORDER BY already rewritten, the alias map, the index
+// direction per table, and how many `?` it carries. Immutable once built, so
+// concurrent requests share one copy; the bound tree each execution derives
+// from it is private (plan.ApplyBindings returns a new tree).
+type sqlPlan struct {
+	node  gsql.Node
+	alias map[string]string
+	desc  map[string]bool
+	vars  int
+}
+
+func (p *sqlPlan) table(name string) string {
+	if t, ok := p.alias[name]; ok {
+		return t
+	}
+	return name
+}
+
+// sqlPlanCacheSize is how many analyzed plans are kept. Query SHAPES are few
+// (a dashboard has a handful and repeats them); the LRU exists to stop an
+// adversary who sends a million distinct texts from pinning heap, not to hold
+// a working set.
+const sqlPlanCacheSize = 64
+
+// sqlPlanCache is a plain LRU. ponytail: one mutex, held only over the map and
+// the list, never over analysis, so two requests may analyze the same new
+// query at once and the second wins; that is cheaper than a per-key lock.
+type sqlPlanCache struct {
+	mu sync.Mutex
+	ll *list.List
+	m  map[string]*list.Element
+}
+
+type sqlPlanEntry struct {
+	key string
+	pl  *sqlPlan
+}
+
+func (c *sqlPlanCache) get(key string) (*sqlPlan, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.m[key]
+	if !ok {
+		return nil, false
+	}
+	c.ll.MoveToFront(el)
+	return el.Value.(*sqlPlanEntry).pl, true
+}
+
+func (c *sqlPlanCache) put(key string, pl *sqlPlan) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m, c.ll = map[string]*list.Element{}, list.New()
+	}
+	if el, ok := c.m[key]; ok {
+		el.Value.(*sqlPlanEntry).pl = pl
+		c.ll.MoveToFront(el)
+		return
+	}
+	c.m[key] = c.ll.PushFront(&sqlPlanEntry{key: key, pl: pl})
+	for c.ll.Len() > sqlPlanCacheSize {
+		el := c.ll.Back()
+		c.ll.Remove(el)
+		delete(c.m, el.Value.(*sqlPlanEntry).key)
+	}
+}
+
+// sqlPlanFor is the cached analyze-and-rewrite. The key is the query text as
+// sent, placeholders and all: two calls with different params share it, which
+// is the whole point, and two different texts never do.
+func (s *Server) sqlPlanFor(sctx *gsql.Context, eng *sqle.Engine, query string) (*sqlPlan, error) {
+	if pl, ok := s.sqlPlans.get(query); ok {
+		return pl, nil
+	}
+	node, err := eng.AnalyzeQuery(sctx, query)
+	if err != nil {
+		return nil, err
+	}
+	pl, err := sqlRewrite(node)
+	if err != nil {
+		return nil, err
+	}
+	s.sqlPlans.put(query, pl)
+	return pl, nil
+}
+
+// sqlBind substitutes the parameters into a cached plan, producing this
+// execution's private tree. It is an ERROR to pass the wrong number: a missing
+// binding would otherwise leave a BindVar in the tree, which narrows nothing
+// and evaluates to "unbound" halfway through a scan.
+func sqlBind(pl *sqlPlan, params []any) (gsql.Node, error) {
+	if len(params) != pl.vars {
+		return nil, fmt.Errorf("query has %d ? placeholder(s) but %d param(s) were given", pl.vars, len(params))
+	}
+	bindings := make(map[string]gsql.Expression, len(params))
+	for i, p := range params {
+		e, err := sqlParamExpr(p)
+		if err != nil {
+			return nil, fmt.Errorf("param %d: %w", i+1, err)
+		}
+		bindings[fmt.Sprintf("v%d", i+1)] = e
+	}
+	node, used, err := plan.ApplyBindings(pl.node, bindings)
+	if err != nil {
+		return nil, err
+	}
+	if len(used) != len(bindings) {
+		return nil, fmt.Errorf("query has %d ? placeholder(s) but only %d could be bound", pl.vars, len(used))
+	}
+	return node, nil
+}
+
+// sqlParamExpr turns one JSON (or Go) parameter into a literal the engine
+// compares exactly as it would the same value written into the query text. A
+// 0x-prefixed even-length hex string becomes BYTES, which is what every byte
+// column here holds; anything else stays the type it arrived as.
+func sqlParamExpr(v any) (gsql.Expression, error) {
+	switch t := v.(type) {
+	case nil:
+		return expression.NewLiteral(nil, types.Null), nil
+	case bool:
+		return expression.NewLiteral(t, types.Boolean), nil
+	case string:
+		if b, ok := sqlHexParam(t); ok {
+			return expression.NewLiteral(b, types.LongBlob), nil
+		}
+		return expression.NewLiteral(t, types.LongText), nil
+	case []byte:
+		return expression.NewLiteral(t, types.LongBlob), nil
+	case json.Number:
+		if n, err := strconv.ParseInt(string(t), 10, 64); err == nil {
+			return expression.NewLiteral(n, types.Int64), nil
+		}
+		if n, err := strconv.ParseUint(string(t), 10, 64); err == nil {
+			return expression.NewLiteral(n, types.Uint64), nil
+		}
+		f, err := t.Float64()
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a number", string(t))
+		}
+		return expression.NewLiteral(f, types.Float64), nil
+	case int:
+		return expression.NewLiteral(int64(t), types.Int64), nil
+	case int64:
+		return expression.NewLiteral(t, types.Int64), nil
+	case uint64:
+		return expression.NewLiteral(t, types.Uint64), nil
+	case float64:
+		return expression.NewLiteral(t, types.Float64), nil
+	}
+	return nil, fmt.Errorf("%T is not a parameter type (use a number, a string, 0x-hex bytes, a bool or null)", v)
+}
+
+// sqlHexParam reads the 0x-hex form every consumer of this chain already
+// writes. Odd length or a non-hex digit is a plain string, not an error: a
+// column that wanted bytes then simply does not match, which is the same
+// answer the engine gives for a wrong-length hash.
+func sqlHexParam(s string) ([]byte, bool) {
+	if len(s) < 2 || (s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) {
+		return nil, false
+	}
+	b, err := hex.DecodeString(s[2:])
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// sqlParseBody sniffs the request body: a JSON object is {"query", "params"},
+// anything else is the raw SQL string the door has always taken.
+func sqlParseBody(body []byte) (string, []any, error) {
+	if len(bytes.TrimSpace(body)) == 0 || bytes.TrimSpace(body)[0] != '{' {
+		return string(body), nil, nil
+	}
+	var req struct {
+		Query  string `json:"query"`
+		Params []any  `json:"params"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber() // block heights are u64; float64 would lose the tail
+	if err := dec.Decode(&req); err != nil {
+		return "", nil, fmt.Errorf("body looks like JSON but is not {\"query\":\"...\",\"params\":[...]}: %v", err)
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		return "", nil, fmt.Errorf("the JSON body needs a non-empty \"query\"")
+	}
+	return req.Query, req.Params, nil
+}
+
 // --- the plan rewrite -------------------------------------------------------
 
-// sqlRewrite is the one pass over the analyzed plan: it refuses OFFSET, takes
-// the narrowing conjuncts off every Filter, and either deletes a servable
-// ORDER BY or refuses it.
-func sqlRewrite(node gsql.Node, q *sqlQuery) (gsql.Node, error) {
+// sqlRewrite is the one structural pass over the analyzed plan: it refuses
+// OFFSET, either deletes a servable ORDER BY or refuses it, and records the
+// aliases and the index direction. It touches NOTHING that depends on a
+// parameter value, which is what makes its result cacheable.
+func sqlRewrite(node gsql.Node) (*sqlPlan, error) {
+	pl := &sqlPlan{alias: map[string]string{}, desc: map[string]bool{}}
 	transform.Inspect(node, func(n gsql.Node) bool {
 		if ta, ok := n.(*plan.TableAlias); ok {
 			if rt, ok := ta.Child.(*plan.ResolvedTable); ok {
-				q.alias[strings.ToLower(ta.Name())] = strings.ToLower(rt.Name())
+				pl.alias[strings.ToLower(ta.Name())] = strings.ToLower(rt.Name())
 			}
 		}
 		return true
@@ -317,19 +540,14 @@ func sqlRewrite(node gsql.Node, q *sqlQuery) (gsql.Node, error) {
 		case *plan.Offset:
 			return nil, transform.SameTree, fmt.Errorf(
 				"OFFSET is not served: paginate on the last row's key instead (WHERE block_number < :last ORDER BY block_number DESC LIMIT n)")
-		case *plan.Filter:
-			for _, c := range expression.SplitConjunction(t.Expression) {
-				sqlNarrow(c, q)
-			}
-			return n, transform.SameTree, nil
 		case *plan.Sort:
-			if err := sqlOrderBy(t.SortFields, q); err != nil {
+			if err := sqlOrderBy(t.SortFields, pl); err != nil {
 				bad = err
 				return n, transform.SameTree, nil
 			}
 			return t.Child, transform.NewTree, nil
 		case *plan.TopN:
-			if err := sqlOrderBy(t.Fields, q); err != nil {
+			if err := sqlOrderBy(t.Fields, pl); err != nil {
 				bad = err
 				return n, transform.SameTree, nil
 			}
@@ -343,12 +561,33 @@ func sqlRewrite(node gsql.Node, q *sqlQuery) (gsql.Node, error) {
 	if bad != nil {
 		return nil, bad
 	}
-	return out, nil
+	pl.node = out
+	transform.InspectExpressions(out, func(e gsql.Expression) bool {
+		if expression.IsBindVar(e) {
+			pl.vars++
+		}
+		return true
+	})
+	return pl, nil
+}
+
+// sqlNarrowPlan takes the narrowing conjuncts off every Filter of the BOUND
+// tree. It runs per execution, never from the cache, because every value it
+// reads came from this request's parameters.
+func sqlNarrowPlan(node gsql.Node, q *sqlQuery) {
+	transform.Inspect(node, func(n gsql.Node) bool {
+		if f, ok := n.(*plan.Filter); ok {
+			for _, c := range expression.SplitConjunction(f.Expression) {
+				sqlNarrow(c, q)
+			}
+		}
+		return true
+	})
 }
 
 // sqlOrderBy accepts an ORDER BY only when it is a prefix of one table's index
-// order in a single direction, and records the direction on that table's scan.
-func sqlOrderBy(fields gsql.SortFields, q *sqlQuery) error {
+// order in a single direction, and records the direction for that table.
+func sqlOrderBy(fields gsql.SortFields, pl *sqlPlan) error {
 	if len(fields) == 0 {
 		return nil
 	}
@@ -364,8 +603,8 @@ func sqlOrderBy(fields gsql.SortFields, q *sqlQuery) error {
 			return fmt.Errorf("ORDER BY mixes ASC and DESC, which no index order serves")
 		}
 		if table == "" {
-			table = q.table(strings.ToLower(gf.Table()))
-		} else if q.table(strings.ToLower(gf.Table())) != table {
+			table = pl.table(strings.ToLower(gf.Table()))
+		} else if pl.table(strings.ToLower(gf.Table())) != table {
 			return fmt.Errorf("ORDER BY spans two tables, which no index order serves")
 		}
 		names = append(names, strings.ToLower(gf.Name()))
@@ -379,7 +618,7 @@ func sqlOrderBy(fields gsql.SortFields, q *sqlQuery) error {
 			return fmt.Errorf("ORDER BY is not served by %s; its index order is (%s)", table, strings.Join(want, ", "))
 		}
 	}
-	q.scan(table).desc = desc
+	pl.desc[table] = desc
 	return nil
 }
 
@@ -622,9 +861,15 @@ func (s *Server) sqlSchemaDoc() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `# epochdb /sql
 
-POST the query to /sql as the request body. Answers are JSON:
-{"columns":[...],"rows":[[...]]}. Byte columns come back as 0x-hex and are
-accepted the same way, or as a MySQL hex literal (0x...).
+POST the query to /sql as the request body, or as
+{"query": "... ? ...", "params": [...]} to bind parameters. Answers are JSON:
+{"columns":[...],"rows":[[...]]}. Byte columns come back as 0x-hex; a 0x-hex
+STRING parameter is bound as those bytes, and a query written out by hand uses
+a MySQL hex literal (0x...) for the same thing.
+
+PARAMETERS ARE THE FAST PATH: the analyzed plan is cached on the placeholder
+text, so the same shape with different values skips parsing and analysis. Write
+the shape once and vary the params, rather than pasting values into the text.
 
 Database: %s. Head block right now: %d.
 
@@ -669,20 +914,21 @@ blocks  one header read per row. WHERE hash = 0x.. resolves through the tx
 txs     WHERE hash = 0x.. is the fp48 tx index, one lookup. Anything else
         decodes every container in the block range and recovers every sender,
         which is the expensive path.
-logs    WHERE address = / topic0 = over a SEALED range is served by the epoch
-        posting lists, which are supersets; the exact filter runs on the rows.
-        The unsealed tail is scanned per block, so a range that reaches the
-        tail is capped at 10000 blocks, and so is any range with no address or
-        topic to narrow it. The posting lists name BLOCKS, not log positions,
-        so every log of a matching block is read and spends budget.
+logs    WHERE address = / topic0 = is served by posting lists over the WHOLE
+        range: the epoch sections below the sealed end, an in-memory index of
+        the same shape above it, so the newest events answer like the oldest
+        and no range cap applies. They are supersets; the exact filter runs on
+        the rows. A range with NO address and NO topic has nothing to narrow it
+        and is capped at 10000 blocks. The posting lists name BLOCKS, not log
+        positions, so every log of a matching block is read and spends budget.
 
 BINARY COLUMNS: compare them whole (address = 0x..). HEX(col) is right, but
 LEFT/SUBSTRING/LENGTH over a binary column go through a character set and
 come back mangled, so slice bytes on your side, not in the query.
 
 NOT HERE YET, and known: no wallet history by address (the address index does
-not exist), no token balances or holdings, no internal calls or traces (frames
-are not captured yet), no receipt status or per-tx gas used, no aggregates by
+not exist), no token balances or holdings, no internal calls or traces (frames are
+captured but have no table yet), no receipt status or per-tx gas used, no aggregates by
 time. Ask for them and they get built as index families, not as scans.
 `)
 	return b.String()
@@ -958,17 +1204,9 @@ func (s *Server) sqlLogRows(sc *sqlScan) (func() (gsql.Row, error), error) {
 	if sc.from > sc.to {
 		return func() (gsql.Row, error) { return nil, io.EOF }, nil
 	}
-	// The tail has no posting lists, so a range that reaches it is scanned per
-	// block; the same 10k cap eth_getLogs carries applies, and so does a range
-	// with nothing to narrow it.
-	sealedEnd := uint64(0)
-	if end, ok := s.hist.Epochs().SealedEnd(); ok {
-		sealedEnd = end
-	}
-	if tailFrom := max(sc.from, sealedEnd+1); sc.to >= tailFrom && sc.to-tailFrom+1 > GetLogsMaxRange {
-		return nil, fmt.Errorf("blocks %d..%d are not sealed and no posting list covers them: narrow block_number to at most %d unsealed blocks",
-			tailFrom, sc.to, GetLogsMaxRange)
-	}
+	// The hot-tail log index covers the unsealed range with the same posting
+	// lists the epochs have, so a narrowed query reaches the head without a
+	// range cap. Only the unnarrowed form still has to walk block by block.
 	if !sc.narrowed && sc.to-sc.from+1 > GetLogsMaxRange {
 		return nil, fmt.Errorf("block range %d exceeds %d: give an address or a topic0, or narrow block_number",
 			sc.to-sc.from+1, GetLogsMaxRange)

@@ -322,6 +322,11 @@ func (s *Store) AppendLogs(block uint64, rec []byte) error {
 // no logs in that block (or the block predates capture, see LogsStart).
 func (s *Store) LogsRecord(block uint64) ([]byte, bool, error) { return s.lg.Get(block) }
 
+// LogsMax returns the highest block that has a stored logs record, ok=false if
+// none. It is the hot-tail log index's catch-up ceiling: a header is appended
+// before its logs record, so the header height is not proof the record landed.
+func (s *Store) LogsMax() (uint64, bool) { return s.lg.Max() }
+
 // AppendRcpt stores block's receipts+full-logs record (EncodeTailRcpt).
 // Blocks with no transactions get no record. Idempotent per block.
 func (s *Store) AppendRcpt(block uint64, rec []byte) error { return s.rc.Append(block, rec) }

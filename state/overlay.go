@@ -76,6 +76,11 @@ type History struct {
 	// a prune (which drops cooked entries) never makes work reappear.
 	tailApplied uint64
 
+	// taillog is the hot-tail log index (state/taillogidx.go): the unsealed
+	// counterpart of the epochs' log posting lists. Always non-nil; it catches
+	// itself up from the raw logs family on first use.
+	taillog *tailLogIndex
+
 	// sealRetryAt is the exec head below which SealTail cannot possibly cut an
 	// epoch, so it does not even open the corpus. Owned by the same single
 	// goroutine that calls SealTail (the cook loop).
@@ -120,7 +125,7 @@ type sortedBucket struct {
 // OpenHistory mmaps every sorted bucket in dir. trieAlloc is the genesis trie
 // state (exec.Genesis.TrieAlloc), the floor every descent ends at.
 func OpenHistory(dir string, store *Store, trieAlloc types.GenesisAlloc) (*History, error) {
-	h := &History{dir: dir, store: store, genesis: trieAlloc}
+	h := &History{dir: dir, store: store, genesis: trieAlloc, taillog: newTailLogIndex()}
 	var (
 		stateHead uint64
 		err       error
