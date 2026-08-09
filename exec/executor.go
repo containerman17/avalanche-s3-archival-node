@@ -831,6 +831,9 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				e.spl.fw.Seconds(), e.spl.fsync.Seconds(),
 				time.Duration(e.flushBusyNs.Swap(0)).Seconds(), dt)
 			e.spl = struct{ read, evm, hash, fw, fsync time.Duration }{}
+			if fl := FrameCountLine(); fl != "" {
+				log.Printf("exec: %s", fl)
+			}
 			if e.sae != nil && e.sae.settledSeen {
 				log.Printf("sae: settled=%d (lag %d..%d over %d settlements)",
 					e.sae.settledHeight, e.sae.lagMin, e.sae.lagMax, e.sae.settlements)
