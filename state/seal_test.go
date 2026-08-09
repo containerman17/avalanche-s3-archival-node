@@ -23,6 +23,39 @@ func synthRcpt(nTxs int, n uint64) []byte {
 	return EncodeTailRcpt(nil, rr)
 }
 
+// synthItx is the frames-family twin of synthRcpt: one participants group per
+// transaction (one address, derived from the block) and one call frame for the
+// first transaction, which is enough to exercise both V2 sections.
+func synthItx(nTxs int, n uint64) []byte {
+	if nTxs == 0 {
+		return nil
+	}
+	var parts []byte
+	for i := 0; i < nTxs; i++ {
+		a := synthParticipant(n, i)
+		parts = binary.AppendUvarint(parts, 1)
+		parts = append(parts, a[:]...)
+	}
+	from, to := synthParticipant(n, 0), synthParticipant(n, 1)
+	frame := []byte{0xf1, 0} // CALL at depth 0
+	frame = append(frame, from[:]...)
+	frame = append(frame, to[:]...)
+	frame = append(frame, 0)                   // no value
+	frame = binary.AppendUvarint(frame, 21000) // gas
+	frame = binary.AppendUvarint(frame, 2100)  // gasUsed
+	frame = append(frame, 0, 0, 0)             // no error, no input, no output
+	rec := binary.AppendUvarint(nil, 0)        // tx index 0
+	rec = binary.AppendUvarint(rec, 1)         // one frame
+	return EncodeTailItx(append(rec, frame...), parts)
+}
+
+// synthParticipant is a deterministic address for block n's tx i.
+func synthParticipant(n uint64, i int) (a [20]byte) {
+	binary.BigEndian.PutUint64(a[:8], n)
+	a[19] = byte(i)
+	return
+}
+
 // fixedEpochTxs pins the seal schedule to a flat n for the duration of a
 // test. The real schedule starts at 250,000 txs, so a synthetic corpus of a
 // few dozen txs would seal nothing at all; this is the only override that
@@ -84,6 +117,9 @@ func TestSealCutAndResume(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := st.AppendRcpt(n, synthRcpt(3, n)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AppendItx(n, synthItx(3, n)); err != nil {
 			t.Fatal(err)
 		}
 		// logs record on even blocks: 1 addr, 1 topic

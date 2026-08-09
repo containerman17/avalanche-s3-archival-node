@@ -74,12 +74,73 @@ func synthEpoch(t *testing.T, st *dist.Store, start uint64) (*EpochInput, string
 		{Block: start + 7, Addrs: [][20]byte{addr20(1)}, Topics: [][32]byte{topic32(9)}},
 		{Block: start + 77, Addrs: [][20]byte{addr20(1), addr20(2)}, Topics: [][32]byte{topic32(9)}},
 	}
+	fillItx(in, 0)
 
 	hash, err := BuildEpoch(st, in)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return in, hash
+}
+
+// fillItx gives an input the V2 capture halves, derived from its own tx
+// hashes so the participants stay positional and the counts agree with
+// TxCount. Every tx gets one participant of its own plus a shared "hot
+// contract" address, which is what makes the address index worth searching;
+// the first tx of every block also gets one call frame, with inputBytes of
+// filler so a test can push the frames section past framesGroupRaw.
+func fillItx(in *EpochInput, inputBytes int) {
+	in.Frames, in.Parts = map[uint64][]byte{}, map[uint64][]byte{}
+	filler := bytes.Repeat([]byte("frame-input-"), inputBytes/12+1)[:inputBytes]
+	for blk, hashes := range in.TxHashes {
+		var parts []byte
+		for i := range hashes {
+			a := txParticipant(blk, i)
+			// The capture merges the top-level from/to with every frame's
+			// from/to before it writes a group, so the frame callee is a
+			// participant of the transaction that called it. That is the
+			// whole reason the address index waits for frames.
+			if i == 0 {
+				parts = binary.AppendUvarint(parts, 3)
+			} else {
+				parts = binary.AppendUvarint(parts, 2)
+			}
+			parts = append(parts, a[:]...)
+			parts = append(parts, hotContract[:]...)
+			if i == 0 {
+				parts = append(parts, calleeAddr[:]...)
+			}
+		}
+		in.Parts[blk] = parts
+
+		from, to := txParticipant(blk, 0), calleeAddr
+		frame := []byte{0xf1, 0} // CALL, depth 0
+		frame = append(frame, from[:]...)
+		frame = append(frame, to[:]...)
+		frame = append(frame, 1, 0x2a)             // value 0x2a
+		frame = binary.AppendUvarint(frame, 21000) // gas
+		frame = binary.AppendUvarint(frame, 2100)  // gasUsed
+		frame = append(frame, 0)                   // no error
+		frame = binary.AppendUvarint(frame, uint64(len(filler)))
+		frame = append(frame, filler...)
+		frame = binary.AppendUvarint(frame, 0) // no output
+		rec := binary.AppendUvarint(nil, 0)    // tx index 0
+		rec = binary.AppendUvarint(rec, 1)     // one frame
+		in.Frames[blk] = append(rec, frame...)
+	}
+}
+
+// hotContract is in every transaction's participant set; calleeAddr is only
+// ever a call frame's callee, so finding it proves frames feed the index.
+var (
+	hotContract = [20]byte{0xc0, 0xff, 0xee}
+	calleeAddr  = [20]byte{0xca, 0x11, 0xee}
+)
+
+func txParticipant(blk uint64, i int) (a [20]byte) {
+	binary.BigEndian.PutUint64(a[:8], blk)
+	a[19] = byte(i)
+	return
 }
 
 // testStore is a store with no S3 credentials whatever the environment says:
@@ -323,7 +384,7 @@ func TestOpenEpochRefusesOldFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = OpenEpoch(st, hash)
-	if err == nil || !strings.Contains(err.Error(), "format v2, unsupported") {
+	if err == nil || !strings.Contains(err.Error(), "unrecognized footer") {
 		t.Fatalf("OpenEpoch on a v2 file: %v, want a format refusal", err)
 	}
 }
@@ -495,4 +556,202 @@ func codeAccRLP(t *testing.T, nonce uint64, balance int64, codeHash common.Hash)
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// TestEpochFramesAndAddressIndex is the V2 round trip: frames come back per
+// block, the address index answers by tx, and a frame's callee (an address
+// that is in NO transaction's from/to) is findable, which is the whole reason
+// the address index needs frames.
+func TestEpochFramesAndAddressIndex(t *testing.T) {
+	st := testStore(t, t.TempDir())
+	in, hash := synthEpoch(t, st, 2000)
+	e, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.Version != epochVersion || !e.HasFrames() {
+		t.Fatalf("version %d, frames %v", e.Version, e.HasFrames())
+	}
+
+	for blk, want := range in.Frames {
+		got, ok, err := e.StoredFramesRecord(blk)
+		if err != nil || !ok || !bytes.Equal(got, want) {
+			t.Fatalf("frames %d: ok=%v err=%v %d bytes want %d", blk, ok, err, len(got), len(want))
+		}
+	}
+	// A block with no transactions has no frames record and says so.
+	for n := in.Start; n <= e.End(); n++ {
+		if _, dup := in.Frames[n]; dup {
+			continue
+		}
+		if _, ok, err := e.StoredFramesRecord(n); ok || err != nil {
+			t.Fatalf("frames %d: ok=%v err=%v, want absent", n, ok, err)
+		}
+	}
+
+	// Cumulative tx counts resolve every ordinal back to its (block, index).
+	var ord uint64
+	for n := in.Start; n <= e.End(); n++ {
+		for i := range in.TxHashes[n] {
+			ref, err := e.TxRefAt(ord)
+			if err != nil || ref.Block != n || ref.Index != uint32(i) {
+				t.Fatalf("ordinal %d: %+v err=%v, want block %d index %d", ord, ref, err, n, i)
+			}
+			ord++
+		}
+	}
+	if ord != e.TxCount {
+		t.Fatalf("walked %d txs, footer says %d", ord, e.TxCount)
+	}
+	if _, err := e.TxRefAt(e.TxCount); err == nil {
+		t.Fatal("an ordinal past the end must error")
+	}
+
+	// The hot contract is in every transaction; the callee is in none of them
+	// and only ever appears inside a call frame.
+	hot, err := e.AddrTxs(hotContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint64(len(hot)) != e.TxCount {
+		t.Fatalf("hot contract in %d txs, want %d", len(hot), e.TxCount)
+	}
+	callee, err := e.AddrTxs(calleeAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callee) != len(in.Frames) {
+		t.Fatalf("frame callee in %d txs, want one per frame-bearing block (%d)", len(callee), len(in.Frames))
+	}
+	for _, ref := range callee {
+		if _, ok := in.Frames[ref.Block]; !ok || ref.Index != 0 {
+			t.Fatalf("callee ref %+v is not the first tx of a frame-bearing block", ref)
+		}
+	}
+	// One sender's own address resolves to exactly its own transaction.
+	for blk, hashes := range in.TxHashes {
+		if len(hashes) == 0 {
+			continue
+		}
+		got, err := e.AddrTxs(txParticipant(blk, 0))
+		if err != nil || len(got) != 1 || got[0].Block != blk || got[0].Index != 0 {
+			t.Fatalf("sender of %d: %+v err=%v", blk, got, err)
+		}
+		break
+	}
+	if got, err := e.AddrTxs([20]byte{0xde, 0xad}); err != nil || got != nil {
+		t.Fatalf("unknown address: %v %v", got, err)
+	}
+}
+
+// TestEpochFrameGroups pushes the frames section past framesGroupRaw so the
+// section is more than one 4MB raw group, and reads a record out of each: the
+// ruled random access is "locate the group, decode one 4MB raw group".
+func TestEpochFrameGroups(t *testing.T) {
+	st := testStore(t, t.TempDir())
+	in := &EpochInput{Start: 1, TxHashes: map[uint64][][32]byte{}}
+	const nBlocks = 60
+	for i := 0; i < nBlocks; i++ {
+		blk := in.Start + uint64(i)
+		in.Containers = append(in.Containers, []byte(fmt.Sprintf("container-%d", blk)))
+		in.Headers = append(in.Headers, []byte(fmt.Sprintf("header-%d", blk)))
+		var h [32]byte
+		binary.BigEndian.PutUint64(h[:8], blk)
+		in.TxHashes[blk] = [][32]byte{h}
+		in.TxCount++
+	}
+	fillItx(in, 200<<10) // 60 * 200KB = ~12MB raw, three 4MB groups
+	hash, err := BuildEpoch(st, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	sizes := e.SectionSizes()
+	if sizes["frames"] == 0 || sizes["frames"] > 4<<20 {
+		t.Fatalf("frames section %d bytes: expected well under one raw group after zstd", sizes["frames"])
+	}
+	// nFrames+1 offsets past the member table: three groups means four.
+	idx := e.sec[secFramesIdx]
+	nMembers := uint64(vu32(idx, 0))
+	nGroups := (vlen(idx)-4-nMembers*12)/8 - 1
+	if nGroups < 3 {
+		t.Fatalf("%d groups over ~12MB of raw frames, want 3 at %d bytes each", nGroups, framesGroupRaw)
+	}
+	for n := in.Start; n < in.Start+nBlocks; n++ {
+		got, ok, err := e.StoredFramesRecord(n)
+		if err != nil || !ok || !bytes.Equal(got, in.Frames[n]) {
+			t.Fatalf("block %d out of group: ok=%v err=%v", n, ok, err)
+		}
+	}
+}
+
+// TestOpenEpochReadsV1 proves a V2 reader still opens a V1 (v6) file. The
+// fixture is a real v6 footer over a real epoch's bytes: the first
+// epochNumSectionsV1 sections of a v7 build lie exactly where a v6 build put
+// them, which is why writeFrames appends its four sections last. The startup
+// conversion itself is a separate task; this only pins that the reader never
+// needs it to answer.
+func TestOpenEpochReadsV1(t *testing.T) {
+	st := testStore(t, t.TempDir())
+	in, hash := synthEpoch(t, st, 5000)
+	raw, _ := readFileT(t, st.SpoolPath(hash))
+	b, err := st.Open(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := b.Size()
+	b.Close()
+
+	v2Foot := raw[size-epochFooterSize : size]
+	const v1FooterSize = epochTableOff + epochNumSectionsV1*16 + 4
+	foot := make([]byte, v1FooterSize)
+	copy(foot, v2Foot[:epochTableOff])
+	binary.LittleEndian.PutUint32(foot[4:8], epochVersionV1)
+	copy(foot[epochTableOff:], v2Foot[epochTableOff:epochTableOff+epochNumSectionsV1*16])
+	copy(foot[v1FooterSize-4:], epochMagic[:])
+	// Wipe the v7 footer's head before writing the shorter v6 one over its
+	// tail, or the probe finds a v7 magic and a v7 version in front of a v6
+	// table. A real v6 file has neither.
+	clear(raw[size-epochFooterSize : size-v1FooterSize])
+	copy(raw[size-v1FooterSize:size], foot)
+	if err := os.WriteFile(st.SpoolPath(hash), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := OpenEpoch(st, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.Version != epochVersionV1 {
+		t.Fatalf("version %d, want %d", e.Version, epochVersionV1)
+	}
+	if e.Start != in.Start || e.Count != uint64(len(in.Containers)) || e.TxCount != in.TxCount {
+		t.Fatalf("footer: %+v", e)
+	}
+	if e.HasFrames() {
+		t.Fatal("a v6 file must report no V2 sections")
+	}
+	for i := range in.Containers {
+		got, err := e.Container(in.Start + uint64(i))
+		if err != nil || !bytes.Equal(got, in.Containers[i]) {
+			t.Fatalf("v6 container %d: %v", i, err)
+		}
+	}
+	k1 := synthKey('s', 1)
+	if v, blk, found, _ := e.StateSearch(k1[:], 5005); !found || blk != 5005 || !bytes.Equal(v, []byte{0x12}) {
+		t.Fatalf("v6 state read: v=%x blk=%d found=%v", v, blk, found)
+	}
+	if _, _, err := e.StoredFramesRecord(5007); err == nil {
+		t.Fatal("a frames read on a v6 file must say the section is absent")
+	}
+	if _, err := e.AddrTxs(hotContract); err != nil {
+		t.Fatalf("an address lookup on a v6 file must be empty, not an error: %v", err)
+	}
 }

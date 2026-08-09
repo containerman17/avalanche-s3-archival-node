@@ -179,6 +179,11 @@ func writeSparseCorpus(t *testing.T, dir string, blocks uint64) {
 		if err := st.AppendRcpt(n, EncodeTailRcpt(storedLogs, rr)); err != nil {
 			t.Fatal(err)
 		}
+		if rec := synthItx(nTx, n); rec != nil {
+			if err := st.AppendItx(n, rec); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	if err := st.SetLogsStart(1); err != nil {
 		t.Fatal(err)

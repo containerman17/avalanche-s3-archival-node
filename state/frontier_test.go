@@ -62,6 +62,9 @@ func buildFrontierEpochs(t *testing.T, dir string) *EpochSet {
 		if err := st.AppendRcpt(n, synthRcpt(3, n)); err != nil {
 			t.Fatal(err)
 		}
+		if err := st.AppendItx(n, synthItx(3, n)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.SetLogsStart(1); err != nil {
 		t.Fatal(err)

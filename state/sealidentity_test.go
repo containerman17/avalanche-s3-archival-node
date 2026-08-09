@@ -38,6 +38,8 @@ func gatherEpochRAM(store *Store, reader *fetch.Reader, start, execHead, epochTx
 		TxHashes: map[uint64][][32]byte{},
 		FullLogs: map[uint64][]byte{},
 		RcptRecs: map[uint64][]byte{},
+		Frames:   map[uint64][]byte{},
+		Parts:    map[uint64][]byte{},
 	}
 	var rawBytes rawSizes
 	for n := start; n <= execHead; n++ {
@@ -96,6 +98,28 @@ func gatherEpochRAM(store *Store, reader *fetch.Reader, start, execHead, epochTx
 			if len(rcptRec) > 0 {
 				in.RcptRecs[n] = rcptRec
 			}
+		}
+
+		// Same rule, and same gather, for the V2 call-frames family.
+		itxRaw, hasItx, err := store.ItxRecord(n)
+		if err != nil {
+			return in, false, rawSizes{}, err
+		}
+		if len(hashes) > 0 && !hasItx {
+			return in, false, rawSizes{}, fmt.Errorf(
+				"seal: block %d has %d txs but no captured call-frames record: this corpus was executed before frame capture, resync it (there is no backfill)",
+				n, len(hashes))
+		}
+		if hasItx {
+			framesRec, partsRec, err := DecodeTailItx(itxRaw)
+			if err != nil {
+				return in, false, rawSizes{}, fmt.Errorf("seal: block %d: %w", n, err)
+			}
+			rawBytes.itx += uint64(len(itxRaw))
+			if len(framesRec) > 0 {
+				in.Frames[n] = framesRec
+			}
+			in.Parts[n] = partsRec
 		}
 
 		if frame, ok, err := store.wl.Get(n); err != nil {

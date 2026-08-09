@@ -54,6 +54,9 @@ func sealCorpus(t *testing.T, dir string, n uint64) (*Store, map[uint64][]common
 		if err := st.AppendRcpt(h, synthRcpt(3, h)); err != nil {
 			t.Fatal(err)
 		}
+		if err := st.AppendItx(h, synthItx(3, h)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.SetLogsStart(1); err != nil {
 		t.Fatal(err)

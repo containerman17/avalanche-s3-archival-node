@@ -178,6 +178,9 @@ func TestSealCodeEndToEnd(t *testing.T) {
 		if err := st.AppendRcpt(n, synthRcpt(3, n)); err != nil {
 			t.Fatal(err)
 		}
+		if err := st.AppendItx(n, synthItx(3, n)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := st.PutCode(hashA, blobA); err != nil {
 		t.Fatal(err)
