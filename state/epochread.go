@@ -37,6 +37,9 @@ type Epoch struct {
 
 	// Hash is the artifact's hex sha256, i.e. its name everywhere.
 	Hash string
+	// Version is the on-disk format this file was written in: epochVersion
+	// (V2) or epochVersionV1. It is what the startup migration keys on.
+	Version uint32
 	// Prev is sha256 of epoch K-1, or the chain root (dist.ChainRoot) for the
 	// first epoch of a chain: the hash chain of DESIGN.md "Distribution".
 	Prev [32]byte
@@ -107,6 +110,12 @@ func (b bloom) mayContain(key []byte) bool {
 var residentSections = []int{
 	secDict, secBodiesIdx, secHeadersIdx, secSSTIdx, secDeletes,
 	secLogsDict, secFullLogsIdx, secRcptIdx,
+	// v7: the frames member table is the same 12-bytes-per-block shape as
+	// fullLogsIdx and rcptIdx, and the cumulative tx count is 4 bytes per
+	// block, which every address query resolves an ordinal through. Both are
+	// resident by the same rule as the other index headers; a v6 file has
+	// them at zero length.
+	secFramesIdx, secTxCum,
 }
 
 // vu64 and vu32 read one little-endian word out of a view. A word CAN straddle
@@ -137,7 +146,8 @@ func (e *Epoch) Dict() []byte { return vslice(e.sec[secDict], 0, vlen(e.sec[secD
 func (e *Epoch) SectionSizes() map[string]uint64 {
 	names := []string{"dict", "bodies", "bodiesIdx", "headers", "headersIdx",
 		"sst", "sstIdx", "deletes", "txidx", "logidx", "keybloom",
-		"logsDict", "fullLogs", "fullLogsIdx", "rcpt", "rcptIdx", "txbloom"}
+		"logsDict", "fullLogs", "fullLogsIdx", "rcpt", "rcptIdx", "txbloom",
+		"frames", "framesIdx", "addridx", "txcum"}
 	out := make(map[string]uint64, epochNumSections)
 	for i, n := range names {
 		out[n] = e.off[i][1]
@@ -162,31 +172,50 @@ func OpenEpoch(st *dist.Store, hash string) (*Epoch, error) {
 // parseFooter fills e from the artifact's fixed-size footer: format check,
 // coverage, prev-hash and the section table. It reads the tail of the blob and
 // nothing else.
+// TWO FORMATS ARE READ, and the probe is the only way to tell them apart: the
+// footer's size depends on its section count, so the version dword's position
+// depends on the version. v7 (V2) first, then v6 (V1), exactly as the v3/v2/v1
+// probe did before the corpus was last rebuilt. A v6 file leaves the four v7
+// sections at {0,0}, which every V2-only reader below treats as absent.
+// Anything else is refused by name; there is no partial read.
 func (e *Epoch) parseFooter(blob *dist.Blob, hash string) error {
 	size := blob.Size()
-	if size < epochFooterSize {
-		return fmt.Errorf("epoch %s: too small", hash)
+	var (
+		ft   []byte
+		nSec int
+	)
+	for _, c := range [...]struct {
+		ver  uint32
+		nSec int
+	}{{epochVersion, epochNumSections}, {epochVersionV1, epochNumSectionsV1}} {
+		fs := uint64(epochTableOff + c.nSec*16 + 4)
+		if size < fs {
+			continue
+		}
+		raw, err := blob.Read(size-fs, fs)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(raw[0:4], epochMagic[:]) || !bytes.Equal(raw[len(raw)-4:], epochMagic[:]) {
+			continue
+		}
+		if binary.LittleEndian.Uint32(raw[4:8]) != c.ver {
+			continue
+		}
+		ft, nSec = raw, c.nSec
+		e.Version = c.ver
+		break
 	}
-	ft, err := blob.Read(size-epochFooterSize, epochFooterSize)
-	if err != nil {
-		return err
-	}
-	// v5 is the only supported format. Older files are recognized far enough
-	// to say so and no further: there is no upgrade path (user ruling
-	// 2026-07-28), the corpus is disposable and gets resynced.
-	if !bytes.Equal(ft[0:4], epochMagic[:]) || !bytes.Equal(ft[epochFooterSize-4:], epochMagic[:]) {
-		return fmt.Errorf("epoch %s: unrecognized footer, not format v%d (older formats are unsupported: delete the corpus and resync)", hash, epochVersion)
-	}
-	if v := binary.LittleEndian.Uint32(ft[4:8]); v != epochVersion {
-		return fmt.Errorf("epoch %s is format v%d, unsupported: delete the corpus and resync", hash, v)
+	if ft == nil {
+		return fmt.Errorf("epoch %s: unrecognized footer, neither format v%d nor v%d (older formats are unsupported: delete the corpus and resync)", hash, epochVersion, epochVersionV1)
 	}
 	e.Start = binary.LittleEndian.Uint64(ft[8:16])
 	e.Count = binary.LittleEndian.Uint64(ft[16:24])
 	e.TxCount = binary.LittleEndian.Uint64(ft[24:32])
 	e.Hash = hash
 	copy(e.Prev[:], ft[32:64])
-	body := size - epochFooterSize
-	for i := 0; i < epochNumSections; i++ {
+	body := size - uint64(len(ft))
+	for i := 0; i < nSec; i++ {
 		off := binary.LittleEndian.Uint64(ft[epochTableOff+i*16:])
 		ln := binary.LittleEndian.Uint64(ft[epochTableOff+8+i*16:])
 		if off > body || ln > body-off { // overflow-safe bounds check
@@ -562,8 +591,8 @@ func (e *Epoch) TxCandidates(fp uint64) ([]uint64, error) {
 // reads: one small read per binary-search probe, then the list itself. The
 // list's END comes from the NEXT table entry's offset, which is exact because
 // buildLogidx appends lists in table order (addrs, then topics).
-func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
-	total := e.off[secLogidx][1]
+func (e *Epoch) postingsLookup(sec int, key []byte) ([]uint64, error) {
+	total := e.off[sec][1]
 	if total < 4 {
 		return nil, nil
 	}
@@ -571,7 +600,7 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	// map (mapping it would fill every chunk of it), and a copy of four bytes
 	// is not worth avoiding.
 	u32 := func(off uint64) (uint32, error) {
-		b, err := e.read(secLogidx, off, 4)
+		b, err := e.read(sec, off, 4)
 		if err != nil {
 			return 0, err
 		}
@@ -584,7 +613,7 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	nAddr := uint64(nAddr64)
 	topicHdr := 4 + nAddr*(20+8)
 	if topicHdr+4 > total {
-		return nil, fmt.Errorf("epoch %d: logidx truncated", e.Start)
+		return nil, fmt.Errorf("epoch %d: postings section %d truncated", e.Start, sec)
 	}
 	nTopic64, err := u32(topicHdr)
 	if err != nil {
@@ -593,7 +622,7 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	nTopic := uint64(nTopic64)
 	listsOff := topicHdr + 4 + nTopic*(32+8)
 	if listsOff > total {
-		return nil, fmt.Errorf("epoch %d: logidx truncated", e.Start)
+		return nil, fmt.Errorf("epoch %d: postings section %d truncated", e.Start, sec)
 	}
 
 	var base, stride, count uint64
@@ -621,7 +650,7 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	}
 	listAt := func(i uint64) (uint64, error) {
 		entOff, width, _ := entryOff(i)
-		ent, err := e.read(secLogidx, entOff, width)
+		ent, err := e.read(sec, entOff, width)
 		if err != nil {
 			return 0, err
 		}
@@ -630,7 +659,7 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 
 	var searchErr error
 	i := uint64(sort.Search(int(count), func(i int) bool {
-		ent, err := e.read(secLogidx, base+uint64(i)*stride, uint64(len(key)))
+		ent, err := e.read(sec, base+uint64(i)*stride, uint64(len(key)))
 		if err != nil {
 			searchErr = err
 			return true
@@ -643,7 +672,7 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if i >= count {
 		return nil, nil
 	}
-	ent, err := e.read(secLogidx, base+i*stride, stride)
+	ent, err := e.read(sec, base+i*stride, stride)
 	if err != nil {
 		return nil, err
 	}
@@ -658,9 +687,9 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 		}
 	}
 	if end < off {
-		return nil, fmt.Errorf("epoch %d: logidx list [%d,%d) is inverted", e.Start, off, end)
+		return nil, fmt.Errorf("epoch %d: postings list [%d,%d) is inverted", e.Start, off, end)
 	}
-	raw, err := e.read(secLogidx, listsOff+off, end-off)
+	raw, err := e.read(sec, listsOff+off, end-off)
 	if err != nil {
 		return nil, err
 	}
@@ -668,12 +697,20 @@ func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	rel := ef.values()
-	out := make([]uint64, len(rel))
-	for j, r := range rel {
-		out[j] = e.Start + r
+	return ef.values(), nil
+}
+
+// logidxLookup is postingsLookup over the log index, whose values are
+// epoch-relative blocks, returned absolute.
+func (e *Epoch) logidxLookup(key []byte) ([]uint64, error) {
+	rel, err := e.postingsLookup(secLogidx, key)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	for j := range rel {
+		rel[j] += e.Start
+	}
+	return rel, nil
 }
 
 // LogAddrBlocks returns the absolute blocks where addr emitted a log.
@@ -681,6 +718,72 @@ func (e *Epoch) LogAddrBlocks(addr [20]byte) ([]uint64, error) { return e.logidx
 
 // LogTopicBlocks returns the absolute blocks where topic appeared.
 func (e *Epoch) LogTopicBlocks(topic [32]byte) ([]uint64, error) { return e.logidxLookup(topic[:]) }
+
+// TxRef names one transaction: the block it is in and its index inside that
+// block. It is what an address-index posting list resolves to.
+type TxRef struct {
+	Block uint64
+	Index uint32
+}
+
+// StoredFramesRecord returns block n's call-frames record (exec/frames.go
+// encoding). ok=false = the block made no nested call. Costs ONE ranged read
+// of a compressed group plus ONE 4MB-raw decode, which is the whole point of
+// the ruled grouping.
+func (e *Epoch) StoredFramesRecord(n uint64) ([]byte, bool, error) {
+	return e.storedRecord(secFrames, e.sec[secFramesIdx], n)
+}
+
+// HasFrames reports whether this epoch carries the V2 sections. A V1 (v6)
+// file never does, and neither does an epoch sealed by a unit test that
+// passed no capture.
+func (e *Epoch) HasFrames() bool { return vlen(e.sec[secTxCum]) >= 4 }
+
+// txcum returns the running tx total through epoch-relative block rel.
+func (e *Epoch) txcum(rel uint64) uint32 { return vu32(e.sec[secTxCum], rel*4) }
+
+// TxRefAt resolves an epoch-relative tx ordinal to its block and index, by
+// binary search over the cumulative tx counts (index family 4). That section
+// is why the address index can be tx-granular: without it a posting list
+// could only name blocks, which is the 5.1x amplification the /sql
+// measurements found in the log index.
+func (e *Epoch) TxRefAt(ord uint64) (TxRef, error) {
+	if !e.HasFrames() || ord >= e.TxCount {
+		return TxRef{}, fmt.Errorf("epoch %d: tx ordinal %d outside 0..%d", e.Start, ord, e.TxCount)
+	}
+	rel := uint64(sort.Search(int(e.Count), func(i int) bool {
+		return uint64(e.txcum(uint64(i))) > ord
+	}))
+	var before uint64
+	if rel > 0 {
+		before = uint64(e.txcum(rel - 1))
+	}
+	return TxRef{Block: e.Start + rel, Index: uint32(ord - before)}, nil
+}
+
+// AddrTxs returns every transaction this epoch saw addr participate in, in
+// ascending order: as sender, as recipient or created contract, or as either
+// side of any call frame. The one index family the /sql experiments asked for
+// first (`WHERE from_addr = X` had nothing to search and decoded every
+// container at 12,700 rows/s).
+//
+// ponytail: no bloom in front of it yet, so a miss costs the section's binary
+// search (a handful of ranged reads) rather than one heap probe. DESIGN.md
+// rules a 16-bit-per-key filter here; add it when a many-epoch corpus makes
+// the miss path show up, the same measurement that produced secTxBloom.
+func (e *Epoch) AddrTxs(addr [20]byte) ([]TxRef, error) {
+	ords, err := e.postingsLookup(secAddridx, addr[:])
+	if err != nil || len(ords) == 0 {
+		return nil, err
+	}
+	out := make([]TxRef, len(ords))
+	for i, o := range ords {
+		if out[i], err = e.TxRefAt(o); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
 
 // HasStoredLogs reports whether this epoch carries the stored-logs
 // sections (index headers present; an epoch with zero logs still counts).

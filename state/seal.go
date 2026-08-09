@@ -334,10 +334,11 @@ func sealEpochs(ctx context.Context, dir string, out *dist.Store, chainRoot [32]
 				EpochMarkerName(s.start, s.count), hash[:12], err)
 		} else {
 			sz := e.SectionSizes()
-			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB rcpt=%.2fMB",
+			log.Printf("seal:   raw: bodies=%.2fMB headers=%.2fMB writelog=%.2fMB logs=%.2fMB rcpt=%.2fMB itx=%.2fMB",
 				float64(s.raw.containers)/1e6, float64(s.raw.headers)/1e6,
 				float64(s.raw.writelog)/1e6, float64(s.raw.logs)/1e6,
-				float64(s.raw.rcpt)/1e6)
+				float64(s.raw.rcpt)/1e6,
+				float64(s.raw.itx)/1e6)
 			log.Printf("seal:   sealed: dict=%.2fMB bodies=%.2fMB(+idx %.2f) headers=%.2fMB(+idx %.2f) sst=%.2fMB(+idx %.2f) deletes=%.2fMB txidx=%.2fMB(+bloom %.2f) logidx=%.2fMB bloom=%.2fMB",
 				float64(sz["dict"])/1e6,
 				float64(sz["bodies"])/1e6, float64(sz["bodiesIdx"])/1e6,
@@ -387,10 +388,10 @@ func retryAt(txCount, blocks, execHead, epochTxs uint64) uint64 {
 
 // rawSizes are the uncompressed raw equivalents consumed by one epoch, for
 // the compression scoreboard.
-type rawSizes struct{ containers, headers, writelog, logs, rcpt uint64 }
+type rawSizes struct{ containers, headers, writelog, logs, rcpt, itx uint64 }
 
 func (r rawSizes) total() uint64 {
-	return r.containers + r.headers + r.writelog + r.logs + r.rcpt
+	return r.containers + r.headers + r.writelog + r.logs + r.rcpt + r.itx
 }
 
 // txPair is one (fingerprint, epoch-relative block) entry of the tx index.
@@ -419,7 +420,7 @@ type epochStream struct {
 	// A family is walked more than once (the builder writes sections in file
 	// order, the logs dict wants its records before they are compressed), so
 	// only the first pass over each one counts its bytes into raw.
-	rowsPass, logsPass, storedPass int
+	rowsPass, logsPass, storedPass, itxPass int
 }
 
 // scanEpoch walks blocks ascending from start until the cumulative tx count
@@ -481,6 +482,19 @@ func scanEpoch(store *Store, reader *fetch.Reader, start, execHead, epochTxs uin
 		if len(hashes) > 0 && !store.rc.Has(n) {
 			return s, false, fmt.Errorf(
 				"seal: block %d has %d txs but no captured receipts record: this corpus was executed before live receipt capture, resync it (there is no backfill)",
+				n, len(hashes))
+		}
+		// Same rule for CALL FRAMES (V2). A missing record here is not a
+		// block that made no internal call (that block still has a
+		// participants half, so it still has a record): it is a block
+		// executed without frame capture, and sealing it would put a silent
+		// hole in the address index, which is exactly the false negative
+		// frames exist to prevent. SAE blocks land here too, on purpose:
+		// saexec has no tracer seam at this pin, so a post-Helicon C-chain
+		// cannot be sealed to V2 until it gets one.
+		if len(hashes) > 0 && !store.ix.Has(n) {
+			return s, false, fmt.Errorf(
+				"seal: block %d has %d txs but no captured call-frames record: this corpus was executed before frame capture, resync it (there is no backfill)",
 				n, len(hashes))
 		}
 
@@ -549,6 +563,7 @@ func (s *epochStream) src() *epochSrc {
 		},
 		Logs:   s.logs,
 		Stored: s.stored,
+		Itx:    s.itx,
 		TxPairs: func(yield func(fp, blk uint64) error) error {
 			for _, p := range s.pairs {
 				if err := yield(p.fp, p.blk); err != nil {
@@ -672,6 +687,35 @@ func (s *epochStream) stored(yield func(uint64, []byte, []byte) error) error {
 	return nil
 }
 
+// itx walks the live capture's call-frames records and splits each into the
+// frames half (copied into the epoch verbatim) and the participants half (the
+// address index's input, which never reaches the epoch). Same shape as
+// stored, and no re-execution here either.
+func (s *epochStream) itx(yield func(uint64, []byte, []byte) error) error {
+	first := s.itxPass == 0
+	s.itxPass++
+	for n := s.start; n < s.start+s.count; n++ {
+		raw, ok, err := s.store.ItxRecord(n)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if first {
+			s.raw.itx += uint64(len(raw))
+		}
+		framesRec, partsRec, err := DecodeTailItx(raw)
+		if err != nil {
+			return fmt.Errorf("seal: block %d: %w", n, err)
+		}
+		if err := yield(n, framesRec, partsRec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // decodeLogRec decodes one capture-format logs record (exec encodeLogsFrame
 // layout: uvarint nAddr + 20B addrs + uvarint nTopic + 32B topics).
 func decodeLogRec(block uint64, rec []byte) (LogRec, error) {
@@ -760,6 +804,7 @@ func DeleteSealedRaw(dir string, sealedEnd uint64) error {
 		"headers_%05d.log", "headers_idx_%05d.log",
 		"logs_%05d.log", "logs_idx_%05d.log",
 		"rcpt_%05d.log", "rcpt_idx_%05d.log",
+		"itx_%05d.log", "itx_idx_%05d.log",
 		"logsbf_%05d.log", "logsbf_idx_%05d.log", "logsbf_done_%05d",
 		"sorted_%05d.idx", "txidx_%05d.idx",
 	}

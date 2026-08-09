@@ -204,19 +204,25 @@ const (
 	txBloomBitsPerTx = 16
 	txBloomHashes    = 11
 
-	// Format v6 is the ONLY supported format: stored-logs sections (v2,
-	// 2026-07-20), contract code as 'c' rows in the SST (v3, 2026-07-28),
-	// the HASH-CHAIN footer field (v4, 2026-07-30) that makes one head hash
-	// authenticate all of a chain's history, the tx-fingerprint bloom (v5,
-	// 2026-07-30), and BLOCK HASHES FOLDED INTO THAT SAME INDEX AND BLOOM
-	// (v6, 2026-07-31), which deletes the floor-to-head block-hash map. Same
-	// 17 sections: v6 changes only what goes into txidx/txbloom. There is no
-	// upgrade path: OpenEpoch refuses an older file and the corpus is rebuilt
-	// by a fresh sync (user ruling 2026-07-28).
-	epochVersion     = 6
-	epochNumSections = 17
-	epochTableOff    = 4 + 4 + 8 + 8 + 8 + 32                  // magic, version, start, count, txs, prev hash
-	epochFooterSize  = epochTableOff + epochNumSections*16 + 4 // + table + trailing magic
+	// FORMAT v7 IS THE ARTIFACT CALLED V2 (DESIGN.md, "Epoch versioning").
+	// The lineage: stored-logs sections (v2, 2026-07-20), contract code as
+	// 'c' rows in the SST (v3, 2026-07-28), the HASH-CHAIN footer field (v4,
+	// 2026-07-30) that makes one head hash authenticate all of a chain's
+	// history, the tx-fingerprint bloom (v5, 2026-07-30), block hashes folded
+	// into that same index and bloom (v6, 2026-07-31), and now STORED CALL
+	// FRAMES plus the first two V2 index families (v7, 2026-08-09).
+	//
+	// v6 IS STILL READ. It is the first version with an upgrade path at all:
+	// migrations exist from V2 onward (user direction 2026-08-09), and the
+	// startup conversion walks a v6 corpus genesis-first because each footer
+	// embeds the previous artifact's name. Anything older is refused as
+	// before. WRITERS ONLY EVER WRITE epochVersion.
+	epochVersion       = 7
+	epochVersionV1     = 6
+	epochNumSections   = 21
+	epochNumSectionsV1 = 17
+	epochTableOff      = 4 + 4 + 8 + 8 + 8 + 32                  // magic, version, start, count, txs, prev hash
+	epochFooterSize    = epochTableOff + epochNumSections*16 + 4 // + table + trailing magic
 
 	logsDictTarget = 128 << 10 // dedicated logs dict (measured better than container dict)
 )
@@ -261,6 +267,14 @@ const (
 	secRcptIdx
 	// v5 addition: the tx-fingerprint bloom.
 	secTxBloom
+	// v7 (V2) additions, written AFTER every v6 section so that the first
+	// epochNumSectionsV1 sections of a v7 file lie exactly where a v6 build
+	// would have put them. That is what makes the startup migration an
+	// append plus a new footer for everything except the frames themselves.
+	secFrames    // call frames, zstd groups of framesGroupRaw RAW bytes
+	secFramesIdx // per-block member table + group offsets (storedFrames)
+	secAddridx   // ADDRESS INDEX: address -> EF over epoch-relative tx ordinals
+	secTxCum     // CUMULATIVE TX COUNT: one u32 per block, epoch-relative
 )
 
 var epochMagic = [4]byte{'E', 'P', 'O', 'C'}
@@ -272,7 +286,17 @@ var sectionPhase = map[int]string{
 	secHeaders:  "headers",
 	secFullLogs: "storedlogs",
 	secRcpt:     "rcpt",
+	secFrames:   "frames",
 }
+
+// framesGroupRaw is THE RULED GROUPING for stored call frames (user ruling
+// 2026-08-09): 4MB of RAW frame bytes per independently compressed zstd
+// group. Measured 11.5x at this size against 8.7x at 512KB and 7.4x at 128KB,
+// so ~360KB compressed, ~11 groups per 4MB casfs chunk. A frame read costs one
+// chunk GET plus one 4MB decode (~5-10ms), which is the point: the ~45MB
+// variant that approached the whole-file bound was rejected because frames
+// must stay QUERY-ADEQUATE, not archive-only.
+const framesGroupRaw = 4 << 20
 
 // ---------- builder input ----------
 
@@ -353,6 +377,13 @@ type EpochInput struct {
 	FullLogs map[uint64][]byte // log-bearing block -> logs record
 	RcptRecs map[uint64][]byte // tx-bearing block -> receipt-fields record
 
+	// Stored call frames and their address-participation twin (v7/V2), both
+	// straight from the executor's live capture (exec/frames.go). Frames are
+	// stored; Parts is the ADDRESS INDEX's input and is dropped after the
+	// seal. nil Parts = seal without the V2 index sections (unit tests only).
+	Frames map[uint64][]byte // block with nested frames -> frames record
+	Parts  map[uint64][]byte // tx-bearing block -> per-tx participants record
+
 	// Code (v3) is every contract code blob referenced by an account row
 	// this epoch writes, keyed by hash. THE PLACEMENT RULE, user decision
 	// 2026-07-28 after measuring both candidates on the mainnet 0-10M
@@ -373,6 +404,22 @@ type EpochInput struct {
 
 // HasStoredLogInputs reports whether this input seals the v2 sections.
 func (in *EpochInput) HasStoredLogInputs() bool { return in.FullLogs != nil && in.RcptRecs != nil }
+
+// sortedBlocks is the union of two per-block maps' keys, ascending: the walk
+// order both the stored-logs and the frames sources have to produce.
+func sortedBlocks(a, b map[uint64][]byte) []uint64 {
+	out := make([]uint64, 0, len(a)+len(b))
+	for k := range a {
+		out = append(out, k)
+	}
+	for k := range b {
+		if _, dup := a[k]; !dup {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
 
 // codeCursor emits the v3 code rows in key order as an SST write walks past
 // them ('c' sorts between the 'a' and 's' rows, so they form one contiguous
@@ -445,6 +492,11 @@ type epochSrc struct {
 	// sections (unit tests only). Walked three times: the logs dict is trained
 	// on those records before either section can be compressed.
 	Stored func(yield func(block uint64, logs, rcpt []byte) error) error
+	// Itx yields (block, frames record, participants record) ascending, the
+	// frames half possibly empty (a block whose txs made no nested call).
+	// nil = seal without the V2 sections (unit tests only). Walked twice:
+	// once for the frames section, once for the address index.
+	Itx func(yield func(block uint64, frames, parts []byte) error) error
 	// TxPairs yields (fingerprint, epoch-relative block) for every tx hash and
 	// every block hash (v6).
 	TxPairs func(yield func(fp, blk uint64) error) error
@@ -514,18 +566,18 @@ func (in *EpochInput) src() *epochSrc {
 	}
 	if in.HasStoredLogInputs() {
 		s.Stored = func(yield func(uint64, []byte, []byte) error) error {
-			blocks := make([]uint64, 0, len(in.FullLogs)+len(in.RcptRecs))
-			for b := range in.FullLogs {
-				blocks = append(blocks, b)
-			}
-			for b := range in.RcptRecs {
-				if _, dup := in.FullLogs[b]; !dup {
-					blocks = append(blocks, b)
+			for _, b := range sortedBlocks(in.FullLogs, in.RcptRecs) {
+				if err := yield(b, in.FullLogs[b], in.RcptRecs[b]); err != nil {
+					return err
 				}
 			}
-			sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
-			for _, b := range blocks {
-				if err := yield(b, in.FullLogs[b], in.RcptRecs[b]); err != nil {
+			return nil
+		}
+	}
+	if in.Parts != nil {
+		s.Itx = func(yield func(uint64, []byte, []byte) error) error {
+			for _, b := range sortedBlocks(in.Parts, in.Frames) {
+				if err := yield(b, in.Frames[b], in.Parts[b]); err != nil {
 					return err
 				}
 			}
@@ -652,6 +704,9 @@ func buildEpoch(st *dist.Store, src *epochSrc) (string, error) {
 		return "", err
 	}
 	if err := writeStored(o, tmp, enc, src); err != nil {
+		return "", err
+	}
+	if err := writeFrames(o, src); err != nil {
 		return "", err
 	}
 
@@ -789,14 +844,21 @@ func (o *epochOut) framed(id int, enc *zstd.Encoder, walk func(func([]byte) erro
 	return offs, nil
 }
 
-// storedFrames is framed for the sparse per-block records (stored logs /
-// receipt fields), which carry a member table on top. Index layout:
+// storedFrames is framed for the sparse per-block records (stored logs,
+// receipt fields, call frames), which carry a member table on top. Index
+// layout:
 //
 //	u32 nMembers | members (12B: relBlock u32, frame u32, slot u32) |
 //	frame offsets u64 x (nFrames+1)
 //
 // Members are in walk order, which is ascending by block.
-func (o *epochOut) storedFrames(id int, enc *zstd.Encoder, start uint64, walk func(func(uint64, []byte) error) error) ([]byte, error) {
+//
+// A group closes at maxCount records OR at maxRaw uncompressed bytes,
+// whichever comes first; 0 disables that bound. The stored-logs and receipt
+// sections are record-counted (framedGroup, the same 16 the bodies use); the
+// frames section is BYTE-counted at framesGroupRaw, because its unit of
+// random access is one 4MB raw group, not sixteen blocks of anything.
+func (o *epochOut) storedFrames(id int, enc *zstd.Encoder, start uint64, maxCount, maxRaw int, walk func(func(uint64, []byte) error) error) ([]byte, error) {
 	o.begin(id)
 	base := o.off
 	var (
@@ -828,7 +890,8 @@ func (o *epochOut) storedFrames(id int, enc *zstd.Encoder, start uint64, walk fu
 		payload = append(payload, rec...)
 		n++
 		nIn.Add(1)
-		if inFrame++; inFrame == framedGroup {
+		inFrame++
+		if (maxCount > 0 && inFrame == maxCount) || (maxRaw > 0 && len(payload) >= maxRaw) {
 			return flush()
 		}
 		return nil
@@ -1116,14 +1179,14 @@ func writeStored(o *epochOut, tmp string, enc *zstd.Encoder, src *epochSrc) erro
 			})
 		}
 	}
-	logsIdx, err := o.storedFrames(secFullLogs, encL, src.Start, half(true))
+	logsIdx, err := o.storedFrames(secFullLogs, encL, src.Start, framedGroup, 0, half(true))
 	if err != nil {
 		return err
 	}
 	if err := o.section(secFullLogsIdx, logsIdx); err != nil {
 		return err
 	}
-	rcptIdx, err := o.storedFrames(secRcpt, enc, src.Start, half(false))
+	rcptIdx, err := o.storedFrames(secRcpt, enc, src.Start, framedGroup, 0, half(false))
 	if err != nil {
 		return err
 	}
@@ -1134,6 +1197,119 @@ func writeStored(o *epochOut, tmp string, enc *zstd.Encoder, src *epochSrc) erro
 // builder did: the epoch's stored-logs records in byte order, every step-th
 // one, at most dictMaxSamples of them. The sort is external because the
 // records themselves are gigabytes.
+// writeFrames writes the four v7 (V2) sections in one place: the stored call
+// frames and the two index families the /sql experiments asked for first.
+//
+// NO DICTIONARY, deliberately. The grouping is 4MB of raw frames, which is
+// two orders of magnitude past the window a 512KB trained dict can help with,
+// and the measured 11.5x was measured dict-less. A dict retest is owed only if
+// the grouping is ever made small (DESIGN.md).
+func writeFrames(o *epochOut, src *epochSrc) error {
+	if src.Itx == nil {
+		for _, id := range []int{secFrames, secFramesIdx, secAddridx, secTxCum} {
+			if err := o.section(id, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	enc, err := newEpochEncoder(nil)
+	if err != nil {
+		return err
+	}
+	defer enc.Close()
+
+	framesIdx, err := o.storedFrames(secFrames, enc, src.Start, 0, framesGroupRaw,
+		func(yield func(uint64, []byte) error) error {
+			return src.Itx(func(b uint64, frames, _ []byte) error {
+				if len(frames) == 0 {
+					return nil
+				}
+				return yield(b, frames)
+			})
+		})
+	if err != nil {
+		return err
+	}
+	if err := o.section(secFramesIdx, framesIdx); err != nil {
+		return err
+	}
+	addridx, txcum, err := buildAddridx(src)
+	if err != nil {
+		return err
+	}
+	if err := o.section(secAddridx, addridx); err != nil {
+		return err
+	}
+	return o.section(secTxCum, txcum)
+}
+
+// buildAddridx builds the two V2 index families in ONE pass over the
+// participants records, because they answer one question together.
+//
+// THE ADDRESS INDEX (family 1, and the /sql measurement's clear first ask:
+// `WHERE from_addr = X` had no index at all and decoded every container at
+// 12,700 rows/s) maps a 20-byte address to an Elias-Fano posting list of
+// epoch-relative TX ORDINALS. Its population is every address the execution
+// touched: the sender, the recipient or created contract, and every call
+// frame's from and to. That is why frames come first: an address only ever
+// paid by a contract is otherwise a silent false negative.
+//
+// THE CUMULATIVE TX COUNT (family 4) is one u32 per block, the running tx
+// total through that block, and it is what turns a tx ordinal back into
+// (block, index). Tiny (+0.05% of corpus) and it is the reason the address
+// index can be tx-granular instead of block-granular, which is the log
+// index's measured 5.1x amplification problem.
+//
+// The section layout is the logidx layout with an EMPTY topic table, so one
+// reader (postingsLookup) serves both.
+func buildAddridx(src *epochSrc) (addridx, txcum []byte, err error) {
+	byAddr := map[[20]byte][]uint64{}
+	cum := make([]uint32, src.Count)
+	var ord uint64
+	var seen atomic.Uint64
+	defer LogProgress("seal: addridx", func() string {
+		return fmt.Sprintf("%d of %d txs indexed", seen.Load(), src.TxCount)
+	})()
+	if err := src.Itx(func(b uint64, _, parts []byte) error {
+		rel := b - src.Start
+		if rel >= src.Count {
+			return fmt.Errorf("seal: participants record for block %d outside epoch %d..%d",
+				b, src.Start, src.Start+src.Count-1)
+		}
+		var n uint64
+		if err := DecodeParticipants(parts, func(addrs [][20]byte) {
+			for _, a := range addrs {
+				byAddr[a] = append(byAddr[a], ord+n)
+			}
+			n++
+		}); err != nil {
+			return fmt.Errorf("seal: block %d: %w", b, err)
+		}
+		ord += n
+		seen.Store(ord)
+		cum[rel] = uint32(n)
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	// THE COUNT MUST AGREE WITH THE FOOTER'S. The participants records are
+	// positional per transaction, so a disagreement means the capture and the
+	// bodies describe different blocks, and every ordinal in the index would
+	// be off. Loud, at seal, rather than wrong answers forever.
+	if ord != src.TxCount {
+		return nil, nil, fmt.Errorf("seal: epoch at %d has %d txs but the captured participants cover %d: the capture does not match the bodies, resync",
+			src.Start, src.TxCount, ord)
+	}
+	var run uint32
+	txcum = make([]byte, 0, len(cum)*4)
+	for _, n := range cum {
+		run += n
+		txcum = binary.LittleEndian.AppendUint32(txcum, run)
+	}
+	return encodePostings(byAddr, nil, max(src.TxCount, 1)), txcum, nil
+}
+
 func trainLogsDict(tmp string, src *epochSrc) ([]byte, error) {
 	recs := newExtSort(tmp, "logsdict", 0)
 	defer LogProgress("seal: logsdict", func() string {
@@ -1279,22 +1455,30 @@ func buildLogidx(walk func(func(LogRec) error) error, start, count uint64) ([]by
 	}); err != nil {
 		return nil, err
 	}
-	addrs := make([][20]byte, 0, len(addrBlocks))
-	for a := range addrBlocks {
+	return encodePostings(addrBlocks, topicBlocks, count), nil
+}
+
+// encodePostings serializes the two posting tables and their Elias-Fano lists.
+// universe bounds the values (block count for logidx, tx count for the address
+// index). Shared by both index sections, which is why one reader can search
+// either: an addridx is simply a section whose topic table is empty.
+func encodePostings(addrVals map[[20]byte][]uint64, topicVals map[[32]byte][]uint64, universe uint64) []byte {
+	addrs := make([][20]byte, 0, len(addrVals))
+	for a := range addrVals {
 		addrs = append(addrs, a)
 	}
 	sort.Slice(addrs, func(i, j int) bool { return bytes.Compare(addrs[i][:], addrs[j][:]) < 0 })
-	topics := make([][32]byte, 0, len(topicBlocks))
-	for t := range topicBlocks {
+	topics := make([][32]byte, 0, len(topicVals))
+	for t := range topicVals {
 		topics = append(topics, t)
 	}
 	sort.Slice(topics, func(i, j int) bool { return bytes.Compare(topics[i][:], topics[j][:]) < 0 })
 
 	var lists []byte
-	marshalList := func(blocks []uint64) uint64 {
+	marshalList := func(vals []uint64) uint64 {
 		off := uint64(len(lists))
-		sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] }) // EF needs non-decreasing
-		lists = append(lists, efMarshal(buildEF(blocks, count))...)
+		sort.Slice(vals, func(i, j int) bool { return vals[i] < vals[j] }) // EF needs non-decreasing
+		lists = append(lists, efMarshal(buildEF(vals, universe))...)
 		return off
 	}
 	var out []byte
@@ -1302,15 +1486,15 @@ func buildLogidx(walk func(func(LogRec) error) error, start, count uint64) ([]by
 	addrTable := make([]byte, 0, len(addrs)*(20+8))
 	for _, a := range addrs {
 		addrTable = append(addrTable, a[:]...)
-		addrTable = binary.LittleEndian.AppendUint64(addrTable, marshalList(addrBlocks[a]))
+		addrTable = binary.LittleEndian.AppendUint64(addrTable, marshalList(addrVals[a]))
 	}
 	out = append(out, addrTable...)
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(topics)))
 	for _, t := range topics {
 		out = append(out, t[:]...)
-		out = binary.LittleEndian.AppendUint64(out, marshalList(topicBlocks[t]))
+		out = binary.LittleEndian.AppendUint64(out, marshalList(topicVals[t]))
 	}
-	return append(out, lists...), nil
+	return append(out, lists...)
 }
 
 // efMarshal serializes an ef as: n u64 | l u32 | 4 length-prefixed word
