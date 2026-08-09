@@ -67,9 +67,14 @@ func u(v uint64) string {
 	return string(buf[i:])
 }
 
-// frameTracer returns the tracer to put in vm.Config, nil when disabled.
+// frameSamplerInst is set once by New (one executor per process); the
+// tracer reaches it through this var because vm.Config is built per tx.
+var frameSamplerInst *frameSampler
+
+// frameTracer returns the tracer to put in vm.Config, nil when both the
+// counter and the sampler are off.
 func frameTracer() vm.EVMLogger {
-	if !frameCountEnabled {
+	if !frameCountEnabled && frameSamplerInst == nil {
 		return nil
 	}
 	return frameCounter{}
@@ -78,12 +83,22 @@ func frameTracer() vm.EVMLogger {
 type frameCounter struct{}
 
 func (frameCounter) CaptureTxStart(uint64) { frameCounts.txs.Add(1) }
-func (frameCounter) CaptureTxEnd(uint64)   {}
+func (frameCounter) CaptureTxEnd(uint64) {
+	if s := frameSamplerInst; s != nil {
+		s.txEnd()
+	}
+}
 func (frameCounter) CaptureStart(*vm.EVM, common.Address, common.Address, bool, []byte, uint64, *big.Int) {
 }
 func (frameCounter) CaptureEnd([]byte, uint64, error) {}
 
 func (frameCounter) CaptureEnter(typ vm.OpCode, from, to common.Address, input []byte, gas uint64, value *big.Int) {
+	if s := frameSamplerInst; s != nil {
+		s.enter(typ, from, to, input, gas, value)
+	}
+	if !frameCountEnabled {
+		return
+	}
 	c := &frameCounts
 	c.frames.Add(1)
 	c.inBytes.Add(uint64(len(input)))
@@ -106,7 +121,11 @@ func (frameCounter) CaptureEnter(typ vm.OpCode, from, to common.Address, input [
 	}
 }
 
-func (frameCounter) CaptureExit([]byte, uint64, error) {}
+func (frameCounter) CaptureExit(output []byte, gasUsed uint64, err error) {
+	if s := frameSamplerInst; s != nil {
+		s.exit(output, gasUsed, err)
+	}
+}
 func (frameCounter) CaptureState(uint64, vm.OpCode, uint64, uint64, *vm.ScopeContext, []byte, int, error) {
 }
 func (frameCounter) CaptureFault(uint64, vm.OpCode, uint64, uint64, *vm.ScopeContext, int, error) {}

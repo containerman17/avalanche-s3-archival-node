@@ -276,6 +276,7 @@ func New(cfg Config) (*Executor, error) {
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("config: Store required")
 	}
+	frameSamplerInst = initFrameSampler(cfg.DataDir)
 	// The crash walk-back re-reads containers from staging, and both raw
 	// deleters (seal, and the pruning node's fold) retire whole 100k-block
 	// buckets behind the sealed/folded end. If the budget can reach past one
