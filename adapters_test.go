@@ -626,8 +626,14 @@ func BenchmarkInProcessCall(b *testing.B) {
 // benchTarget picks a real contract out of the corpus and an ERC20-shaped
 // calldata for it: a call that reverts still runs the EVM, so the measurement
 // stands either way, but a call that returns is the honest DeFi shape.
+// EPOCHDB_BENCH_TO names a contract instead, which is how the CODE-HEAVY shape
+// is measured: a proxy's call loads its own code and its implementation's, so
+// it is two code reads per call rather than one.
 func benchTarget(b *testing.B, n *epochdb.Node, head uint64) (common.Address, []byte) {
 	b.Helper()
+	if to := os.Getenv("EPOCHDB_BENCH_TO"); to != "" {
+		return common.HexToAddress(to), common.FromHex("0x18160ddd") // totalSupply()
+	}
 	from := uint64(0)
 	if head > 200 {
 		from = head - 200

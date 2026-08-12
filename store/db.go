@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/common/lru"
 	"github.com/containerman17/epochdb/dist"
 )
 
@@ -138,6 +140,12 @@ type DB struct {
 	// line.
 	flat    *flatCache
 	flatWhy string
+	// code is the contract-code cache in front of the Code descent (flat.go),
+	// keyed by code hash, nil when its budget is 0; codeWhy is where that budget
+	// came from, for the same one log line.
+	code       *lru.SizeConstrainedCache[common.Hash, []byte]
+	codeBudget uint64
+	codeWhy    string
 
 	mu   sync.RWMutex
 	man  *Manifest
@@ -170,8 +178,16 @@ func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
 		mem.close()
 		return nil, err
 	}
+	codeBudget, codeWhy, err := codeCacheBytes(budget)
+	if err != nil {
+		mem.close()
+		return nil, err
+	}
 	d := &DB{dir: dir, cas: cas, chainRoot: chainRoot, mem: mem, man: man, flat: newFlatCache(budget)}
-	d.flatWhy = why
+	d.flatWhy, d.codeBudget, d.codeWhy = why, codeBudget, codeWhy
+	if codeBudget > 0 {
+		d.code = lru.NewSizeConstrainedCache[common.Hash, []byte](codeBudget)
+	}
 	for _, ref := range man.Runs {
 		r, err := OpenRun(cas, ref.Name)
 		if err != nil {
@@ -199,6 +215,10 @@ func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
 // FlatCacheBudget reports the flat latest-state cache's byte budget and where
 // the number came from, so one log line tells an operator why they got it.
 func (d *DB) FlatCacheBudget() (uint64, string) { return d.flat.budget, d.flatWhy }
+
+// CodeCacheBudget reports the contract-code cache's byte budget and where the
+// number came from, beside FlatCacheBudget's.
+func (d *DB) CodeCacheBudget() (uint64, string) { return d.codeBudget, d.codeWhy }
 
 func (d *DB) Close() error {
 	d.mu.Lock()
@@ -671,9 +691,20 @@ func (d *DB) CodeHashAt(addr []byte, at uint64) ([]byte, bool, error) {
 	return d.latest(SecState, CodeRefPrefix(addr), at)
 }
 
-// Code resolves a code blob by hash: window, then runs newest-to-oldest,
-// bloom-gated. ONE FUNCTION, ALL CALLERS.
+// Code resolves a code blob by hash: the code cache, then window, then runs
+// newest-to-oldest, bloom-gated. ONE FUNCTION, ALL CALLERS.
+//
+// THE CACHE NEEDS NO CONSISTENCY RULE AT ALL (flat.go): bytecode is immutable
+// by hash, so a hit is the right answer at every height and there is nothing to
+// invalidate. Only a run hit is filled: a window hit is already RAM, and the
+// blob a run hands back is a copy this DB owns.
 func (d *DB) Code(hash []byte) ([]byte, bool, error) {
+	h := common.BytesToHash(hash)
+	if d.code != nil {
+		if b, ok := d.code.Get(h); ok {
+			return b, true, nil
+		}
+	}
 	if b, ok := d.mem.codeBlob(hash); ok {
 		return b, true, nil
 	}
@@ -681,8 +712,14 @@ func (d *DB) Code(hash []byte) ([]byte, bool, error) {
 	runs := d.snapshot()
 	for i := len(runs) - 1; i >= 0; i-- {
 		v, ok, err := runs[i].Get(SecState, key)
-		if err != nil || ok {
-			return v, ok, err
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			if d.code != nil {
+				d.code.Add(h, v)
+			}
+			return v, true, nil
 		}
 	}
 	return nil, false, nil

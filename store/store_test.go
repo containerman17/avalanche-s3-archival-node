@@ -601,6 +601,46 @@ func TestFlatCacheBudget(t *testing.T) {
 	}
 }
 
+// TestCodeCache: the code cache is keyed by the WHOLE hash and answers the same
+// bytes the descent does, twice, which is the only way a content-addressed
+// cache can be wrong. It runs against flushed runs, because a window hit never
+// reaches the cache.
+func TestCodeCache(t *testing.T) {
+	db, _ := testDB(t)
+	if db.code == nil {
+		t.Fatal("the code cache is off by default")
+	}
+	blobs := map[string][]byte{}
+	b := block(1, 1)
+	for i := byte(1); i <= 4; i++ {
+		h, blob := hash32(i), []byte(fmt.Sprintf("code-%d", i))
+		b.Code[string(h)] = blob
+		blobs[string(h)] = blob
+	}
+	if err := db.WriteBlock(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// Twice: the first pass fills, the second is served entirely by the cache.
+	for pass := 0; pass < 2; pass++ {
+		for i := byte(1); i <= 4; i++ {
+			got, ok, err := db.Code(hash32(i))
+			if err != nil || !ok {
+				t.Fatalf("pass %d: code %d: ok=%v err=%v", pass, i, ok, err)
+			}
+			if !bytes.Equal(got, blobs[string(hash32(i))]) {
+				t.Fatalf("pass %d: code %d is %q", pass, i, got)
+			}
+		}
+		// A hash nothing carries stays absent through the cache and around it.
+		if _, ok, err := db.Code(hash32(9)); err != nil || ok {
+			t.Fatalf("pass %d: an unknown hash answered %v %v", pass, ok, err)
+		}
+	}
+}
+
 // TestConcurrentReadsWhileWriting is the check the memtable's read-lock fast
 // path exists to pass: readers pread the window log while the executor keeps
 // appending to it, so the flushed watermark and the append must not race and a

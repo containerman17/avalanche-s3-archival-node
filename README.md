@@ -117,6 +117,10 @@ EPOCHDB_FLAT_CACHE        bytes of the flat latest-state cache: the in-RAM accou
                           an eighth of the container's own memory.max, or 1GB when there is
                           no container). 0 turns it off; it is a pure read cache, so the
                           only thing it can cost is speed.
+EPOCHDB_CODE_CACHE        bytes of the contract-code cache: an LRU of code blobs by hash in
+                          front of the code descent (default a tenth of EPOCHDB_FLAT_CACHE's
+                          budget). Bytecode is immutable by hash, so this cache has nothing
+                          to invalidate. 0 turns it off.
 EPOCHDB_NEW_CHAIN         set to 1 only to start a NEW chain in a prefix that already holds
                           other chains' objects. See "Joining a published chain".
 GOMEMLIMIT                honoured if you set it; otherwise derived as 7/10 of the container ceiling

@@ -116,6 +116,38 @@ func flatCacheBytes() (uint64, string, error) {
 	return flatCacheNoContainer, "1GB, no container ceiling to size against", nil
 }
 
+// THE CODE CACHE (user ruling 2026-08-13: contract code is a cache candidate,
+// and it may be a bit slower than the flat state cache because it is roughly
+// 20x less used). BYTECODE IS IMMUTABLE BY HASH, so unlike state this needs
+// ZERO consistency machinery: no height, no fill race, no drop rule. One hash
+// names one blob at every height forever, so a bounded LRU in front of DB.Code
+// is the whole design, and eth_call at the tip stops paying a descent plus a
+// 32KB zstd decode per contract it touches.
+//
+// codeCacheShare makes the budget A TENTH of the flat cache's: code is the far
+// smaller working set (a contract's blob, not its whole state region), it is
+// touched ~20x less often, and it is spent out of the same heap grant rather
+// than being a new claim on the box. EPOCHDB_FLAT_CACHE=0 therefore turns this
+// off too, which is the arithmetic saying what it says.
+const codeCacheShare = 10
+
+// codeCacheBytes sizes the code cache exactly the way flatCacheBytes sizes the
+// flat one: EPOCHDB_CODE_CACHE in plain bytes wins over the formula, 0 turns
+// the cache off, and a value that is not a byte count REFUSES TO START.
+func codeCacheBytes(flat uint64) (uint64, string, error) {
+	if v := os.Getenv("EPOCHDB_CODE_CACHE"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return 0, "", fmt.Errorf("EPOCHDB_CODE_CACHE=%q is not a byte count", v)
+		}
+		if n == 0 {
+			return 0, "EPOCHDB_CODE_CACHE=0, the code cache is off", nil
+		}
+		return n, "EPOCHDB_CODE_CACHE override", nil
+	}
+	return flat / codeCacheShare, "a tenth of the flat latest-state cache's budget", nil
+}
+
 func containerMemoryLimit() (uint64, bool) {
 	b, err := os.ReadFile(cgroupMemMaxPath)
 	if err != nil {

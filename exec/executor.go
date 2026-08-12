@@ -398,6 +398,11 @@ func New(cfg Config) (*Executor, error) {
 	} else {
 		log.Printf("exec: flat latest-state cache OFF (%s), every state read takes the descent", why)
 	}
+	if n, why := cfg.Store.CodeCacheBudget(); n > 0 {
+		log.Printf("exec: contract code cache %d MB (%s)", n>>20, why)
+	} else {
+		log.Printf("exec: contract code cache OFF (%s), every code read takes the descent", why)
+	}
 
 	ethdbKV := store.EthDB(cfg.Store, cfg.Misc, g.TrieAlloc)
 	memdb := rawdb.NewDatabase(ethdbKV)
