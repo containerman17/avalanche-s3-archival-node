@@ -145,9 +145,10 @@ func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
 		}
 		d.runs = append(d.runs, r)
 	}
-	// CRASH RECOVERY IS RE-EXECUTION: the window restarts empty at the last
-	// flushed TxNum and the executor replays out of staging. No WAL.
-	if err := mem.reset(d.NextTx(), d.NextHeight()); err != nil {
+	// The window is replayed back into RAM from its own log and cut at the last
+	// COMPLETE block; the executor's reconcile walk-back re-executes from there
+	// out of staging.
+	if err := mem.recover(d.flushedTx(), d.flushedHeight()); err != nil {
 		d.Close()
 		return nil, err
 	}
@@ -162,7 +163,7 @@ func (d *DB) Close() error {
 	}
 	d.runs = nil
 	if d.mem != nil {
-		d.mem.discard()
+		d.mem.close()
 		d.mem = nil
 	}
 	return nil
@@ -202,6 +203,10 @@ func (d *DB) NextHeight() uint64 {
 	if started {
 		return next
 	}
+	return d.flushedHeight()
+}
+
+func (d *DB) flushedHeight() uint64 {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if len(d.man.Runs) == 0 {
@@ -209,6 +214,11 @@ func (d *DB) NextHeight() uint64 {
 	}
 	return d.man.Runs[len(d.man.Runs)-1].ToHeight + 1
 }
+
+// Sync makes the window durable. THE ORDER RULE: the executor calls this before
+// it lets Firewood persist, so the state layer is never behind Firewood and a
+// restart always has rows for every block Firewood committed.
+func (d *DB) Sync() error { return d.mem.sync() }
 
 // Head is the highest stored block height, ok=false on an empty store.
 func (d *DB) Head() (uint64, bool) {
@@ -297,6 +307,7 @@ func (d *DB) Flush() error {
 	d.runs = append(d.runs, run)
 	d.mu.Unlock()
 
+	// Only now may the window's staging go.
 	return d.mem.reset(nextTx, nextHeight)
 }
 
@@ -311,7 +322,7 @@ func (d *DB) writeSections(w *RunWriter) error {
 	}
 	for fam := range m.chain {
 		pfx := famPrefix[fam]
-		if err := m.chain[fam].each(func(n uint64, val []byte) error {
+		if err := m.eachChain(fam, func(n uint64, val []byte) error {
 			return w.Set(numKey(pfx, n), val)
 		}); err != nil {
 			return err

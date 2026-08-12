@@ -305,3 +305,73 @@ func TestSplitPins(t *testing.T) {
 		}
 	}
 }
+
+// TestWindowRecovery: a restart replays the window log back into RAM, cuts a
+// torn tail at the last complete block, and serves everything the window held.
+// Without this the state layer would come back behind Firewood, which cannot be
+// rolled back.
+func TestWindowRecovery(t *testing.T) {
+	dir := t.TempDir()
+	cas, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(dir, cas, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(0); h < 5; h++ {
+		if err := db.WriteBlock(block(h, 3)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a kill mid-block: append garbage past the last end record.
+	wl := filepath.Join(dir, "window", "window.log")
+	f, err := os.OpenFile(wl, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("Tsome torn tail")); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	db2, err := Open(dir, cas, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if got := db2.NextHeight(); got != 5 {
+		t.Fatalf("recovered next height = %d, want 5", got)
+	}
+	if got := db2.NextTx(); got != 15 {
+		t.Fatalf("recovered next tx = %d, want 15", got)
+	}
+	for h := uint64(0); h < 5; h++ {
+		hdr, ok, err := db2.HeaderRLP(h)
+		if err != nil || !ok || string(hdr) != fmt.Sprintf("header-%d", h) {
+			t.Fatalf("recovered hdr %d: %q %v %v", h, hdr, ok, err)
+		}
+	}
+	v, ok, err := db2.StorageAt(addr(2), hash32(7), 14)
+	if err != nil || !ok || !bytes.Equal(v, []byte{4, 2}) {
+		t.Fatalf("recovered slot: %x %v %v", v, ok, err)
+	}
+	if n, ok, err := db2.TxNumByHash(hash32(42)); err != nil || !ok || n != 14 {
+		t.Fatalf("recovered txh: %d %v %v", n, ok, err)
+	}
+	// The recovered window still flushes into a run.
+	if err := db2.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := db2.Manifest().Runs[0].ToTx; got != 15 {
+		t.Fatalf("flushed run to_tx = %d, want 15", got)
+	}
+}

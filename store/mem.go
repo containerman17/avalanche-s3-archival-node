@@ -1,8 +1,11 @@
 package store
 
 import (
+	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,38 +14,44 @@ import (
 
 // THE MEMTABLE covers the unflushed window and serves it (DESIGN rule 2).
 //
-// MEMORY IS STRICTLY BOUNDED REGARDLESS OF CHAIN LENGTH. State and lookup rows
-// are held in RAM because they have to be sorted at flush anyway; CHAIN ROWS
-// ARE NOT, because they are the bulk (tx and receipt bytes) and they already
-// arrive sorted. They stream to per-family spill files during execution and the
-// only thing kept in RAM is one offset per row, so the window costs ~16 bytes
-// per tx, not ~500.
+// MEMORY IS STRICTLY BOUNDED REGARDLESS OF CHAIN LENGTH, and the window is
+// DURABLE, for a reason that is not about crash-safety of the rows themselves:
+// Firewood cannot be rolled back. It keeps two revisions, so a restart that
+// found the state layer 50,000 blocks behind Firewood could neither rewind
+// Firewood to the flush boundary nor re-execute forward from it. The window
+// therefore streams into ONE append-only log beside the runs, the same
+// first-class on-disk staging pattern the fetcher uses, fsynced on the
+// executor's own cadence. On restart it is replayed back into RAM and the
+// executor resumes exactly where the reconcile walk-back expects it.
+//
+// What stays in RAM is what has to be sorted at flush anyway: the state and
+// lookup rows. The chain families are the bulk (tx and receipt bytes) and keep
+// only ONE OFFSET PER ROW, so the window costs ~16 bytes per tx, not ~500.
 type memtable struct {
 	mu sync.RWMutex
 
-	dir string
+	path string
+	f    *os.File
+	bw   *bufio.Writer
+	pos  uint64 // bytes written (including the buffer)
 
 	// window bounds
-	baseTx     uint64 // first TxNum of the window
-	nextTx     uint64 // TxNum the next tx will take
+	baseTx     uint64
+	nextTx     uint64
 	baseHeight uint64
 	nextHeight uint64
 	started    bool
 
-	// chain spills, one per family, in Comparer order.
-	chain [5]*spill
+	// chain rows: one (offset, length) per row, contiguous from base.
+	chain [5]chainIndex
 
-	// state rows: prefix (state/... without the TxNum suffix) -> ascending
-	// (txnum, value) history within the window.
+	// state rows: key prefix -> ascending (txnum, value) inside the window.
 	state map[string][]memVal
-	// code blobs by hash, deduplicated for the run.
-	code map[string][]byte
+	code  map[string][]byte
 
 	// lookup rows.
-	txh  map[string]uint64 // tx hash -> TxNum
-	post []posting         // addr/, logaddr/, topic/ rows
-
-	bytes uint64
+	txh  map[string]uint64
+	post []posting
 }
 
 type memVal struct {
@@ -53,9 +62,38 @@ type memVal struct {
 type posting struct {
 	key   []byte // full key including the TxNum suffix
 	val   byte
-	num   uint64 // txh rows only: the TxNum the hash resolves to
+	num   uint64 // txh rows only
 	isTxh bool
 }
+
+type chainIndex struct {
+	base uint64
+	set  bool
+	off  []uint64
+	n    []uint32
+}
+
+func (c *chainIndex) add(num, off uint64, n int) error {
+	if !c.set {
+		c.base, c.set = num, true
+	}
+	if num != c.base+uint64(len(c.off)) {
+		return fmt.Errorf("store: chain row %d is not contiguous after %d", num, c.base+uint64(len(c.off)))
+	}
+	c.off = append(c.off, off)
+	c.n = append(c.n, uint32(n))
+	return nil
+}
+
+func (c *chainIndex) find(num uint64) (off uint64, n uint32, ok bool) {
+	if !c.set || num < c.base || num >= c.base+uint64(len(c.off)) {
+		return 0, 0, false
+	}
+	i := num - c.base
+	return c.off[i], c.n[i], true
+}
+
+func (c *chainIndex) reset() { c.base, c.set, c.off, c.n = 0, false, c.off[:0], c.n[:0] }
 
 // chain spill families, in the order their key prefixes sort.
 const (
@@ -67,56 +105,203 @@ const (
 )
 
 var famPrefix = [5]string{PrefixBlk, PrefixHdr, PrefixPvm, PrefixRcpt, PrefixTx}
-var famName = [5]string{"blk", "hdr", "pvm", "rcpt", "tx"}
+
+// window-log record kinds.
+const (
+	recBlk   = 'B'
+	recHdr   = 'H'
+	recPvm   = 'P'
+	recRcpt  = 'R'
+	recTx    = 'T'
+	recState = 'S'
+	recPost  = 'L'
+	recTxh   = 'X'
+	recCode  = 'C'
+	recEnd   = 'E' // end of a block: the only point a torn tail may be cut at
+)
+
+var famRec = [5]byte{recBlk, recHdr, recPvm, recRcpt, recTx}
+
+const recHeader = 1 + 8 + 4 // kind, num, payload length
 
 func newMemtable(dir string) (*memtable, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	m := &memtable{
-		dir:   dir,
-		state: map[string][]memVal{},
-		code:  map[string][]byte{},
-		txh:   map[string]uint64{},
+	m := &memtable{path: filepath.Join(dir, "window.log")}
+	m.clear()
+	f, err := os.OpenFile(m.path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, err
 	}
-	for i := range m.chain {
-		s, err := newSpill(filepath.Join(dir, "spill-"+famName[i]+".tmp"))
-		if err != nil {
-			m.discard()
-			return nil, err
-		}
-		m.chain[i] = s
-	}
+	m.f = f
+	m.bw = bufio.NewWriterSize(f, 1<<20)
 	return m, nil
 }
 
-// reset starts a fresh window at the given TxNum/height.
-func (m *memtable) reset(baseTx, baseHeight uint64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, s := range m.chain {
-		if err := s.reset(); err != nil {
-			return err
-		}
-	}
-	m.baseTx, m.nextTx = baseTx, baseTx
-	m.baseHeight, m.nextHeight = baseHeight, baseHeight
-	m.started = false
+func (m *memtable) clear() {
 	m.state = map[string][]memVal{}
 	m.code = map[string][]byte{}
 	m.txh = map[string]uint64{}
 	m.post = nil
-	m.bytes = 0
+	for i := range m.chain {
+		m.chain[i].reset()
+	}
+	m.pos = 0
+	m.started = false
+}
+
+// recover replays the window log, rebuilding the in-memory indexes and cutting
+// a torn tail back to the last complete block. baseTx/baseHeight are where the
+// last flush left off, which is where an empty window starts.
+func (m *memtable) recover(baseTx, baseHeight uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clear()
+	m.baseTx, m.nextTx = baseTx, baseTx
+	m.baseHeight, m.nextHeight = baseHeight, baseHeight
+
+	if err := m.bw.Flush(); err != nil {
+		return err
+	}
+	if _, err := m.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	r := bufio.NewReaderSize(m.f, 1<<20)
+	var (
+		off    uint64
+		good   uint64 // end offset of the last complete block
+		hdrBuf [recHeader]byte
+		pend   []func()
+	)
+	commit := func() {
+		for _, f := range pend {
+			f()
+		}
+		pend = nil
+	}
+	// A TORN TAIL IS CUT AT A BLOCK BOUNDARY, never inside one: mutations
+	// accumulate as closures and are applied only when the block's end record
+	// lands. Anything after the last end record is unreadable by definition
+	// (its block is half-recorded), so it is truncated away and the executor
+	// re-executes it.
+replay:
+	for {
+		if _, err := io.ReadFull(r, hdrBuf[:]); err != nil {
+			break
+		}
+		kind := hdrBuf[0]
+		num := binary.BigEndian.Uint64(hdrBuf[1:9])
+		n := binary.BigEndian.Uint32(hdrBuf[9:])
+		if n > 1<<30 {
+			break
+		}
+		payload := make([]byte, n)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			break
+		}
+		body := off + recHeader
+		off = body + uint64(n)
+
+		switch kind {
+		case recBlk, recHdr, recPvm, recRcpt, recTx:
+			fam := 0
+			for i, k := range famRec {
+				if k == kind {
+					fam = i
+				}
+			}
+			f, b, l := fam, body, int(n)
+			pend = append(pend, func() { m.chain[f].add(num, b, l) })
+		case recState:
+			if len(payload) < 2 {
+				break replay
+			}
+			kl := int(binary.BigEndian.Uint16(payload))
+			if len(payload) < 2+kl {
+				break replay
+			}
+			key, val := string(payload[2:2+kl]), append([]byte(nil), payload[2+kl:]...)
+			pend = append(pend, func() { m.state[key] = append(m.state[key], memVal{txnum: num, val: val}) })
+		case recPost:
+			if len(payload) < 1 {
+				break replay
+			}
+			key, v := append([]byte(nil), payload[1:]...), payload[0]
+			pend = append(pend, func() { m.post = append(m.post, posting{key: key, val: v}) })
+		case recTxh:
+			h := string(payload)
+			pend = append(pend, func() { m.txh[h] = num })
+		case recCode:
+			if len(payload) < 32 {
+				break replay
+			}
+			h, blob := string(payload[:32]), append([]byte(nil), payload[32:]...)
+			pend = append(pend, func() { m.code[h] = blob })
+		case recEnd:
+			if n != 8 {
+				break replay
+			}
+			if !m.started {
+				m.baseHeight, m.started = num, true
+			}
+			commit()
+			m.nextHeight = num + 1
+			m.nextTx = binary.BigEndian.Uint64(payload)
+			good = off
+		default:
+			break replay
+		}
+	}
+	if err := m.f.Truncate(int64(good)); err != nil {
+		return err
+	}
+	if _, err := m.f.Seek(int64(good), io.SeekStart); err != nil {
+		return err
+	}
+	m.bw.Reset(m.f)
+	m.pos = good
 	return nil
 }
 
-func (m *memtable) discard() {
-	for _, s := range m.chain {
-		if s != nil {
-			s.close()
-			os.Remove(s.path)
-		}
+// reset starts a fresh, empty window at the given TxNum/height.
+func (m *memtable) reset(baseTx, baseHeight uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clear()
+	m.baseTx, m.nextTx = baseTx, baseTx
+	m.baseHeight, m.nextHeight = baseHeight, baseHeight
+	if err := m.f.Truncate(0); err != nil {
+		return err
 	}
+	if _, err := m.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	m.bw.Reset(m.f)
+	return nil
+}
+
+func (m *memtable) close() error {
+	if m.f == nil {
+		return nil
+	}
+	err := m.bw.Flush()
+	if cerr := m.f.Close(); err == nil {
+		err = cerr
+	}
+	m.f = nil
+	return err
+}
+
+// Sync makes the window durable. It is called on the executor's own cadence,
+// which is what keeps the state layer at or ahead of Firewood.
+func (m *memtable) sync() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.bw.Flush(); err != nil {
+		return err
+	}
+	return m.f.Sync()
 }
 
 // ---------------------------------------------------------------------------
@@ -164,17 +349,41 @@ type BlockWrite struct {
 	HeaderRLP []byte
 	Pvm       []byte
 	Txs       []TxWrite
-	// Code blobs first seen in this block, by hash.
-	Code map[string][]byte
+	Code      map[string][]byte // code blobs first seen in this block, by hash
 }
 
-// add folds one block into the window. Blocks must arrive in height order.
+func (m *memtable) write(kind byte, num uint64, payload ...[]byte) (body uint64, n int, err error) {
+	for _, p := range payload {
+		n += len(p)
+	}
+	var h [recHeader]byte
+	h[0] = kind
+	binary.BigEndian.PutUint64(h[1:9], num)
+	binary.BigEndian.PutUint32(h[9:], uint32(n))
+	if _, err = m.bw.Write(h[:]); err != nil {
+		return 0, 0, err
+	}
+	body = m.pos + recHeader
+	for _, p := range payload {
+		if _, err = m.bw.Write(p); err != nil {
+			return 0, 0, err
+		}
+	}
+	m.pos = body + uint64(n)
+	return body, n, nil
+}
+
+// add folds one block into the window. Blocks arrive in height order; a block
+// the window already holds is skipped, because re-execution after a walk-back
+// reconcile replays blocks that are already here and the rows are identical.
 func (m *memtable) add(b *BlockWrite) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.started && b.Height < m.nextHeight {
+		return nil
+	}
 	if !m.started {
-		m.baseHeight, m.nextHeight = b.Height, b.Height
-		m.started = true
+		m.baseHeight, m.nextHeight, m.started = b.Height, b.Height, true
 	}
 	if b.Height != m.nextHeight {
 		return fmt.Errorf("store: block %d out of order, window expects %d", b.Height, m.nextHeight)
@@ -184,25 +393,38 @@ func (m *memtable) add(b *BlockWrite) error {
 	var blkVal [12]byte
 	binary.BigEndian.PutUint64(blkVal[:8], first)
 	binary.BigEndian.PutUint32(blkVal[8:], uint32(len(b.Txs)))
-	if err := m.chain[famBlk].append(b.Height, blkVal[:]); err != nil {
+	if err := m.chainRow(famBlk, b.Height, blkVal[:]); err != nil {
 		return err
 	}
-	if err := m.chain[famHdr].append(b.Height, b.HeaderRLP); err != nil {
+	if err := m.chainRow(famHdr, b.Height, b.HeaderRLP); err != nil {
 		return err
 	}
-	if err := m.chain[famPvm].append(b.Height, b.Pvm); err != nil {
+	if err := m.chainRow(famPvm, b.Height, b.Pvm); err != nil {
 		return err
+	}
+	for h, blob := range b.Code {
+		if _, ok := m.code[h]; ok {
+			continue
+		}
+		if _, _, err := m.write(recCode, 0, []byte(h), blob); err != nil {
+			return err
+		}
+		m.code[h] = blob
 	}
 	for i := range b.Txs {
 		t := &b.Txs[i]
 		n := first + uint64(i)
-		if err := m.chain[famRcpt].append(n, t.Receipt); err != nil {
+		if err := m.chainRow(famRcpt, n, t.Receipt); err != nil {
 			return err
 		}
-		if err := m.chain[famTx].append(n, t.RLP); err != nil {
+		if err := m.chainRow(famTx, n, t.RLP); err != nil {
+			return err
+		}
+		if _, _, err := m.write(recTxh, n, t.Hash); err != nil {
 			return err
 		}
 		m.txh[string(t.Hash)] = n
+
 		roles := map[string]byte{}
 		if len(t.Sender) > 0 {
 			roles[string(t.Sender)] |= RoleSender
@@ -215,28 +437,56 @@ func (m *memtable) add(b *BlockWrite) error {
 		}
 		for _, a := range t.LogAddrs {
 			roles[string(a)] |= RoleEmitter
-			m.post = append(m.post, posting{key: Suffixed(LogAddrPrefix(a), n)})
+			if err := m.postRow(Suffixed(LogAddrPrefix(a), n), 0); err != nil {
+				return err
+			}
 		}
 		for _, tp := range t.Topics {
-			m.post = append(m.post, posting{key: Suffixed(TopicPrefix(tp), n)})
+			if err := m.postRow(Suffixed(TopicPrefix(tp), n), 0); err != nil {
+				return err
+			}
 		}
-		for a, bits := range roles {
-			m.post = append(m.post, posting{key: Suffixed(AddrPrefix([]byte(a)), n), val: bits})
+		addrs := make([]string, 0, len(roles))
+		for a := range roles {
+			addrs = append(addrs, a)
+		}
+		sort.Strings(addrs)
+		for _, a := range addrs {
+			if err := m.postRow(Suffixed(AddrPrefix([]byte(a)), n), roles[a]); err != nil {
+				return err
+			}
 		}
 		for _, r := range t.State {
-			k := string(stateKeyPrefix(r))
-			m.state[k] = append(m.state[k], memVal{txnum: n, val: r.Val})
-			m.bytes += uint64(len(k) + len(r.Val) + 32)
-		}
-	}
-	for h, blob := range b.Code {
-		if _, ok := m.code[h]; !ok {
-			m.code[h] = blob
-			m.bytes += uint64(len(blob) + 64)
+			k := stateKeyPrefix(r)
+			var kl [2]byte
+			binary.BigEndian.PutUint16(kl[:], uint16(len(k)))
+			if _, _, err := m.write(recState, n, kl[:], k, r.Val); err != nil {
+				return err
+			}
+			m.state[string(k)] = append(m.state[string(k)], memVal{txnum: n, val: r.Val})
 		}
 	}
 	m.nextTx = first + uint64(len(b.Txs))
 	m.nextHeight = b.Height + 1
+	var endVal [8]byte
+	binary.BigEndian.PutUint64(endVal[:], m.nextTx)
+	_, _, err := m.write(recEnd, b.Height, endVal[:])
+	return err
+}
+
+func (m *memtable) chainRow(fam int, num uint64, val []byte) error {
+	off, n, err := m.write(famRec[fam], num, val)
+	if err != nil {
+		return err
+	}
+	return m.chain[fam].add(num, off, n)
+}
+
+func (m *memtable) postRow(key []byte, val byte) error {
+	if _, _, err := m.write(recPost, TxNumOf(key), []byte{val}, key); err != nil {
+		return err
+	}
+	m.post = append(m.post, posting{key: key, val: val})
 	return nil
 }
 
@@ -244,13 +494,26 @@ func (m *memtable) add(b *BlockWrite) error {
 // reads
 // ---------------------------------------------------------------------------
 
-func (m *memtable) chainGet(fam int, n uint64) ([]byte, bool, error) {
+func (m *memtable) chainGet(fam int, num uint64) ([]byte, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.chain[fam].get(n)
+	off, n, ok := m.chain[fam].find(num)
+	if !ok {
+		return nil, false, nil
+	}
+	if n == 0 {
+		return nil, true, nil
+	}
+	if err := m.bw.Flush(); err != nil {
+		return nil, false, err
+	}
+	p := make([]byte, n)
+	if _, err := m.f.ReadAt(p, int64(off)); err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	return p, true, nil
 }
 
-// latestState returns the newest value under prefix at or below txnum.
 func (m *memtable) latestState(prefix []byte, at uint64) ([]byte, uint64, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -276,122 +539,30 @@ func (m *memtable) txNum(hash []byte) (uint64, bool) {
 	return n, ok
 }
 
-// window reports the window's TxNum and height bounds.
 func (m *memtable) window() (baseTx, nextTx, baseHeight, nextHeight uint64, started bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.baseTx, m.nextTx, m.baseHeight, m.nextHeight, m.started
 }
 
-// ---------------------------------------------------------------------------
-// spill: an append-only file plus one offset per row
-// ---------------------------------------------------------------------------
-
-// spill holds one chain family's rows of the current window. Row numbers are
-// contiguous from base, so the index is a plain offset slice, ~16 bytes per row
-// and nothing proportional to the chain.
-type spill struct {
-	path string
-	f    *os.File
-	base uint64
-	offs []uint64 // offs[i] is the end offset of row base+i
-	pos  uint64
-	buf  []byte
-	set  bool
-}
-
-func newSpill(path string) (*spill, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	return &spill{path: path, f: f}, nil
-}
-
-func (s *spill) reset() error {
-	if err := s.f.Truncate(0); err != nil {
+// eachChain streams one chain family's rows in number order, for the flush.
+func (m *memtable) eachChain(fam int, fn func(num uint64, val []byte) error) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.bw.Flush(); err != nil {
 		return err
 	}
-	s.base, s.offs, s.pos, s.buf, s.set = 0, s.offs[:0], 0, s.buf[:0], false
-	return nil
-}
-
-func (s *spill) append(n uint64, val []byte) error {
-	if !s.set {
-		s.base, s.set = n, true
-	}
-	if n != s.base+uint64(len(s.offs)) {
-		return fmt.Errorf("store: spill %s: row %d is not contiguous after %d", s.path, n, s.base+uint64(len(s.offs)))
-	}
-	s.buf = append(s.buf, val...)
-	s.pos += uint64(len(val))
-	s.offs = append(s.offs, s.pos)
-	if len(s.buf) >= 1<<20 {
-		return s.flushBuf()
-	}
-	return nil
-}
-
-func (s *spill) flushBuf() error {
-	if len(s.buf) == 0 {
-		return nil
-	}
-	if _, err := s.f.Write(s.buf); err != nil {
-		return err
-	}
-	s.buf = s.buf[:0]
-	return nil
-}
-
-func (s *spill) count() uint64 { return uint64(len(s.offs)) }
-
-func (s *spill) get(n uint64) ([]byte, bool, error) {
-	if !s.set || n < s.base || n >= s.base+uint64(len(s.offs)) {
-		return nil, false, nil
-	}
-	i := n - s.base
-	end := s.offs[i]
-	var start uint64
-	if i > 0 {
-		start = s.offs[i-1]
-	}
-	if end == start {
-		return nil, true, nil
-	}
-	// The tail may still be in the write buffer.
-	written := s.pos - uint64(len(s.buf))
-	if start >= written {
-		return append([]byte(nil), s.buf[start-written:end-written]...), true, nil
-	}
-	if err := s.flushBuf(); err != nil {
-		return nil, false, err
-	}
-	p := make([]byte, end-start)
-	if _, err := s.f.ReadAt(p, int64(start)); err != nil {
-		return nil, false, err
-	}
-	return p, true, nil
-}
-
-// each streams every row of the spill in number order.
-func (s *spill) each(fn func(n uint64, val []byte) error) error {
-	if err := s.flushBuf(); err != nil {
-		return err
-	}
-	var start uint64
-	for i, end := range s.offs {
-		p := make([]byte, end-start)
-		if end > start {
-			if _, err := s.f.ReadAt(p, int64(start)); err != nil {
+	c := &m.chain[fam]
+	for i := range c.off {
+		p := make([]byte, c.n[i])
+		if c.n[i] > 0 {
+			if _, err := m.f.ReadAt(p, int64(c.off[i])); err != nil {
 				return err
 			}
 		}
-		if err := fn(s.base+uint64(i), p); err != nil {
+		if err := fn(c.base+uint64(i), p); err != nil {
 			return err
 		}
-		start = end
 	}
 	return nil
 }
-
-func (s *spill) close() error { return s.f.Close() }
