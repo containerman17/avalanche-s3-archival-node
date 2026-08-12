@@ -314,17 +314,21 @@ func (s Section) String() string {
 }
 
 // BlockSize is the pinned per-section block size, MEASURED THEN PINNED on
-// numine: chain 512KB, state 32KB, lookup 8KB. Chain is write-once and read
-// sequentially, so it takes the biggest block the codec can chew (the size
-// curve is still falling at 512KB and a sequential scan never pays for it).
-// State and lookup are point-read families and a point read decompresses one
-// whole block, so their sizes are the smallest that still compress: 32KB for
-// state, where a slot's history is a contiguous scan, and 8KB for lookup, where
-// every probe is one random row.
+// numine: chain 128KB, state 32KB, lookup 8KB. EVERY SECTION IS A POINT-READ
+// SECTION, chain included: `hdr/`, `blk/`, `tx/` and `rcpt/` are separate Gets
+// landing in different blocks, there is no block cache by design, and a point
+// read decompresses ONE WHOLE BLOCK. So the block size is the smallest that
+// still compresses well, per family: 128KB for chain, whose rows are large and
+// whose scans are long; 32KB for state, where a slot's history is a contiguous
+// scan; 8KB for lookup, where every probe is one random row.
+//
+// The chain size is the paid-for trade: 512KB costs 2.6x the latency of a warm
+// `eth_getTransactionByHash`-shaped read (~173us vs ~67us) and buys back ~2% of
+// corpus bytes. Latency on a hot query shape wins.
 func BlockSize(s Section) int {
 	switch s {
 	case SecChain:
-		return 512 << 10
+		return 128 << 10
 	case SecState:
 		return 32 << 10
 	}

@@ -222,8 +222,8 @@ func TestFormatConstantsArePinned(t *testing.T) {
 	if TableFormat != sstable.TableFormatPebblev2 {
 		t.Errorf("TableFormat is %v, want Pebblev2", TableFormat)
 	}
-	if BlockSize(SecChain) != 512<<10 || BlockSize(SecState) != 32<<10 || BlockSize(SecLookup) != 8<<10 {
-		t.Errorf("block sizes are %d/%d/%d, want 512K/32K/8K",
+	if BlockSize(SecChain) != 128<<10 || BlockSize(SecState) != 32<<10 || BlockSize(SecLookup) != 8<<10 {
+		t.Errorf("block sizes are %d/%d/%d, want 128K/32K/8K",
 			BlockSize(SecChain), BlockSize(SecState), BlockSize(SecLookup))
 	}
 	if Compression.UsesMinLZ() {
