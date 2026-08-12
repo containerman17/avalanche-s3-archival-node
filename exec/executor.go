@@ -1026,6 +1026,7 @@ func (e *Executor) executeBlock(blk *types.Block, pvm []byte) (common.Hash, erro
 	if err := e.cfg.Store.WriteBlock(bw); err != nil {
 		return common.Hash{}, err
 	}
+	e.wrapDB.forgetRecentCode()
 	if err := e.maybeFlush(blockNum); err != nil {
 		return common.Hash{}, err
 	}
