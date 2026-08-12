@@ -195,8 +195,11 @@ func (s *Server) otsSearchBefore(params []json.RawMessage) (any, *rpcError) {
 		return &otsSearchResult{Txs: []*rpcTransaction{}, Receipts: []map[string]any{}, FirstPage: true, LastPage: true}, nil
 	}
 	hiTx := head
+	if blockNum > s.head() {
+		blockNum = 0 // a cursor above the head means "from the tip", not "none"
+	}
 	if blockNum > 0 {
-		first, rerr := s.otsFirstTxOf(min(blockNum, s.head()))
+		first, rerr := s.otsFirstTxOf(blockNum)
 		if rerr != nil {
 			return nil, rerr
 		}

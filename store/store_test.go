@@ -3,9 +3,14 @@ package store
 import (
 	"bytes"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
+	"github.com/ava-labs/libevm/rlp"
 
 	"github.com/containerman17/epochdb/dist"
 )
@@ -315,6 +320,7 @@ func TestSplitPins(t *testing.T) {
 		{Suffixed(LogAddrPrefix(addr(1)), 9), 29},
 		{Suffixed(TopicPrefix(hash32(1)), 9), 39},
 		{TxHashKey(hash32(1)), 36},
+		{BlkHashKey(hash32(1)), 37}, // whole key: a block hash carries no suffix
 		{CodeKey(hash32(1)), 37},
 	}
 	for _, c := range cases {
@@ -392,4 +398,46 @@ func TestWindowRecovery(t *testing.T) {
 	if got := db2.Manifest().Runs[0].ToTx; got != 15 {
 		t.Fatalf("flushed run to_tx = %d, want 15", got)
 	}
+}
+
+// TestBlockHashIndex pins the two things the block-hash family rests on: that a
+// block hash is keccak256 of the STORED header RLP (so nothing has to carry it
+// in), and that the row answers both from the window and from a sealed run.
+func TestBlockHashIndex(t *testing.T) {
+	db, _ := testDB(t)
+	hdr := &types.Header{
+		Number: big.NewInt(1), Time: 1767225600, GasLimit: 15_000_000,
+		BaseFee: big.NewInt(25_000_000_000), Difficulty: big.NewInt(1), Extra: []byte{},
+	}
+	raw, err := rlp.EncodeToBytes(hdr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := crypto.Keccak256Hash(raw); got != hdr.Hash() {
+		t.Fatalf("keccak256(header RLP) = %s, header.Hash() = %s: the derived row would be wrong", got, hdr.Hash())
+	}
+	if err := db.WriteBlock(&BlockWrite{Height: 1, HeaderRLP: raw, Pvm: []byte("pvm")}); err != nil {
+		t.Fatal(err)
+	}
+	check := func(where string) {
+		t.Helper()
+		n, ok, err := db.HeightByHash(hdr.Hash().Bytes())
+		if err != nil || !ok || n != 1 {
+			t.Fatalf("%s: HeightByHash = %d,%v,%v", where, n, ok, err)
+		}
+		// An unknown hash is a clean miss, never an error and never a height.
+		if _, ok, err := db.HeightByHash(hash32(200)); ok || err != nil {
+			t.Fatalf("%s: unknown block hash: ok=%v err=%v", where, ok, err)
+		}
+		// A TX hash must never answer a BLOCK hash probe: the two families
+		// share one window map and are told apart by their key prefix.
+		if _, ok, err := db.TxNumByHash(hdr.Hash().Bytes()); ok || err != nil {
+			t.Fatalf("%s: a block hash answered a tx-hash probe: ok=%v err=%v", where, ok, err)
+		}
+	}
+	check("window")
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	check("run")
 }
