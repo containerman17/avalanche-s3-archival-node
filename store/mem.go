@@ -222,7 +222,7 @@ replay:
 				break replay
 			}
 			key, val := string(payload[2:2+kl]), append([]byte(nil), payload[2+kl:]...)
-			pend = append(pend, func() { m.state[key] = append(m.state[key], memVal{txnum: num, val: val}) })
+			pend = append(pend, func() { m.putState(key, num, val) })
 		case recPost:
 			if len(payload) < 1 {
 				break replay
@@ -463,7 +463,7 @@ func (m *memtable) add(b *BlockWrite) error {
 			if _, _, err := m.write(recState, n, kl[:], k, r.Val); err != nil {
 				return err
 			}
-			m.state[string(k)] = append(m.state[string(k)], memVal{txnum: n, val: r.Val})
+			m.putState(string(k), n, r.Val)
 		}
 	}
 	m.nextTx = first + uint64(len(b.Txs))
@@ -512,6 +512,23 @@ func (m *memtable) chainGet(fam int, num uint64) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	return p, true, nil
+}
+
+// putState appends one post-tx row, or REPLACES the row already at that TxNum.
+// A block with no transactions of its own still writes state (an upgrade
+// activation, a coreth atomic tx), and its rows land at the TxNum the block
+// would have started at, which the next such block shares. The post-image at a
+// TxNum is by definition the last write at it, so later wins. The alternative
+// is Erigon's block-boundary pseudo-txnums, which would buy the distinction at
+// the cost of making `tx/<txnum>` non-dense; not worth it until something needs
+// to tell two empty blocks' writes apart.
+func (m *memtable) putState(key string, txnum uint64, val []byte) {
+	h := m.state[key]
+	if n := len(h); n > 0 && h[n-1].txnum == txnum {
+		h[n-1].val = val
+		return
+	}
+	m.state[key] = append(h, memVal{txnum: txnum, val: val})
 }
 
 func (m *memtable) latestState(prefix []byte, at uint64) ([]byte, uint64, bool) {

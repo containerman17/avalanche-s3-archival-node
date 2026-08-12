@@ -209,22 +209,30 @@ var Comparer = &sstable.Comparer{
 // table-level bloom.
 const TableFormat = sstable.TableFormatPebblev2
 
+// PebbleVersion is pinned LIKE A FORMAT CONSTANT (DESIGN's determinism pins),
+// and the pin is not ours to choose freely: libevm's ethdb/pebble wrapper is
+// written against this exact API, and a newer pebble stops the whole repo from
+// compiling. Bumping it means bumping libevm too, and it is a storage version
+// question either way.
+const PebbleVersion = "v0.0.0-20230928194634-aa077af62593"
+
 // Compression is pinned, and it is SNAPPY rather than the zstd DESIGN expects
 // to win, for a reason that is a property of the libraries and not a taste:
 //
-// pebble v1.1.5's zstd path is `github.com/DataDog/zstd`, and avalanchego pins
-// that module at v1.5.2, where Decompress sizes its own destination buffer from
-// a >= 1MB hint and therefore ALWAYS reallocates. pebble then rejects the block
+// pebble's zstd path is `github.com/DataDog/zstd`, and avalanchego pins that
+// module at v1.5.2, where Decompress sizes its own destination buffer from a
+// >= 1MB hint and therefore ALWAYS reallocates. pebble then rejects the block
 // ("decompressed into unexpected buffer"), so every zstd-compressed run is
-// unreadable by the same binary that wrote it. On top of that, pebble v1.1.5
-// picks DataDog under cgo and klauspost without it, and the two produce
-// DIFFERENT BYTES from the same rows, which the byte-identity promise forbids
-// outright. Snappy is pure Go, one code path, deterministic everywhere.
+// unreadable by the same binary that wrote it. On top of that, pebble picks
+// DataDog under cgo and klauspost without it, and the two produce DIFFERENT
+// BYTES from the same rows, which the byte-identity promise forbids outright.
+// Snappy is pure Go, one code path, deterministic everywhere.
 //
 // The codec is a format constant, so moving to zstd later is a storage version
 // bump plus an IO-class reindex, which is exactly the upgrade path DESIGN
-// already provides. It needs pebble v2 (whose zstd is a rewritten package with
-// a `pebblegozstd` escape hatch) and the measurement pass DESIGN asks for.
+// already provides. It needs pebble v2 (a different module path, so it can be
+// linked beside the one libevm needs; its zstd is a rewritten package with a
+// `pebblegozstd` escape hatch) plus the measurement pass DESIGN asks for.
 const Compression = sstable.SnappyCompression
 
 // Section identifies one of a run's three SST sections.
