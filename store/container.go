@@ -96,13 +96,7 @@ func SplitContainer(raw []byte) (pvm []byte, inner *types.Block, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	a, b, c := raw[:off+hs], raw[off+he:off+ts], raw[off+te:]
-
-	pvm = binary.BigEndian.AppendUint32(make([]byte, 0, 8+len(a)+len(b)+len(c)), uint32(len(a)))
-	pvm = append(pvm, a...)
-	pvm = binary.BigEndian.AppendUint32(pvm, uint32(len(b)))
-	pvm = append(pvm, b...)
-	pvm = append(pvm, c...)
+	pvm = pvmTemplate(raw, off+hs, off+he, off+ts, off+te)
 
 	out, err := Reassemble(pvm, headerRLP, txRLPs)
 	if err != nil {
@@ -112,6 +106,18 @@ func SplitContainer(raw []byte) (pvm []byte, inner *types.Block, err error) {
 		return nil, nil, fmt.Errorf("store: container does not round trip (%d bytes in, %d out)", len(raw), len(out))
 	}
 	return pvm, inner, nil
+}
+
+// pvmTemplate cuts the container into the three template pieces around the
+// header span [hs, he) and the transaction-payload span [ts, te), and packs
+// them as [4B len(A)] A [4B len(B)] B C.
+func pvmTemplate(raw []byte, hs, he, ts, te int) []byte {
+	a, b, c := raw[:hs], raw[he:ts], raw[te:]
+	pvm := binary.BigEndian.AppendUint32(make([]byte, 0, 8+len(a)+len(b)+len(c)), uint32(len(a)))
+	pvm = append(pvm, a...)
+	pvm = binary.BigEndian.AppendUint32(pvm, uint32(len(b)))
+	pvm = append(pvm, b...)
+	return append(pvm, c...)
 }
 
 // Reassemble rebuilds the verbatim container from the stored pieces.

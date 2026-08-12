@@ -26,8 +26,7 @@ import (
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/rpc"
-	"github.com/containerman17/epochdb/state"
-	"github.com/containerman17/epochdb/verify"
+	"github.com/containerman17/epochdb/store"
 )
 
 // serveMain is `epochdb serve`, THE ONLY OPERATOR COMMAND (RULING 2026-08-03),
@@ -90,12 +89,6 @@ func serveMain(args []string) {
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
 
-	// Bad flag values die before anything binds or dials. So does a machine
-	// that cannot train an epoch dictionary: serve seals on the cook tick, and
-	// finding that out at the first epoch boundary is hours too late.
-	if err := state.CheckDictTrainer(); err != nil {
-		log.Fatalf("epochdb: serve: %v", err)
-	}
 	// Before the port, before the dial, before a byte of this dir is opened:
 	// this process is now the dir's one writer, or it does not run.
 	release, lockErr := lockDataDir(*dataDir)
@@ -209,15 +202,10 @@ func serveMain(args []string) {
 		// itself.
 		mux.Handle("/ext/bc/"+id+"/rpc", n.srv)
 		mux.Handle("/ext/bc/"+id+"/ws", n.srv)
-		// THE SECOND API SURFACE (user ruling 2026-08-09: one /rpc, one /sql).
-		// POST the query to /sql; GET /sql/schema is the published description
-		// of the tables, which is how a client discovers them.
-		mux.Handle("/sql", n.srv.SQLHandler())
-		mux.Handle("/sql/schema", n.srv.SQLHandler())
 		mux.Handle("/", n.srv)
-		log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc), executed=%d cooked=%d chainId=%s (cook every %s)",
-			id, *port, id, n.e.LiveHead(), n.hist.StateHead(), n.chainID, *cookEvery)
-		go syncLoop(ctx, n.store.Cas(), *syncEvery)
+		log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc), executed=%d runs=%d chainId=%s",
+			id, *port, id, n.e.LiveHead(), len(n.store.Manifest().Runs), n.chainID)
+		go syncLoop(ctx, n.cas, *syncEvery)
 
 		select {
 		case <-ctx.Done():
@@ -332,41 +320,6 @@ func serveOn(port int, run func(net.Listener)) error {
 	return nil
 }
 
-// verifySealed re-verifies what has been SEALED (and therefore published): the
-// full no-execution engine over this chain's epoch set, `epochdb dev verify` and
-// its log half in one, subnet-evm included because the verifier takes its VM
-// kind off the descriptor.
-//
-// IT DELIBERATELY DOES NOT VERIFY THE LOCAL RAW TAIL [RULING 2026-08-03]. The
-// honest way to verify raw is to re-download and re-execute it, which is what a
-// from-scratch start already does, and the tail is at most one epoch (8M txs).
-// So from-scratch reprocessing IS the local-raw verification story, and the
-// sealed epochs, the artifacts other people consume, are the thing that needs a
-// dedicated verifier.
-//
-// It runs at startup, after joinChain has walked the epoch chain (the local
-// index is what names the epochs) and before the chain serves anything. A
-// failure is an error out of startNode, i.e. THAT chain refuses to start.
-func verifySealed(cfg nodeConfig) error {
-	st, err := dist.Open(cfg.DataDir)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	tmp, err := os.MkdirTemp(cfg.DataDir, ".verify-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmp)
-	logf("verify: re-verifying the sealed epochs before serving; this reads the whole corpus")
-	blocks, wall, err := verify.VerifySet(st, tmp, cfg.Chain, 0)
-	if err != nil {
-		return fmt.Errorf("FAIL after %d blocks in %s: %w", blocks, wall.Round(time.Second), err)
-	}
-	logf("verify: PASS, %d sealed blocks in %s", blocks, wall.Round(time.Second))
-	return nil
-}
-
 // nodeConfig is everything the node needs. `serve` fills exactly one.
 type nodeConfig struct {
 	DataDir       string
@@ -395,10 +348,9 @@ type chainNode struct {
 	cfg      nodeConfig
 	fetcher  *fetch.Fetcher
 	e        *exec.Executor
-	store    *state.Store
-	hist     *state.History
+	store    *store.DB
+	cas      *dist.Store
 	srv      *rpc.Server
-	txidx    *txIndexHolder
 	accepted func() uint64
 	chainID  fmt.Stringer // eth chainId, for the startup line
 	// execDone closes when the executor goroutine has RETURNED. Closing the
@@ -425,11 +377,6 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	// AFTER the join, because the join is what makes the epoch set nameable
 	// (and, on a cold dir, present at all), and before anything of this dir is
 	// opened for serving.
-	if cfg.Verify {
-		if err := verifySealed(cfg); err != nil {
-			return nil, fmt.Errorf("verify: %w", err)
-		}
-	}
 
 	// Unwind whatever is already open if a later step fails, so a start that
 	// gives up releases the Firewood handle and the mmaps it took.
@@ -465,17 +412,26 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	// mode (see nodeStatus and liveNode).
 	accepted := func() uint64 { h, _ := fetcher.Store().Head(); return h }
 
-	// --- state layer: the executor owns the writer, the RPC shares it ---------
-	store, err := state.Open(cfg.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("open state layer: %w", err)
-	}
-	closers = append(closers, func() { store.Close() })
-
+	// --- storage v0: the executor owns the writer, the RPC shares it ---------
 	g, err := exec.ChainGenesis(cfg.Chain)
 	if err != nil {
 		return nil, fmt.Errorf("genesis: %w", err)
 	}
+	cas, err := dist.Open(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("open artifact store: %w", err)
+	}
+	closers = append(closers, func() { cas.Close() })
+	db, err := store.Open(cfg.DataDir, cas, cfg.Chain.Root())
+	if err != nil {
+		return nil, fmt.Errorf("open storage v0: %w", err)
+	}
+	closers = append(closers, func() { db.Close() })
+	misc, err := store.OpenMisc(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("open misc store: %w", err)
+	}
+	closers = append(closers, func() { misc.Close() })
 
 	// onBlock is late-bound: the executor is built before the RPC server, and
 	// exec.New's reconcile must not publish into a nil server.
@@ -486,7 +442,8 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	e, err := exec.New(exec.Config{
 		DataDir: cfg.DataDir,
 		Blocks:  blocks,
-		Store:   store,
+		Store:   db,
+		Misc:    misc,
 		OnBlock: func(h uint64, hash common.Hash) {
 			if f := onBlock.Load(); f != nil {
 				(*f)(h, hash)
@@ -512,12 +469,6 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	}
 	closers = append(closers, func() { e.Close() })
 
-	hist, err := state.OpenHistory(cfg.DataDir, store, g.TrieAlloc)
-	if err != nil {
-		return nil, fmt.Errorf("open history: %w", err)
-	}
-	closers = append(closers, func() { hist.Close() })
-
 	// The sealed history IS history: the follower must not walk below it,
 	// whatever the raw staging store still happens to hold. sealOnce raises
 	// this again on every epoch cut, including the one the startup cook below
@@ -528,33 +479,20 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	// sealed end (exec.BuildFrontier), and those few blocks have to come back
 	// down the wire to be re-executed. A dir with no exec head at all keeps the
 	// sealed floor: it has not been frontier-built and cannot serve anyway.
-	floor := hist.Epochs().CoveredEnd()
-	if head := e.LiveHead(); head > 0 && head < floor {
-		floor = head
-	}
-	fetcher.SetFloor(floor)
+	// THE FETCH FLOOR IS THE LAST FLUSHED RUN BOUNDARY, never higher: crash
+	// recovery re-executes out of staging from wherever the reconcile walk-back
+	// lands, which is at worst the last run's end. Flush raises it again, in
+	// the publish-before-delete order: cut, publish, then unlink.
+	fetcher.SetFloor(flushedFloor(db))
 
 	n = &chainNode{
-		cfg: cfg, fetcher: fetcher, e: e, store: store, hist: hist,
-		txidx: &txIndexHolder{}, accepted: accepted, chainID: g.Config.ChainID,
+		cfg: cfg, fetcher: fetcher, e: e, store: db, cas: cas,
+		accepted: accepted, chainID: g.Config.ChainID,
 		execDone: make(chan struct{}),
 	}
 
-	// --- the one read path: uncooked tail overlay, then the descent ----------
-	// Cook once before serving so the descent reaches as high as it can, then
-	// hand the residue (executed but not indexed, and therefore answerable
-	// only from the raw writelog) to the overlay. Both must happen before the
-	// executor and the RPC goroutines start.
-	n.cookOnce(ctx)
-	tailBlocks, tailEntries, tailBytes, err := hist.EnableTail(e.LiveHead())
-	if err != nil {
-		return nil, fmt.Errorf("tail overlay: %w", err)
-	}
-	logf("tail overlay: cooked=%d executed=%d, backfilled %d uncooked blocks (%d entries, %.1fMB)",
-		hist.StateHead(), e.LiveHead(), tailBlocks, tailEntries, float64(tailBytes)/1e6)
-
 	// --- RPC -----------------------------------------------------------------
-	n.srv = rpc.NewServer(hist, rpc.HistoryChainContext(hist), g.Config)
+	n.srv = rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db), g.Config)
 	live := liveNode{live: e.LiveHead, settled: e.SettledHeight}
 	if cfg.Backfill != nil {
 		live.target = fetcher.SyncTarget
@@ -563,20 +501,11 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	}
 	n.srv.EnableLive(live)
 
-	n.txidx.reopen(cfg.DataDir, hist.Epochs())
-	n.srv.EnableTxAPIs(n.txidx, rpc.SealedBlocks{Epochs: hist.Epochs(), Blocks: blocks}, exec.ParseEthBlock)
-
-	// NO floor-to-head block-hash map (deleted 2026-07-31, DESIGN.md ruling
-	// 2): block hashes live in the same fp48 index as tx hashes, sealed and
-	// raw alike, so eth_getBlockByHash resolves through WalkCandidates. Only
-	// the blocks accepted since the last cook need in-process tracking, and
-	// those arrive through OnBlock into a bounded ring.
 	advance := func(h uint64, hash common.Hash) {
 		n.srv.AddBlockHash(hash, h)
-		hist.SetHead(h)
+		n.fetcher.SetFloor(flushedFloor(n.store))
 	}
 	onBlock.Store(&advance)
-	hist.SetHead(e.LiveHead())
 
 	if cfg.Backfill != nil {
 		go func() { report("backfill", cfg.Backfill(ctx, fetcher)) }()
@@ -588,7 +517,6 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		close(n.execDone) // BEFORE report: report may flush, and flushing waits
 		report("executor", err)
 	}()
-	go n.cookLoop(ctx)
 	go n.statusLoop(ctx)
 	return n, nil
 }
@@ -649,42 +577,6 @@ func (l liveNode) SyncTarget() uint64 {
 	return l.target()
 }
 
-// cookLoop drags the historical read window up to the head: cook-index makes
-// state at newly executed heights answerable by the descent, cook-txindex
-// makes their txs findable by hash, and History.Refresh publishes both.
-//
-// SEAL RIDES THIS LOOP TOO (ruling 2026-08-01: sealing is automatic, there is
-// no seal process and no cron). It supersedes "seal stays out of the process",
-// whose objection was the DELETE of raw buckets this process reads: an
-// external sibling unlinked files while our fds, mmaps and in-RAM bucket index
-// still pointed at them, and there was no way to tell the reader first. In
-// process there is, and the ordering IS the safety (state.History.SealTail),
-// per epoch rather than per pass, so a backlog crunch frees disk as it goes:
-//
-//	seal    write ONE epoch, delete nothing. Both sources exist.
-//	refresh publish it into the live EpochSet every reader already holds,
-//	        so a sealed height now has a sealed answer.
-//	delete  only then unlink the raw buckets it replaced, and drop our own
-//	        handles on them so the space is actually returned. Then the next
-//	        epoch, until the exec head has no whole epoch left or ctx is done.
-//
-// Nothing races a sibling because there is no sibling: one process owns the
-// dir, and cook and seal are the same goroutine, so cook's tmp+rename cannot
-// overlap a seal. Cost is gated by the exec head (SealTail opens nothing below
-// the extrapolated boundary), so riding the cook cadence is free.
-func (n *chainNode) cookLoop(ctx context.Context) {
-	t := time.NewTicker(n.cfg.CookEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		n.cookOnce(ctx)
-	}
-}
-
 // syncLoop pushes whatever the producers left in the spool to the bucket and
 // unlinks the local copy once the bucket confirms it. Fail-loud but never
 // fatal: an upload that cannot happen leaves the artifact durable in the spool
@@ -704,84 +596,6 @@ func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
 		if err := st.Sync(); err != nil {
 			log.Printf("epochdb: SYNC FAILED (artifacts stay in the spool, chain unaffected): %v", err)
 		}
-	}
-}
-
-// cookOnce is one pass of that loop, also run once at startup so the node
-// serves with the smallest possible uncooked tail.
-//
-// The overlay prune comes LAST, strictly after Refresh: Refresh publishes the
-// new cooked watermark only once the new sorted buckets are readable, so
-// everything dropped here is already answerable by the descent, and a latest
-// read that misses the overlay picks up its descent target afterwards. See
-// state/tail.go prune for the full race argument.
-func (n *chainNode) cookOnce(ctx context.Context) {
-	start := time.Now()
-	dir, hist := n.cfg.DataDir, n.hist
-	if err := state.CookIndex(dir); err != nil {
-		logf("COOK FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
-		return
-	}
-	if err := state.CookTxIndex(dir); err != nil {
-		logf("COOK-TXINDEX FAILED (tail tx lookups frozen, chain unaffected): %v", err)
-	}
-	if err := hist.Refresh(); err != nil {
-		logf("HISTORY REFRESH FAILED (historical window is frozen at %d, chain unaffected): %v", hist.StateHead(), err)
-		return
-	}
-	n.txidx.reopen(dir, hist.Epochs())
-	entries, size := hist.PruneTail()
-	logf("cook: historical window now reaches %d (in %s); tail overlay %d entries %.1fMB",
-		hist.StateHead(), time.Since(start).Round(time.Millisecond), entries, float64(size)/1e6)
-	n.sealOnce(ctx)
-}
-
-// sealOnce is the cook pass's seal step: cut whatever epochs the durable exec
-// head has made whole, publish them, drop the raw they replace, ONE EPOCH AT A
-// TIME. Same fail-loud-but-keep-serving contract as cook, and for the same
-// reason: the chain does not stop because history could not be compacted. The
-// sealed artifacts land in the same spool the syncLoop uploads from, so they
-// reach the bucket on the next sync tick with no extra wiring.
-//
-// ctx is the node's: a shutdown mid-crunch stops the pass at the next epoch
-// boundary instead of after all of them (Fuji, 2026-08-01: a SIGINT during a
-// 14-epoch backlog left the node sealing for hours), and the next start resumes
-// where it stopped.
-func (n *chainNode) sealOnce(ctx context.Context) {
-	start := time.Now()
-	// Per epoch, right after state published it and deleted its raw: the
-	// staging segments are the fetcher's, not the state layer's, so their
-	// handles are released here (an unlinked arrival log this process still
-	// holds open frees no disk), and the same call raises the follower's
-	// backfill floor, so a walk started after this epoch never asks for what it
-	// just deleted.
-	epochs, sealedEnd, err := n.hist.SealTail(ctx, n.cfg.Chain.Root(), func(end uint64) {
-		n.fetcher.SetFloor(end)
-		if err := n.fetcher.Store().Retire(end); err != nil {
-			logf("seal: retiring staging segments: %v", err)
-		}
-	})
-	if err != nil {
-		logf("SEAL FAILED (history stays raw, chain unaffected): %v", err)
-		return
-	}
-	if epochs == 0 {
-		return
-	}
-	logf("seal: %d epoch(s) cut, sealed through %d, raw retired (in %s)",
-		epochs, sealedEnd, time.Since(start).Round(time.Millisecond))
-}
-
-func (n *chainNode) statusLoop(ctx context.Context) {
-	t := time.NewTicker(10 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		logf("serve: %s", n.snapshot().status())
 	}
 }
 
@@ -861,42 +675,15 @@ func (s nodeStatus) serveStatus(chain string) serveStatus {
 	return out
 }
 
-// txIndexHolder swaps the raw tx index under the RPC server as cook rebuilds
-// it. The index is heap-only (no mmap, no fds), so a replaced one is just
-// garbage.
-type txIndexHolder struct {
-	mu   sync.RWMutex
-	cur  state.CombinedTxIndex
-	oerr error // why there is no index; nil once one is loaded
-}
 
-func (t *txIndexHolder) WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if t.cur.Epochs == nil {
-		// Walking zero candidates would answer "no such tx" for EVERY hash on
-		// the chain, on a node reporting serving:true: null from
-		// eth_getTransactionByHash / eth_getTransactionReceipt /
-		// eth_getBlockByHash, "0x" from eth_getRawTransactionByHash. One
-		// corrupt txidx bucket must not read as an empty chain.
-		if t.oerr != nil {
-			return fmt.Errorf("tx index unavailable: %w", t.oerr)
-		}
-		return errors.New("tx index unavailable: never loaded")
+// flushedFloor is the height staging may be retired behind: the end of the last
+// FLUSHED run. Not the executed head and not the window start, because crash
+// recovery re-executes out of staging from wherever the reconcile walk-back
+// lands, and a run boundary is the lowest point that can ever be.
+func flushedFloor(db *store.DB) uint64 {
+	runs := db.Manifest().Runs
+	if len(runs) == 0 {
+		return 0
 	}
-	return t.cur.WalkCandidates(hash, fn)
-}
-
-func (t *txIndexHolder) reopen(dir string, epochs *state.EpochSet) {
-	raw, err := state.OpenTxIndex(dir)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if err != nil {
-		log.Printf("epochdb: raw tx index unavailable: %v", err)
-		if t.cur.Epochs == nil { // no previous index to keep serving from
-			t.oerr = err
-		}
-		return
-	}
-	t.cur, t.oerr = state.CombinedTxIndex{Raw: raw, Epochs: epochs}, nil
+	return runs[len(runs)-1].ToHeight
 }

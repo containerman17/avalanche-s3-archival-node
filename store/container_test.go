@@ -132,6 +132,64 @@ func TestContainerRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCorethShapeTemplate covers the reason the pvm row is a TEMPLATE and not
+// just the wrapper prefix and suffix: coreth's block body carries Version and
+// ExtData AFTER the uncles, so a rebuild from header + txs alone would drop
+// them. This process cannot register coreth's extras (subnet-evm's are already
+// in, and the registry is process-global and mutually exclusive), so the
+// five-field body is hand-built and driven through the same span/template code
+// SplitContainer uses.
+func TestCorethShapeTemplate(t *testing.T) {
+	hdr, err := rlp.EncodeToBytes(testHeader(9))
+	if err != nil {
+		t.Fatalf("encode header: %v", err)
+	}
+	var txRLPs [][]byte
+	for _, tx := range testTxs(2) {
+		enc, err := rlp.EncodeToBytes(tx)
+		if err != nil {
+			t.Fatalf("encode tx: %v", err)
+		}
+		txRLPs = append(txRLPs, enc)
+	}
+	txs := make([]rlp.RawValue, len(txRLPs))
+	for i, t := range txRLPs {
+		txs[i] = t
+	}
+	extData := []byte("atomic tx bytes")
+	inner, err := rlp.EncodeToBytes(&struct {
+		Header  rlp.RawValue
+		Txs     []rlp.RawValue
+		Uncles  []rlp.RawValue
+		Version uint32
+		ExtData *[]byte
+	}{Header: hdr, Txs: txs, Version: 3, ExtData: &extData})
+	if err != nil {
+		t.Fatalf("encode coreth-shaped block: %v", err)
+	}
+
+	// Fake wrapper bytes around it, standing in for the proposervm prefix and
+	// signature suffix.
+	raw := append(append([]byte("PREFIX"), inner...), []byte("SIGNATURE")...)
+	off := bytes.Index(raw, inner)
+
+	hs, he, ts, te, err := blockSpans(inner)
+	if err != nil {
+		t.Fatalf("blockSpans: %v", err)
+	}
+	pvm := pvmTemplate(raw, off+hs, off+he, off+ts, off+te)
+	out, err := Reassemble(pvm, hdr, txRLPs)
+	if err != nil {
+		t.Fatalf("Reassemble: %v", err)
+	}
+	if !bytes.Equal(out, raw) {
+		t.Fatalf("coreth-shaped container not byte-identical: got %d bytes, want %d", len(out), len(raw))
+	}
+	if !bytes.Contains(pvm, extData) {
+		t.Fatal("ExtData did not survive into the pvm template")
+	}
+}
+
 func TestContainerRejectsGarbage(t *testing.T) {
 	if _, _, err := SplitContainer(nil); err == nil {
 		t.Fatal("empty container accepted")
@@ -150,6 +208,68 @@ func TestReassembleRejectsBadPvm(t *testing.T) {
 		if _, err := Reassemble(bad, []byte{0x80}, nil); err == nil {
 			t.Fatalf("bad pvm row %x accepted", bad)
 		}
+	}
+}
+
+// --- ethdb + misc -----------------------------------------------------------
+
+func TestEthDBCodeAndMisc(t *testing.T) {
+	db, dir := testDB(t)
+	m, err := OpenMisc(dir)
+	if err != nil {
+		t.Fatalf("OpenMisc: %v", err)
+	}
+	kv := EthDB(db, m)
+
+	b := block(1, 1)
+	b.Code[string(hash32(5))] = []byte("CODE")
+	if err := db.WriteBlock(b); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
+	}
+
+	got, err := kv.Get(append([]byte{'c'}, hash32(5)...))
+	if err != nil || string(got) != "CODE" {
+		t.Fatalf("code read: %q %v", got, err)
+	}
+
+	// Code writes are a no-op: the executor already captured the blob.
+	if err := kv.Put(append([]byte{'c'}, hash32(6)...), []byte("OTHER")); err != nil {
+		t.Fatalf("code put: %v", err)
+	}
+	if _, err := kv.Get(append([]byte{'c'}, hash32(6)...)); err == nil {
+		t.Fatal("code put was not a no-op")
+	}
+
+	// Everything else lands in misc.log and survives a reopen.
+	if err := kv.Put([]byte("LastBlock"), []byte("head")); err != nil {
+		t.Fatalf("misc put: %v", err)
+	}
+	if err := m.BindVMKind("subnet-evm"); err != nil {
+		t.Fatalf("BindVMKind: %v", err)
+	}
+	if err := m.SetFrontierFloor(4242); err != nil {
+		t.Fatalf("SetFrontierFloor: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("misc close: %v", err)
+	}
+
+	m2, err := OpenMisc(dir)
+	if err != nil {
+		t.Fatalf("reopen misc: %v", err)
+	}
+	defer m2.Close()
+	if v, ok := m2.Get([]byte("LastBlock")); !ok || string(v) != "head" {
+		t.Fatalf("misc key lost across reopen: %q %v", v, ok)
+	}
+	if h, ok := m2.FrontierFloor(); !ok || h != 4242 {
+		t.Fatalf("frontier floor = %d %v", h, ok)
+	}
+	if err := m2.BindVMKind("subnet-evm"); err != nil {
+		t.Fatalf("rebinding the same kind: %v", err)
+	}
+	if err := m2.BindVMKind("coreth"); err == nil {
+		t.Fatal("rebinding the other VM kind was accepted")
 	}
 }
 
