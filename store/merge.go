@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/containerman17/epochdb/dist"
 )
 
@@ -200,35 +200,37 @@ type cursor struct {
 	key, val []byte
 }
 
-// next advances the cursor. pebble's LazyValue lives in an internal package, so
-// the value is resolved here rather than passed around.
+// next advances the cursor. The two bodies below are duplicated on purpose:
+// pebble's *base.InternalKV lives in an internal package, so the type cannot be
+// named in a shared helper's signature, and the KV is only valid until the next
+// positioning call anyway, which is why the bytes are copied here.
 func (c *cursor) next() error {
-	k, v := c.it.Next()
-	if k == nil {
+	kv := c.it.Next()
+	if kv == nil {
 		c.key, c.val = nil, nil
 		return nil
 	}
-	raw, _, err := v.Value(nil)
+	raw, _, err := kv.Value(nil)
 	if err != nil {
 		return err
 	}
-	c.key = append(c.key[:0], k.UserKey...)
+	c.key = append(c.key[:0], kv.K.UserKey...)
 	c.val = append(c.val[:0], raw...)
 	return nil
 }
 
 // first positions the cursor on the section's first row.
 func (c *cursor) first() error {
-	k, v := c.it.First()
-	if k == nil {
+	kv := c.it.First()
+	if kv == nil {
 		c.key, c.val = nil, nil
 		return nil
 	}
-	raw, _, err := v.Value(nil)
+	raw, _, err := kv.Value(nil)
 	if err != nil {
 		return err
 	}
-	c.key = append(c.key[:0], k.UserKey...)
+	c.key = append(c.key[:0], kv.K.UserKey...)
 	c.val = append(c.val[:0], raw...)
 	return nil
 }
@@ -260,7 +262,7 @@ func mergeSection(inputs []*Run, s Section, w *RunWriter) (uint64, error) {
 		}
 	}()
 	for i, r := range inputs {
-		it, err := r.rd[s].NewIter(nil, nil)
+		it, err := r.newIter(s)
 		if err != nil {
 			return 0, err
 		}

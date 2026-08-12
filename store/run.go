@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2/sstable"
+	sstblock "github.com/cockroachdb/pebble/v2/sstable/block"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/containerman17/epochdb/dist"
 )
 
@@ -248,7 +251,7 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 			r.Close()
 			return nil, err
 		}
-		rd, err := sstable.NewReader(readable, readerOptions())
+		rd, err := sstable.NewReader(context.Background(), readable, readerOptions())
 		if err != nil {
 			r.Close()
 			return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
@@ -265,7 +268,11 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 		// would be a second one. They are read once here into the section's
 		// resident overlay, which serves those byte ranges from RAM forever
 		// after; only data blocks ever reach the blob again.
-		for _, bh := range append([]sstable.BlockHandle{lay.TopIndex, lay.Properties, lay.MetaIndex, lay.Filter}, lay.Index...) {
+		resident := append([]sstblock.Handle{lay.TopIndex, lay.Properties, lay.MetaIndex}, lay.Index...)
+		for _, nbh := range lay.Filter {
+			resident = append(resident, nbh.Handle)
+		}
+		for _, bh := range resident {
 			if err := sec.reside(bh); err != nil {
 				r.Close()
 				return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
@@ -273,8 +280,8 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 		}
 		// pebble's sstable.Reader has no point-get, so the bloom gate is ours
 		// to apply: keep the filter bytes in hand for MayHave.
-		if lay.Filter.Length > 0 {
-			f, err := blob.Read(r.Footer.Off[s]+lay.Filter.Offset, lay.Filter.Length)
+		if len(lay.Filter) > 0 && lay.Filter[0].Length > 0 {
+			f, err := blob.Read(r.Footer.Off[s]+lay.Filter[0].Offset, lay.Filter[0].Length)
 			if err != nil {
 				r.Close()
 				return nil, err
@@ -329,21 +336,28 @@ func (r *Run) MayHave(s Section, key []byte) bool {
 	return mayContain(r.filter[s], key)
 }
 
+// newIter is the ONE place a section iterator is constructed. Runs carry no
+// suffix rewriting and no blob files, so the transform set is empty and the
+// blob context asserts that nothing here ever produces a blob handle.
+func (r *Run) newIter(s Section) (sstable.Iterator, error) {
+	return r.rd[s].NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
+}
+
 // Get is an exact-key point read.
 func (r *Run) Get(s Section, key []byte) ([]byte, bool, error) {
 	if !r.MayHave(s, key) {
 		return nil, false, nil
 	}
-	it, err := r.rd[s].NewIter(nil, nil)
+	it, err := r.newIter(s)
 	if err != nil {
 		return nil, false, err
 	}
 	defer it.Close()
-	k, v := it.SeekGE(key, 0)
-	if k == nil || !Comparer.Equal(k.UserKey, key) {
+	kv := it.SeekGE(key, 0)
+	if kv == nil || !Comparer.Equal(kv.K.UserKey, key) {
 		return nil, false, nil
 	}
-	val, _, err := v.Value(nil)
+	val, _, err := kv.Value(nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -357,21 +371,21 @@ func (r *Run) Latest(s Section, prefix []byte, at uint64) (val []byte, txnum uin
 	if !r.MayHave(s, Suffixed(prefix, 0)) {
 		return nil, 0, false, nil
 	}
-	it, err := r.rd[s].NewIter(nil, nil)
+	it, err := r.newIter(s)
 	if err != nil {
 		return nil, 0, false, err
 	}
 	defer it.Close()
 	// SeekLT past the sought TxNum, then check we are still under the prefix.
-	k, v := it.SeekLT(Suffixed(prefix, at+1), 0)
-	if k == nil || len(k.UserKey) != len(prefix)+8 || string(k.UserKey[:len(prefix)]) != string(prefix) {
+	kv := it.SeekLT(Suffixed(prefix, at+1), 0)
+	if kv == nil || len(kv.K.UserKey) != len(prefix)+8 || string(kv.K.UserKey[:len(prefix)]) != string(prefix) {
 		return nil, 0, false, nil
 	}
-	raw, _, err := v.Value(nil)
+	raw, _, err := kv.Value(nil)
 	if err != nil {
 		return nil, 0, false, err
 	}
-	return append([]byte(nil), raw...), TxNumOf(k.UserKey), true, nil
+	return append([]byte(nil), raw...), TxNumOf(kv.K.UserKey), true, nil
 }
 
 // Scan calls fn for every row under prefix with a TxNum suffix in [lo, hi],
@@ -380,20 +394,20 @@ func (r *Run) Scan(s Section, prefix []byte, lo, hi uint64, fn func(txnum uint64
 	if !r.MayHave(s, Suffixed(prefix, 0)) {
 		return nil
 	}
-	it, err := r.rd[s].NewIter(nil, nil)
+	it, err := r.newIter(s)
 	if err != nil {
 		return err
 	}
 	defer it.Close()
-	for k, v := it.SeekGE(Suffixed(prefix, lo), 0); k != nil; k, v = it.Next() {
-		if len(k.UserKey) != len(prefix)+8 || string(k.UserKey[:len(prefix)]) != string(prefix) {
+	for kv := it.SeekGE(Suffixed(prefix, lo), 0); kv != nil; kv = it.Next() {
+		if len(kv.K.UserKey) != len(prefix)+8 || string(kv.K.UserKey[:len(prefix)]) != string(prefix) {
 			return nil
 		}
-		n := TxNumOf(k.UserKey)
+		n := TxNumOf(kv.K.UserKey)
 		if n > hi {
 			return nil
 		}
-		raw, _, err := v.Value(nil)
+		raw, _, err := kv.Value(nil)
 		if err != nil {
 			return err
 		}
@@ -412,7 +426,7 @@ func (r *Run) ScanDesc(s Section, prefix []byte, lo, hi uint64, fn func(txnum ui
 	if !r.MayHave(s, Suffixed(prefix, 0)) {
 		return nil
 	}
-	it, err := r.rd[s].NewIter(nil, nil)
+	it, err := r.newIter(s)
 	if err != nil {
 		return err
 	}
@@ -420,15 +434,15 @@ func (r *Run) ScanDesc(s Section, prefix []byte, lo, hi uint64, fn func(txnum ui
 	if hi == ^uint64(0) {
 		hi-- // the exclusive bound below is hi+1, and TxNum 2^64-1 does not exist
 	}
-	for k, v := it.SeekLT(Suffixed(prefix, hi+1), 0); k != nil; k, v = it.Prev() {
-		if len(k.UserKey) != len(prefix)+8 || string(k.UserKey[:len(prefix)]) != string(prefix) {
+	for kv := it.SeekLT(Suffixed(prefix, hi+1), 0); kv != nil; kv = it.Prev() {
+		if len(kv.K.UserKey) != len(prefix)+8 || string(kv.K.UserKey[:len(prefix)]) != string(prefix) {
 			return nil
 		}
-		n := TxNumOf(k.UserKey)
+		n := TxNumOf(kv.K.UserKey)
 		if n < lo {
 			return nil
 		}
-		raw, _, err := v.Value(nil)
+		raw, _, err := kv.Value(nil)
 		if err != nil {
 			return err
 		}
@@ -441,17 +455,17 @@ func (r *Run) ScanDesc(s Section, prefix []byte, lo, hi uint64, fn func(txnum ui
 
 // ScanRange calls fn for every chain-section row in [loKey, hiKey), ascending.
 func (r *Run) ScanRange(s Section, loKey, hiKey []byte, fn func(key, val []byte) bool) error {
-	it, err := r.rd[s].NewIter(nil, hiKey)
+	it, err := r.rd[s].NewIter(sstable.NoTransforms, nil, hiKey, sstable.AssertNoBlobHandles)
 	if err != nil {
 		return err
 	}
 	defer it.Close()
-	for k, v := it.SeekGE(loKey, 0); k != nil; k, v = it.Next() {
-		raw, _, err := v.Value(nil)
+	for kv := it.SeekGE(loKey, 0); kv != nil; kv = it.Next() {
+		raw, _, err := kv.Value(nil)
 		if err != nil {
 			return err
 		}
-		if !fn(k.UserKey, raw) {
+		if !fn(kv.K.UserKey, raw) {
 			return nil
 		}
 	}
@@ -478,10 +492,10 @@ type residentRange struct {
 // which readBlock always asks for on top of the block handle's length. A
 // resident range that stopped at the handle's length would be a partial hit
 // and would send the read to the artifact anyway.
-const blockTrailer = 5
+const blockTrailer = sstblock.TrailerLen
 
 // reside pins one block handle's bytes in RAM.
-func (s *sectionReadable) reside(bh sstable.BlockHandle) error {
+func (s *sectionReadable) reside(bh sstblock.Handle) error {
 	if bh.Length == 0 {
 		return nil
 	}
@@ -526,16 +540,20 @@ func (s *sectionReadable) ReadAt(p []byte, off int64) (int, error) {
 
 func (s *sectionReadable) Close() error { return nil }
 
-func (s *sectionReadable) Stat() (os.FileInfo, error) { return sectionStat{n: int64(s.n)}, nil }
+func (s *sectionReadable) Stat() (vfs.FileInfo, error) { return sectionStat{n: int64(s.n)}, nil }
 
+// sectionStat is the only thing pebble asks a ReadableFile about: the size. The
+// rest of the FileInfo surface is filled with zeroes ON PURPOSE, because a run
+// carries no wall clock anywhere (DESIGN's determinism pins).
 type sectionStat struct{ n int64 }
 
-func (s sectionStat) Name() string       { return "section" }
-func (s sectionStat) Size() int64        { return s.n }
-func (s sectionStat) Mode() os.FileMode  { return 0 }
-func (s sectionStat) ModTime() time.Time { return time.Time{} }
-func (s sectionStat) IsDir() bool        { return false }
-func (s sectionStat) Sys() any           { return nil }
+func (s sectionStat) Name() string           { return "section" }
+func (s sectionStat) Size() int64            { return s.n }
+func (s sectionStat) Mode() os.FileMode      { return 0 }
+func (s sectionStat) ModTime() time.Time     { return time.Time{} }
+func (s sectionStat) IsDir() bool            { return false }
+func (s sectionStat) Sys() any               { return nil }
+func (s sectionStat) DeviceID() vfs.DeviceID { return vfs.DeviceID{} }
 
 var _ sstable.ReadableFile = (*sectionReadable)(nil)
 

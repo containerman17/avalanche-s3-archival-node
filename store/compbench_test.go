@@ -19,11 +19,8 @@ import (
 
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
-	"github.com/cockroachdb/pebble/sstable"
-	v2bloom "github.com/cockroachdb/pebble/v2/bloom"
-	v2sst "github.com/cockroachdb/pebble/v2/sstable"
-	v2block "github.com/cockroachdb/pebble/v2/sstable/block"
-	v2vfs "github.com/cockroachdb/pebble/v2/vfs"
+	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/containerman17/epochdb/dist"
 )
 
@@ -31,52 +28,23 @@ import (
 // and block size are per-section format constants, measured then pinned).
 //
 // This is a MEASUREMENT HARNESS, not a format: it reads a real corpus's runs
-// through the pinned pebble v1 reader and REWRITES the same rows through
-// cockroachdb/pebble/v2's sstable writer, which is a different module path and
-// therefore links beside the v1 that libevm's ethdb wrapper pins. Nothing here
-// touches the live format; the production constants stay where format.go puts
-// them until the numbers are reviewed.
+// and REWRITES the same rows through the same sstable writer the store uses,
+// varying only the codec and the block size. It is what produced the pinned
+// constants in format.go and it is what a re-measurement runs.
 //
 //	EPOCHDB_CORPUS_DIR=$PWD/data-numine3 go test -run TestCompressionMatrix -v -timeout 6h ./store/
 //
 // Optional: EPOCHDB_BENCH_RUNS=n limits the run count, EPOCHDB_BENCH_DIR moves
 // the scratch space off the corpus filesystem.
 
-// v2Comparer is the pinned comparer expressed against pebble v2: the same
-// bytewise order and the same Split, so the prefix blooms cover the same key
-// prefixes and the sizes are comparable row for row.
-var v2Comparer = func() *v2sst.Comparer {
-	c := *v2sst.DefaultComparer
-	c.Split = split
-	c.Separator = func(dst, a, b []byte) []byte { return append(dst, a...) }
-	c.Successor = func(dst, a []byte) []byte { return append(dst, a...) }
-	c.Name = "epochdb.v0"
-	return &c
-}()
-
-// codecs are the matrix's algorithm axis. The zstd profiles are built by
-// copying the registered ZSTD profile (all three block classes zstd, minimum
-// reduction 12%) and moving the level: the level type lives in pebble's
-// internal/compression package, so a copy-and-set is the only way to name a
-// level from outside the module, and it is also the only thing that has to
-// stay true if pebble adds presets.
-func zstdProfile(level uint8) *v2sst.CompressionProfile {
-	p := *v2sst.ZstdCompression
-	p.Name = "zstd" + strconv.Itoa(int(level))
-	p.DataBlocks.Level = level
-	p.ValueBlocks.Level = level
-	p.OtherBlocks.Level = level
-	return &p
-}
-
 type codec struct {
 	name string
-	prof *v2sst.CompressionProfile
+	prof *sstable.CompressionProfile
 }
 
 func codecs() []codec {
 	return []codec{
-		{"snappy", v2sst.SnappyCompression},
+		{"snappy", sstable.SnappyCompression},
 		{"zstd1", zstdProfile(1)},
 		{"zstd3", zstdProfile(3)},
 		{"zstd9", zstdProfile(9)},
@@ -95,38 +63,20 @@ func blockSizesFor(s Section) []int {
 	return []int{8 << 10, 16 << 10, 32 << 10, 128 << 10, 512 << 10}
 }
 
-// v2Options mirrors writerOptions' per-section profile onto pebble v2 with the
-// codec and block size under test. IndexBlockSize follows the block size rather
-// than staying pinned, because an index block that cannot hold the section's
+// benchOptions is the SHIPPED per-section profile with the codec and block size
+// under test swapped in. IndexBlockSize follows the block size by the same rule
+// production uses, because an index block that cannot hold the section's
 // separators turns into a two-level index and that is a property of the block
 // size, not a free choice.
-func v2Options(s Section, prof *v2sst.CompressionProfile, blockSize int) v2sst.WriterOptions {
-	o := v2sst.WriterOptions{
-		Comparer:             v2Comparer,
-		TableFormat:          v2sst.TableFormatPebblev2,
-		Compression:          prof,
-		Checksum:             v2block.ChecksumTypeCRC32c,
-		BlockRestartInterval: 16,
-		MergerName:           "nullptr",
-		BlockSize:            blockSize,
-		IndexBlockSize:       max(64<<10, 2*blockSize),
-	}
-	if s != SecChain {
-		o.FilterPolicy = v2bloom.FilterPolicy(20)
-		o.FilterType = v2sst.TableFilter
-	}
+func benchOptions(s Section, prof *sstable.CompressionProfile, blockSize int) sstable.WriterOptions {
+	o := writerOptions(s)
+	o.Compression = prof
+	o.BlockSize = blockSize
+	o.IndexBlockSize = max(64<<10, 2*blockSize)
 	return o
 }
 
-func v2ReaderOptions() v2sst.ReaderOptions {
-	fp := v2bloom.FilterPolicy(20)
-	return v2sst.ReaderOptions{
-		Comparer: v2Comparer,
-		Filters:  map[string]v2sst.FilterPolicy{fp.Name(): fp},
-	}
-}
-
-// fileWritable is pebble v2's objstorage.Writable over a plain file.
+// fileWritable is pebble's objstorage.Writable over a plain file.
 type fileWritable struct {
 	f  *os.File
 	bw *bufio.Writer
@@ -177,16 +127,16 @@ func loadSection(r *Run, s Section) (*rowset, error) {
 	return rs, err
 }
 
-// writeV2 rewrites rows through pebble v2 and reports the file size and the
-// wall time the writer took (Close included, fsync excluded: the codec is what
-// is under test, not the disk).
-func writeV2(path string, rs *rowset, o v2sst.WriterOptions, from, to int) (uint64, time.Duration, error) {
+// writeSST rewrites rows through the sstable writer and reports the file size
+// and the wall time the writer took (Close included, fsync excluded: the codec
+// is what is under test, not the disk).
+func writeSST(path string, rs *rowset, o sstable.WriterOptions, from, to int) (uint64, time.Duration, error) {
 	fw, err := newFileWritable(path)
 	if err != nil {
 		return 0, 0, err
 	}
 	start := time.Now()
-	w := v2sst.NewWriter(fw, o)
+	w := sstable.NewWriter(fw, o)
 	for i := from; i < to; i++ {
 		if err := w.Set(rs.keys[i], rs.vals[i]); err != nil {
 			w.Close()
@@ -200,35 +150,35 @@ func writeV2(path string, rs *rowset, o v2sst.WriterOptions, from, to int) (uint
 }
 
 // writeSubset rewrites an arbitrary key/value list (a family carved out of a
-// section) through pebble v2.
-func writeSubset(path string, keys, vals [][]byte, o v2sst.WriterOptions) (uint64, time.Duration, error) {
+// section) through the sstable writer.
+func writeSubset(path string, keys, vals [][]byte, o sstable.WriterOptions) (uint64, time.Duration, error) {
 	rs := &rowset{keys: keys, vals: vals}
-	return writeV2(path, rs, o, 0, len(keys))
+	return writeSST(path, rs, o, 0, len(keys))
 }
 
-// openV2 opens a rewritten section for point reads.
-func openV2(path string) (*v2sst.Reader, error) {
-	f, err := v2vfs.Default.Open(path)
+// openSST opens a rewritten section for point reads.
+func openSST(path string) (*sstable.Reader, error) {
+	f, err := vfs.Default.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	readable, err := v2sst.NewSimpleReadable(f)
+	readable, err := sstable.NewSimpleReadable(f)
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	return v2sst.NewReader(context.Background(), readable, v2ReaderOptions())
+	return sstable.NewReader(context.Background(), readable, readerOptions())
 }
 
 // pointReadMedian is the measured cost of serving ONE row: seek, read the data
 // block, decompress it, hand back the value. No block cache is configured, so
 // every probe decompresses, which is exactly the cold-ish shape a read-through
 // node sees once the chunk is local.
-func pointReadMedian(r *v2sst.Reader, keys [][]byte) (time.Duration, error) {
+func pointReadMedian(r *sstable.Reader, keys [][]byte) (time.Duration, error) {
 	d := make([]time.Duration, 0, len(keys))
 	for _, k := range keys {
 		start := time.Now()
-		it, err := r.NewIter(v2sst.NoTransforms, nil, nil, v2sst.AssertNoBlobHandles)
+		it, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 		if err != nil {
 			return 0, err
 		}
@@ -419,7 +369,7 @@ func TestCompressionMatrix(t *testing.T) {
 					sizes[c.name] = map[int]uint64{}
 					for _, bs := range blockSizesFor(s) {
 						path := filepath.Join(dir, fmt.Sprintf("cur-%d.sst", ri))
-						n, _, err := writeV2(path, rs, v2Options(s, c.prof, bs), 0, len(rs.keys))
+						n, _, err := writeSST(path, rs, benchOptions(s, c.prof, bs), 0, len(rs.keys))
 						if err != nil {
 							t.Errorf("run %d %v %s %dKB: %v", ri, s, c.name, bs>>10, err)
 							return
@@ -457,7 +407,7 @@ func TestCompressionMatrix(t *testing.T) {
 		for _, c := range codecs() {
 			for _, bs := range blockSizesFor(s) {
 				path := filepath.Join(probeDir, fmt.Sprintf("%v-%s-%d.sst", s, c.name, bs))
-				_, d, err := writeV2(path, rs, v2Options(s, c.prof, bs), 0, len(rs.keys))
+				_, d, err := writeSST(path, rs, benchOptions(s, c.prof, bs), 0, len(rs.keys))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -481,7 +431,7 @@ func TestCompressionMatrix(t *testing.T) {
 			read[s][c.name] = map[int]time.Duration{}
 			for _, bs := range blockSizesFor(s) {
 				path := filepath.Join(probeDir, fmt.Sprintf("%v-%s-%d.sst", s, c.name, bs))
-				rd, err := openV2(path)
+				rd, err := openSST(path)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -620,31 +570,31 @@ func redistOne(path string, rs *rowset) (*redistTotals, error) {
 		kStrip, vStrip = append(kStrip, k), append(vStrip, v)
 	}
 
-	base, high := zstdProfile(3), zstdProfile(19)
+	baseProf, highProf := zstdProfile(3), zstdProfile(19)
 	const (
 		bs128 = 128 << 10
 		bs512 = 512 << 10
 	)
 	var err error
-	size := func(keys, vals [][]byte, bs int, prof *v2sst.CompressionProfile) uint64 {
+	size := func(keys, vals [][]byte, bs int, prof *sstable.CompressionProfile) uint64 {
 		if err != nil {
 			return 0
 		}
 		var n uint64
-		n, _, err = writeSubset(path, keys, vals, v2Options(SecChain, prof, bs))
+		n, _, err = writeSubset(path, keys, vals, benchOptions(SecChain, prof, bs))
 		os.Remove(path)
 		return n
 	}
-	tt.chainWhole = size(kAll, vAll, bs128, base)
-	tt.chainNoItx = size(kNoItx, vNoItx, bs128, base)
-	tt.chainNoRcpt = size(kNoRcpt, vNoRcpt, bs128, base)
-	tt.chainNoInput = size(kStrip, vStrip, bs128, base)
-	tt.itxOwn = size(kItx, vItx, bs128, base)
-	tt.itxOwnHigh = size(kItx, vItx, bs512, high)
-	tt.rcptOwn = size(kRcpt, vRcpt, bs128, base)
-	tt.rcptOwnHigh = size(kRcpt, vRcpt, bs512, high)
-	tt.inputOwn = size(kInput, vInput, bs128, base)
-	tt.inputOwnHigh = size(kInput, vInput, bs512, high)
+	tt.chainWhole = size(kAll, vAll, bs128, baseProf)
+	tt.chainNoItx = size(kNoItx, vNoItx, bs128, baseProf)
+	tt.chainNoRcpt = size(kNoRcpt, vNoRcpt, bs128, baseProf)
+	tt.chainNoInput = size(kStrip, vStrip, bs128, baseProf)
+	tt.itxOwn = size(kItx, vItx, bs128, baseProf)
+	tt.itxOwnHigh = size(kItx, vItx, bs512, highProf)
+	tt.rcptOwn = size(kRcpt, vRcpt, bs128, baseProf)
+	tt.rcptOwnHigh = size(kRcpt, vRcpt, bs512, highProf)
+	tt.inputOwn = size(kInput, vInput, bs128, baseProf)
+	tt.inputOwnHigh = size(kInput, vInput, bs512, highProf)
 	return tt, err
 }
 
@@ -727,13 +677,13 @@ func txInput(raw []byte) []byte {
 // DETERMINISM
 // ---------------------------------------------------------------------------
 
-// TestV2ZstdDeterminism is the gate the whole zstd question hangs on (DESIGN:
+// TestZstdDeterminism is the gate the whole zstd question hangs on (DESIGN:
 // byte-identity across independent builders is the core promise). It writes the
-// same rows twice through pebble v2 at each zstd level and requires identical
-// bytes, and it PRINTS the hashes so a second process (and a run with
-// -tags pebblegozstd, which swaps DataDog's cgo zstd for klauspost's pure Go
-// one) can be diffed against it.
-func TestV2ZstdDeterminism(t *testing.T) {
+// same rows twice at each zstd level and requires identical bytes, and it
+// PRINTS the hashes so a second process (and a run with -tags pebblegozstd,
+// which swaps DataDog's cgo zstd for klauspost's pure Go one) can be diffed
+// against it.
+func TestZstdDeterminism(t *testing.T) {
 	dir := t.TempDir()
 	rng := rand.New(rand.NewSource(7))
 	var keys, vals [][]byte
@@ -754,7 +704,7 @@ func TestV2ZstdDeterminism(t *testing.T) {
 		var first string
 		for pass := 0; pass < 2; pass++ {
 			p := filepath.Join(dir, fmt.Sprintf("%s-%d.sst", c.name, pass))
-			if _, _, err := writeSubset(p, keys, vals, v2Options(SecChain, c.prof, 128<<10)); err != nil {
+			if _, _, err := writeSubset(p, keys, vals, benchOptions(SecChain, c.prof, 128<<10)); err != nil {
 				t.Fatal(err)
 			}
 			b, err := os.ReadFile(p)
@@ -770,7 +720,7 @@ func TestV2ZstdDeterminism(t *testing.T) {
 				t.Fatalf("%s: two passes produced different bytes (%s vs %s)", c.name, first, h)
 			}
 			// and it must read back through the same binary that wrote it
-			rd, err := openV2(p)
+			rd, err := openSST(p)
 			if err != nil {
 				t.Fatalf("%s: reopen: %v", c.name, err)
 			}
@@ -781,62 +731,6 @@ func TestV2ZstdDeterminism(t *testing.T) {
 		}
 	}
 }
-
-// TestV1SnappyByteIdentity is the guard the whole measurement pass has to pass
-// before anything it says can be believed: LINKING pebble v2 bumps
-// github.com/golang/snappy and github.com/DataDog/zstd by MVS, and snappy is
-// the codec the SHIPPED format uses. It rewrites a corpus run's sections with
-// the v1 writer at the production options and requires the bytes to equal what
-// is already in the artifact, which is the byte-identity promise checked
-// against a corpus written before the bump.
-func TestV1SnappyByteIdentity(t *testing.T) {
-	runs, _ := openCorpus(t)
-	r := runs[0]
-	for s := SecChain; s < numSections; s++ {
-		rs, err := loadSection(r, s)
-		if err != nil {
-			t.Fatal(err)
-		}
-		p := filepath.Join(t.TempDir(), "v1.sst")
-		f, err := os.Create(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		bw := bufio.NewWriterSize(f, 1<<20)
-		w := sstable.NewWriter(&v1Writable{bw: bw}, writerOptions(s))
-		for i := range rs.keys {
-			if err := w.Set(rs.keys[i], rs.vals[i]); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := w.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := bw.Flush(); err != nil {
-			t.Fatal(err)
-		}
-		f.Close()
-		got, err := os.ReadFile(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want, err := r.blob.Read(r.Footer.Off[s], r.Footer.Len[s])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("%v: rewrite is %d bytes, corpus section is %d bytes, NOT identical: the dependency bump moved the shipped format's bytes", s, len(got), len(want))
-			continue
-		}
-		t.Logf("%v: %d bytes, byte-identical to the corpus", s, len(got))
-	}
-}
-
-type v1Writable struct{ bw *bufio.Writer }
-
-func (w *v1Writable) Write(p []byte) error { _, err := w.bw.Write(p); return err }
-func (w *v1Writable) Finish() error        { return nil }
-func (w *v1Writable) Abort()               {}
 
 // TestResidentBudget reports what each shape costs the node's ALWAYS-RESIDENT
 // local budget (DESIGN, read-through: blooms, SST index blocks, properties and
@@ -854,7 +748,7 @@ func TestResidentBudget(t *testing.T) {
 		for _, c := range codecs() {
 			for _, bs := range blockSizesFor(s) {
 				path := filepath.Join(probeDir, fmt.Sprintf("%v-%s-%d.sst", s, c.name, bs))
-				rd, err := openV2(path)
+				rd, err := openSST(path)
 				if err != nil {
 					t.Skipf("%s: %v (run TestCompressionMatrix first)", path, err)
 				}

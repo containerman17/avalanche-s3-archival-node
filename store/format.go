@@ -14,9 +14,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 
-	"github.com/cockroachdb/pebble/bloom"
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/v2/bloom"
+	"github.com/cockroachdb/pebble/v2/sstable"
+	sstblock "github.com/cockroachdb/pebble/v2/sstable/block"
 )
 
 // StorageVersion is recorded in the manifest. A version bump plus a reindex
@@ -214,16 +216,18 @@ func split(key []byte) int {
 // Successor are the identity: index-key shortening buys a little index space
 // and costs a rule that has to stay consistent with Split forever, and this
 // engine writes runs once and reads them for years.
-var Comparer = &sstable.Comparer{
-	Compare:        bytes.Compare,
-	Equal:          bytes.Equal,
-	AbbreviatedKey: sstable.DefaultComparer.AbbreviatedKey,
-	FormatKey:      sstable.DefaultComparer.FormatKey,
-	Separator:      func(dst, a, b []byte) []byte { return append(dst, a...) },
-	Successor:      func(dst, a []byte) []byte { return append(dst, a...) },
-	Split:          split,
-	Name:           "epochdb.v0",
-}
+//
+// It is built by COPYING DefaultComparer and moving four fields rather than by
+// naming every field: pebble's Comparer grows members (suffix comparison, point
+// vs range) and a literal silently leaves the new ones nil.
+var Comparer = func() *sstable.Comparer {
+	c := *sstable.DefaultComparer
+	c.Split = split
+	c.Separator = func(dst, a, b []byte) []byte { return append(dst, a...) }
+	c.Successor = func(dst, a []byte) []byte { return append(dst, a...) }
+	c.Name = "epochdb.v0"
+	return &c
+}()
 
 // ---------------------------------------------------------------------------
 // FORMAT CONSTANTS. Pinned, not configured: same sorted rows in, identical
@@ -232,34 +236,60 @@ var Comparer = &sstable.Comparer{
 
 // TableFormat is pinned. Pebblev2 is the newest format with no value blocks and
 // no obsolete bits, i.e. the fewest moving parts that still carries a
-// table-level bloom.
+// table-level bloom. It is also below TableFormatPebblev5, so no columnar key
+// schema is in play and the row-block writer is the only encoder.
 const TableFormat = sstable.TableFormatPebblev2
 
-// PebbleVersion is pinned LIKE A FORMAT CONSTANT (DESIGN's determinism pins),
-// and the pin is not ours to choose freely: libevm's ethdb/pebble wrapper is
-// written against this exact API, and a newer pebble stops the whole repo from
-// compiling. Bumping it means bumping libevm too, and it is a storage version
-// question either way.
-const PebbleVersion = "v0.0.0-20230928194634-aa077af62593"
+// PebbleModule and PebbleVersion pin the sstable library LIKE FORMAT CONSTANTS
+// (DESIGN's determinism pins). The store reads and writes through ONE
+// implementation, pebble v2's sstable package. libevm's own ethdb/pebble
+// wrapper still links pebble v1; that is a different module path and it never
+// touches a run.
+const (
+	PebbleModule  = "github.com/cockroachdb/pebble/v2"
+	PebbleVersion = "v2.1.6"
+)
 
-// Compression is pinned, and it is SNAPPY rather than the zstd DESIGN expects
-// to win, for a reason that is a property of the libraries and not a taste:
+// ZstdLevel is the pinned zstd level for every section, measured then pinned on
+// numine (DESIGN, "Storage v0"). Level 9 is where the size curve flattens: 19
+// buys a couple of percent for several times the write clock.
+const ZstdLevel = 9
+
+// CgoRequired records that cgo IS a format constant here. pebble v2 reaches
+// zstd through github.com/DataDog/zstd under `cgo && !pebblegozstd` and through
+// github.com/klauspost/compress/zstd otherwise, and the two produce DIFFERENT
+// BYTES from the same rows (klauspost also collapses levels onto four speed
+// classes). epochdb is always cgo because firewood is, so the DataDog path is
+// the one that runs; a `-tags pebblegozstd` build would write runs that are
+// valid but not byte-identical to everyone else's. TestZstdPinnedProfile
+// asserts the cgo side of the pin.
+const CgoRequired = true
+
+// zstdProfile is the pinned codec, and the construction is forced: the level
+// type lives in pebble's internal/compression package, so a level can only be
+// named by COPYING an exported profile and moving the field.
 //
-// pebble's zstd path is `github.com/DataDog/zstd`, and avalanchego pins that
-// module at v1.5.2, where Decompress sizes its own destination buffer from a
-// >= 1MB hint and therefore ALWAYS reallocates. pebble then rejects the block
-// ("decompressed into unexpected buffer"), so every zstd-compressed run is
-// unreadable by the same binary that wrote it. On top of that, pebble picks
-// DataDog under cgo and klauspost without it, and the two produce DIFFERENT
-// BYTES from the same rows, which the byte-identity promise forbids outright.
-// Snappy is pure Go, one code path, deterministic everywhere.
-//
-// The codec is a format constant, so moving to zstd later is a storage version
-// bump plus an IO-class reindex, which is exactly the upgrade path DESIGN
-// already provides. It needs pebble v2 (a different module path, so it can be
-// linked beside the one libevm needs; its zstd is a rewritten package with a
-// `pebblegozstd` escape hatch) plus the measurement pass DESIGN asks for.
-const Compression = sstable.SnappyCompression
+// IT MUST BE BASED ON ZstdCompression. GoodCompression, FastCompression and
+// BalancedCompression set OtherBlocks to the fastest algorithm, which is MinLZ
+// on amd64, and MinLZ needs TableFormatPebblev6; with an older format
+// WriterOptions.ensureDefaults silently REPLACES the whole profile with Snappy,
+// so a run would be snappy under a zstd label.
+func zstdProfile(level uint8) *sstable.CompressionProfile {
+	p := *sstable.ZstdCompression
+	p.Name = "zstd" + strconv.Itoa(int(level))
+	p.DataBlocks.Level = level
+	p.ValueBlocks.Level = level
+	p.OtherBlocks.Level = level
+	return &p
+}
+
+// Compression is pinned: ZSTD AT LEVEL 9 IN ALL THREE SECTIONS, measured on the
+// numine corpus. The old snappy pin was not a taste but a library fact (pebble
+// v1 reached zstd through DataDog/zstd v1.5.2, whose Decompress always
+// reallocates, which pebble rejects as a corrupt block); pebble v2 raises that
+// module past the bug and the write-then-read-back round trip passes in the
+// binary that wrote it.
+var Compression = zstdProfile(ZstdLevel)
 
 // Section identifies one of a run's three SST sections.
 type Section int
@@ -283,31 +313,43 @@ func (s Section) String() string {
 	return "?"
 }
 
-// writerOptions is the pinned per-section profile. Chain is write-once and read
-// sequentially, so it takes big blocks, a high-ratio codec and NO bloom:
+// BlockSize is the pinned per-section block size, MEASURED THEN PINNED on
+// numine: chain 512KB, state 32KB, lookup 8KB. Chain is write-once and read
+// sequentially, so it takes the biggest block the codec can chew (the size
+// curve is still falling at 512KB and a sequential scan never pays for it).
+// State and lookup are point-read families and a point read decompresses one
+// whole block, so their sizes are the smallest that still compress: 32KB for
+// state, where a slot's history is a contiguous scan, and 8KB for lookup, where
+// every probe is one random row.
+func BlockSize(s Section) int {
+	switch s {
+	case SecChain:
+		return 512 << 10
+	case SecState:
+		return 32 << 10
+	}
+	return 8 << 10
+}
+
+// indexBlockSize keeps the index one block deep for as long as it can: twice
+// the data block size, never below 64KB. Past that pebble builds a two-level
+// index by itself, which is a property of the block size and not a knob.
+func indexBlockSize(s Section) int { return max(64<<10, 2*BlockSize(s)) }
+
+// writerOptions is the pinned per-section profile. Chain carries NO bloom:
 // existence there is answered by the run's tx range before any file opens.
-// State and lookup are point-read families: small blocks and blooms.
 func writerOptions(s Section) sstable.WriterOptions {
 	o := sstable.WriterOptions{
 		Comparer:             Comparer,
 		TableFormat:          TableFormat,
 		Compression:          Compression,
-		Checksum:             sstable.ChecksumTypeCRC32c,
+		Checksum:             sstblock.ChecksumTypeCRC32c,
 		BlockRestartInterval: 16,
 		MergerName:           "nullptr",
+		BlockSize:            BlockSize(s),
+		IndexBlockSize:       indexBlockSize(s),
 	}
-	switch s {
-	case SecChain:
-		o.BlockSize = 128 << 10
-		o.IndexBlockSize = 256 << 10
-	case SecState:
-		o.BlockSize = 16 << 10
-		o.IndexBlockSize = 64 << 10
-		o.FilterPolicy = bloom.FilterPolicy(20)
-		o.FilterType = sstable.TableFilter
-	case SecLookup:
-		o.BlockSize = 8 << 10
-		o.IndexBlockSize = 64 << 10
+	if s != SecChain {
 		o.FilterPolicy = bloom.FilterPolicy(20)
 		o.FilterType = sstable.TableFilter
 	}
@@ -316,12 +358,12 @@ func writerOptions(s Section) sstable.WriterOptions {
 
 // readerOptions must name the filter policy, or the reader never records where
 // the filter block is and the bloom gate silently degrades to "may have
-// everything".
+// everything". The merger needs no name here: pebble accepts "nullptr" as "no
+// merge operator" without a registration.
 func readerOptions() sstable.ReaderOptions {
 	return sstable.ReaderOptions{
-		Comparer:   Comparer,
-		MergerName: "nullptr",
-		Filters:    map[string]sstable.FilterPolicy{filterPolicy.Name(): filterPolicy},
+		Comparer: Comparer,
+		Filters:  map[string]sstable.FilterPolicy{filterPolicy.Name(): filterPolicy},
 	}
 }
 

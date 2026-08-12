@@ -11,6 +11,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
+	"github.com/cockroachdb/pebble/v2/sstable"
 
 	"github.com/containerman17/epochdb/dist"
 )
@@ -211,6 +212,66 @@ func TestDeterminism(t *testing.T) {
 		t.Fatal("empty run")
 	}
 }
+
+// TestFormatConstantsArePinned guards the format constants that a corpus is
+// unreadable or non-identical without. The size comparison is the load-bearing
+// half: pebble's WriterOptions.ensureDefaults SILENTLY replaces a compression
+// profile the table format cannot carry with Snappy, so a profile built on the
+// wrong preset would compile, run, and quietly ship snappy runs.
+func TestFormatConstantsArePinned(t *testing.T) {
+	if TableFormat != sstable.TableFormatPebblev2 {
+		t.Errorf("TableFormat is %v, want Pebblev2", TableFormat)
+	}
+	if BlockSize(SecChain) != 512<<10 || BlockSize(SecState) != 32<<10 || BlockSize(SecLookup) != 8<<10 {
+		t.Errorf("block sizes are %d/%d/%d, want 512K/32K/8K",
+			BlockSize(SecChain), BlockSize(SecState), BlockSize(SecLookup))
+	}
+	if Compression.UsesMinLZ() {
+		t.Fatal("the pinned profile uses MinLZ, which TableFormatPebblev2 cannot carry: pebble would swap the whole profile for Snappy")
+	}
+	for name, got := range map[string]uint8{
+		"DataBlocks":  Compression.DataBlocks.Level,
+		"ValueBlocks": Compression.ValueBlocks.Level,
+		"OtherBlocks": Compression.OtherBlocks.Level,
+	} {
+		if got != ZstdLevel {
+			t.Errorf("%s level is %d, want %d", name, got, ZstdLevel)
+		}
+	}
+	if a := Compression.DataBlocks.Algorithm; a != sstable.ZstdCompression.DataBlocks.Algorithm {
+		t.Errorf("data blocks use algorithm %v, want zstd", a)
+	}
+
+	// And it must actually reach the bytes: the same rows must come out
+	// materially smaller than snappy would write them.
+	size := func(prof *sstable.CompressionProfile) int {
+		var buf sizeWritable
+		o := writerOptions(SecChain)
+		o.Compression = prof
+		w := sstable.NewWriter(&buf, o)
+		for i := 0; i < 20000; i++ {
+			if err := w.Set(TxKey(uint64(i)), []byte(fmt.Sprintf("tx-%d-and-a-very-repetitive-tail-that-any-codec-should-shrink", i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.n
+	}
+	zstd, snappy := size(Compression), size(sstable.SnappyCompression)
+	t.Logf("20,000 chain rows: pinned zstd%d %d bytes, snappy %d bytes", ZstdLevel, zstd, snappy)
+	if zstd >= snappy {
+		t.Errorf("the pinned profile wrote %d bytes and snappy wrote %d: the profile did not reach the blocks", zstd, snappy)
+	}
+}
+
+// sizeWritable counts the bytes an sstable writer produces.
+type sizeWritable struct{ n int }
+
+func (w *sizeWritable) Write(p []byte) error { w.n += len(p); return nil }
+func (w *sizeWritable) Finish() error        { return nil }
+func (w *sizeWritable) Abort()               {}
 
 // TestPrevLink: the first run's prev is the chain root and each later run's
 // prev is its predecessor's name.

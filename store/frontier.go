@@ -45,7 +45,7 @@ func (d *DB) MergeFrontier(atTx uint64, fn func(FrontierRow) error) error {
 		if r.Footer.FromTx > atTx {
 			continue
 		}
-		it, err := r.rd[SecState].NewIter(nil, nil)
+		it, err := r.newIter(SecState)
 		if err != nil {
 			return err
 		}
