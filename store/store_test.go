@@ -43,13 +43,15 @@ func block(height uint64, n int) *BlockWrite {
 	for i := 0; i < n; i++ {
 		h := hash32(byte(height*10 + uint64(i)))
 		b.Txs = append(b.Txs, TxWrite{
-			Hash:     h,
-			RLP:      []byte(fmt.Sprintf("tx-%d-%d", height, i)),
-			Receipt:  []byte(fmt.Sprintf("rcpt-%d-%d", height, i)),
-			Sender:   addr(1),
-			To:       addr(2),
-			LogAddrs: [][]byte{addr(3)},
-			Topics:   [][]byte{hash32(9)},
+			Hash:       h,
+			RLP:        []byte(fmt.Sprintf("tx-%d-%d", height, i)),
+			Receipt:    []byte(fmt.Sprintf("rcpt-%d-%d", height, i)),
+			Frames:     []byte(fmt.Sprintf("itx-%d-%d", height, i)),
+			FrameAddrs: [][]byte{addr(4)},
+			Sender:     addr(1),
+			To:         addr(2),
+			LogAddrs:   [][]byte{addr(3)},
+			Topics:     [][]byte{hash32(9)},
 			State: []StateRow{
 				{Kind: 's', Addr: addr(2), Slot: hash32(7), Val: []byte{byte(height), byte(i)}},
 				{Kind: 'a', Addr: addr(2), Val: []byte(fmt.Sprintf("acct-%d-%d", height, i))},
@@ -88,6 +90,10 @@ func TestRoundTrip(t *testing.T) {
 				got, ok, err := db.TxRLP(first + i)
 				if err != nil || !ok || string(got) != want {
 					t.Fatalf("%s: tx %d: %q %v %v", where, first+i, got, ok, err)
+				}
+				fr, ok, err := db.Frames(first + i)
+				if err != nil || !ok || string(fr) != fmt.Sprintf("itx-%d-%d", h, i) {
+					t.Fatalf("%s: itx %d: %q %v %v", where, first+i, fr, ok, err)
 				}
 				rc, ok, err := db.Receipt(first + i)
 				if err != nil || !ok || string(rc) != fmt.Sprintf("rcpt-%d-%d", h, i) {
@@ -135,6 +141,18 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if len(got) != 12 {
 		t.Fatalf("logaddr postings: got %d, want 12", len(got))
+	}
+
+	// The frame participant earns its own role bit in the addr/ family.
+	var bits byte
+	if err := db.Postings(AddrPrefix(addr(4)), 0, 1<<62, func(_ uint64, v byte) bool {
+		bits |= v
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if bits&RoleFrame == 0 {
+		t.Fatalf("addr/ row for a frame participant has role bits %08b, want RoleFrame set", bits)
 	}
 }
 

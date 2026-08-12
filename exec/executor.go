@@ -1078,11 +1078,21 @@ func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) err
 	if err != nil {
 		return fmt.Errorf("encode tx %s: %w", tx.Hash(), err)
 	}
+	// FRAMES ARE TAKEN BEFORE ANYTHING ELSE, and a miss is DEATH. Frames can
+	// never be backfilled by IO, so a block stored without them is a block that
+	// has to be re-executed to ever have them, which is exactly the corpus this
+	// design refuses to produce.
+	frameRec, frameAddrs, ok := frames.take()
+	if !ok {
+		e.dieOnUncapturedTrace(tx.Hash().String())
+	}
 	tw := store.TxWrite{
-		Hash:    tx.Hash().Bytes(),
-		RLP:     raw,
-		Receipt: store.EncodeTxReceipt(r, r.CumulativeGasUsed),
-		State:   e.capture.take(),
+		Hash:       tx.Hash().Bytes(),
+		RLP:        raw,
+		Receipt:    store.EncodeTxReceipt(r, r.CumulativeGasUsed),
+		Frames:     frameRec,
+		FrameAddrs: frameAddrs,
+		State:      e.capture.take(),
 	}
 	// NO ECDSA RECOVERY HERE: ApplyTransaction already recovered the sender and
 	// cached it on the transaction, so this is a field read.
@@ -1110,6 +1120,24 @@ func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) err
 	}
 	e.curBW.Txs = append(e.curBW.Txs, tw)
 	return nil
+}
+
+// dieOnUncapturedTrace is THE FAIL-STOP, and it is the design rather than an
+// accident (DESIGN principles, "traces are stored, and capture failure is
+// death"; user, verbatim: "We can just die... we are going to reach the Fuji
+// C-chain block at a certain height, and we are going to die. And this is
+// okay."). It is reached when a transaction executed without the frame tracer
+// attached, which at this dependency pin means the SAE path: saexec.Execute
+// hardcodes vm.Config{}, so a post-Helicon C-chain block has no tracer seam.
+// The upstream passthrough PR is what unblocks it; until then this death is
+// expected at Fuji C-chain's Helicon activation height and surprises nobody.
+func (e *Executor) dieOnUncapturedTrace(what string) {
+	log.Fatalf("epochdb: exec: block %d (%s): THE CALL TRACE WAS NOT CAPTURED, so this block cannot be stored.\n"+
+		"  Cause at this dependency pin: saexec.Execute hardcodes vm.Config{}, so a post-Helicon C-chain block has no tracer seam.\n"+
+		"  This death is the design, written in advance: see DESIGN.md, the principles section, \"TRACES ARE STORED, AND CAPTURE FAILURE IS DEATH\".\n"+
+		"  Frames can never be backfilled by IO, so storing the block without them would produce exactly the corpus that rule forbids.\n"+
+		"  The fix is the upstream vm.Config/tracer passthrough for saexec; L1s and pre-Helicon blocks capture fine today.",
+		e.curHeader.Number, what)
 }
 
 // runEVM applies the block's upgrades and every transaction onto statedb,

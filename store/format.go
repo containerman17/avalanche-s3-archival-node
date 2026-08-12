@@ -30,6 +30,7 @@ const StorageVersion = 0
 //
 //	blk/<height>   -> first TxNum of the block (8B) + tx count (4B)
 //	hdr/<height>   -> header RLP verbatim
+//	itx/<txnum>    -> the tx's call frames in enter order with depth
 //	pvm/<height>   -> proposervm wrapper bytes verbatim (empty pre-fork)
 //	rcpt/<txnum>   -> receipt + full logs
 //	tx/<txnum>     -> tx RLP verbatim
@@ -57,6 +58,7 @@ const StorageVersion = 0
 const (
 	PrefixBlk  = "blk/"
 	PrefixHdr  = "hdr/"
+	PrefixItx  = "itx/"
 	PrefixPvm  = "pvm/"
 	PrefixRcpt = "rcpt/"
 	PrefixTx   = "tx/"
@@ -76,6 +78,10 @@ const (
 	RoleRecipient byte = 1 << 1
 	RoleCreated   byte = 1 << 2
 	RoleEmitter   byte = 1 << 3
+	// RoleFrame is "this address was a party to a call frame inside the tx",
+	// which is the whole point of storing traces: history of address X stops
+	// being sender/recipient/emitter only.
+	RoleFrame byte = 1 << 4
 )
 
 func beU64(n uint64) []byte {
@@ -93,6 +99,7 @@ func numKey(prefix string, n uint64) []byte {
 // BlkKey ... TxKey are the chain-section keys.
 func BlkKey(height uint64) []byte  { return numKey(PrefixBlk, height) }
 func HdrKey(height uint64) []byte  { return numKey(PrefixHdr, height) }
+func ItxKey(txnum uint64) []byte   { return numKey(PrefixItx, txnum) }
 func PvmKey(height uint64) []byte  { return numKey(PrefixPvm, height) }
 func RcptKey(txnum uint64) []byte  { return numKey(PrefixRcpt, txnum) }
 func TxKey(txnum uint64) []byte    { return numKey(PrefixTx, txnum) }

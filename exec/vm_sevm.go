@@ -223,7 +223,7 @@ func (sevmVM) runEVM(cc chainContext, chainCfg *params.ChainConfig, _ *snow.Cont
 		statedb.SetTxContext(tx.Hash(), txIndex)
 		receipt, err := sevmcore.ApplyTransaction(
 			chainCfg, sc, blockCtx, gp, statedb,
-			header, tx, &usedGas, vm.Config{},
+			header, tx, &usedGas, vm.Config{Tracer: frameTracer()},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("tx %d: %w", txIndex, err)

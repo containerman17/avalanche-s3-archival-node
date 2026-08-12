@@ -442,6 +442,9 @@ func (d *DB) BlockTxRange(height uint64) (first uint64, count uint32, ok bool, e
 // TxRLP returns a transaction's RLP verbatim.
 func (d *DB) TxRLP(txnum uint64) ([]byte, bool, error) { return d.chainRow(famTx, txnum, false) }
 
+// Frames returns a transaction's stored call frames.
+func (d *DB) Frames(txnum uint64) ([]byte, bool, error) { return d.chainRow(famItx, txnum, false) }
+
 // Receipt returns a transaction's stored receipt + full logs.
 func (d *DB) Receipt(txnum uint64) ([]byte, bool, error) { return d.chainRow(famRcpt, txnum, false) }
 

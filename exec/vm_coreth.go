@@ -138,7 +138,7 @@ func (corethVM) runEVM(cc chainContext, chainCfg *params.ChainConfig, snowCtx *s
 		statedb.SetTxContext(tx.Hash(), txIndex)
 		receipt, err := corethcore.ApplyTransaction(
 			chainCfg, cc, blockCtx, gp, statedb,
-			header, tx, &usedGas, vm.Config{},
+			header, tx, &usedGas, vm.Config{Tracer: frameTracer()},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("tx %d: %w", txIndex, err)

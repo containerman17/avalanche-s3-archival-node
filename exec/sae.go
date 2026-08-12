@@ -424,6 +424,10 @@ func receiptLogs(receipts types.Receipts) []*types.Log {
 // row shape as captureTx, minus the per-tx state (see executeSAEBlock).
 func (e *Executor) appendSAETxs(bw *store.BlockWrite, blk *types.Block, receipts types.Receipts) error {
 	txs := blk.Transactions()
+	if len(txs) > 0 {
+		e.curHeader = blk.Header()
+		e.dieOnUncapturedTrace("SAE block, saexec owns the transaction loop")
+	}
 	if len(receipts) != len(txs) {
 		return fmt.Errorf("sae block %d: %d receipts for %d txs", blk.NumberU64(), len(receipts), len(txs))
 	}

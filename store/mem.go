@@ -43,7 +43,7 @@ type memtable struct {
 	started    bool
 
 	// chain rows: one (offset, length) per row, contiguous from base.
-	chain [5]chainIndex
+	chain [6]chainIndex
 
 	// state rows: key prefix -> ascending (txnum, value) inside the window.
 	state map[string][]memVal
@@ -99,17 +99,19 @@ func (c *chainIndex) reset() { c.base, c.set, c.off, c.n = 0, false, c.off[:0], 
 const (
 	famBlk = iota
 	famHdr
+	famItx
 	famPvm
 	famRcpt
 	famTx
 )
 
-var famPrefix = [5]string{PrefixBlk, PrefixHdr, PrefixPvm, PrefixRcpt, PrefixTx}
+var famPrefix = [6]string{PrefixBlk, PrefixHdr, PrefixItx, PrefixPvm, PrefixRcpt, PrefixTx}
 
 // window-log record kinds.
 const (
 	recBlk   = 'B'
 	recHdr   = 'H'
+	recItx   = 'I'
 	recPvm   = 'P'
 	recRcpt  = 'R'
 	recTx    = 'T'
@@ -120,7 +122,7 @@ const (
 	recEnd   = 'E' // end of a block: the only point a torn tail may be cut at
 )
 
-var famRec = [5]byte{recBlk, recHdr, recPvm, recRcpt, recTx}
+var famRec = [6]byte{recBlk, recHdr, recItx, recPvm, recRcpt, recTx}
 
 const recHeader = 1 + 8 + 4 // kind, num, payload length
 
@@ -204,7 +206,7 @@ replay:
 		off = body + uint64(n)
 
 		switch kind {
-		case recBlk, recHdr, recPvm, recRcpt, recTx:
+		case recBlk, recHdr, recItx, recPvm, recRcpt, recTx:
 			fam := 0
 			for i, k := range famRec {
 				if k == kind {
@@ -331,15 +333,21 @@ func stateKeyPrefix(r StateRow) []byte {
 
 // TxWrite is everything one transaction contributes.
 type TxWrite struct {
-	Hash     []byte
-	RLP      []byte
-	Receipt  []byte
-	State    []StateRow
-	Sender   []byte
-	To       []byte // nil for a creation
-	Created  []byte // contract address for a creation
-	LogAddrs [][]byte
-	Topics   [][]byte
+	Hash    []byte
+	RLP     []byte
+	Receipt []byte
+	// Frames is the tx's call frames in enter order with depth, the `itx/`
+	// row. Empty for a transaction that made no nested call, which is a real
+	// answer and not a missing one: FRAMES CAN NEVER BE BACKFILLED BY IO, so
+	// the executor dies rather than store a block it could not trace.
+	Frames     []byte
+	FrameAddrs [][]byte
+	State      []StateRow
+	Sender     []byte
+	To         []byte // nil for a creation
+	Created    []byte // contract address for a creation
+	LogAddrs   [][]byte
+	Topics     [][]byte
 }
 
 // BlockWrite is everything one block contributes, handed over in one call so
@@ -419,6 +427,9 @@ func (m *memtable) add(b *BlockWrite) error {
 	for i := range b.Txs {
 		t := &b.Txs[i]
 		n := first + uint64(i)
+		if err := m.chainRow(famItx, n, t.Frames); err != nil {
+			return err
+		}
 		if err := m.chainRow(famRcpt, n, t.Receipt); err != nil {
 			return err
 		}
@@ -439,6 +450,9 @@ func (m *memtable) add(b *BlockWrite) error {
 		}
 		if len(t.Created) > 0 {
 			roles[string(t.Created)] |= RoleCreated
+		}
+		for _, a := range t.FrameAddrs {
+			roles[string(a)] |= RoleFrame
 		}
 		for _, a := range t.LogAddrs {
 			roles[string(a)] |= RoleEmitter
