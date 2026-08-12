@@ -113,7 +113,7 @@ func verifyRange(db *store.DB, from, to uint64) (blocks, txs uint64, err error) 
 				return blocks, txs, fmt.Errorf("block %d: tx/%d missing", n, first+i)
 			}
 			tx := new(types.Transaction)
-			if err := tx.UnmarshalBinary(raw); err != nil {
+			if err := rlp.DecodeBytes(raw, tx); err != nil {
 				return blocks, txs, fmt.Errorf("block %d: decode tx/%d: %w", n, first+i, err)
 			}
 			list = append(list, tx)

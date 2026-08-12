@@ -59,7 +59,7 @@ func (s *Server) newFilter(params []json.RawMessage) (any, *rpcError) {
 	reg.mu.Lock()
 	reg.m[id] = &filterEntry{
 		kind: 'l', from: from, to: to, addrs: addrs, topics: topics,
-		lastHead: s.hist.Head(),
+		lastHead: s.head(),
 	}
 	reg.mu.Unlock()
 	return id, nil
@@ -69,7 +69,7 @@ func (s *Server) newBlockFilter() (any, *rpcError) {
 	reg := s.filtersReg()
 	id := newFilterID()
 	reg.mu.Lock()
-	reg.m[id] = &filterEntry{kind: 'b', lastHead: s.hist.Head()}
+	reg.m[id] = &filterEntry{kind: 'b', lastHead: s.head()}
 	reg.mu.Unlock()
 	return id, nil
 }
@@ -106,7 +106,7 @@ func (s *Server) getFilterChanges(params []json.RawMessage) (any, *rpcError) {
 		reg.mu.Unlock()
 		return nil, &rpcError{Code: -32000, Message: "filter not found"}
 	}
-	head := s.hist.Head()
+	head := s.head()
 	last := f.lastHead
 	kind, from, to, addrs, topics := f.kind, f.from, f.to, f.addrs, f.topics
 	reg.mu.Unlock()
@@ -166,7 +166,7 @@ func (s *Server) getFilterLogs(params []json.RawMessage) (any, *rpcError) {
 	if !ok || f.kind != 'l' {
 		return nil, &rpcError{Code: -32000, Message: "filter not found"}
 	}
-	return s.runGetLogs(f.from, min(f.to, s.hist.Head()), f.addrs, f.topics)
+	return s.runGetLogs(f.from, min(f.to, s.head()), f.addrs, f.topics)
 }
 
 func (s *Server) uninstallFilter(params []json.RawMessage) (any, *rpcError) {
@@ -208,7 +208,7 @@ func emptyTxPool(method string) any {
 // baseFee mirrors coreth's eth_baseFee: the current base fee. Pre-AP3
 // heads have none; report zero rather than an error.
 func (s *Server) baseFee() (any, *rpcError) {
-	base, rerr := s.baseFeeAt(s.hist.Head())
+	base, rerr := s.baseFeeAt(s.head())
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -218,13 +218,10 @@ func (s *Server) baseFee() (any, *rpcError) {
 	return hexutil.EncodeBig(base), nil
 }
 
-func (s *Server) getHeaderBy(params []json.RawMessage, byHash bool) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, byHash)
+func (s *Server) getHeaderByNumber(params []json.RawMessage) (any, *rpcError) {
+	blk, rerr := s.blockParam(params)
 	if rerr != nil {
 		return nil, rerr
-	}
-	if !ok {
-		return nil, nil
 	}
 	m, rerr := s.marshalHeader(blk)
 	if rerr != nil {
@@ -252,13 +249,10 @@ func (s *Server) rawTxByHash(params []json.RawMessage) (any, *rpcError) {
 	return hexutil.Encode(raw), nil
 }
 
-func (s *Server) rawTxByBlockAndIndex(params []json.RawMessage, byHash bool) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, byHash)
+func (s *Server) rawTxByBlockAndIndex(params []json.RawMessage) (any, *rpcError) {
+	blk, rerr := s.blockParam(params)
 	if rerr != nil {
 		return nil, rerr
-	}
-	if !ok {
-		return nil, nil
 	}
 	if len(params) < 2 {
 		return nil, errInvalid("need [block, index]")

@@ -118,11 +118,10 @@ const tipOverrideHowTo = "cb58, or a 0x-hex eth block hash for pre-ProposerVM bl
 // our own release gates and experiments drive them: `epochdb dev seal ...`,
 // `epochdb dev ab-bench ...`. Flag sets are unchanged.
 var devCommands = map[string]func([]string){
-	"fetch":        fetchMain,
-	"exec":         execMain,
-	"verify":       verifyMain,
-	"ab-bench-rpc": benchRPCMain,
-	"probe":        probeMain,
+	"fetch":  fetchMain,
+	"exec":   execMain,
+	"verify": verifyMain,
+	"probe":  probeMain,
 }
 
 func main() {

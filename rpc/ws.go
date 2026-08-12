@@ -145,7 +145,7 @@ func (w *wsSession) subscribe(params []json.RawMessage) (any, *rpcError) {
 	if err := json.Unmarshal(params[0], &kind); err != nil {
 		return nil, errInvalid("bad subscription kind: %v", err)
 	}
-	sub := &wsSub{kind: kind, last: w.srv.hist.Head()}
+	sub := &wsSub{kind: kind, last: w.srv.head()}
 	switch kind {
 	case "newHeads":
 	case "newPendingTransactions", "newAcceptedTransactions":
@@ -233,7 +233,7 @@ func (w *wsSession) poll(done chan struct{}) {
 // tick delivers one round of notifications. It returns false when the
 // connection is gone and the poller should stop.
 func (w *wsSession) tick() bool {
-	head := w.srv.hist.Head()
+	head := w.srv.head()
 
 	// Snapshot under the lock; the deliveries themselves do disk reads and
 	// must not hold it. The cursor advances AFTER delivery, over the range

@@ -6,8 +6,6 @@ import (
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
-
-	"github.com/containerman17/epochdb/state"
 )
 
 // Direct Go reads for in-process consumers (the read-only SDK). Every one of
@@ -22,9 +20,9 @@ func (e *rpcError) error() error {
 }
 
 // StateAt opens the state at height n with the three serving bands of
-// stateAt: above the executed head is an error, at or above the serving head
-// is the uncooked-tail overlay over the descent, below it is the descent
-// alone. The returned StateDB is single-use and NOT goroutine-safe.
+// stateAt: above the executed head is an error, at or above the stored head is
+// the latest view (re-read per access), below it is the fixed-height view. The
+// returned StateDB is single-use and NOT goroutine-safe.
 func (s *Server) StateAt(n uint64) (*ethstate.StateDB, error) {
 	st, rerr := s.stateAt(n)
 	return st, rerr.error()
@@ -36,54 +34,20 @@ func (s *Server) BlockAt(n uint64) (*types.Block, error) {
 	return blk, rerr.error()
 }
 
-// HeightByHash resolves an eth block hash to its height: the bounded
-// live-tail map first, then the fingerprint index, which since epoch format
-// v6 carries every block hash mapped to that block's own height. There is no
-// whole-history hash map anywhere.
-//
-// A candidate is VERIFIED against the real header, so a fingerprint that
-// belongs to a tx rather than to a block (or to a different block entirely)
-// is rejected at the cost of one header read, exactly like the tx path's
-// container read.
-func (s *Server) HeightByHash(hash common.Hash) (uint64, bool, error) {
-	if n, ok := s.recent.get(hash); ok {
-		return n, true, nil
-	}
-	if s.txidx == nil {
-		return 0, false, errors.New("block hash index not available yet (the node cooks it on its own cadence)")
-	}
-	var (
-		height uint64
-		found  bool
-	)
-	err := s.txidx.WalkCandidates(hash, func(n uint64) (bool, error) {
-		raw, ok, err := s.hist.HeaderRLP(n)
-		if err != nil {
-			return false, err
-		}
-		if !ok || state.BlockHashFromHeaderRLP(raw) != hash {
-			return false, nil
-		}
-		height, found = n, true
-		return true, nil
-	})
-	if err != nil {
-		return 0, false, err
-	}
-	return height, found, nil
+// HeightByHash has no answer in phase 1: storage v0 keeps no block-hash index,
+// and a scan of history is not one.
+func (s *Server) HeightByHash(common.Hash) (uint64, bool, error) {
+	return 0, false, notInPhase1("block by hash").error()
 }
 
 // FindTx resolves a tx hash to its block and index. found=false is a clean
 // "unknown tx".
 func (s *Server) FindTx(hash common.Hash) (blk *types.Block, txIndex int, found bool, err error) {
-	if s.txidx == nil {
-		return nil, 0, false, errors.New("tx index not available yet (the node cooks it on its own cadence)")
-	}
 	return s.findTx(hash)
 }
 
-// BlockReceipts reconstructs every receipt of blk from the stored sections
-// (sealed epoch or live tail capture, one encoding, no re-execution).
+// BlockReceipts reconstructs every receipt of blk from its stored per-tx
+// receipt rows (no re-execution).
 func (s *Server) BlockReceipts(blk *types.Block) (types.Receipts, error) {
 	rs, rerr := s.storedBlockReceipts(blk)
 	return rs, rerr.error()
@@ -93,9 +57,6 @@ func (s *Server) BlockReceipts(blk *types.Block) (types.Receipts, error) {
 // stored log sections. Range bounds are the caller's to keep sane; the JSON
 // path caps them at GetLogsMaxRange.
 func (s *Server) GetLogs(from, to uint64, addrs []common.Address, topics [][]common.Hash) ([]*types.Log, error) {
-	if s.blocks == nil {
-		return nil, errors.New("block source not available")
-	}
 	logs, rerr := s.runGetLogs(from, to, addrs, topics)
 	return logs, rerr.error()
 }

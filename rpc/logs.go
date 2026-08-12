@@ -8,7 +8,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 
-	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/store"
 )
 
 // GetLogsMaxRange caps eth_getLogs to this many blocks per query.
@@ -22,10 +22,10 @@ type logsFilter struct {
 	BlockHash *common.Hash      `json:"blockHash"`
 }
 
-// getLogs: posting-list candidates (sealed epochs) -> stored-logs sections
+// getLogs: posting-list candidates -> the blocks' stored per-tx receipt rows
 // -> exact positional filter. The posting lists are position-agnostic by
-// design, so they only ever produce a candidate superset; the stored
-// sections provide ground truth. Never re-executes.
+// design, so they only ever produce a candidate superset; the receipt rows
+// provide ground truth. Never re-executes.
 func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 	if len(params) < 1 {
 		return nil, errInvalid("need [filter]")
@@ -35,7 +35,10 @@ func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 		return nil, errInvalid("bad filter: %v", err)
 	}
 	if f.BlockHash != nil {
-		return s.getLogsAtHash(&f)
+		// The blockHash form needs a hash index, which storage v0 has none of.
+		// An empty array here would say "that block has no matching logs",
+		// which is a different answer and a wrong one.
+		return nil, notInPhase1("eth_getLogs with blockHash")
 	}
 	from, to, addrs, topics, rerr := s.parseFilterCriteria(&f)
 	if rerr != nil {
@@ -44,42 +47,11 @@ func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 	return s.runGetLogs(from, to, addrs, topics)
 }
 
-// getLogsAtHash is the blockHash filter form: the logs of EXACTLY one block,
-// addresses and topics applying exactly as they do on the range form. The
-// 10k-block range cap is irrelevant here by construction.
-//
-// AN UNKNOWN HASH IS AN ERROR NAMING IT, never an empty array: `[]` says "that
-// block has no matching logs", which is a different answer and a wrong one.
-func (s *Server) getLogsAtHash(f *logsFilter) (any, *rpcError) {
-	if hasBound(f.FromBlock) || hasBound(f.ToBlock) {
-		return nil, errInvalid("blockHash is mutually exclusive with fromBlock/toBlock")
-	}
-	n, ok, err := s.HeightByHash(*f.BlockHash)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
-	}
-	if !ok {
-		return nil, &rpcError{Code: -32000, Message: "unknown block hash " + f.BlockHash.Hex()}
-	}
-	addrs, topics, rerr := parseLogMatchers(f)
-	if rerr != nil {
-		return nil, rerr
-	}
-	if n == 0 {
-		return []*types.Log{}, nil // genesis: no transactions, so no logs record
-	}
-	return s.runGetLogs(n, n, addrs, topics)
-}
-
-// hasBound reads a range bound: an absent key and an explicit JSON null both
-// mean "no bound", which is how geth's own filter decoder reads them.
-func hasBound(raw json.RawMessage) bool { return len(raw) > 0 && string(raw) != "null" }
-
 // parseFilterCriteria resolves and validates a logs filter object, shared
 // between eth_getLogs and the filter API.
 func (s *Server) parseFilterCriteria(f *logsFilter) (from, to uint64, addrs []common.Address, topics [][]common.Hash, _ *rpcError) {
 	// A STORED filter is a moving range, so a single fixed block has no
-	// meaning here; eth_getLogs serves that form directly (getLogsAtHash).
+	// meaning here.
 	if f.BlockHash != nil {
 		return 0, 0, nil, nil, errInvalid("blockHash filter is for eth_getLogs, not for a stored filter over a range")
 	}
@@ -166,60 +138,24 @@ func (s *Server) runGetLogs(from, to uint64, addrs []common.Address, topics [][]
 }
 
 // logsOfBlock is every stored log of block n, fully addressed (tx hash, block
-// hash, positional indexes), with no filter applied. It is the one place the
-// stored-logs sections are turned into types.Log, shared by eth_getLogs and
-// the /sql logs table.
+// hash, positional indexes), with no filter applied. The addressing (block
+// hash, tx hash, block-wide log index) is exactly what storedBlockReceipts
+// derives, so there is ONE place that turns rcpt/ rows into types.Log.
 func (s *Server) logsOfBlock(n uint64) ([]*types.Log, *rpcError) {
-	// Sealed epoch below, live capture above: one encoding, so the tail
-	// answers with the same full log payloads as a sealed epoch does.
-	var rec []byte
-	if e, inEpoch := s.hist.Epochs().At(n); inEpoch {
-		var err error
-		rec, _, err = e.StoredLogsRecord(n)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-	} else {
-		logsRec, _, ok, err := s.hist.StoredTail(n)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		if !ok {
-			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
-				"no stored logs for block %d: it is not in a sealed epoch and this node captured none (it never executed that block)", n)}
-		}
-		rec = logsRec
+	blk, rerr := s.blockAt(n)
+	if rerr != nil {
+		return nil, rerr
 	}
-	if len(rec) == 0 {
+	if len(blk.Transactions()) == 0 {
 		return nil, nil
 	}
-	stored, err := state.DecodeStoredLogs(rec)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	receipts, rerr := s.storedBlockReceipts(blk)
+	if rerr != nil {
+		return nil, rerr
 	}
-	// txHash/blockHash are derived from the block body at read time.
-	raw, ok, err := s.blocks.GetByHeight(n)
-	if err != nil || !ok {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("container %d: ok=%v err=%v", n, ok, err)}
-	}
-	blk, err := s.parse(raw)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
-	}
-	blockHash := blk.Hash()
-	txs := blk.Transactions()
-	out := make([]*types.Log, 0, len(stored))
-	for pos, sl := range stored {
-		out = append(out, &types.Log{
-			Address:     sl.Address,
-			Topics:      sl.Topics,
-			Data:        sl.Data,
-			BlockNumber: n,
-			TxHash:      txs[sl.TxIndex].Hash(),
-			TxIndex:     sl.TxIndex,
-			BlockHash:   blockHash,
-			Index:       uint(pos),
-		})
+	var out []*types.Log
+	for _, r := range receipts {
+		out = append(out, r.Logs...)
 	}
 	return out, nil
 }
@@ -255,92 +191,27 @@ func logMatches(l *types.Log, addrs []common.Address, topics [][]common.Hash) bo
 	return true
 }
 
-// logCandidates returns the ascending candidate block set: epoch posting
-// lists for the sealed range, raw logs-record scan for the tail. With no
-// filters at all, every block in the sealed range is a candidate (the
-// posting lists cannot enumerate "any log"; re-execution skips empty
-// blocks fast). ponytail: wildcard queries re-execute the whole range,
-// bounded by GetLogsMaxRange; add an any-log block list section if that
-// ever matters.
+// logCandidates returns the ascending candidate block set for [from, to],
+// driven by the lookup postings: union over the addresses, union per topic
+// position, then INTERSECT, all in TxNum space, and the surviving TxNums map
+// back to their blocks. The postings are position-agnostic, so this is a
+// superset and runGetLogs applies the exact filter.
+//
+// A filter with NO address and NO topics has no posting list to drive it, so
+// every block of the range is a candidate. That scan is bounded by
+// GetLogsMaxRange.
 func (s *Server) logCandidates(from, to uint64, addrs []common.Address, topics [][]common.Hash) ([]uint64, *rpcError) {
-	inSet := map[uint64]bool{}
-	epochs := s.hist.Epochs()
-	if err := epochs.RequireCovered(from); err != nil {
-		return nil, coverageError(err)
-	}
-	if err := epochs.RequireCovered(to); err != nil {
-		return nil, coverageError(err)
-	}
-	sealedEnd := uint64(0)
-	if end, ok := epochs.SealedEnd(); ok {
-		sealedEnd = end
+	loTx, hiTx, rerr := s.txRangeOf(from, to)
+	if rerr != nil {
+		return nil, rerr
 	}
 
-	// sealed portion via posting lists
-	for _, e := range epochs.All() {
-		lo, hi := max(from, e.Start), min(to, e.End())
-		if lo > hi {
-			continue
-		}
-		blocks, err := epochLogCandidates(e, lo, hi, addrs, topics)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		for _, b := range blocks {
-			inSet[b] = true
-		}
-	}
-
-	// unsealed tail via the hot-tail log index, which covers everything up to
-	// the logs family's max block; above that (the handful of blocks the
-	// executor appended since) the per-block records answer, as they always did.
-	tailFrom := max(from, sealedEnd+1)
-	if tailFrom <= to {
-		blocks, covered, matched, err := s.hist.TailLogCandidates(tailFrom, to, addrBytes(addrs), topicBytes(topics))
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		if matched {
-			for _, b := range blocks {
-				inSet[b] = true
-			}
-			tailFrom = max(tailFrom, covered+1)
-		}
-		for n := tailFrom; n <= to; n++ {
-			rec, ok, err := s.hist.LogTuples(n)
-			if err != nil {
-				return nil, &rpcError{Code: -32000, Message: err.Error()}
-			}
-			if !ok {
-				continue // no logs in this block
-			}
-			if recMatches(rec, addrs, topics) {
-				inSet[n] = true
-			}
-		}
-	}
-
-	out := make([]uint64, 0, len(inSet))
-	for b := range inSet {
-		out = append(out, b)
-	}
-	sortUint64(out)
-	return out, nil
-}
-
-// epochLogCandidates intersects the epoch's position-agnostic posting
-// lists: union over addresses AND union per topic position.
-func epochLogCandidates(e *state.Epoch, lo, hi uint64, addrs []common.Address, topics [][]common.Hash) ([]uint64, error) {
 	var sets []map[uint64]bool
 	if len(addrs) > 0 {
 		set := map[uint64]bool{}
 		for _, a := range addrs {
-			blocks, err := e.LogAddrBlocks([20]byte(a))
-			if err != nil {
-				return nil, err
-			}
-			for _, b := range blocks {
-				set[b] = true
+			if rerr := s.collectPostings(store.LogAddrPrefix(a[:]), loTx, hiTx, set); rerr != nil {
+				return nil, rerr
 			}
 		}
 		sets = append(sets, set)
@@ -351,108 +222,81 @@ func epochLogCandidates(e *state.Epoch, lo, hi uint64, addrs []common.Address, t
 		}
 		set := map[uint64]bool{}
 		for _, t := range want {
-			blocks, err := e.LogTopicBlocks([32]byte(t))
-			if err != nil {
-				return nil, err
-			}
-			for _, b := range blocks {
-				set[b] = true
+			if rerr := s.collectPostings(store.TopicPrefix(t[:]), loTx, hiTx, set); rerr != nil {
+				return nil, rerr
 			}
 		}
 		sets = append(sets, set)
 	}
-	var out []uint64
+
 	if len(sets) == 0 {
-		for b := lo; b <= hi; b++ { // wildcard: whole clipped range
-			out = append(out, b)
+		out := make([]uint64, 0, to-from+1)
+		for n := from; n <= to; n++ {
+			out = append(out, n)
 		}
 		return out, nil
 	}
-	// intersect, smallest set drives
+
+	// Intersect, smallest set drives.
 	smallest := sets[0]
-	for _, s := range sets[1:] {
-		if len(s) < len(smallest) {
-			smallest = s
+	for _, set := range sets[1:] {
+		if len(set) < len(smallest) {
+			smallest = set
 		}
 	}
-	for b := range smallest {
-		if b < lo || b > hi {
+	inSet := map[uint64]bool{}
+	for txnum := range smallest {
+		all := true
+		for _, set := range sets {
+			all = all && set[txnum]
+		}
+		if !all {
 			continue
 		}
-		all := true
-		for _, s := range sets {
-			all = all && s[b]
+		n, ok, err := s.db.HeightOfTx(txnum)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
-		if all {
-			out = append(out, b)
+		if ok && n >= from && n <= to {
+			inSet[n] = true
 		}
 	}
+	out := make([]uint64, 0, len(inSet))
+	for b := range inSet {
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
 }
 
-// recMatches applies the position-agnostic superset test to a raw logs
-// record (any requested address present AND, per topic position, any of
-// its values present anywhere).
-func recMatches(rec state.LogRec, addrs []common.Address, topics [][]common.Hash) bool {
-	if len(addrs) > 0 {
-		ok := false
-		for _, a := range addrs {
-			for _, ra := range rec.Addrs {
-				ok = ok || ra == [20]byte(a)
-			}
-		}
-		if !ok {
-			return false
-		}
+// collectPostings adds every TxNum under prefix in [loTx, hiTx] to set.
+func (s *Server) collectPostings(prefix []byte, loTx, hiTx uint64, set map[uint64]bool) *rpcError {
+	if err := s.db.Postings(prefix, loTx, hiTx, func(txnum uint64, _ byte) bool {
+		set[txnum] = true
+		return true
+	}); err != nil {
+		return &rpcError{Code: -32000, Message: err.Error()}
 	}
-	for _, want := range topics {
-		if want == nil {
-			continue
-		}
-		ok := false
-		for _, t := range want {
-			for _, rt := range rec.Topics {
-				ok = ok || rt == [32]byte(t)
-			}
-		}
-		if !ok {
-			return false
-		}
-	}
-	return true
+	return nil
 }
 
-// addrBytes/topicBytes drop common.Address/common.Hash for the raw arrays the
-// state package's index keys on. A nil topic position stays nil (wildcard).
-func addrBytes(addrs []common.Address) [][20]byte {
-	if len(addrs) == 0 {
-		return nil
+// txRangeOf converts a block range into the TxNum range the postings live in.
+// A block with no transactions reports the TxNum it WOULD have started at, so
+// an empty range comes back as hiTx < loTx and matches nothing.
+func (s *Server) txRangeOf(from, to uint64) (loTx, hiTx uint64, _ *rpcError) {
+	loTx, _, ok, err := s.db.BlockTxRange(from)
+	if err != nil || !ok {
+		return 0, 0, &rpcError{Code: -32000, Message: fmt.Sprintf("tx range of block %d: ok=%v err=%v", from, ok, err)}
 	}
-	out := make([][20]byte, len(addrs))
-	for i, a := range addrs {
-		out[i] = a
+	first, count, ok, err := s.db.BlockTxRange(to)
+	if err != nil || !ok {
+		return 0, 0, &rpcError{Code: -32000, Message: fmt.Sprintf("tx range of block %d: ok=%v err=%v", to, ok, err)}
 	}
-	return out
-}
-
-func topicBytes(topics [][]common.Hash) [][][32]byte {
-	if len(topics) == 0 {
-		return nil
-	}
-	out := make([][][32]byte, len(topics))
-	for i, want := range topics {
-		if want == nil {
-			continue
+	if count == 0 {
+		if first == 0 {
+			return 1, 0, nil // nothing at all below the range
 		}
-		pos := make([][32]byte, len(want))
-		for j, t := range want {
-			pos[j] = t
-		}
-		out[i] = pos
+		return loTx, first - 1, nil
 	}
-	return out
-}
-
-func sortUint64(v []uint64) {
-	sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
+	return loTx, first + uint64(count) - 1, nil
 }

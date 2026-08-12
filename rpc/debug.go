@@ -16,6 +16,8 @@ import (
 
 	// Register the native tracers (callTracer, prestateTracer, ...).
 	_ "github.com/ava-labs/libevm/eth/tracers/native"
+
+	"github.com/containerman17/epochdb/store"
 )
 
 // traceConfig mirrors geth's TraceConfig: struct-logger options inline,
@@ -57,17 +59,17 @@ func parseTraceConfig(params []json.RawMessage, idx int) (*traceConfig, *rpcErro
 func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig) ([]json.RawMessage, *rpcError) {
 	header := blk.Header()
 	n := blk.NumberU64()
-	if n == 0 || n > s.hist.Head() {
-		return nil, errInvalid("block %d not traceable (head %d)", n, s.hist.Head())
+	if n == 0 || n > s.head() {
+		return nil, errInvalid("block %d not traceable (head %d)", n, s.head())
 	}
 	if rerr := s.setExecBaseFee(header); rerr != nil {
 		return nil, rerr
 	}
-	// The parent state through the SAME band selection eth_call uses: the
-	// descent alone (hist.StateAt) answers zeroed accounts above the cooked
-	// watermark, so a trace on a following node used to come back as a
-	// complete, plausible, entirely fictional trace over the whole cook
-	// window. stateAt refuses instead, and says cook lag.
+	// The parent state through the SAME band selection eth_call uses: a
+	// fixed-height view (db.StateAt) of a height the executor has not reached
+	// answers zeroed accounts, so a trace on a following node used to come back
+	// as a complete, plausible, entirely fictional trace. stateAt refuses
+	// instead, and names the executed head.
 	statedb, rerr := s.stateAt(n - 1)
 	if rerr != nil {
 		return nil, rerr
@@ -147,9 +149,6 @@ func (s *Server) traceTxsInBlock(blk *types.Block, target int, cfg *traceConfig)
 }
 
 func (s *Server) debugTraceTransaction(params []json.RawMessage) (any, *rpcError) {
-	if s.txidx == nil {
-		return nil, &rpcError{Code: -32000, Message: "tx index not available yet (the node cooks it on its own cadence)"}
-	}
 	hash, rerr := txHashParam(params)
 	if rerr != nil {
 		return nil, rerr
@@ -179,13 +178,10 @@ type txTraceResult struct {
 	Error  string          `json:"error,omitempty"`
 }
 
-func (s *Server) debugTraceBlock(params []json.RawMessage, byHash bool) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, byHash)
+func (s *Server) debugTraceBlock(params []json.RawMessage) (any, *rpcError) {
+	blk, rerr := s.blockParam(params)
 	if rerr != nil {
 		return nil, rerr
-	}
-	if !ok {
-		return nil, &rpcError{Code: -32000, Message: "block not found"}
 	}
 	cfg, rerr := parseTraceConfig(params, 1)
 	if rerr != nil {
@@ -204,34 +200,61 @@ func (s *Server) debugTraceBlock(params []json.RawMessage, byHash bool) (any, *r
 
 // --- raw getters -------------------------------------------------------------
 
+// debugGetRawBlock hands back the VERBATIM container bytes the block was
+// fetched as, reassembled from the pieces the store keeps (DESIGN's container
+// reassembly). The tx/ rows are MarshalBinary, while a container's tx list
+// holds each tx as an RLP value, so the transactions are re-encoded into that
+// form here; both are the same bytes for a legacy tx.
 func (s *Server) debugGetRawBlock(params []json.RawMessage) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, false)
-	if rerr != nil || !ok {
+	if len(params) < 1 {
+		return nil, errInvalid("need [blockTag]")
+	}
+	n, rerr := s.blockNumber(params[0])
+	if rerr != nil {
 		return nil, rerr
 	}
-	raw, err := rlp.EncodeToBytes(blk)
+	headerRLP, ok, err := s.db.HeaderRLP(n)
+	if err != nil || !ok {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d: ok=%v err=%v", n, ok, err)}
+	}
+	pvm, _, err := s.db.Pvm(n)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	txs, err := s.blockTxs(n)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	txRLPs := make([][]byte, len(txs))
+	for i, tx := range txs {
+		if txRLPs[i], err = rlp.EncodeToBytes(tx); err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+	}
+	raw, err := store.Reassemble(pvm, headerRLP, txRLPs)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	return hexutil.Bytes(raw), nil
 }
 
+// debugGetRawHeader is the stored header row, verbatim.
 func (s *Server) debugGetRawHeader(params []json.RawMessage) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, false)
-	if rerr != nil || !ok {
+	if len(params) < 1 {
+		return nil, errInvalid("need [blockTag]")
+	}
+	n, rerr := s.blockNumber(params[0])
+	if rerr != nil {
 		return nil, rerr
 	}
-	raw, err := rlp.EncodeToBytes(blk.Header())
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	raw, ok, err := s.db.HeaderRLP(n)
+	if err != nil || !ok {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d: ok=%v err=%v", n, ok, err)}
 	}
 	return hexutil.Bytes(raw), nil
 }
 
 func (s *Server) debugGetRawTransaction(params []json.RawMessage) (any, *rpcError) {
-	if s.txidx == nil {
-		return nil, &rpcError{Code: -32000, Message: "tx index not available yet (the node cooks it on its own cadence)"}
-	}
 	hash, rerr := txHashParam(params)
 	if rerr != nil {
 		return nil, rerr
@@ -251,8 +274,8 @@ func (s *Server) debugGetRawTransaction(params []json.RawMessage) (any, *rpcErro
 }
 
 func (s *Server) debugGetRawReceipts(params []json.RawMessage) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, false)
-	if rerr != nil || !ok {
+	blk, rerr := s.blockParam(params)
+	if rerr != nil {
 		return nil, rerr
 	}
 	if blk.NumberU64() == 0 || len(blk.Transactions()) == 0 {
@@ -264,7 +287,7 @@ func (s *Server) debugGetRawReceipts(params []json.RawMessage) (any, *rpcError) 
 	if rerr != nil {
 		return nil, rerr
 	}
-	receipts, err := ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk, base)
+	receipts, err := ReExecuteBlock(s.db, s.genesis, s.chainCtx, s.chainCfg, blk, base)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
@@ -327,86 +350,18 @@ func (s *Server) debugTraceCall(params []json.RawMessage) (any, *rpcError) {
 	return res, nil
 }
 
-// --- debug_getModifiedAccountsByNumber / ByHash --------------------------------
-
-// modifiedAccountsBlock resolves one parameter of the method: a plain JSON
-// number (geth's signature), a hex/named tag, or a block hash.
-func (s *Server) modifiedAccountsBlock(raw json.RawMessage, byHash bool) (uint64, *rpcError) {
-	if byHash {
-		n, ok, rerr := s.heightByHash(raw)
-		if rerr != nil {
-			return 0, rerr
-		}
-		if !ok {
-			return 0, &rpcError{Code: -32000, Message: "block not found"}
-		}
-		return n, nil
-	}
+// blockNumberParam resolves a block parameter that geth spells as a plain JSON
+// number (debug_printBlock, debug_getAccessibleState), accepting a hex or
+// named tag too.
+func (s *Server) blockNumberParam(raw json.RawMessage) (uint64, *rpcError) {
 	var num uint64
 	if err := json.Unmarshal(raw, &num); err == nil {
-		if num > s.hist.Head() {
-			return 0, errInvalid("block %d beyond head %d", num, s.hist.Head())
+		if num > s.head() {
+			return 0, errInvalid("block %d beyond head %d", num, s.head())
 		}
 		return num, nil
 	}
 	return s.blockNumber(raw)
-}
-
-// debugGetModifiedAccounts serves debug_getModifiedAccountsByNumber/ByHash
-// from the per-block write capture, at ANY height. One param: accounts
-// modified in that block. Two params: union over (start, end] (geth diffs
-// the two tries instead, so a value rewritten to its original across
-// blocks still counts here; addresses come in capture order, not hash
-// order).
-func (s *Server) debugGetModifiedAccounts(params []json.RawMessage, byHash bool) (any, *rpcError) {
-	if len(params) < 1 {
-		return nil, errInvalid("need [startBlock, endBlock?]")
-	}
-	start, rerr := s.modifiedAccountsBlock(params[0], byHash)
-	if rerr != nil {
-		return nil, rerr
-	}
-	lo, hi := start, start
-	if len(params) > 1 && string(params[1]) != "null" {
-		end, rerr := s.modifiedAccountsBlock(params[1], byHash)
-		if rerr != nil {
-			return nil, rerr
-		}
-		if end <= start {
-			return nil, errInvalid("end block %d must be after start block %d", end, start)
-		}
-		lo, hi = start+1, end
-	}
-	if hi-lo+1 > GetLogsMaxRange {
-		return nil, errInvalid("block range %d exceeds %d", hi-lo+1, GetLogsMaxRange)
-	}
-	seen := map[common.Address]bool{}
-	out := []common.Address{}
-	for n := lo; n <= hi; n++ {
-		addrs, ok, err := s.hist.ModifiedAccounts(n)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		if !ok {
-			// No frame: fine for an empty block, an error if txs ran
-			// (write capture absent, e.g. an epoch-only node).
-			blk, rerr := s.blockAt(n)
-			if rerr != nil {
-				return nil, rerr
-			}
-			if len(blk.Transactions()) > 0 {
-				return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("write capture missing for block %d (raw writelog absent on this node)", n)}
-			}
-			continue
-		}
-		for _, a := range addrs {
-			if !seen[a] {
-				seen[a] = true
-				out = append(out, a)
-			}
-		}
-	}
-	return out, nil
 }
 
 // --- eth_createAccessList -----------------------------------------------------

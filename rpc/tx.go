@@ -13,87 +13,36 @@ import (
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/params"
 
-	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/store"
 )
 
-// BlockSource yields raw containers by height (a fetch.Reader, an epoch
-// set, or a composition of both).
-type BlockSource interface {
-	GetByHeight(n uint64) ([]byte, bool, error)
-}
-
-// SealedBlocks serves containers from sealed epochs first, raw staging as
-// the fallback for the unsealed tail.
-type SealedBlocks struct {
-	Epochs *state.EpochSet
-	Blocks BlockSource // fetch.Reader (read-only opener) or the live fetch.Store
-}
-
-func (s SealedBlocks) GetByHeight(n uint64) ([]byte, bool, error) {
-	if raw, ok, err := s.Epochs.GetByHeight(n); ok || err != nil {
-		return raw, ok, err
-	}
-	return s.Blocks.GetByHeight(n)
-}
-
-// TxCandidateSource walks the candidate block heights for a tx hash, newest
-// first, stopping when the callback says it found the tx (state.TxIndex or
-// state.CombinedTxIndex). It is a walk rather than a list so an unknown hash
-// (every wallet polling its own still-pending tx) is rejected by the per-epoch
-// tx blooms without loading any epoch's tx index, and a known one stops at the
-// first epoch that answers instead of probing all of history.
-type TxCandidateSource interface {
-	WalkCandidates(hash common.Hash, fn func(blk uint64) (bool, error)) error
-}
-
-// ContainerParser decodes a raw container into an eth block (exec.ParseEthBlock).
-type ContainerParser func([]byte) (*types.Block, error)
-
-// EnableTxAPIs wires the tx-hash index, the container source, and the
-// container parser into the server, enabling eth_getTransactionByHash and
-// eth_getTransactionReceipt.
-func (s *Server) EnableTxAPIs(idx TxCandidateSource, blocks BlockSource, parse ContainerParser) {
-	s.txidx, s.blocks, s.parse = idx, blocks, parse
-}
-
-// coverageError maps a state coverage failure (a mid-set hole) to a
-// JSON-RPC error.
-func coverageError(err error) *rpcError {
-	return &rpcError{Code: -32000, Message: err.Error()}
-}
-
-// findTx resolves a tx hash through the fingerprint index and verifies the
-// candidates against the actual blocks. found=false is a clean "unknown tx".
+// findTx resolves a tx hash to its block and its index in that block. It is
+// ONE lookup row (txh/ -> TxNum) plus the block the TxNum falls in: there is
+// no candidate walk and no bloom holder any more. found=false is a clean
+// "unknown tx".
 func (s *Server) findTx(hash common.Hash) (blk *types.Block, txIndex int, found bool, err error) {
-	err = s.txidx.WalkCandidates(hash, func(h uint64) (bool, error) {
-		raw, ok, err := s.blocks.GetByHeight(h)
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			// The index put a candidate HERE and the container cannot be
-			// read (a missing epoch, raw retired below a gap). "Not found"
-			// would be indistinguishable from an unknown tx, and the
-			// receipt path's coverage refusal never runs on that answer, so
-			// stop the walk with the truth instead.
-			return false, fmt.Errorf("container %d is a candidate for %s but is not readable on this node", h, hash)
-		}
-		b, err := s.parse(raw)
-		if err != nil {
-			return false, fmt.Errorf("parse container %d: %w", h, err)
-		}
-		for i, tx := range b.Transactions() {
-			if tx.Hash() == hash {
-				blk, txIndex, found = b, i, true
-				return true, nil
-			}
-		}
-		return false, nil
-	})
+	txnum, ok, err := s.db.TxNumByHash(hash[:])
+	if err != nil || !ok {
+		return nil, 0, false, err
+	}
+	n, ok, err := s.db.HeightOfTx(txnum)
 	if err != nil {
 		return nil, 0, false, err
 	}
-	return blk, txIndex, found, nil
+	if !ok {
+		return nil, 0, false, fmt.Errorf("tx %s is stored at TxNum %d, which is in no block", hash, txnum)
+	}
+	first, count, ok, err := s.db.BlockTxRange(n)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !ok || txnum < first || txnum >= first+uint64(count) {
+		return nil, 0, false, fmt.Errorf("tx %s at TxNum %d is outside block %d's range", hash, txnum, n)
+	}
+	if blk, err = s.blockByNumber(n); err != nil {
+		return nil, 0, false, err
+	}
+	return blk, int(txnum - first), true, nil
 }
 
 func txHashParam(params []json.RawMessage) (common.Hash, *rpcError) {
@@ -144,9 +93,6 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 		return nil, nil
 	}
 	n := blk.NumberU64()
-	if err := s.hist.Epochs().RequireCovered(n); err != nil {
-		return nil, coverageError(err)
-	}
 	header := blk.Header()
 	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
 	receipts, rerr := s.storedBlockReceipts(blk)
@@ -160,52 +106,38 @@ func (s *Server) getTransactionReceipt(params []json.RawMessage) (any, *rpcError
 	return out, nil
 }
 
-// storedSections returns block n's receipt-fields and full-logs records: from
-// the sealed epoch when n is in one, otherwise from the live tail capture the
-// executor writes per block (same encoding, so this is one branch and no
-// re-execution anywhere). A node that never executed AND never sealed n has
-// neither, which is a clean error.
-func (s *Server) storedSections(n uint64) (rcptRec, logsRec []byte, _ *rpcError) {
-	if e, ok := s.hist.Epochs().At(n); ok {
-		rcptRec, ok, err := e.StoredRcptRecord(n)
-		if err != nil {
-			return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("read stored receipts for block %d: %v", n, err)}
-		}
-		if !ok {
-			return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("block %d has no stored receipts in epoch %s", n, e.Hash)}
-		}
-		logsRec, _, err := e.StoredLogsRecord(n)
-		if err != nil {
-			return nil, nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		return rcptRec, logsRec, nil
-	}
-	logsRec, rcptRec, ok, err := s.hist.StoredTail(n)
+// storedReceipt decodes the rcpt/<txnum> row of one transaction. THE ROW IS
+// PER TRANSACTION in storage v0, so there is no block-level record to split.
+func (s *Server) storedReceipt(txnum uint64) (status, gasUsed, cumulative uint64, logs []store.StoredLog, _ *rpcError) {
+	rec, ok, err := s.db.Receipt(txnum)
 	if err != nil {
-		return nil, nil, &rpcError{Code: -32000, Message: err.Error()}
+		return 0, 0, 0, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("read receipt of tx %d: %v", txnum, err)}
 	}
 	if !ok {
-		return nil, nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
-			"no stored receipts for block %d: it is not in a sealed epoch and this node captured none (it never executed that block)", n)}
+		return 0, 0, 0, nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
+			"tx %d has no stored receipt: this node never executed it", txnum)}
 	}
-	return rcptRec, logsRec, nil
+	status, gasUsed, cumulative, logs, err = store.DecodeTxReceipt(rec)
+	if err != nil {
+		return 0, 0, 0, nil, &rpcError{Code: -32000, Message: fmt.Sprintf("decode receipt of tx %d: %v", txnum, err)}
+	}
+	return status, gasUsed, cumulative, logs, nil
 }
 
-// storedBlockReceipts reconstructs every receipt of blk from the stored
-// sections (the ONLY receipt source, no re-execution): gasUsed / status /
-// cumulative from the receipt-fields record, logs from the stored-logs
-// record, everything else derived from the txs themselves. Serves the sealed
-// range and the unsealed tail alike.
+// storedBlockReceipts reconstructs every receipt of blk from its per-tx rcpt/
+// rows (the ONLY receipt source, no re-execution): status / gasUsed /
+// cumulative and the full logs come out of the row, everything else is derived
+// from the txs themselves.
 func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcError) {
 	n := blk.NumberU64()
-	rcptRec, logsRec, rerr := s.storedSections(n)
-	if rerr != nil {
-		return nil, rerr
-	}
 	txs := blk.Transactions()
-	entries, err := state.DecodeStoredReceipts(rcptRec)
-	if err != nil || len(entries) != len(txs) {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("stored receipts decode for block %d: %d entries for %d txs: %v", n, len(entries), len(txs), err)}
+	first, count, ok, err := s.db.BlockTxRange(n)
+	if err != nil {
+		return nil, &rpcError{Code: -32000, Message: err.Error()}
+	}
+	if !ok || int(count) != len(txs) {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
+			"block %d holds %d transactions but its tx range covers %d (stored=%v)", n, len(txs), count, ok)}
 	}
 	header := blk.Header()
 	base, rerr := s.headerBaseFee(header)
@@ -215,12 +147,17 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 	signer := types.MakeSigner(s.chainCfg, header.Number, header.Time)
 	blockHash := blk.Hash()
 	receipts := make(types.Receipts, len(txs))
+	logIndex := uint(0) // logIndex is block-wide, so it runs across the txs
 	for i, tx := range txs {
+		status, gasUsed, cumulative, logs, rerr := s.storedReceipt(first + uint64(i))
+		if rerr != nil {
+			return nil, rerr
+		}
 		r := &types.Receipt{
 			Type:              tx.Type(),
-			Status:            entries[i].Status,
-			CumulativeGasUsed: entries[i].CumulativeGas,
-			GasUsed:           entries[i].GasUsed,
+			Status:            status,
+			CumulativeGasUsed: cumulative,
+			GasUsed:           gasUsed,
 			TxHash:            tx.Hash(),
 			EffectiveGasPrice: effectiveGasPrice(tx, base),
 			Logs:              []*types.Log{},
@@ -234,29 +171,21 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 			}
 			r.ContractAddress = crypto.CreateAddress(from, tx.Nonce())
 		}
-		receipts[i] = r
-	}
-	if len(logsRec) > 0 {
-		stored, err := state.DecodeStoredLogs(logsRec)
-		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
-		}
-		for pos, sl := range stored {
-			r := receipts[sl.TxIndex]
+		for _, sl := range logs {
 			r.Logs = append(r.Logs, &types.Log{
 				Address:     sl.Address,
 				Topics:      sl.Topics,
 				Data:        sl.Data,
 				BlockNumber: n,
 				TxHash:      r.TxHash,
-				TxIndex:     sl.TxIndex,
+				TxIndex:     uint(i),
 				BlockHash:   blockHash,
-				Index:       uint(pos),
+				Index:       logIndex,
 			})
+			logIndex++
 		}
-	}
-	for _, r := range receipts {
 		r.Bloom = types.CreateBloom(types.Receipts{r})
+		receipts[i] = r
 	}
 	return receipts, nil
 }
@@ -275,13 +204,13 @@ func (s *Server) storedBlockReceipts(blk *types.Block) (types.Receipts, *rpcErro
 // from what really executed. It is the same substitution saexec.Execute makes
 // on its own header copy; blk.Header() is a copy, so the block is untouched.
 // nil means "the header's own", which is right everywhere below the boundary.
-func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params.ChainConfig, blk *types.Block, baseFee *big.Int) (types.Receipts, error) {
+func ReExecuteBlock(db *store.DB, genesis types.GenesisAlloc, chainCtx ChainContext, chainCfg *params.ChainConfig, blk *types.Block, baseFee *big.Int) (types.Receipts, error) {
 	header := blk.Header()
 	if baseFee != nil {
 		header.BaseFee = baseFee
 	}
 	n := blk.NumberU64()
-	statedb, err := ethstate.New(common.Hash{}, hist.StateAt(n-1), nil)
+	statedb, err := ethstate.New(common.Hash{}, db.StateAt(genesis, n-1), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -314,11 +243,11 @@ func ReExecuteBlock(hist *state.History, chainCtx ChainContext, chainCfg *params
 		)
 		// A statedb read failure is RECORDED, not returned: geth's
 		// getDeleteStateObject calls setError and hands back an empty account,
-		// so a re-execution over a height the cook has not indexed yet reads
-		// every account as nonce 0 and either fails with a nonsense
+		// so a re-execution over a height whose rows are not there reads every
+		// account as nonce 0 and either fails with a nonsense
 		// "nonce too high ... state: 0" or, worse, succeeds against zeroed
 		// state and returns wrong receipts. Surface the read error instead, so
-		// this path gives the same clean cook-lag refusal eth_call does.
+		// this path gives the same clean refusal eth_call does.
 		if dbErr := statedb.Error(); dbErr != nil {
 			return nil, dbErr
 		}

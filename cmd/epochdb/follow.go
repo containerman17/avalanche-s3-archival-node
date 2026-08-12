@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -287,7 +286,7 @@ func statusOf(spec string, n *chainNode) serveStatus {
 		return serveStatus{Chain: spec}
 	}
 	s := n.snapshot().serveStatus(n.cfg.Chain.BlockchainID.String())
-	if cs, ok := n.store.Cas().CacheStats(); ok {
+	if cs, ok := n.cas.CacheStats(); ok {
 		if cs.VictimAge > 0 {
 			s.CacheHorizon = cs.VictimAge.String()
 		}
@@ -366,17 +365,10 @@ type chainNode struct {
 // error the caller reports and exits on, so the same code is usable from a test
 // and the flush on the way out is never skipped.
 func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err error)) (n *chainNode, err error) {
-	// THE START SEQUENCE, before a single file of this dir is opened: resolve
-	// the chain's `latest` pointer, refuse to start if it names history we
-	// cannot assemble, and frontier-build if the dir has none of its own
-	// (joinChain, RULING 2026-08-03). An empty data dir with credentials joins
-	// the published chain here; there is no bootstrap step to remember.
-	if err := joinChain(ctx, cfg, buildFrontier); err != nil {
-		return nil, err
-	}
-	// AFTER the join, because the join is what makes the epoch set nameable
-	// (and, on a cold dir, present at all), and before anything of this dir is
-	// opened for serving.
+	// THE JOIN PATH IS GONE WITH THE EPOCHS. Resolving a published chain's
+	// pointer, walking its run footers backwards and frontier-building from the
+	// runs' state family is phase-2 work; until it lands, a data dir either has
+	// its own history or syncs one from genesis over p2p.
 
 	// Unwind whatever is already open if a later step fails, so a start that
 	// gives up releases the Firewood handle and the mmaps it took.
@@ -405,7 +397,7 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		return nil, fmt.Errorf("fetch: %w", err)
 	}
 	closers = append(closers, func() { fetcher.Close() })
-	var blocks rpc.BlockSource = fetcher.Store()
+	var blocks exec.BlockSource = fetcher.Store()
 	// The FOLLOWER's accepted head, and only the follower's: the staging store
 	// keeps every index sidecar the dir ever got, so under --tip-override this
 	// is a leftover height and not this run's ceiling. Nothing reads it in that
@@ -502,7 +494,6 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 	n.srv.EnableLive(live)
 
 	advance := func(h uint64, hash common.Hash) {
-		n.srv.AddBlockHash(hash, h)
 		n.fetcher.SetFloor(flushedFloor(n.store))
 	}
 	onBlock.Store(&advance)
@@ -517,7 +508,6 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		close(n.execDone) // BEFORE report: report may flush, and flushing waits
 		report("executor", err)
 	}()
-	go n.statusLoop(ctx)
 	return n, nil
 }
 
@@ -537,7 +527,6 @@ func (n *chainNode) closeAll() {
 	if err := n.fetcher.Close(); err != nil {
 		logf("fetch close: %v", err)
 	}
-	n.hist.Close()
 	n.store.Close()
 }
 
@@ -624,15 +613,15 @@ type nodeStatus struct {
 }
 
 func (n *chainNode) snapshot() nodeStatus {
-	entries, size := n.hist.TailStats()
+	head, _ := n.store.Head()
 	s := nodeStatus{
 		backfill: n.cfg.Backfill != nil,
 		executed: n.e.LiveHead(),
-		served:   n.hist.Head(),
-		cooked:   n.hist.StateHead(),
+		served:   head,
+		cooked:   flushedFloor(n.store),
 		settled:  n.e.SettledHeight(),
-		entries:  entries,
-		bytes:    size,
+		entries:  len(n.store.Manifest().Runs),
+		bytes:    n.store.SectionSizes()[0] + n.store.SectionSizes()[1] + n.store.SectionSizes()[2],
 		staging:  n.fetcher.StagedBytes(),
 	}
 	if s.backfill {
@@ -674,7 +663,6 @@ func (s nodeStatus) serveStatus(chain string) serveStatus {
 	}
 	return out
 }
-
 
 // flushedFloor is the height staging may be retired behind: the end of the last
 // FLUSHED run. Not the executed head and not the window start, because crash

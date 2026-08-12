@@ -1068,7 +1068,12 @@ func (e *Executor) endCapture() {
 func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) error {
 	e.curStatedb.IntermediateRoot(e.chainCfg.IsEIP158(e.curHeader.Number))
 
-	raw, err := tx.MarshalBinary()
+	// THE VERBATIM FORM IS THE ONE INSIDE THE CONTAINER'S TX LIST, which for a
+	// typed transaction is the opaque bytes wrapped in an RLP string, not the
+	// bare MarshalBinary bytes. Storing the container's own form is what lets
+	// Reassemble be pure concatenation, and rlp.DecodeBytes reads both shapes
+	// back into a Transaction.
+	raw, err := rlp.EncodeToBytes(tx)
 	if err != nil {
 		return fmt.Errorf("encode tx %s: %w", tx.Hash(), err)
 	}

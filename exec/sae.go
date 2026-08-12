@@ -428,7 +428,7 @@ func (e *Executor) appendSAETxs(bw *store.BlockWrite, blk *types.Block, receipts
 		return fmt.Errorf("sae block %d: %d receipts for %d txs", blk.NumberU64(), len(receipts), len(txs))
 	}
 	for i, tx := range txs {
-		raw, err := tx.MarshalBinary()
+		raw, err := rlp.EncodeToBytes(tx)
 		if err != nil {
 			return fmt.Errorf("encode tx %s: %w", tx.Hash(), err)
 		}

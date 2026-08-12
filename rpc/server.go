@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 
-	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/gorilla/websocket"
 
 	"github.com/ava-labs/libevm/common"
@@ -24,55 +23,55 @@ import (
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/store"
 )
 
 // GasCap bounds eth_call execution.
 const GasCap = 50_000_000
 
-// Server serves historical reads at heights [0, hist.Head()]. Requests
-// run fully concurrent: every shared reader underneath is immutable
-// (mmaps, RO maps) or internally locked (bucketLog handle LRU); zstd
-// DecodeAll is concurrent-safe.
+// Server serves reads at heights [0, db.Head()]. Requests run fully
+// concurrent: the memtable and the live runs underneath are immutable or
+// internally locked.
 type Server struct {
-	hist     *state.History
+	db *store.DB
+	// genesis is the genesis trie state (exec.Genesis.TrieAlloc): the floor
+	// every state read falls through to, handed to the store's state adapter.
+	genesis  types.GenesisAlloc
 	chainCtx ChainContext
 	chainCfg *params.ChainConfig
-
-	// tx APIs, wired by EnableTxAPIs (nil = methods unavailable).
-	txidx  TxCandidateSource
-	blocks BlockSource
-	parse  ContainerParser
 
 	// filter registry (rpc/filters.go), created on first use.
 	filtersOnce sync.Once
 	filters     *filterReg
 
-	// recent is the BOUNDED live-tail block-hash map (see recentHashes):
-	// everything older resolves through the tx index.
-	recent *recentHashes
-
 	// live is the in-process executor (serve); nil before EnableLive
 	// serve, where every read is historical.
 	live Live
+}
 
-	// the /sql door's engine (rpc/sql.go), built on first query, plus the
-	// analyzed-plan LRU keyed on the placeholder query text.
-	sqlOnce  sync.Once
-	sqlEng   *sqle.Engine
-	sqlPlans sqlPlanCache
+// notInPhase1 is the named refusal for a method storage v0 cannot serve yet.
+// It is never an empty result and never a guess: a caller can tell "this node
+// does not index that" from "there is nothing there".
+func notInPhase1(method string) *rpcError {
+	return &rpcError{Code: -32000, Message: method + ": not in phase 1"}
+}
+
+// head is the highest stored block height (0 on an empty store).
+func (s *Server) head() uint64 {
+	n, _ := s.db.Head()
+	return n
 }
 
 // Live is the in-process executor view that serve wires in: the height
 // labels, and nothing else. Latest STATE does not come through here, it comes
-// from History's uncooked-tail overlay (ruling 2026-07-29: Firewood is
+// from the store's own latest view (ruling 2026-07-29: Firewood is
 // verify-only and has no readers).
 type Live interface {
 	// LiveHead is the last EXECUTED height: the `latest` label.
 	LiveHead() uint64
 	// AcceptedHead is the last height the follower accepted (>= LiveHead):
 	// the `pending` label. It BOUNDS WHAT A READ MAY NAME, so it is only ever
-	// a height whose container this node holds.
+	// a height this node holds the container of.
 	AcceptedHead() uint64
 	// SettledHeight is the last SAE-settled height: the `safe`/`finalized`
 	// labels. Below the Helicon boundary it equals LiveHead.
@@ -88,77 +87,24 @@ type Live interface {
 // EnableLive wires the executor frontier into the server (serve).
 func (s *Server) EnableLive(l Live) { s.live = l }
 
-// recentBlockHashes bounds the live-tail block-hash map. Every block hash is
-// in the tx index (epoch format v6 for sealed epochs, the cooked staging
-// index for the raw tail), so the only heights this has to answer for are the
-// ones ACCEPTED SINCE THE LAST COOK, which at chain pace is a couple of
-// hundred: 128Ki entries is over a day of cook outage at Fuji/mainnet block
-// rates, for ~4MB of ring plus a map of the same order.
-//
-// ponytail: fixed-size FIFO, not a cook-watermark prune. During a multi-
-// thousand-block/s catch-up the ring can wrap before the next cook, and a
-// block-by-hash for a height in the wrapped window answers null until that
-// cook lands (a node in that state already reports eth_syncing). Swap the
-// FIFO for an explicit "drop below the cooked height" prune if that window
-// ever has to be zero.
-const recentBlockHashes = 1 << 17
-
-// recentHashes is the eth block hash -> height map for the LIVE TAIL only:
-// serve/sdk push each accepted block in, the oldest entry falls out, and the
-// whole of history is answered by the fingerprint index instead. The
-// floor-to-head version of this map was the largest resident item in the
-// process (measured 100.7 B/entry, 5.78GB at Fuji's 57.4M blocks).
-type recentHashes struct {
-	mu   sync.RWMutex
-	m    map[common.Hash]uint64
-	ring []common.Hash
-	next int
-}
-
-func newRecentHashes(n int) *recentHashes {
-	return &recentHashes{m: make(map[common.Hash]uint64), ring: make([]common.Hash, n)}
-}
-
-func (h *recentHashes) get(k common.Hash) (uint64, bool) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	n, ok := h.m[k]
-	return n, ok
-}
-
-func (h *recentHashes) add(k common.Hash, n uint64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if _, dup := h.m[k]; dup {
-		return
-	}
-	if old := h.ring[h.next]; old != (common.Hash{}) {
-		delete(h.m, old)
-	}
-	h.ring[h.next] = k
-	h.next = (h.next + 1) % len(h.ring)
-	h.m[k] = n
-}
-
-// HistoryChainContext serves BLOCKHASH headers through the epochs-aware
-// History (raw store first, sealed epochs once the raws are gone). It is
+// StoreChainContext serves BLOCKHASH headers straight out of storage v0. It is
 // VM-neutral: the consensus engine the two VMs disagree about is added by
 // whichever backend the seam picks (rpc/vm.go).
-func HistoryChainContext(hist *state.History) ChainContext {
-	return histChainCtx{hist}
+func StoreChainContext(db *store.DB) ChainContext {
+	return storeChainCtx{db}
 }
 
-type histChainCtx struct{ hist *state.History }
+type storeChainCtx struct{ db *store.DB }
 
-func (c histChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
+func (c storeChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
 	h, _ := c.headerAt(n) // the error is only visible through captureHeaders
 	return h
 }
 
 // headerAt is GetHeader plus the error the ChainContext signature cannot
 // carry. (nil, nil) means the header is genuinely absent.
-func (c histChainCtx) headerAt(n uint64) (*types.Header, error) {
-	raw, ok, err := c.hist.HeaderRLP(n)
+func (c storeChainCtx) headerAt(n uint64) (*types.Header, error) {
+	raw, ok, err := c.db.HeaderRLP(n)
 	if err != nil {
 		return nil, fmt.Errorf("read header %d: %w", n, err)
 	}
@@ -207,8 +153,11 @@ func (c *captureCtx) GetHeader(hash common.Hash, n uint64) *types.Header {
 	return h
 }
 
-func NewServer(hist *state.History, chainCtx ChainContext, chainCfg *params.ChainConfig) *Server {
-	return &Server{hist: hist, chainCtx: chainCtx, chainCfg: chainCfg, recent: newRecentHashes(recentBlockHashes)}
+// NewServer builds the read server over one chain's storage v0. genesis is
+// exec.Genesis.TrieAlloc: what the genesis MATERIALISED, which the store's
+// state adapter needs as its below-first-write floor.
+func NewServer(db *store.DB, genesis types.GenesisAlloc, chainCtx ChainContext, chainCfg *params.ChainConfig) *Server {
+	return &Server{db: db, genesis: genesis, chainCtx: chainCtx, chainCfg: chainCfg}
 }
 
 type rpcRequest struct {
@@ -351,7 +300,7 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 	case "eth_chainId":
 		return hexutil.EncodeBig(s.chainCfg.ChainID), nil
 	case "eth_blockNumber":
-		return hexutil.EncodeUint64(s.hist.Head()), nil
+		return hexutil.EncodeUint64(s.head()), nil
 	case "eth_getBalance":
 		return s.accountField(req.Params, func(st *ethstate.StateDB, a common.Address) any {
 			return hexutil.EncodeBig(st.GetBalance(a).ToBig())
@@ -368,32 +317,31 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.getStorageAt(req.Params)
 	case "eth_call":
 		return s.ethCall(req.Params)
-	case "eth_getTransactionByHash", "eth_getTransactionReceipt":
-		if s.txidx == nil {
-			return nil, &rpcError{Code: -32000, Message: "tx index not available yet (the node cooks it on its own cadence)"}
-		}
-		if req.Method == "eth_getTransactionByHash" {
-			return s.getTransactionByHash(req.Params)
-		}
+	case "eth_getTransactionByHash":
+		return s.getTransactionByHash(req.Params)
+	case "eth_getTransactionReceipt":
 		return s.getTransactionReceipt(req.Params)
 	case "eth_getLogs":
-		if s.blocks == nil {
-			return nil, &rpcError{Code: -32000, Message: "log queries need the container source (tx APIs enabled)"}
-		}
 		return s.getLogs(req.Params)
 	// block, fee, and trivia methods live in block.go / misc.go.
 	case "eth_getBlockByNumber":
 		return s.getBlockByNumber(req.Params)
-	case "eth_getBlockByHash":
-		return s.getBlockByHash(req.Params)
 	case "eth_getBlockTransactionCountByNumber":
-		return s.blockTxCount(req.Params, false)
-	case "eth_getBlockTransactionCountByHash":
-		return s.blockTxCount(req.Params, true)
+		return s.blockTxCount(req.Params)
 	case "eth_getTransactionByBlockNumberAndIndex":
-		return s.txByBlockAndIndex(req.Params, false)
-	case "eth_getTransactionByBlockHashAndIndex":
-		return s.txByBlockAndIndex(req.Params, true)
+		return s.txByBlockAndIndex(req.Params)
+	// Everything keyed by BLOCK HASH: storage v0 has no hash index, and a scan
+	// is not an answer.
+	case "eth_getBlockByHash", "eth_getBlockTransactionCountByHash",
+		"eth_getTransactionByBlockHashAndIndex", "eth_getRawTransactionByBlockHashAndIndex",
+		"eth_getHeaderByHash", "debug_traceBlockByHash", "debug_getModifiedAccountsByHash":
+		return nil, notInPhase1(req.Method)
+	case "debug_getModifiedAccountsByNumber":
+		// Storage v0 keys state rows by account, not by block, so "which
+		// accounts did this block touch" has no index behind it. Answering it
+		// by scanning a block's state rows needs a family this version does
+		// not have.
+		return nil, notInPhase1(req.Method)
 	case "eth_getBlockReceipts":
 		return s.getBlockReceipts(req.Params)
 	case "eth_estimateGas":
@@ -463,9 +411,7 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 	case "debug_traceTransaction":
 		return s.debugTraceTransaction(req.Params)
 	case "debug_traceBlockByNumber":
-		return s.debugTraceBlock(req.Params, false)
-	case "debug_traceBlockByHash":
-		return s.debugTraceBlock(req.Params, true)
+		return s.debugTraceBlock(req.Params)
 	case "debug_getRawBlock":
 		return s.debugGetRawBlock(req.Params)
 	case "debug_getRawHeader":
@@ -478,10 +424,6 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.createAccessList(req.Params)
 	case "debug_traceCall":
 		return s.debugTraceCall(req.Params)
-	case "debug_getModifiedAccountsByNumber":
-		return s.debugGetModifiedAccounts(req.Params, false)
-	case "debug_getModifiedAccountsByHash":
-		return s.debugGetModifiedAccounts(req.Params, true)
 	case "debug_getBadBlocks":
 		return []any{}, nil // root-verified replay retains no bad blocks
 	case "debug_printBlock":
@@ -533,15 +475,11 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 	case "eth_baseFee":
 		return s.baseFee()
 	case "eth_getHeaderByNumber":
-		return s.getHeaderBy(req.Params, false)
-	case "eth_getHeaderByHash":
-		return s.getHeaderBy(req.Params, true)
+		return s.getHeaderByNumber(req.Params)
 	case "eth_getRawTransactionByHash":
 		return s.rawTxByHash(req.Params)
 	case "eth_getRawTransactionByBlockNumberAndIndex":
-		return s.rawTxByBlockAndIndex(req.Params, false)
-	case "eth_getRawTransactionByBlockHashAndIndex":
-		return s.rawTxByBlockAndIndex(req.Params, true)
+		return s.rawTxByBlockAndIndex(req.Params)
 	case "eth_sendRawTransaction", "eth_sendTransaction", "eth_fillTransaction", "eth_resend":
 		return nil, errTxSubmission(req.Method)
 	case "eth_sign", "eth_signTransaction":
@@ -572,7 +510,7 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 // (there is no mempool, so pending state is latest state); the pending BLOCK
 // itself is served by getBlockByNumber, which handles the tag before this.
 func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
-	head := s.hist.Head()
+	head := s.head()
 	if len(raw) == 0 {
 		return head, nil
 	}
@@ -591,16 +529,10 @@ func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 		}
 		switch {
 		case o.BlockHash != nil:
-			// Every height this node serves is canonical (there is no side
-			// chain to confuse it with), so requireCanonical is a no-op.
-			n, ok, err := s.HeightByHash(*o.BlockHash)
-			if err != nil {
-				return 0, &rpcError{Code: -32000, Message: err.Error()}
-			}
-			if !ok {
-				return 0, &rpcError{Code: -32000, Message: "header for hash not found"}
-			}
-			return n, nil
+			// No hash index in storage v0, so a block-hash tag has no answer
+			// here. The refusal names it rather than falling back to latest,
+			// which would answer a different question confidently.
+			return 0, notInPhase1("block tag by blockHash")
 		case len(o.BlockNumber) > 0:
 			return s.blockNumber(o.BlockNumber)
 		}
@@ -634,7 +566,7 @@ func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 // acceptedHead is the highest height any tail source can answer for: the
 // follower's accepted height when following, the serving head otherwise.
 func (s *Server) acceptedHead() uint64 {
-	head := s.hist.Head()
+	head := s.head()
 	if s.live == nil {
 		return head
 	}
@@ -644,12 +576,11 @@ func (s *Server) acceptedHead() uint64 {
 // stateAt opens the state at height n. Three bands when following:
 //
 //	n > executed        not executed here yet (staged, or a backfill hole): error.
-//	n in [head, exec]   the executed head: the uncooked-tail overlay over the
-//	                    descent, so latest/pending answer at chain pace with no
-//	                    cook wait and no Firewood. The band is one advance tick
-//	                    wide, which is the same head race every node has.
-//	n < head            the historical descent, which refuses heights the cook
-//	                    has not reached rather than answering with a pre-gap value.
+//	n in [head, exec]   the executed head: the latest view, re-read at every
+//	                    access so it follows the executor instead of pinning a
+//	                    height that moved. The band is one advance tick wide,
+//	                    which is the same head race every node has.
+//	n < head            the fixed-height view over the store.
 func (s *Server) stateAt(n uint64) (*ethstate.StateDB, *rpcError) {
 	if s.live != nil {
 		executed := s.live.LiveHead()
@@ -657,15 +588,15 @@ func (s *Server) stateAt(n uint64) (*ethstate.StateDB, *rpcError) {
 		case n > executed:
 			return nil, &rpcError{Code: -32000, Message: fmt.Sprintf(
 				"state at block %d is not executed yet (executed head %d)", n, executed)}
-		case n >= s.hist.Head():
-			st, err := ethstate.New(common.Hash{}, s.hist.StateLatest(), nil)
+		case n >= s.head():
+			st, err := ethstate.New(common.Hash{}, s.db.StateLatest(s.genesis), nil)
 			if err != nil {
 				return nil, &rpcError{Code: -32000, Message: err.Error()}
 			}
 			return st, nil
 		}
 	}
-	st, err := ethstate.New(common.Hash{}, s.hist.StateAt(n), nil)
+	st, err := ethstate.New(common.Hash{}, s.db.StateAt(s.genesis, n), nil)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}

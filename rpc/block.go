@@ -7,48 +7,66 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/rlp"
 )
 
-// AddBlockHash records an accepted block in the bounded live-tail map
-// (serve, sdk). Blocks below it resolve through the tx index, whose
-// fingerprint space carries every block hash, so this is the ONLY block-hash
-// state the process keeps and it never grows past recentBlockHashes.
-func (s *Server) AddBlockHash(h common.Hash, n uint64) { s.recent.add(h, n) }
-
-// blockAt fetches and parses the container at height n (must be <= head).
-func (s *Server) blockAt(n uint64) (*types.Block, *rpcError) {
-	if s.blocks == nil || s.parse == nil {
-		return nil, &rpcError{Code: -32000, Message: "block source not available"}
-	}
-	if n > s.acceptedHead() {
-		return nil, errInvalid("block %d beyond head %d", n, s.hist.Head())
-	}
-	raw, ok, err := s.blocks.GetByHeight(n)
+// blockByNumber assembles the block at height n out of storage v0: the header
+// row plus the block's own tx rows. Uncles are always empty on these chains,
+// which is what makes this an assembly and not a container decode. Nothing is
+// cached: the rows are the cache.
+func (s *Server) blockByNumber(n uint64) (*types.Block, error) {
+	headerRLP, ok, err := s.db.HeaderRLP(n)
 	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+		return nil, fmt.Errorf("read header %d: %w", n, err)
 	}
 	if !ok {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("container %d missing", n)}
+		return nil, fmt.Errorf("block %d is not stored", n)
 	}
-	blk, err := s.parse(raw)
+	var header types.Header
+	if err := rlp.DecodeBytes(headerRLP, &header); err != nil {
+		return nil, fmt.Errorf("decode header %d: %w", n, err)
+	}
+	txs, err := s.blockTxs(n)
+	if err != nil {
+		return nil, err
+	}
+	return types.NewBlockWithHeader(&header).WithBody(types.Body{Transactions: txs}), nil
+}
+
+// blockTxs decodes a block's transactions from their tx/ rows, in block order.
+func (s *Server) blockTxs(n uint64) (types.Transactions, error) {
+	first, count, ok, err := s.db.BlockTxRange(n)
+	if err != nil {
+		return nil, fmt.Errorf("read tx range of block %d: %w", n, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("block %d is not stored", n)
+	}
+	txs := make(types.Transactions, count)
+	for i := range txs {
+		raw, ok, err := s.db.TxRLP(first + uint64(i))
+		if err != nil {
+			return nil, fmt.Errorf("read tx %d: %w", first+uint64(i), err)
+		}
+		if !ok {
+			return nil, fmt.Errorf("tx %d of block %d is not stored", i, n)
+		}
+		tx := new(types.Transaction)
+		if err := tx.UnmarshalBinary(raw); err != nil {
+			return nil, fmt.Errorf("decode tx %d of block %d: %w", i, n, err)
+		}
+		txs[i] = tx
+	}
+	return txs, nil
+}
+
+// blockAt is blockByNumber with the JSON-RPC error shape.
+func (s *Server) blockAt(n uint64) (*types.Block, *rpcError) {
+	blk, err := s.blockByNumber(n)
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	return blk, nil
-}
-
-// heightByHash resolves an eth block hash. ok=false = unknown hash (null
-// result, geth-style).
-func (s *Server) heightByHash(raw json.RawMessage) (uint64, bool, *rpcError) {
-	var h common.Hash
-	if err := json.Unmarshal(raw, &h); err != nil {
-		return 0, false, errInvalid("bad block hash: %v", err)
-	}
-	n, ok, err := s.HeightByHash(h)
-	if err != nil {
-		return 0, false, &rpcError{Code: -32000, Message: err.Error()}
-	}
-	return n, ok, nil
 }
 
 // marshalBlock duplicates coreth internal/ethapi RPCMarshalHeader/Block
@@ -186,39 +204,17 @@ func isTag(raw json.RawMessage, tag string) bool {
 	return json.Unmarshal(raw, &s) == nil && s == tag
 }
 
-func (s *Server) getBlockByHash(params []json.RawMessage) (any, *rpcError) {
-	if len(params) < 1 {
-		return nil, errInvalid("need [blockHash, fullTx]")
-	}
-	n, ok, rerr := s.heightByHash(params[0])
+func (s *Server) blockTxCount(params []json.RawMessage) (any, *rpcError) {
+	blk, rerr := s.blockParam(params)
 	if rerr != nil {
-		return nil, rerr
-	}
-	if !ok {
-		return nil, nil
-	}
-	full, rerr := fullTxFlag(params, 1)
-	if rerr != nil {
-		return nil, rerr
-	}
-	blk, rerr := s.blockAt(n)
-	if rerr != nil {
-		return nil, rerr
-	}
-	return s.marshalBlock(blk, full)
-}
-
-func (s *Server) blockTxCount(params []json.RawMessage, byHash bool) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, byHash)
-	if rerr != nil || !ok {
 		return nil, rerr
 	}
 	return hexutil.Uint(len(blk.Transactions())), nil
 }
 
-func (s *Server) txByBlockAndIndex(params []json.RawMessage, byHash bool) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, byHash)
-	if rerr != nil || !ok {
+func (s *Server) txByBlockAndIndex(params []json.RawMessage) (any, *rpcError) {
+	blk, rerr := s.blockParam(params)
+	if rerr != nil {
 		return nil, rerr
 	}
 	if len(params) < 2 {
@@ -247,48 +243,29 @@ func (s *Server) txByBlockAndIndex(params []json.RawMessage, byHash bool) (any, 
 	return out, nil
 }
 
-// blockParam resolves params[0] as either a block tag or a block hash.
-// ok=false with nil error means unknown hash (null result).
-func (s *Server) blockParam(params []json.RawMessage, byHash bool) (*types.Block, bool, *rpcError) {
+// blockParam resolves params[0] as a block tag and reads that block.
+func (s *Server) blockParam(params []json.RawMessage) (*types.Block, *rpcError) {
 	if len(params) < 1 {
-		return nil, false, errInvalid("need [block...]")
+		return nil, errInvalid("need [block...]")
 	}
-	var n uint64
-	if byHash {
-		var ok bool
-		var rerr *rpcError
-		n, ok, rerr = s.heightByHash(params[0])
-		if rerr != nil || !ok {
-			return nil, false, rerr
-		}
-	} else {
-		var rerr *rpcError
-		n, rerr = s.blockNumber(params[0])
-		if rerr != nil {
-			return nil, false, rerr
-		}
-	}
-	blk, rerr := s.blockAt(n)
+	n, rerr := s.blockNumber(params[0])
 	if rerr != nil {
-		return nil, false, rerr
+		return nil, rerr
 	}
-	return blk, true, nil
+	return s.blockAt(n)
 }
 
-// getBlockReceipts returns every receipt of the block from the stored
-// epoch sections (coreth's public API does not expose this method; shape
-// matches geth's, entries match coreth's per-tx eth_getTransactionReceipt).
+// getBlockReceipts returns every receipt of the block from its stored per-tx
+// receipt rows (coreth's public API does not expose this method; shape matches
+// geth's, entries match coreth's per-tx eth_getTransactionReceipt).
 func (s *Server) getBlockReceipts(params []json.RawMessage) (any, *rpcError) {
-	blk, ok, rerr := s.blockParam(params, false)
-	if rerr != nil || !ok {
+	blk, rerr := s.blockParam(params)
+	if rerr != nil {
 		return nil, rerr
 	}
 	n := blk.NumberU64()
 	if n == 0 || len(blk.Transactions()) == 0 {
 		return []any{}, nil
-	}
-	if err := s.hist.Epochs().RequireCovered(n); err != nil {
-		return nil, coverageError(err)
 	}
 	receipts, rerr := s.storedBlockReceipts(blk)
 	if rerr != nil {

@@ -12,15 +12,13 @@ import (
 	"github.com/ava-labs/libevm/eth/tracers"
 	ethparams "github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
-
-	"github.com/containerman17/epochdb/state"
 )
 
 // ClientVersion is returned by web3_clientVersion.
 const ClientVersion = "epochdb/v0.1.0"
 
 func (s *Server) headerAt(n uint64) (*types.Header, *rpcError) {
-	raw, ok, err := s.hist.HeaderRLP(n)
+	raw, ok, err := s.db.HeaderRLP(n)
 	if err != nil || !ok {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d unavailable: ok=%v err=%v", n, ok, err)}
 	}
@@ -70,15 +68,17 @@ func (s *Server) gasConsumed(n uint64) (uint64, error) {
 	if len(txs) == 0 {
 		return used, nil
 	}
-	rcptRec, _, rerr := s.storedSections(n)
+	// The block's total transaction gas is the LAST transaction's cumulative
+	// gas, which is one stored row rather than a sum over all of them.
+	first, count, ok, err := s.db.BlockTxRange(n)
+	if err != nil || !ok || int(count) != len(txs) {
+		return 0, fmt.Errorf("tx range of block %d: %d rows for %d txs (stored=%v): %v", n, count, len(txs), ok, err)
+	}
+	_, _, cumulative, _, rerr := s.storedReceipt(first + uint64(count) - 1)
 	if rerr != nil {
 		return 0, fmt.Errorf("%s", rerr.Message)
 	}
-	entries, err := state.DecodeStoredReceipts(rcptRec)
-	if err != nil || len(entries) != len(txs) {
-		return 0, fmt.Errorf("stored receipts decode for block %d: %d entries for %d txs: %v", n, len(entries), len(txs), err)
-	}
-	return used + entries[len(entries)-1].CumulativeGas, nil
+	return used + cumulative, nil
 }
 
 // baseFees is the base fee of every block in [from, to], through the per-VM
@@ -300,7 +300,7 @@ func searchGas(lo, hi uint64, executable func(uint64) (bool, *rpcError)) (uint64
 // reported it as a confident number.
 func (s *Server) gasOracle() (*big.Int, *rpcError) {
 	var prices []*big.Int
-	n := s.hist.Head()
+	n := s.head()
 	for scanned := 0; n > 0 && scanned < 20 && len(prices) < 100; n-- {
 		blk, rerr := s.blockAt(n)
 		if rerr != nil {
@@ -336,7 +336,7 @@ func (s *Server) suggestTip() (*big.Int, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	base, rerr := s.baseFeeAt(s.hist.Head())
+	base, rerr := s.baseFeeAt(s.head())
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -372,7 +372,7 @@ func (s *Server) nextBaseFee(n uint64) (*big.Int, *rpcError) {
 // head it is projected.
 func (s *Server) trailingBaseFee(n uint64) (*hexutil.Big, *rpcError) {
 	var next *big.Int
-	if n < s.hist.Head() {
+	if n < s.head() {
 		var rerr *rpcError
 		if next, rerr = s.baseFeeAt(n + 1); rerr != nil {
 			return nil, rerr
@@ -506,13 +506,11 @@ func (s *Server) rewardRow(n uint64, header *types.Header, baseFee *big.Int, per
 		}
 		return row, nil
 	}
-	// ponytail: gas weights come from one re-execution; feeHistory must
-	// cover the unsealed raw tail (incl. "latest"), which has no stored
-	// receipt-fields yet. Switch to the stored sections when the unified
-	// follower stores them for the tail too.
-	receipts, err := ReExecuteBlock(s.hist, s.chainCtx, s.chainCfg, blk, baseFee)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("re-execute block %d: %v", n, err)}
+	// The gas weights are the stored per-tx receipt rows, which cover every
+	// executed height including the head, so this costs no re-execution.
+	receipts, rerr := s.storedBlockReceipts(blk)
+	if rerr != nil {
+		return nil, rerr
 	}
 	type tg struct {
 		tip *big.Int

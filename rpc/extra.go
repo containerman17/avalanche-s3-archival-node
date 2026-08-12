@@ -99,7 +99,7 @@ var (
 // the base fee doubled used to be the CURRENT head's rather than the next
 // block's, since nothing projected one.
 func (s *Server) suggestPriceOptions() (any, *rpcError) {
-	base, rerr := s.nextBaseFee(s.hist.Head())
+	base, rerr := s.nextBaseFee(s.head())
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -143,7 +143,7 @@ func (s *Server) printBlock(params []json.RawMessage) (any, *rpcError) {
 	if len(params) < 1 {
 		return nil, errInvalid("need [blockNumber]")
 	}
-	n, rerr := s.modifiedAccountsBlock(params[0], false)
+	n, rerr := s.blockNumberParam(params[0])
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -165,11 +165,11 @@ func (s *Server) getAccessibleState(params []json.RawMessage) (any, *rpcError) {
 	if len(params) < 2 {
 		return nil, errInvalid("need [fromBlock, toBlock]")
 	}
-	from, rerr := s.modifiedAccountsBlock(params[0], false)
+	from, rerr := s.blockNumberParam(params[0])
 	if rerr != nil {
 		return nil, rerr
 	}
-	to, rerr := s.modifiedAccountsBlock(params[1], false)
+	to, rerr := s.blockNumberParam(params[1])
 	if rerr != nil {
 		return nil, rerr
 	}
