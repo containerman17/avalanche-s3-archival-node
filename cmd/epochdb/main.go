@@ -121,6 +121,7 @@ var devCommands = map[string]func([]string){
 	"fetch":   fetchMain,
 	"exec":    execMain,
 	"verify":  verifyMain,
+	"rpcdiff": rpcdiffMain,
 	"probe":   probeMain,
 	"publish": publishMain,
 }
