@@ -512,9 +512,12 @@ func (m *memtable) postRow(key []byte, val byte) error {
 // reads
 // ---------------------------------------------------------------------------
 
+// chainGet takes the WRITE lock, not the read lock: serving a row that is still
+// in the write buffer has to flush it, and two readers flushing a bufio.Writer
+// at once is a data race on the executor's own output.
 func (m *memtable) chainGet(fam int, num uint64) ([]byte, bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	off, n, ok := m.chain[fam].find(num)
 	if !ok {
 		return nil, false, nil
@@ -582,8 +585,8 @@ func (m *memtable) window() (baseTx, nextTx, baseHeight, nextHeight uint64, star
 
 // eachChain streams one chain family's rows in number order, for the flush.
 func (m *memtable) eachChain(fam int, fn func(num uint64, val []byte) error) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.bw.Flush(); err != nil {
 		return err
 	}
