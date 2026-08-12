@@ -247,6 +247,19 @@ func (d *DB) Head() (uint64, bool) {
 	return n - 1, true
 }
 
+// FlushedFloor is the height staging may be retired behind: the end of the last
+// FLUSHED run, 0 when nothing has flushed. Not the executed head and not the
+// window start, because crash recovery re-executes out of staging from wherever
+// the reconcile walk-back lands, and a run boundary is the lowest point that
+// can ever be.
+func (d *DB) FlushedFloor() uint64 {
+	runs := d.Manifest().Runs
+	if len(runs) == 0 {
+		return 0
+	}
+	return runs[len(runs)-1].ToHeight
+}
+
 // WriteBlock folds one block into the window and flushes when a trigger fires.
 // The caller must have appended the block's per-tx state rows into b BEFORE it
 // commits Firewood (DESIGN's standing order rule).

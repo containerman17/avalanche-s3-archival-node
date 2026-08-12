@@ -76,12 +76,11 @@ fails late, after work.
 serve --data <dir>              data directory; ONE chain owns it (default ./data)
       --network fuji|mainnet    the network the chain lives on (default fuji)
       --chain C|<blockchainID>  C is --network's primary C-chain, anything else is an L1 (default C)
-      --port 9650               HTTP listen port
-      --verify                  re-verify every sealed epoch before serving; a failure means no start
+      --port 9650               HTTP listen port: JSON-RPC, plain HTTP at /v0/, /status
+      --grpc-port 9660          gRPC listen port (0 disables)
       --vdr-sources <urls>      comma-separated P-chain RPCs for the cross-checked validator set
       --node <uri>              bootstrap RPC node URI (default: the public endpoint for the network)
       --state-cache <GiB>       executor read cache (default 1, clamped to 1/8 of the container's ceiling)
-      --cook-every <dur>        index and seal cadence (default 1m)
       --sync-every <dur>        bucket upload cadence (default 5m, no-op without S3)
       --per-peer <n>            max outstanding requests per archival peer (default 1)
       --tip-override <containerID>  backfill down from a container ID instead of following
@@ -205,9 +204,24 @@ Two measured joins, each on a machine that had never seen the chain:
 - **A small L1**, 7 epochs: 25,073,821 rows into 2,787,236 accounts and 22,286,282 slots, frontier
   built and root-verified at block 3,742,654, in **4m16s** (~97.8k rows/s), zero chunk rejections.
 
-Add `--verify` to re-verify every sealed epoch with the no-execution verifier before serving a byte.
-It pulls the whole corpus down and exits nonzero on a mismatch, so it is a deliberate, expensive
-first start rather than something to leave switched on.
+## Entry points
+
+One process, four surfaces over one core query layer, none stacked on another:
+
+- **The Go library.** `epochdb.Open(ctx, epochdb.Config{...})` starts the same full node `serve`
+  runs and hands back `Head`, `StateAt`, `CallAt`, `TraceTx`, `Core()` and `Store()`, with nothing
+  serialized on the way. `serve` is a thin main over it.
+- **gRPC** on `--grpc-port`: `GetHead`, `StreamHeads`, `GetBlock`, `GetTransaction`, `Call`,
+  `GetState`, `SearchTransactionsByAddress`, `GetLogs`. Proto and generated code in `grpcapi/`.
+- **Plain HTTP** at `/v0/<method>`: the same method set, parameters in any form, JSON out.
+
+  ```
+  curl 'localhost:9650/v0/getBlock?number=1036467'
+  curl -d 'address=0xEAaB...&limit=5' localhost:9650/v0/searchTransactionsByAddress
+  curl -H 'Content-Type: application/json' -d '{"to":"0xEAaB...","data":"0x18160ddd"}' localhost:9650/v0/call
+  ```
+
+- **JSON-RPC** at `/` and `/ext/bc/<blockchainID>/rpc`, below.
 
 ## RPC
 

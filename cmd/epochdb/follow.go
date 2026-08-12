@@ -18,22 +18,26 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
-	"github.com/ava-labs/libevm/common"
 
+	"github.com/containerman17/epochdb"
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/rpc"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/epochdb/grpcapi"
+	"github.com/containerman17/epochdb/plainhttp"
 )
 
 // serveMain is `epochdb serve`, THE ONLY OPERATOR COMMAND (RULING 2026-08-03),
 // hosting exactly ONE CHAIN (RULING 2026-08-04). One process that follows the
-// chain, executes, indexes, seals, publishes and serves RPC continuously. No
-// restarts, ever, and no static mode: following is what a node does (ruling
-// 2026-07-29). The serve process is the sole writer and sole server of its data
-// dir; side consumers use its RPC port.
+// chain, executes, indexes, flushes, publishes and answers queries
+// continuously. No restarts, ever, and no static mode: following is what a node
+// does (ruling 2026-07-29). The serve process is the sole writer and sole
+// server of its data dir; side consumers use its ports.
+//
+// IT IS A THIN MAIN OVER THE LIBRARY: everything below the flags is
+// epochdb.Open, which is the entry point a Go consumer links directly (DESIGN
+// "Entry points and adapters"). One lifecycle, so an in-process consumer and
+// this command cannot drift apart.
 //
 // SEVERAL CHAINS ON A BOX ARE SEVERAL PROCESSES, one container each, sharing
 // EPOCHDB_CACHE_DIR. Nothing here coordinates them: the windowed chunk cache is
@@ -48,39 +52,24 @@ import (
 //	                block source, so an accepted container is executable the
 //	                moment it is durable.
 //	exec.Executor   the only holder of the Firewood handle, which it uses ONLY
-//	                to verify roots; sole writer of the state layer
-//	                (writelog/headers/logs/rcpt/code) and, through
-//	                AppendWrites, of the tail overlay. Runs one goroutine,
-//	                publishes its executed height after every committed block.
-//	rpc.Server      N request goroutines. latest/pending state is the uncooked
-//	                tail overlay over the descent (no cook wait, and no
-//	                Firewood: it is verify-only and has no readers);
-//	                historical heights use the descent alone;
-//	                blocks/txs/receipts/logs come from the same live files the
-//	                executor is appending to.
-//	exec OnBlock    runs ON the executor goroutine: publishes the serving head
-//	                and the block-hash entry for the block just committed, so
-//	                eth_blockNumber and the frontier can never disagree by more
-//	                than the microseconds between two stores.
-//	cook loop       cook-index + cook-txindex + History.Refresh on a cadence,
-//	                so the historical window chases the head, then seal: whole
-//	                epochs are cut, published and their raw retired on the same
-//	                tick. Async and fail-loud: a cook or seal failure is
-//	                logged, never stalls the chain.
-//
-// Sealing is automatic and in-process (ruling 2026-08-01); see cookLoop for
-// the ordering that makes deleting raw safe under a live reader.
+//	                to verify roots; sole writer of the state layer and of the
+//	                unflushed window. Runs one goroutine, publishes its executed
+//	                height after every committed block.
+//	rpc.Server      THE CORE QUERY LAYER, N request goroutines. JSON-RPC,
+//	                gRPC and plain HTTP are three PEER adapters over it, none
+//	                stacked on another.
+//	exec OnBlock    runs ON the executor goroutine: raises the fetch floor to
+//	                the last flushed run boundary.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "data directory; ONE chain owns it, and this process serves that one chain")
-	port := fs.Int("port", 9650, "HTTP listen port; the chain answers at / and at /ext/bc/<blockchainID>/rpc, and /status reports it")
+	port := fs.Int("port", 9650, "HTTP listen port: JSON-RPC at / and /ext/bc/<blockchainID>/rpc, the plain HTTP adapter at /v0/<method>, /status")
+	grpcPort := fs.Int("grpc-port", 9660, "gRPC listen port, THE PRIMARY REMOTE API (0 disables)")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (the network --chain lives on)")
 	chainSpec := fs.String("chain", "C", "chain: C for --network's primary C-chain, or an L1's blockchainID")
-	doVerify := fs.Bool("verify", false, "before serving, re-verify every SEALED epoch with the full no-execution engine (diff-applied state roots, txRoot, receiptsRoot reconstructed from the stored logs, header chain). Pulls every byte of the corpus; a failure means the process does not start")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: --node URI only, with a warning")
 	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default: the public endpoint for the chain's networkID)")
 	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
-	cookEvery := fs.Duration("cook-every", time.Minute, "cadence for the in-process cook (index + txindex) that drags the historical window up to the head, and for the seal that rides it")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
 	walks := fs.Int("walks", 16, "concurrent backward walks (--tip-override)")
@@ -133,7 +122,7 @@ func serveMain(args []string) {
 
 	// /status answers from the bind, i.e. through the hour of startup work, so
 	// the handler reads the node through a pointer that is nil until it is up.
-	var node atomic.Pointer[chainNode]
+	var node atomic.Pointer[epochdb.Node]
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -158,14 +147,13 @@ func serveMain(args []string) {
 		}
 		id := c.BlockchainID.String()
 
-		cfg := nodeConfig{
+		cfg := epochdb.Config{
 			DataDir:       *dataDir,
 			Chain:         c,
 			NodeURI:       *nodeURI,
 			StateCacheGiB: *stateCacheGiB,
 			PerPeer:       *perPeer,
-			CookEvery:     *cookEvery,
-			Verify:        *doVerify,
+			OnExit:        report,
 		}
 		// The descriptor, not --network, names the network to dial: it is what
 		// the dir was built with, and an L1 on mainnet under the default
@@ -186,10 +174,7 @@ func serveMain(args []string) {
 				return fe.SyncTo(ctx, resolveTipOverride(ctx, fe, tip), *walks)
 			}
 		}
-		if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-			log.Fatalf("epochdb: serve: %v", err)
-		}
-		n, err := startNode(ctx, cfg, report)
+		n, err := epochdb.Open(ctx, cfg)
 		if err != nil {
 			log.Fatalf("epochdb: serve: %s did not start: %v", id, err)
 		}
@@ -198,13 +183,24 @@ func serveMain(args []string) {
 		// /ext/bc/<id>/rpc is avalanchego's own routing, so wallets,
 		// subnets.avax.network tooling and the ab-benches point at this chain
 		// unchanged. /ws is the same handler: rpc.Server upgrades websockets
-		// itself.
-		mux.Handle("/ext/bc/"+id+"/rpc", n.srv)
-		mux.Handle("/ext/bc/"+id+"/ws", n.srv)
-		mux.Handle("/", n.srv)
-		log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc), executed=%d runs=%d chainId=%s",
-			id, *port, id, n.e.LiveHead(), len(n.store.Manifest().Runs), n.chainID)
-		go syncLoop(ctx, n.cas, *syncEvery)
+		// itself. /v0/ is the plain HTTP adapter, a PEER of JSON-RPC over the
+		// same core layer and never a proxy to it.
+		mux.Handle("/ext/bc/"+id+"/rpc", n.Core())
+		mux.Handle("/ext/bc/"+id+"/ws", n.Core())
+		mux.Handle("/v0/", http.StripPrefix("/v0", plainhttp.Handler(n)))
+		mux.Handle("/", n.Core())
+		head, _ := n.Head()
+		log.Printf("epochdb: serve: %s on :%d (also /ext/bc/%s/rpc, plain HTTP /v0/), executed=%d runs=%d chainId=%s",
+			id, *port, id, head.Number, n.Status().Runs, n.ChainID())
+		if *grpcPort > 0 {
+			gsrv, err := grpcapi.Serve(*grpcPort, n)
+			if err != nil {
+				log.Fatalf("epochdb: serve: gRPC: %v", err)
+			}
+			defer gsrv.Stop()
+			log.Printf("epochdb: serve: gRPC on :%d", *grpcPort)
+		}
+		go syncLoop(ctx, n.CAS(), *syncEvery)
 
 		select {
 		case <-ctx.Done():
@@ -212,18 +208,18 @@ func serveMain(args []string) {
 		case err := <-dead:
 			// The writers close before we die, so the restart is a clean resume
 			// rather than a crash walk-back. stop() cancels ctx first, because
-			// closeAll waits for the executor goroutine to return before it
+			// Close waits for the executor goroutine to return before it
 			// releases the executor's writers.
 			log.Printf("epochdb: serve: FATAL: %v", err)
 			stop()
 			exit = 1
 		}
-		// Stop serving BEFORE closing the read side: closeAll unmaps files the
-		// RPC goroutines read.
+		// Stop serving BEFORE closing the read side: Close unmaps files the
+		// request goroutines read.
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		srv.Shutdown(sctx)
 		cancel()
-		n.closeAll()
+		n.Close()
 	})
 	if err != nil {
 		log.Fatalf("epochdb: serve: %v", err)
@@ -273,20 +269,20 @@ type serveStatus struct {
 	CacheEvictErrors uint64 `json:"cacheEvictErrors,omitempty"`
 	CacheReadErrors  uint64 `json:"cacheReadErrors,omitempty"`
 	CacheLastError   string `json:"cacheLastError,omitempty"`
-	// The retained raw staging the seal has not yet drained. Unbounded by
-	// design: staging drains as sealing retires it, and the disk is the budget.
+	// The retained raw staging the flush has not yet drained. Unbounded by
+	// design: staging drains as flushing retires it, and the disk is the budget.
 	StagingBytes uint64 `json:"stagingBytes,omitempty"`
 }
 
 // statusOf builds that answer. n is nil between the bind and the moment the
 // chain is up, which is minutes to hours on a cold dir: serving=false and the
 // spec the operator asked for is the whole honest answer there.
-func statusOf(spec string, n *chainNode) serveStatus {
+func statusOf(spec string, n *epochdb.Node) serveStatus {
 	if n == nil {
 		return serveStatus{Chain: spec}
 	}
-	s := n.snapshot().serveStatus(n.cfg.Chain.BlockchainID.String())
-	if cs, ok := n.cas.CacheStats(); ok {
+	s := serveStatusOf(n.Status(), spec)
+	if cs, ok := n.CAS().CacheStats(); ok {
 		if cs.VictimAge > 0 {
 			s.CacheHorizon = cs.VictimAge.String()
 		}
@@ -300,10 +296,10 @@ func statusOf(spec string, n *chainNode) serveStatus {
 
 // serveOn binds the RPC port and ONLY THEN does the startup work on it. The
 // order is the whole point: starting a chain is an hour of work on a big corpus
-// (joinChain's walk and, on an empty dir, its whole frontier build, then the
-// exec open, the startup cook and the tail overlay), and while it ran nothing
-// had touched the port, so a collision surfaced as FATAL 68 minutes in (Fuji,
-// 2026-08-01, twice in one night). A bad port now fails in milliseconds.
+// (the join walk and, on an empty dir, its whole frontier build, then the exec
+// open), and while it ran nothing had touched the port, so a collision surfaced
+// as FATAL 68 minutes in (Fuji, 2026-08-01, twice in one night). A bad port now
+// fails in milliseconds.
 //
 // Connections that arrive before a chain is up wait in the kernel's accept
 // backlog until its handler registers: zero code, and unlike a 503 nothing a
@@ -317,267 +313,6 @@ func serveOn(port int, run func(net.Listener)) error {
 	defer ln.Close()
 	run(ln)
 	return nil
-}
-
-// nodeConfig is everything the node needs. `serve` fills exactly one.
-type nodeConfig struct {
-	DataDir       string
-	Chain         *chain.Chain
-	NodeURI       string
-	VdrSources    []string
-	StateCacheGiB int
-	PerPeer       int
-	CookEvery     time.Duration
-	// Backfill replaces the consensus follower with a bounded walk
-	// (serve --tip-override). nil follows the live tip.
-	Backfill func(context.Context, *fetch.Fetcher) error
-	// Verify re-verifies the SEALED epochs before the node serves anything
-	// (serve --verify). A failure means the process does not start.
-	Verify bool
-}
-
-// logf is every node log line. One chain per process means the line needs no
-// chain label: the container is the label.
-func logf(format string, args ...any) { log.Printf("epochdb: "+format, args...) }
-
-// chainNode is the chain's running stack: follower, executor, state layer,
-// history and RPC handler, all on the caller's context. `serve` runs exactly
-// one.
-type chainNode struct {
-	cfg      nodeConfig
-	fetcher  *fetch.Fetcher
-	e        *exec.Executor
-	store    *store.DB
-	cas      *dist.Store
-	srv      *rpc.Server
-	accepted func() uint64
-	chainID  fmt.Stringer // eth chainId, for the startup line
-	// execDone closes when the executor goroutine has RETURNED. Closing the
-	// executor while Run is still in a block would corrupt exactly the writers
-	// the flush exists to protect, so closeAll waits on this. Cancel the node's
-	// context first or the wait never ends.
-	execDone chan struct{}
-}
-
-// startNode wires one chain's goroutines onto ctx and returns with it running.
-// Every component goroutine's exit goes to report, which takes the process down
-// nonzero on a real failure. Nothing here calls log.Fatal: a start failure is an
-// error the caller reports and exits on, so the same code is usable from a test
-// and the flush on the way out is never skipped.
-func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err error)) (n *chainNode, err error) {
-	// THE JOIN PATH runs below, between opening the artifact store and opening
-	// the executor: store.Join resolves this chain's pointer, walks the run
-	// footers backward to the chain root and writes the manifest, and a dir
-	// that came up with runs but no executed state builds its frontier out of
-	// them. Both are no-ops on a warm dir and cost it zero bucket requests.
-
-	// Unwind whatever is already open if a later step fails, so a start that
-	// gives up releases the Firewood handle and the mmaps it took.
-	var closers []func()
-	defer func() {
-		if err == nil {
-			return
-		}
-		for i := len(closers) - 1; i >= 0; i-- {
-			closers[i]()
-		}
-	}()
-
-	// --- staging: the follower writes it, the executor reads it ---------------
-	// Chain is what makes the follower track the L1's subnet and register the
-	// subnet-evm extras (M5); nil-equivalent for the C-chain, whose descriptor
-	// carries the primary subnet.
-	fetcher, err := fetch.New(fetch.Config{
-		DataDir:    cfg.DataDir,
-		NodeURI:    cfg.NodeURI,
-		PerPeer:    cfg.PerPeer,
-		Chain:      cfg.Chain,
-		VdrSources: cfg.VdrSources,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("fetch: %w", err)
-	}
-	closers = append(closers, func() { fetcher.Close() })
-	var blocks exec.BlockSource = fetcher.Store()
-	// The FOLLOWER's accepted head, and only the follower's: the staging store
-	// keeps every index sidecar the dir ever got, so under --tip-override this
-	// is a leftover height and not this run's ceiling. Nothing reads it in that
-	// mode (see nodeStatus and liveNode).
-	accepted := func() uint64 { h, _ := fetcher.Store().Head(); return h }
-
-	// --- storage v0: the executor owns the writer, the RPC shares it ---------
-	g, err := exec.ChainGenesis(cfg.Chain)
-	if err != nil {
-		return nil, fmt.Errorf("genesis: %w", err)
-	}
-	cas, err := dist.Open(cfg.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("open artifact store: %w", err)
-	}
-	closers = append(closers, func() { cas.Close() })
-	// JOIN BEFORE OPEN: the manifest is what store.Open reads, so a fresh dir
-	// joining a published chain has to have it on disk first. A missing pointer
-	// over a populated prefix is a HARD ERROR here, never a silent re-sync.
-	if err := store.Join(cas, cfg.DataDir, cfg.Chain.Root()); err != nil {
-		return nil, fmt.Errorf("join chain: %w", err)
-	}
-	db, err := store.Open(cfg.DataDir, cas, cfg.Chain.Root())
-	if err != nil {
-		return nil, fmt.Errorf("open storage v0: %w", err)
-	}
-	closers = append(closers, func() { db.Close() })
-	misc, err := store.OpenMisc(cfg.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("open misc store: %w", err)
-	}
-	closers = append(closers, func() { misc.Close() })
-
-	// THE FRONTIER BUILD, on its own Executor that is closed before the real
-	// one opens: that is what unpins Firewood's in-memory history. A torn build
-	// heals itself first.
-	if err := buildFrontier(cfg, blocks, db, misc); err != nil {
-		return nil, err
-	}
-
-	// onBlock is late-bound: the executor is built before the RPC server, and
-	// exec.New's reconcile must not publish into a nil server.
-	var onBlock atomic.Pointer[func(uint64, common.Hash)]
-	// exec.New stamps the data dir with the VM kind and refuses a dir built by
-	// the other one (state.Store.BindVMKind): that check is what keeps a
-	// subnet-evm node from opening a coreth corpus.
-	e, err := exec.New(exec.Config{
-		DataDir: cfg.DataDir,
-		Blocks:  blocks,
-		Store:   db,
-		Misc:    misc,
-		OnBlock: func(h uint64, hash common.Hash) {
-			if f := onBlock.Load(); f != nil {
-				(*f)(h, hash)
-			}
-		},
-		StateCacheBytes: uint64(cfg.StateCacheGiB) << 30,
-		// UNPINNED 2026-07-29: this was 1 only so the served frontier was a
-		// committed Firewood revision. Nothing reads Firewood any more, so
-		// batching costs nothing in freshness: head, block-hash index and the
-		// tail overlay all advance together at the batch boundary, because
-		// publishLive/OnBlock and the state-layer appends all happen in
-		// flushBatch. 64 is invisible at tip pace (Run flushes the open batch
-		// the moment staging runs dry, which at the tip is after every block,
-		// so a following node still commits and root-verifies per block) and
-		// is what makes catch-up fast. Ceiling is 1498 (exec.New's walk-back
-		// guard); 64 keeps the crash walk-back at 8k blocks, well inside one
-		// 100k raw bucket.
-		CommitEvery: 64,
-		Chain:       cfg.Chain,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("exec.New: %w", err)
-	}
-	closers = append(closers, func() { e.Close() })
-
-	// The sealed history IS history: the follower must not walk below it,
-	// whatever the raw staging store still happens to hold. sealOnce raises
-	// this again on every epoch cut, including the one the startup cook below
-	// may do.
-	//
-	// Never above the exec head, though: an SAE bootstrap parks the frontier
-	// at the settled height a header attests, up to a settlement lag BELOW the
-	// sealed end (exec.BuildFrontier), and those few blocks have to come back
-	// down the wire to be re-executed. A dir with no exec head at all keeps the
-	// sealed floor: it has not been frontier-built and cannot serve anyway.
-	// THE FETCH FLOOR IS THE LAST FLUSHED RUN BOUNDARY, never higher: crash
-	// recovery re-executes out of staging from wherever the reconcile walk-back
-	// lands, which is at worst the last run's end. Flush raises it again, in
-	// the publish-before-delete order: cut, publish, then unlink.
-	fetcher.SetFloor(flushedFloor(db))
-
-	n = &chainNode{
-		cfg: cfg, fetcher: fetcher, e: e, store: db, cas: cas,
-		accepted: accepted, chainID: g.Config.ChainID,
-		execDone: make(chan struct{}),
-	}
-
-	// --- RPC -----------------------------------------------------------------
-	n.srv = rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db), g.Config)
-	live := liveNode{live: e.LiveHead, settled: e.SettledHeight}
-	if cfg.Backfill != nil {
-		live.target = fetcher.SyncTarget
-	} else {
-		live.accepted = accepted
-	}
-	n.srv.EnableLive(live)
-
-	advance := func(h uint64, hash common.Hash) {
-		n.fetcher.SetFloor(flushedFloor(n.store))
-	}
-	onBlock.Store(&advance)
-
-	if cfg.Backfill != nil {
-		go func() { report("backfill", cfg.Backfill(ctx, fetcher)) }()
-	} else {
-		go func() { report("follower", fetcher.Follow(ctx)) }()
-	}
-	go func() {
-		err := e.Run(ctx)
-		close(n.execDone) // BEFORE report: report may flush, and flushing waits
-		report("executor", err)
-	}()
-	return n, nil
-}
-
-// closeAll is the clean process-shutdown path: every writer flushed and
-// released, executor first (it is the only writer of the state layer, and the
-// holder of the open batch, the state watermark and the Firewood handle).
-//
-// CANCEL THE NODE'S CONTEXT FIRST or the wait on execDone never ends: closing
-// the executor while Run is still inside a block would corrupt exactly the
-// writers the flush exists to protect. Safe only once the RPC listener is done
-// with this node, because it unmaps files those goroutines read.
-func (n *chainNode) closeAll() {
-	<-n.execDone
-	if err := n.e.Close(); err != nil {
-		logf("executor close: %v", err)
-	}
-	if err := n.fetcher.Close(); err != nil {
-		logf("fetch close: %v", err)
-	}
-	n.store.Close()
-}
-
-// liveNode is the rpc.Live surface (SAE labels pending/latest/safe) plus the
-// height eth_syncing advertises.
-//
-// TWO QUESTIONS, TWO VALUES (2026-08-05), because making one number answer both
-// is what put a leftover height in front of clients. AcceptedHead bounds what a
-// read may NAME (`pending`, the block-number ceiling), so it is only ever a
-// height whose container this node holds; SyncTarget is only the goal, and may
-// sit millions of blocks above anything answerable. Following they coincide, so
-// both funcs below are the follower's accepted head. Under --tip-override there
-// is NO follower: the staging store's head is whatever an earlier run left in
-// the dir, so nothing above the executed head may be named, while the goal is
-// the walk's ceiling.
-type liveNode struct {
-	live     func() uint64 // executed head
-	settled  func() uint64
-	accepted func() uint64 // the follower's accepted head; nil when backfilling
-	target   func() uint64 // the backfill ceiling; nil when following
-}
-
-func (l liveNode) LiveHead() uint64      { return l.live() }
-func (l liveNode) SettledHeight() uint64 { return l.settled() }
-
-func (l liveNode) AcceptedHead() uint64 {
-	if l.accepted == nil {
-		return l.live()
-	}
-	return max(l.accepted(), l.live())
-}
-
-func (l liveNode) SyncTarget() uint64 {
-	if l.target == nil {
-		return l.AcceptedHead()
-	}
-	return l.target()
 }
 
 // syncLoop pushes whatever the producers left in the spool to the bucket and
@@ -602,125 +337,31 @@ func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
 	}
 }
 
-// nodeStatus is the chain's numbers, read once and rendered two ways: the log
-// line (status) and /status (serveStatus).
-//
-// head IS THE FIX OF 2026-08-05: it is the height execution is measured
-// against, and where it comes from depends on the mode. Following, it is the
-// follower's accepted head. Backfilling (--tip-override) there IS no follower,
-// and the staging store's head is the follower's number: a dir that once
-// followed still holds index sidecars far above a later override's ceiling, so
-// a 10,129,485-block mainnet backfill reported accepted=66854601 and an
-// exec_lag of 59.3M against a height nothing in the run would ever reach. A
-// backfill measures against the ceiling its walk was given.
-type nodeStatus struct {
-	backfill bool
-	head     uint64 // accepted head (follow) or override ceiling (backfill)
-	stored   uint64 // containers in staging; backfill progress toward head
-	executed uint64
-	served   uint64
-	cooked   uint64
-	settled  uint64
-	entries  int
-	bytes    uint64
-	staging  uint64 // raw staging retained on disk
-}
-
-func (n *chainNode) snapshot() nodeStatus {
-	head, _ := n.store.Head()
-	s := nodeStatus{
-		backfill: n.cfg.Backfill != nil,
-		executed: n.e.LiveHead(),
-		served:   head,
-		cooked:   flushedFloor(n.store),
-		settled:  n.e.SettledHeight(),
-		entries:  len(n.store.Manifest().Runs),
-		bytes:    n.store.SectionSizes()[0] + n.store.SectionSizes()[1] + n.store.SectionSizes()[2],
-		staging:  n.fetcher.StagedBytes(),
-	}
-	if s.backfill {
-		// Count, not a contiguous-run scan: the run above the exec head is
-		// millions of heights wide during a stage-1 walk and probing it every
-		// tick would hold the store's lock against the fetcher.
-		s.head, s.stored = n.fetcher.SyncTarget(), n.fetcher.Store().Count()
-	} else {
-		s.head = n.accepted()
-	}
-	return s
-}
-
-// status is the one-line health of this chain, for the log loop. /status
-// answers with the structured twin (statusOf).
-func (s nodeStatus) status() string {
-	lead, lag := fmt.Sprintf("accepted=%d", s.head), fmt.Sprintf("%d", int64(s.head)-int64(s.executed))
-	if s.backfill {
-		lead = fmt.Sprintf("target=%d stored=%d", s.head, s.stored)
-		if s.head == 0 { // the walk has not resolved its anchors yet
-			lead, lag = fmt.Sprintf("target=? stored=%d", s.stored), "?"
+// statusLine is the one-line health of this chain, for the log loop. /status
+// answers with the structured twin (serveStatusOf).
+func statusLine(s epochdb.Status) string {
+	lead, lag := fmt.Sprintf("accepted=%d", s.Head), fmt.Sprintf("%d", int64(s.Head)-int64(s.Executed))
+	if s.Backfill {
+		lead = fmt.Sprintf("target=%d stored=%d", s.Head, s.Stored)
+		if s.Head == 0 { // the walk has not resolved its anchors yet
+			lead, lag = fmt.Sprintf("target=? stored=%d", s.Stored), "?"
 		}
 	}
 	line := fmt.Sprintf("%s executed=%d served=%d cooked=%d settled=%d exec_lag=%s tail=%d/%.1fMB",
-		lead, s.executed, s.served, s.cooked, s.settled, lag, s.entries, float64(s.bytes)/1e6)
-	if s.staging > 0 {
-		line += fmt.Sprintf(" staging=%.1fGB", float64(s.staging)/1e9)
+		lead, s.Executed, s.Served, s.Flushed, s.Settled, lag, s.Runs, float64(s.Bytes)/1e6)
+	if s.Staging > 0 {
+		line += fmt.Sprintf(" staging=%.1fGB", float64(s.Staging)/1e9)
 	}
 	return line
 }
 
-func (s nodeStatus) serveStatus(chain string) serveStatus {
-	out := serveStatus{Chain: chain, Serving: true, Executed: s.executed, Cooked: s.cooked,
-		StagingBytes: s.staging}
-	if s.backfill {
-		out.Target, out.Stored = s.head, s.stored
+func serveStatusOf(s epochdb.Status, chain string) serveStatus {
+	out := serveStatus{Chain: chain, Serving: true, Executed: s.Executed, Cooked: s.Flushed,
+		StagingBytes: s.Staging}
+	if s.Backfill {
+		out.Target, out.Stored = s.Head, s.Stored
 	} else {
-		out.Accepted = s.head
+		out.Accepted = s.Head
 	}
 	return out
-}
-
-// flushedFloor is the height staging may be retired behind: the end of the last
-// FLUSHED run. Not the executed head and not the window start, because crash
-// recovery re-executes out of staging from wherever the reconcile walk-back
-// lands, and a run boundary is the lowest point that can ever be.
-func flushedFloor(db *store.DB) uint64 {
-	runs := db.Manifest().Runs
-	if len(runs) == 0 {
-		return 0
-	}
-	return runs[len(runs)-1].ToHeight
-}
-
-// buildFrontier gives a dir that joined a published chain the state to serve
-// it. It is a no-op on every other dir: a dir that executed its own history
-// already has a Firewood, and a dir with no runs has nothing to merge.
-//
-// The build runs on its OWN Executor, opened with FrontierBuild and closed
-// before the serving one opens, which is what unpins Firewood's in-memory
-// history (a merge holds a revision per batch otherwise).
-func buildFrontier(cfg nodeConfig, blocks exec.BlockSource, db *store.DB, misc *store.MiscStore) error {
-	head, ok := db.Head()
-	if !ok || head == 0 {
-		return nil
-	}
-	if _, err := exec.HealTornFrontier(cfg.DataDir, misc); err != nil {
-		return err
-	}
-	need, err := exec.FrontierNeeded(cfg.DataDir)
-	if err != nil || !need {
-		return err
-	}
-	log.Printf("epochdb: this dir holds runs through block %d and no state: building the frontier out of them", head)
-	e, err := exec.New(exec.Config{
-		DataDir:       cfg.DataDir,
-		Blocks:        blocks,
-		Store:         db,
-		Misc:          misc,
-		Chain:         cfg.Chain,
-		FrontierBuild: true,
-	})
-	if err != nil {
-		return fmt.Errorf("frontier build: exec.New: %w", err)
-	}
-	defer e.Close()
-	return e.BuildFrontier()
 }

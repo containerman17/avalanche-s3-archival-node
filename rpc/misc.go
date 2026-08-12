@@ -8,7 +8,6 @@ import (
 
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/core/vm"
 	"github.com/ava-labs/libevm/eth/tracers"
 	ethparams "github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
@@ -152,62 +151,11 @@ func (s *Server) execHeader(n uint64) (*types.Header, *rpcError) {
 
 // runCall executes args as a message at height n with the given gas limit,
 // optionally under a tracer (debug_traceCall) and optionally with eth_call's
-// state/block overrides. Kept separate from server.go's ethCall (file
-// discipline); same semantics.
+// state/block overrides. It is ONE call to the shared core: a second copy of
+// the message build and the EVM setup is exactly how eth_call and
+// debug_traceCall drift apart (args.GasPrice was already dropped here once).
 func (s *Server) runCall(args *callArgs, n, gas uint64, tracer tracers.Tracer, ov *overrides) (*callResult, *rpcError) {
-	header, rerr := s.execHeader(n)
-	if rerr != nil {
-		return nil, rerr
-	}
-	st, rerr := s.stateAt(n)
-	if rerr != nil {
-		return nil, rerr
-	}
-	if err := ov.stateDiff().apply(st); err != nil {
-		return nil, errInvalid("%v", err)
-	}
-	msg := &callMsg{
-		To:        args.To,
-		Value:     new(big.Int),
-		GasLimit:  gas,
-		GasPrice:  new(big.Int),
-		GasFeeCap: new(big.Int),
-		GasTipCap: new(big.Int),
-	}
-	if args.From != nil {
-		msg.From = *args.From
-	}
-	if args.Value != nil {
-		msg.Value = (*big.Int)(args.Value)
-	}
-	if args.GasPrice != nil {
-		// Dropped before, which ethCall never did: with NoBaseFee set, a ZERO
-		// gas price is what makes the EVM zero blockCtx.BaseFee (geth's
-		// basefee <= feecap invariant, vm.NewEVM), so ignoring the caller's
-		// price left GASPRICE and BASEFEE at 0 in every eth_estimateGas and
-		// debug_traceCall no matter what the caller asked for.
-		msg.GasPrice = (*big.Int)(args.GasPrice)
-	}
-	if args.Input != nil {
-		msg.Data = *args.Input
-	} else if args.Data != nil {
-		msg.Data = *args.Data
-	}
-	vmCfg := vm.Config{NoBaseFee: true}
-	if tracer != nil {
-		vmCfg.Tracer = tracer
-	}
-	backend := registeredVM()
-	blockCtx := backend.blockContext(header, s.chainCtx)
-	ov.blockDiff().apply(&blockCtx)
-	res, err := backend.applyMsg(s.chainCfg, blockCtx, st, msg, vmCfg)
-	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
-	}
-	if err := st.Error(); err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
-	}
-	return res, nil
+	return s.call(args.msg(gas), n, tracer, ov)
 }
 
 // estimateGas: geth-style binary search over the executable gas limit.

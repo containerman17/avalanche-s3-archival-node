@@ -1,0 +1,14 @@
+# THE GENERATOR IS PINNED LIKE A FORMAT CONSTANT, and there is no Makefile in
+# this repo, so `go generate ./grpcapi` (gen.go) is the whole build step.
+# protoc-gen-go is pinned to the SAME google.golang.org/protobuf version the
+# module requires, so generated code and runtime never disagree.
+version: v2
+managed:
+  enabled: false
+plugins:
+  - local: ["go", "run", "google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11"]
+    out: .
+    opt: paths=source_relative
+  - local: ["go", "run", "google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2"]
+    out: .
+    opt: paths=source_relative

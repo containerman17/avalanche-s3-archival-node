@@ -533,5 +533,5 @@ func flushedFloor2(dataDir string, c *chain.Chain) uint64 {
 		return 0
 	}
 	defer db.Close()
-	return flushedFloor(db)
+	return db.FlushedFloor()
 }
