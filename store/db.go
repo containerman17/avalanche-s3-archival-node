@@ -390,15 +390,15 @@ func (d *DB) writeSections(w *RunWriter) error {
 	if err := w.Begin(SecLookup); err != nil {
 		return err
 	}
-	rows := make([]posting, 0, len(m.post)+len(m.txh))
+	rows := make([]posting, 0, len(m.post)+len(m.nums))
 	rows = append(rows, m.post...)
-	for h, n := range m.txh {
-		rows = append(rows, posting{key: TxHashKey([]byte(h)), val: 0, num: n, isTxh: true})
+	for k, n := range m.nums {
+		rows = append(rows, posting{key: []byte(k), num: n, isNum: true})
 	}
 	sort.Slice(rows, func(i, j int) bool { return string(rows[i].key) < string(rows[j].key) })
 	for _, r := range rows {
 		var val []byte
-		if r.isTxh {
+		if r.isNum {
 			val = beU64(r.num)
 		} else {
 			val = []byte{r.val}
@@ -474,13 +474,13 @@ func (d *DB) Frames(txnum uint64) ([]byte, bool, error) { return d.chainRow(famI
 // Receipt returns a transaction's stored receipt + full logs.
 func (d *DB) Receipt(txnum uint64) ([]byte, bool, error) { return d.chainRow(famRcpt, txnum, false) }
 
-// TxNumByHash resolves a tx hash to its TxNum. A hash lives in exactly one run,
-// so nearly every probe is a bloom miss: the filter's best case.
-func (d *DB) TxNumByHash(hash []byte) (uint64, bool, error) {
-	if n, ok := d.mem.txNum(hash); ok {
+// lookupNum resolves one suffix-free lookup row: the window, then the runs
+// newest-to-oldest, whole-key-bloom gated. A hash lives in exactly one run, so
+// nearly every probe is a bloom miss: the filter's best case.
+func (d *DB) lookupNum(key []byte) (uint64, bool, error) {
+	if n, ok := d.mem.lookupNum(key); ok {
 		return n, true, nil
 	}
-	key := TxHashKey(hash)
 	runs := d.snapshot()
 	for i := len(runs) - 1; i >= 0; i-- {
 		v, ok, err := runs[i].Get(SecLookup, key)
@@ -489,13 +489,21 @@ func (d *DB) TxNumByHash(hash []byte) (uint64, bool, error) {
 		}
 		if ok {
 			if len(v) != 8 {
-				return 0, false, fmt.Errorf("store: txh row is %d bytes, want 8", len(v))
+				return 0, false, fmt.Errorf("store: %s row is %d bytes, want 8", key[:5], len(v))
 			}
 			return beDecode(v), true, nil
 		}
 	}
 	return 0, false, nil
 }
+
+// TxNumByHash resolves a tx hash to its TxNum.
+func (d *DB) TxNumByHash(hash []byte) (uint64, bool, error) { return d.lookupNum(TxHashKey(hash)) }
+
+// HeightByHash resolves a BLOCK HASH to its height. ok=false is a clean "no
+// such block on this chain", never "I could not read it": a read failure comes
+// back as the error.
+func (d *DB) HeightByHash(hash []byte) (uint64, bool, error) { return d.lookupNum(BlkHashKey(hash)) }
 
 // latest walks the descent for the newest value under prefix at or below txnum.
 func (d *DB) latest(sec Section, prefix []byte, at uint64) ([]byte, bool, error) {
@@ -589,6 +597,55 @@ func (d *DB) Postings(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, va
 			continue
 		}
 		if !fn(n, p.val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// PostingsDesc is Postings in reverse: one lookup family's posting rows in
+// [loTx, hiTx] DESCENDING, window first (it holds the newest rows), then the
+// runs newest-to-oldest. It is what newest-first keyset pagination reads: a
+// page is the first pageSize rows this walk yields, and the cursor for the next
+// page is the last TxNum it returned. fn returning false stops the walk.
+func (d *DB) PostingsDesc(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, val byte) bool) error {
+	d.mem.mu.RLock()
+	rows := append([]posting(nil), d.mem.post...)
+	d.mem.mu.RUnlock()
+	sort.Slice(rows, func(i, j int) bool { return TxNumOf(rows[i].key) > TxNumOf(rows[j].key) })
+	for _, p := range rows {
+		if len(p.key) != len(prefix)+8 || string(p.key[:len(prefix)]) != string(prefix) {
+			continue
+		}
+		n := TxNumOf(p.key)
+		if n < loTx || n > hiTx {
+			continue
+		}
+		if !fn(n, p.val) {
+			return nil
+		}
+	}
+	runs := d.snapshot()
+	for i := len(runs) - 1; i >= 0; i-- {
+		r := runs[i]
+		if r.Footer.ToTx <= loTx || r.Footer.FromTx > hiTx {
+			continue
+		}
+		stop := false
+		if err := r.ScanDesc(SecLookup, prefix, loTx, hiTx, func(n uint64, v []byte) bool {
+			var b byte
+			if len(v) > 0 {
+				b = v[0]
+			}
+			if !fn(n, b) {
+				stop = true
+				return false
+			}
+			return true
+		}); err != nil {
+			return err
+		}
+		if stop {
 			return nil
 		}
 	}

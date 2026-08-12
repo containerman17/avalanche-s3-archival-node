@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/ava-labs/libevm/crypto"
 )
 
 // THE MEMTABLE covers the unflushed window and serves it (DESIGN rule 2).
@@ -49,8 +51,10 @@ type memtable struct {
 	state map[string][]memVal
 	code  map[string][]byte
 
-	// lookup rows.
-	txh  map[string]uint64
+	// lookup rows. nums holds the two suffix-free families (txh/ -> TxNum and
+	// blkh/ -> height) keyed by their FULL key, so one map and one log record
+	// kind serve both and a tx hash can never answer a block-hash probe.
+	nums map[string]uint64
 	post []posting
 }
 
@@ -62,8 +66,8 @@ type memVal struct {
 type posting struct {
 	key   []byte // full key including the TxNum suffix
 	val   byte
-	num   uint64 // txh rows only
-	isTxh bool
+	num   uint64 // txh/ and blkh/ rows only
+	isNum bool   // the value is num as 8 big-endian bytes, not the role byte
 }
 
 type chainIndex struct {
@@ -117,7 +121,7 @@ const (
 	recTx    = 'T'
 	recState = 'S'
 	recPost  = 'L'
-	recTxh   = 'X'
+	recNum   = 'X' // a suffix-free lookup row: full key in the payload, value in num
 	recCode  = 'C'
 	recEnd   = 'E' // end of a block: the only point a torn tail may be cut at
 )
@@ -144,7 +148,7 @@ func newMemtable(dir string) (*memtable, error) {
 func (m *memtable) clear() {
 	m.state = map[string][]memVal{}
 	m.code = map[string][]byte{}
-	m.txh = map[string]uint64{}
+	m.nums = map[string]uint64{}
 	m.post = nil
 	for i := range m.chain {
 		m.chain[i].reset()
@@ -231,9 +235,9 @@ replay:
 			}
 			key, v := append([]byte(nil), payload[1:]...), payload[0]
 			pend = append(pend, func() { m.post = append(m.post, posting{key: key, val: v}) })
-		case recTxh:
-			h := string(payload)
-			pend = append(pend, func() { m.txh[h] = num })
+		case recNum:
+			k := string(payload)
+			pend = append(pend, func() { m.nums[k] = num })
 		case recCode:
 			if len(payload) < 32 {
 				break replay
@@ -415,6 +419,11 @@ func (m *memtable) add(b *BlockWrite) error {
 	if err := m.chainRow(famPvm, b.Height, b.Pvm); err != nil {
 		return err
 	}
+	// THE BLOCK-HASH INDEX ROW, derived here rather than carried in: a block
+	// hash is keccak256 of the header RLP, and the header RLP is right there.
+	if err := m.numRow(BlkHashKey(crypto.Keccak256(b.HeaderRLP)), b.Height); err != nil {
+		return err
+	}
 	for h, blob := range b.Code {
 		if _, ok := m.code[h]; ok {
 			continue
@@ -436,10 +445,9 @@ func (m *memtable) add(b *BlockWrite) error {
 		if err := m.chainRow(famTx, n, t.RLP); err != nil {
 			return err
 		}
-		if _, _, err := m.write(recTxh, n, t.Hash); err != nil {
+		if err := m.numRow(TxHashKey(t.Hash), n); err != nil {
 			return err
 		}
-		m.txh[string(t.Hash)] = n
 
 		roles := map[string]byte{}
 		if len(t.Sender) > 0 {
@@ -514,6 +522,15 @@ func (m *memtable) chainRow(fam int, num uint64, val []byte) error {
 	return m.chain[fam].add(num, off, n)
 }
 
+// numRow records one suffix-free lookup row (txh/ or blkh/).
+func (m *memtable) numRow(key []byte, num uint64) error {
+	if _, _, err := m.write(recNum, num, key); err != nil {
+		return err
+	}
+	m.nums[string(key)] = num
+	return nil
+}
+
 func (m *memtable) postRow(key []byte, val byte) error {
 	if _, _, err := m.write(recPost, TxNumOf(key), []byte{val}, key); err != nil {
 		return err
@@ -584,10 +601,11 @@ func (m *memtable) codeBlob(hash []byte) ([]byte, bool) {
 	return b, ok
 }
 
-func (m *memtable) txNum(hash []byte) (uint64, bool) {
+// lookupNum serves a suffix-free lookup row (txh/ or blkh/) out of the window.
+func (m *memtable) lookupNum(key []byte) (uint64, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	n, ok := m.txh[string(hash)]
+	n, ok := m.nums[string(key)]
 	return n, ok
 }
 

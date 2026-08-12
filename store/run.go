@@ -404,6 +404,41 @@ func (r *Run) Scan(s Section, prefix []byte, lo, hi uint64, fn func(txnum uint64
 	return nil
 }
 
+// ScanDesc is Scan in reverse: every row under prefix with a TxNum suffix in
+// [lo, hi], DESCENDING. Newest-first is the only order an address-history page
+// can be cut in, so the iterator does it rather than a caller buffering the
+// whole range and throwing most of it away.
+func (r *Run) ScanDesc(s Section, prefix []byte, lo, hi uint64, fn func(txnum uint64, val []byte) bool) error {
+	if !r.MayHave(s, Suffixed(prefix, 0)) {
+		return nil
+	}
+	it, err := r.rd[s].NewIter(nil, nil)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	if hi == ^uint64(0) {
+		hi-- // the exclusive bound below is hi+1, and TxNum 2^64-1 does not exist
+	}
+	for k, v := it.SeekLT(Suffixed(prefix, hi+1), 0); k != nil; k, v = it.Prev() {
+		if len(k.UserKey) != len(prefix)+8 || string(k.UserKey[:len(prefix)]) != string(prefix) {
+			return nil
+		}
+		n := TxNumOf(k.UserKey)
+		if n < lo {
+			return nil
+		}
+		raw, _, err := v.Value(nil)
+		if err != nil {
+			return err
+		}
+		if !fn(n, raw) {
+			return nil
+		}
+	}
+	return nil
+}
+
 // ScanRange calls fn for every chain-section row in [loKey, hiKey), ascending.
 func (r *Run) ScanRange(s Section, loKey, hiKey []byte, fn func(key, val []byte) bool) error {
 	it, err := r.rd[s].NewIter(nil, hiKey)

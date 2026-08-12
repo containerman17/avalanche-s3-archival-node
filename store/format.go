@@ -47,6 +47,7 @@ const StorageVersion = 0
 // Lookup section, arrives unsorted, sorted in memory at flush:
 //
 //	txh/<txhash>            -> txnum (8B)
+//	blkh/<blockhash>        -> height (8B)
 //	addr/<address>/<txnum>  -> role bits (1B)
 //	logaddr/<address>/<txnum> -> log index within the tx (1B)
 //	topic/<value>/<txnum>   -> topic position (1B)
@@ -67,6 +68,7 @@ const (
 	PrefixState = "state/"
 
 	PrefixTxHash  = "txh/"
+	PrefixBlkHash = "blkh/"
 	PrefixAddr    = "addr/"
 	PrefixLogAddr = "logaddr/"
 	PrefixTopic   = "topic/"
@@ -105,6 +107,23 @@ func RcptKey(txnum uint64) []byte  { return numKey(PrefixRcpt, txnum) }
 func TxKey(txnum uint64) []byte    { return numKey(PrefixTx, txnum) }
 func TxHashKey(h []byte) []byte    { return append([]byte(PrefixTxHash), h...) }
 func CodeKey(hash []byte) []byte   { return append([]byte(PrefixCode), hash...) }
+
+// BlkHashKey is the BLOCK-HASH INDEX row, blkh/<blockhash> -> height. It is the
+// txh/ family's twin in every respect: a lookup-section row with no TxNum
+// suffix, so split() reports the whole key and the bloom is a WHOLE-KEY bloom;
+// a block hash lives in exactly one run, so nearly every probe is a miss, which
+// is the filter's best case.
+//
+// The hash is never carried in from the executor: a block hash IS
+// keccak256(header RLP) (libevm's Header.Hash is rlpHash), and the header RLP
+// is stored verbatim, so the row is derived at write time from bytes the store
+// already holds.
+//
+// REINDEX: adding this family is a new key prefix over data that is already
+// stored, so it is an IO-class rebuild (DESIGN's storage versioning). Storage
+// version stays 0 because no corpus is published yet; every local corpus is
+// rebuilt from staging, clean slate.
+func BlkHashKey(h []byte) []byte { return append([]byte(PrefixBlkHash), h...) }
 
 // AccountPrefix is state/<addr>/a/ : the key range that is one account's
 // history.
