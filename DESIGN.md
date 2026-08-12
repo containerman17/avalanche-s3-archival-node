@@ -12,7 +12,7 @@ THE GOAL (user, 2026-08-10, restated from origin): the fastest and most compact 
 
 NEXT STEPS, in order:
 1. Build storage v0: runs, manifest, memtable, flush, blooms, stored frames. **DONE** except read-through from S3, the deterministic merger and the join path, which are the next step.
-2. Prove on numine (mainnet L1, 1.06M txs). **DONE for layer 1**: clean p2p sync from genesis, 1,036,335 blocks / 1,066,587 txs, execution 7m20s to tip at ~2,900 blk/s with zero root mismatches, and layer 1 PASS over the whole chain in 7m10s. Layer 2 needs the archival subnet-evm oracle we sync ourselves, NEVER the pre-clickhouse binary (user ruling 2026-08-12: it was built without verification, so verifying against it is verifying slop against slop). **TODO**
+2. Prove on numine (mainnet L1, 1.06M txs). **DONE for layer 1**: clean p2p sync from genesis, 1,036,335 blocks / 1,066,587 txs, execution 7m20s to tip at ~2,900 blk/s with zero root mismatches, and layer 1 PASS over the whole chain in 7m10s. Layer 2 diffs against Glacier's hosted archival RPC (below), NEVER the pre-clickhouse binary (user ruling 2026-08-12: it was built without verification, so verifying against it is verifying slop against slop). **TODO**
 3. RPC parity plus the Otterscan methods from day one ("it forces required indexes", user 2026-08-12), gRPC and the plain-HTTP adapter. **TODO**
 4. Rebuild chains smallest-first under NEW S3 prefixes, clean p2p syncs from genesis. Mainnet C last (~2 weeks serial at the measured 1,100-1,300 tx/s, execution-bound; fetch runs concurrent). **TODO**
 
@@ -102,7 +102,7 @@ Full parity minus the refusal classes (user ruling 2026-08-01: "whatever API met
 
 ## Verification: three layers, no self-trust [layer 1 DONE, layers 2 and 3 TODO]
 
-NEVER VERIFY AGAINST OUR OWN PRIOR BINARY (user ruling 2026-08-12). (1) CRYPTOGRAPHIC SELF-VERIFICATION, the strongest oracle: every run recomputes header hash chain, txRoot, receiptsRoot, logsBloom from stored bytes, and state roots against a throwaway Firewood fed from the state family: consensus math, not implementation. A check that cannot run is a FAILURE, never a pass; the anchor is mandatory. (2) THE OFFICIAL CLIENT: an archival avalanchego/subnet-evm node we sync ourselves, diffed on eth_* including historical state (the method the flat-history avalanchego PR proved: 5,685 queries, 0 mismatches). (3) PUBLIC RPC SPOT CHECKS where one exists (mainnet C bodies/receipts/logs; its public endpoint has no archive state, so state rides on layers 1 and 2).
+NEVER VERIFY AGAINST OUR OWN PRIOR BINARY (user ruling 2026-08-12). (1) CRYPTOGRAPHIC SELF-VERIFICATION, the strongest oracle: every run recomputes header hash chain, txRoot, receiptsRoot, logsBloom from stored bytes, and state roots against a throwaway Firewood fed from the state family: consensus math, not implementation. A check that cannot run is a FAILURE, never a pass; the anchor is mandatory. (2) AN INDEPENDENT ARCHIVAL RPC, diffed on eth_* including historical state (the method the flat-history avalanchego PR proved: 5,685 queries, 0 mismatches). HOSTED FIRST: Glacier serves per-L1 RPCs at `https://glacier-api.avax.network/v1/ext/bc/<evmChainId>/rpc`, and numine's (8021) answers archive queries (verified 2026-08-12); throttle the diff, rate limits unknown. A self-run archival avalanchego/subnet-evm node is the fallback ONLY where no hosted archive exists: it costs ~18h of P-chain re-execution before the L1 syncs a single block (user, 2026-08-12). (3) PUBLIC RPC SPOT CHECKS where one exists (mainnet C bodies/receipts/logs; its public endpoint has no archive state, so state rides on layers 1 and 2).
 
 ## The windowed shared chunk cache [DONE, unchanged]
 
@@ -142,7 +142,7 @@ Unchanged: the box slice (`MemoryHigh` ~70%, `MemoryMax` ~85%, sshd always runs)
 - The deterministic MERGER (fan-in 8, upload from level 1): **TODO**. Runs are identified by tx range and the manifest is merge-ready; nothing merges yet.
 - READ-THROUGH FROM S3 for runs, the join/start decision tree over run footers, and the frontier build over the runs' state family: **TODO**.
 - RPC parity restore: **IN PROGRESS**. Everything keyed by BLOCK HASH refuses with a named -32000 until a hash index exists.
-- The archival-oracle node for verification layer 2: **TODO** alongside the numine proof.
+- Verification layer 2 on numine: diff the served eth_* surface against the Glacier hosted archive, throttled: **TODO** once RPC parity is restored.
 - Deterministic merge constants (fan-in 8, upload from level 1) to be validated against real run counts during the rebuild.
 - eth_sendRawTransaction / mempool relay: **TODO**, out of scope until designed.
 - PEER-TO-PEER CHUNK SERVING between consensus-connected nodes: **TODO**.
