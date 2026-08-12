@@ -49,11 +49,19 @@ type Server struct {
 	live Live
 }
 
-// notInPhase1 is the named refusal for a method storage v0 cannot serve yet.
-// It is never an empty result and never a guess: a caller can tell "this node
-// does not index that" from "there is nothing there".
-func notInPhase1(method string) *rpcError {
-	return &rpcError{Code: -32000, Message: method + ": not in phase 1"}
+// heightOfHashTag resolves a block-hash TAG (the object form's blockHash, or a
+// bare hash string) to a height. An unknown hash is an ERROR here and not a
+// null: the caller asked to read something AT that block, and answering at
+// `latest` instead would confidently answer a different question.
+func (s *Server) heightOfHashTag(h common.Hash) (uint64, *rpcError) {
+	n, ok, rerr := s.heightByHash(h)
+	if rerr != nil {
+		return 0, rerr
+	}
+	if !ok {
+		return 0, errInvalid("block %s is not on this chain", h)
+	}
+	return n, nil
 }
 
 // head is the highest stored block height (0 on an empty store).
@@ -330,18 +338,28 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.blockTxCount(req.Params)
 	case "eth_getTransactionByBlockNumberAndIndex":
 		return s.txByBlockAndIndex(req.Params)
-	// Everything keyed by BLOCK HASH: storage v0 has no hash index, and a scan
-	// is not an answer.
-	case "eth_getBlockByHash", "eth_getBlockTransactionCountByHash",
-		"eth_getTransactionByBlockHashAndIndex", "eth_getRawTransactionByBlockHashAndIndex",
-		"eth_getHeaderByHash", "debug_traceBlockByHash", "debug_getModifiedAccountsByHash":
-		return nil, notInPhase1(req.Method)
-	case "debug_getModifiedAccountsByNumber":
-		// Storage v0 keys state rows by account, not by block, so "which
-		// accounts did this block touch" has no index behind it. Answering it
-		// by scanning a block's state rows needs a family this version does
-		// not have.
-		return nil, notInPhase1(req.Method)
+	// Keyed by BLOCK HASH: the blkh/ lookup row answers the height, and the
+	// by-number twin answers everything after it (rpc/block.go).
+	case "eth_getBlockByHash":
+		return s.byHash(req.Params, s.getBlockByNumber)
+	case "eth_getBlockTransactionCountByHash":
+		return s.byHash(req.Params, s.blockTxCount)
+	case "eth_getTransactionByBlockHashAndIndex":
+		return s.byHash(req.Params, s.txByBlockAndIndex)
+	case "eth_getRawTransactionByBlockHashAndIndex":
+		return s.byHash(req.Params, s.rawTxByBlockAndIndex)
+	case "eth_getHeaderByHash":
+		return s.byHash(req.Params, s.getHeaderByNumber)
+	case "debug_traceBlockByHash":
+		return s.byHashStrict(req.Method, req.Params, s.debugTraceBlock)
+	case "debug_getModifiedAccountsByNumber", "debug_getModifiedAccountsByHash":
+		// NOT a phase gap: storage v0 keys state rows by ACCOUNT, not by block,
+		// so "which accounts did this block touch" has no index behind it and
+		// never will in this version. Answering it would mean scanning every
+		// account's history, which is not an answer. A new family plus a
+		// storage version bump plus a reindex is what this method costs.
+		return nil, &rpcError{Code: -32000, Message: req.Method +
+			": storage v0 keys state by account, not by block, so there is no touched-account index (a new key family and a reindex, not a lookup)"}
 	case "eth_getBlockReceipts":
 		return s.getBlockReceipts(req.Params)
 	case "eth_estimateGas":
@@ -487,6 +505,11 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 	case "eth_subscribe", "eth_unsubscribe":
 		return nil, &rpcError{Code: -32000, Message: req.Method + " requires the WebSocket transport"}
 	default:
+		// The Otterscan namespace (rpc/otterscan.go) is dispatched by its own
+		// switch so the table above stays the coreth-parity surface.
+		if res, rerr, ok := s.otsDispatch(req.Method, req.Params); ok {
+			return res, rerr
+		}
 		if ns, _, ok := strings.Cut(req.Method, "_"); ok {
 			switch ns {
 			case "personal", "miner", "admin", "les", "clique", "ethash":
@@ -529,10 +552,9 @@ func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 		}
 		switch {
 		case o.BlockHash != nil:
-			// No hash index in storage v0, so a block-hash tag has no answer
-			// here. The refusal names it rather than falling back to latest,
-			// which would answer a different question confidently.
-			return 0, notInPhase1("block tag by blockHash")
+			// requireCanonical needs no separate treatment: this node stores one
+			// accepted chain, so every stored block is canonical.
+			return s.heightOfHashTag(*o.BlockHash)
 		case len(o.BlockNumber) > 0:
 			return s.blockNumber(o.BlockNumber)
 		}
@@ -541,6 +563,12 @@ func (s *Server) blockNumber(raw json.RawMessage) (uint64, *rpcError) {
 	var tag string
 	if err := json.Unmarshal(raw, &tag); err != nil {
 		return 0, errInvalid("bad block tag: %v", err)
+	}
+	// geth's BlockNumberOrHash also accepts a BARE 32-byte hash string at every
+	// blockNrOrHash position, so it is resolved here, once, rather than in the
+	// nine methods that take one.
+	if len(tag) == 2+2*common.HashLength && strings.HasPrefix(tag, "0x") {
+		return s.heightOfHashTag(common.HexToHash(tag))
 	}
 	switch tag {
 	case "latest", "pending", "":

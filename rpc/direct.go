@@ -34,10 +34,11 @@ func (s *Server) BlockAt(n uint64) (*types.Block, error) {
 	return blk, rerr.error()
 }
 
-// HeightByHash has no answer in phase 1: storage v0 keeps no block-hash index,
-// and a scan of history is not one.
-func (s *Server) HeightByHash(common.Hash) (uint64, bool, error) {
-	return 0, false, notInPhase1("block by hash").error()
+// HeightByHash resolves a block hash through the blkh/ lookup rows. found=false
+// is a clean "not on this chain"; a read failure is the error.
+func (s *Server) HeightByHash(h common.Hash) (uint64, bool, error) {
+	n, ok, rerr := s.heightByHash(h)
+	return n, ok, rerr.error()
 }
 
 // FindTx resolves a tx hash to its block and index. found=false is a clean

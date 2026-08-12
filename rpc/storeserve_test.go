@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
@@ -163,9 +164,37 @@ func TestServeStorageV0(t *testing.T) {
 		t.Fatalf("eth_getLogs wildcard: %v %v", logs, rerr)
 	}
 
-	// Block-hash keyed methods refuse by name; they never answer null or [].
-	if _, rerr := call(t, srv, "eth_getBlockByHash", common.Hash{1}, false); rerr == nil ||
-		rerr.Message != "eth_getBlockByHash: not in phase 1" {
+	// THE BLOCK-HASH INDEX: the by-hash spelling answers exactly what the
+	// by-number spelling does, and an unknown hash is null (not on this chain),
+	// never an error and never an empty block.
+	byNum, rerr := call(t, srv, "eth_getBlockByNumber", "0x1", false)
+	if rerr != nil {
+		t.Fatalf("eth_getBlockByNumber: %v", rerr)
+	}
+	hash := byNum.(map[string]any)["hash"].(common.Hash)
+	byHash, rerr := call(t, srv, "eth_getBlockByHash", hash, false)
+	if rerr != nil {
 		t.Fatalf("eth_getBlockByHash: %v", rerr)
+	}
+	if byHash.(map[string]any)["number"].(*hexutil.Big).ToInt().Uint64() != 1 {
+		t.Fatalf("eth_getBlockByHash returned %v", byHash)
+	}
+	if res, rerr := call(t, srv, "eth_getBlockByHash", common.Hash{1}, false); rerr != nil || res != nil {
+		t.Fatalf("unknown block hash: %v %v", res, rerr)
+	}
+
+	// eth_getLogs BY BLOCK HASH: an unknown hash is an ERROR, never `[]`
+	// (standing bug-ruling: `[]` would claim the block has no matching logs).
+	logs, rerr = call(t, srv, "eth_getLogs", map[string]any{"blockHash": hash, "address": logAddr})
+	if rerr != nil || len(logs.([]*types.Log)) != 1 {
+		t.Fatalf("eth_getLogs by blockHash: %v %v", logs, rerr)
+	}
+	if _, rerr := call(t, srv, "eth_getLogs", map[string]any{"blockHash": common.Hash{9}}); rerr == nil {
+		t.Fatal("eth_getLogs with an unknown blockHash answered instead of erroring")
+	}
+
+	// A bare block hash is a valid blockNrOrHash at every state position.
+	if res, rerr := call(t, srv, "eth_getBlockTransactionCountByHash", hash); rerr != nil || res != hexutil.Uint(1) {
+		t.Fatalf("eth_getBlockTransactionCountByHash: %v %v", res, rerr)
 	}
 }

@@ -35,10 +35,21 @@ func (s *Server) getLogs(params []json.RawMessage) (any, *rpcError) {
 		return nil, errInvalid("bad filter: %v", err)
 	}
 	if f.BlockHash != nil {
-		// The blockHash form needs a hash index, which storage v0 has none of.
-		// An empty array here would say "that block has no matching logs",
-		// which is a different answer and a wrong one.
-		return nil, notInPhase1("eth_getLogs with blockHash")
+		// THE blockHash FORM: one block, exactly. AN UNKNOWN HASH IS AN ERROR,
+		// NEVER `[]` (standing bug-ruling): an empty array would say "that block
+		// has no matching logs", which is a different answer and a wrong one.
+		n, rerr := s.heightOfHashTag(*f.BlockHash)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if n == 0 {
+			return []*types.Log{}, nil // genesis emits no logs
+		}
+		addrs, topics, rerr := parseLogMatchers(&f)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return s.runGetLogs(n, n, addrs, topics)
 	}
 	from, to, addrs, topics, rerr := s.parseFilterCriteria(&f)
 	if rerr != nil {

@@ -247,6 +247,70 @@ func (s *Server) txByBlockAndIndex(params []json.RawMessage) (any, *rpcError) {
 	return out, nil
 }
 
+// --- the BLOCK-HASH INDEX seam -----------------------------------------------
+//
+// Every *ByHash method is its *ByNumber twin with one lookup row in front of
+// it: `blkh/<blockhash>` -> height. Resolving the hash and re-dispatching keeps
+// ONE assembly path per answer shape, so the two spellings of a method can
+// never drift apart.
+
+// heightByHash resolves a block hash through the store's blkh/ rows.
+// found=false means NO SUCH BLOCK ON THIS CHAIN; a failed read is the error,
+// never a false. (DESIGN: null means "not on this chain", never "I could not
+// read it".)
+func (s *Server) heightByHash(h common.Hash) (uint64, bool, *rpcError) {
+	n, ok, err := s.db.HeightByHash(h[:])
+	if err != nil {
+		return 0, false, &rpcError{Code: -32000, Message: fmt.Sprintf("look up block %s: %v", h, err)}
+	}
+	return n, ok, nil
+}
+
+// hashParamHeight reads params[0] as a block hash and resolves its height.
+func (s *Server) hashParamHeight(params []json.RawMessage) (uint64, bool, *rpcError) {
+	if len(params) < 1 {
+		return 0, false, errInvalid("need [blockHash, ...]")
+	}
+	var h common.Hash
+	if err := json.Unmarshal(params[0], &h); err != nil {
+		return 0, false, errInvalid("bad block hash: %v", err)
+	}
+	return s.heightByHash(h)
+}
+
+// byHash re-dispatches a *ByHash method as its *ByNumber twin. An unknown hash
+// is JSON null, which is what a block that is not on this chain means.
+func (s *Server) byHash(params []json.RawMessage, fn func([]json.RawMessage) (any, *rpcError)) (any, *rpcError) {
+	n, ok, rerr := s.hashParamHeight(params)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if !ok {
+		return nil, nil
+	}
+	return fn(withHeight(params, n))
+}
+
+// byHashStrict is byHash for the methods geth ERRORS on rather than nulls:
+// debug_traceBlockByHash has nothing to trace and says so.
+func (s *Server) byHashStrict(method string, params []json.RawMessage, fn func([]json.RawMessage) (any, *rpcError)) (any, *rpcError) {
+	n, ok, rerr := s.hashParamHeight(params)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if !ok {
+		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("%s: block %s is not on this chain", method, params[0])}
+	}
+	return fn(withHeight(params, n))
+}
+
+// withHeight replaces params[0] with a height tag, leaving the rest alone.
+func withHeight(params []json.RawMessage, n uint64) []json.RawMessage {
+	out := append([]json.RawMessage(nil), params...)
+	out[0] = json.RawMessage(`"` + hexutil.EncodeUint64(n) + `"`)
+	return out
+}
+
 // blockParam resolves params[0] as a block tag and reads that block.
 func (s *Server) blockParam(params []json.RawMessage) (*types.Block, *rpcError) {
 	if len(params) < 1 {
