@@ -51,8 +51,12 @@ func (s *Server) blockTxs(n uint64) (types.Transactions, error) {
 		if !ok {
 			return nil, fmt.Errorf("tx %d of block %d is not stored", i, n)
 		}
+		// THE ROW IS THE CONTAINER'S OWN FORM: a typed transaction sits in a
+		// block's tx list as an RLP string wrapping its opaque bytes, not as
+		// the bare MarshalBinary bytes, and storing that form is what lets
+		// Reassemble be pure concatenation. rlp.DecodeBytes reads both shapes.
 		tx := new(types.Transaction)
-		if err := tx.UnmarshalBinary(raw); err != nil {
+		if err := rlp.DecodeBytes(raw, tx); err != nil {
 			return nil, fmt.Errorf("decode tx %d of block %d: %w", i, n, err)
 		}
 		txs[i] = tx

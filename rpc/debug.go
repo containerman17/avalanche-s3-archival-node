@@ -202,9 +202,9 @@ func (s *Server) debugTraceBlock(params []json.RawMessage) (any, *rpcError) {
 
 // debugGetRawBlock hands back the VERBATIM container bytes the block was
 // fetched as, reassembled from the pieces the store keeps (DESIGN's container
-// reassembly). The tx/ rows are MarshalBinary, while a container's tx list
-// holds each tx as an RLP value, so the transactions are re-encoded into that
-// form here; both are the same bytes for a legacy tx.
+// reassembly). The tx/ rows already hold the container's own form, so the
+// re-encode below is the identity in bytes; it exists only because the block
+// object is what this path has in hand.
 func (s *Server) debugGetRawBlock(params []json.RawMessage) (any, *rpcError) {
 	if len(params) < 1 {
 		return nil, errInvalid("need [blockTag]")
