@@ -11,8 +11,8 @@ THE STORAGE LAYER IS BEING REBUILT (user rulings 2026-08-10..12). The product pr
 THE GOAL (user, 2026-08-10, restated from origin): the fastest and most compact node, existing for DeFi work. Two hard requirements: (1) blazingly fast in-process EVM calls at the current block (RPC is too slow; 200-400k calls/s on the target 96-core box); (2) state at a fixed historical block for simulations, extracted once, speed of extraction secondary. The target dev machine holds 200-500GB, so READ-THROUGH FROM S3 IS THE MAIN INSTRUMENT, not full local copies. DISTRIBUTION IS A BYPRODUCT, NOT THE GOAL (user ruling 2026-08-10): never complicate a design to preserve distribution traits; determinism survives because it is nearly free and is also the debugging story.
 
 NEXT STEPS, in order:
-1. Build storage v0: runs, manifest, memtable, flush, blooms. **DONE** except read-through from S3, the deterministic merger and the join path, which are the next step.
-2. Prove on numine (mainnet L1, 1.06M txs; clean p2p sync measured 7m30s to tip). Verify per the three-layer stack below; the oracle is an archival subnet-evm node we sync ourselves, NEVER the pre-clickhouse binary (user ruling 2026-08-12: it was built without verification, so verifying against it is verifying slop against slop). **TODO**
+1. Build storage v0: runs, manifest, memtable, flush, blooms, stored frames. **DONE** except read-through from S3, the deterministic merger and the join path, which are the next step.
+2. Prove on numine (mainnet L1, 1.06M txs). **DONE for layer 1**: clean p2p sync from genesis, 1,036,335 blocks / 1,066,587 txs, execution 7m20s to tip at ~2,900 blk/s with zero root mismatches, and layer 1 PASS over the whole chain in 7m10s. Layer 2 needs the archival subnet-evm oracle we sync ourselves, NEVER the pre-clickhouse binary (user ruling 2026-08-12: it was built without verification, so verifying against it is verifying slop against slop). **TODO**
 3. RPC parity plus the Otterscan methods from day one ("it forces required indexes", user 2026-08-12), gRPC and the plain-HTTP adapter. **TODO**
 4. Rebuild chains smallest-first under NEW S3 prefixes, clean p2p syncs from genesis. Mainnet C last (~2 weeks serial at the measured 1,100-1,300 tx/s, execution-bound; fetch runs concurrent). **TODO**
 
@@ -119,6 +119,7 @@ One publisher, many read-only consumers; object storage R2/B2-class with zero eg
 - MAINNET SCALE: ~0.95-1.1B distinct state keys, ~1.6-1.8B total writes, 92.1M blocks, ~1.5B txs. PER-TX STATE ROWS add the within-block write-collision rate over per-block: low single-digit percent expected on Avalanche (fees are burned, so no per-tx coinbase write; measure at rebuild).
 - STATE VS TRIE: Firewood is ~86% merkle overhead over flat state; current state 130-157GB; flat history was 175GB per-block at mainnet-43M, per-tx somewhat above.
 - RUN COUNT: flush at 500k txs = ~3,000 L0 runs over mainnet history, merged 8x per level to ~25-30 live runs; blooms and SST indexes resident at a few GB.
+- SECTION SPLIT, MEASURED ON NUMINE 2026-08-12 (20 L0 runs, blocks 1..1,000,000, 1,030,022 txs, snappy): chain 630.3MB (71.7%), state 157.2MB (17.9%), lookup 92.1MB (10.5%), 879.6MB total, i.e. ~854 B/tx all-in. Frames cost ~64MB of the chain section and ~2.5MB of lookup at 4.77 frames/tx. Chain dominating by 4x is what makes it the section worth the highest compression level once a usable zstd exists.
 - REPLAY WALL CLOCK, measured i7i.2xlarge: mainnet from genesis ~2 weeks serial at 1,100-1,300 tx/s; first 500M txs 3.3 days; numine (1.03M blocks) 7m30s to tip on the dev box.
 - The old cook's 60s bucket rewrite (~100-150GB/day SSD at tip pace) DIES with the cook: flush writes each byte once per level, bounded by the merge fan-in.
 
