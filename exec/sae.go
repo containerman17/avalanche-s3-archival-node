@@ -21,7 +21,7 @@ import (
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/rlp"
-	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/store"
 
 	saetypes "github.com/ava-labs/avalanchego/vms/saevm/types"
 )
@@ -200,7 +200,7 @@ func (h *saeHooks) worstCaseGasTime(hdr *types.Header) (*gastime.Time, error) {
 // goes into the ring and the header that later carries SettledHeight == N
 // must present exactly that root (plus the gas clock at N, which the same
 // markers pin). Nothing advances past a mismatch.
-func (e *Executor) executeSAEBlock(blk *types.Block) error {
+func (e *Executor) executeSAEBlock(blk *types.Block, pvm []byte) error {
 	if e.sae == nil {
 		if err := e.initSAE(); err != nil {
 			return err
@@ -228,23 +228,25 @@ func (e *Executor) executeSAEBlock(blk *types.Block) error {
 		}
 	}
 
-	frame := &blockFrame{}
-	e.wrapDB.setFrame(frame)
-	// saexec.Execute hardcodes vm.Config{} at this pin, so no frame capture
-	// happens below the seam. begin() still runs so a stale block's frames
-	// can never leak into an SAE block's record; seal REFUSES a tx-bearing
-	// block with no frames record, which is how that hole stays loud.
-	frames.begin()
+	// STATE CAPTURE IS PER BLOCK ON THIS PATH ONLY. saexec.Execute owns the
+	// transaction loop below the seam and offers no per-tx boundary, so an SAE
+	// block's post-images all land at its LAST TxNum instead of at the tx that
+	// wrote them. That is a lossy transform of the per-tx rule, accepted here
+	// because Helicon is not scheduled on mainnet in this dep set; giving SAE
+	// per-tx rows means a boundary inside saexec, which is exactly the kind of
+	// seam the frames ruling killed. Revisit when a chain actually crosses it.
+	cap := &capture{code: map[string][]byte{}}
+	e.wrapDB.setCapture(cap)
 	res, err := saexec.Execute(
 		b, e, math.MaxInt, nil, e.sae.hooks,
 		e.chainCfg, saeChainContext{e}, &saexec.NullReceiptStore{}, logging.NoLog{},
 	)
 	if err != nil {
-		e.wrapDB.setFrame(nil)
+		e.wrapDB.setCapture(nil)
 		return err
 	}
 	if err := e.sae.hooks.takeErr(); err != nil {
-		e.wrapDB.setFrame(nil)
+		e.wrapDB.setCapture(nil)
 		return err
 	}
 
@@ -255,7 +257,7 @@ func (e *Executor) executeSAEBlock(blk *types.Block) error {
 		e.fwHeight+1, true,
 		stateconf.WithTrieDBUpdateOpts(stateconf.WithTrieDBUpdatePayload(header.ParentHash, blk.Hash())),
 	)
-	e.wrapDB.setFrame(nil)
+	e.wrapDB.setCapture(nil)
 	if err != nil {
 		return fmt.Errorf("statedb commit: %w", err)
 	}
@@ -271,31 +273,16 @@ func (e *Executor) executeSAEBlock(blk *types.Block) error {
 		return err
 	}
 
-	// Frames stay per-block post-images, exactly as below the boundary; a
-	// block that wrote nothing gets no record, which is the convention the
-	// cook/seal and verify paths read.
-	if len(frame.buf) > 0 {
-		if err := e.cfg.Store.AppendWrites(blockNum, frame.buf); err != nil {
-			return err
-		}
+	bw := &store.BlockWrite{
+		Height: blockNum, HeaderRLP: headerRLP, Pvm: pvm,
+		Tail: cap.take(), Code: cap.code,
 	}
-	if err := e.cfg.Store.AppendHeader(blockNum, headerRLP); err != nil {
+	e.signer = types.MakeSigner(e.chainCfg, header.Number, header.Time)
+	if err := e.appendSAETxs(bw, blk, res.Receipts); err != nil {
 		return err
 	}
-	if rec := encodeLogsFrame(receiptLogs(res.Receipts)); rec != nil {
-		if err := e.cfg.Store.AppendLogs(blockNum, rec); err != nil {
-			return err
-		}
-	}
-	if rec := storedTailRecord(res.Receipts); rec != nil {
-		if err := e.cfg.Store.AppendRcpt(blockNum, rec); err != nil {
-			return err
-		}
-	}
-	if rec := frames.record(); rec != nil {
-		if err := e.cfg.Store.AppendItx(blockNum, rec); err != nil {
-			return err
-		}
+	if err := e.cfg.Store.WriteBlock(bw); err != nil {
+		return err
 	}
 	if err := e.maybeFlush(blockNum); err != nil {
 		return err
@@ -368,7 +355,7 @@ func (e *Executor) checkSettled(n uint64, header *types.Header) error {
 		return fmt.Errorf("block %d settles height %d, below the previously settled %d: settlement is monotonic",
 			n, s.Height, e.sae.settledHeight)
 	}
-	if floor, ok := e.cfg.Store.FrontierFloor(); ok && s.Height < floor {
+	if floor, ok := e.cfg.Misc.FrontierFloor(); ok && s.Height < floor {
 		// A bootstrapped node's state came from a frontier merge at floor,
 		// verified against the header that settles it (exec/frontier.go), and
 		// it never executed anything below that: there is no root of ours to
@@ -433,14 +420,41 @@ func receiptLogs(receipts types.Receipts) []*types.Log {
 	return logs
 }
 
-// storedTailRecord builds the tail receipts+full-logs record from receipts the
-// executor already holds, in the EPOCH stored-section encoding. Both execution
-// paths call it; sealing copies the result into the epoch's sections byte for
-// byte, so no block is ever re-executed to derive them. SAE-proof by
-// construction: receipts are per-block deterministic at execution regardless
-// of when a header settles them.
-func storedTailRecord(receipts types.Receipts) []byte {
-	return state.EncodeTailRcpt(state.EncodeStoredLogs(receipts), state.EncodeStoredReceipts(receipts))
+// appendSAETxs builds the SAE block's per-tx rows from execution outputs. Same
+// row shape as captureTx, minus the per-tx state (see executeSAEBlock).
+func (e *Executor) appendSAETxs(bw *store.BlockWrite, blk *types.Block, receipts types.Receipts) error {
+	txs := blk.Transactions()
+	if len(receipts) != len(txs) {
+		return fmt.Errorf("sae block %d: %d receipts for %d txs", blk.NumberU64(), len(receipts), len(txs))
+	}
+	for i, tx := range txs {
+		raw, err := tx.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("encode tx %s: %w", tx.Hash(), err)
+		}
+		r := receipts[i]
+		tw := store.TxWrite{
+			Hash:    tx.Hash().Bytes(),
+			RLP:     raw,
+			Receipt: store.EncodeTxReceipt(r, r.CumulativeGasUsed),
+		}
+		if from, err := types.Sender(e.signer, tx); err == nil {
+			tw.Sender = from.Bytes()
+		}
+		if to := tx.To(); to != nil {
+			tw.To = to.Bytes()
+		} else if r.ContractAddress != (common.Address{}) {
+			tw.Created = r.ContractAddress.Bytes()
+		}
+		for _, l := range r.Logs {
+			tw.LogAddrs = append(tw.LogAddrs, l.Address.Bytes())
+			for _, tp := range l.Topics {
+				tw.Topics = append(tw.Topics, tp.Bytes())
+			}
+		}
+		bw.Txs = append(bw.Txs, tw)
+	}
+	return nil
 }
 
 // --- discard sinks -----------------------------------------------------------

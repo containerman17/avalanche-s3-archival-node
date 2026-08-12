@@ -106,7 +106,7 @@ func (corethVM) newStateDatabase(db ethdb.Database, tdb *triedb.Database) ethsta
 // already exist in memory: capture is free). Shared by the per-block and
 // batched paths.
 func (corethVM) runEVM(cc chainContext, chainCfg *params.ChainConfig, snowCtx *snow.Context,
-	blk *types.Block, parentTime uint64, statedb *ethstate.StateDB,
+	blk *types.Block, parentTime uint64, statedb *ethstate.StateDB, onTx TxHook,
 ) (types.Receipts, error) {
 	header := blk.Header()
 
@@ -138,12 +138,17 @@ func (corethVM) runEVM(cc chainContext, chainCfg *params.ChainConfig, snowCtx *s
 		statedb.SetTxContext(tx.Hash(), txIndex)
 		receipt, err := corethcore.ApplyTransaction(
 			chainCfg, cc, blockCtx, gp, statedb,
-			header, tx, &usedGas, vm.Config{Tracer: frameTracer()},
+			header, tx, &usedGas, vm.Config{},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("tx %d: %w", txIndex, err)
 		}
 		receipts = append(receipts, receipt)
+		if onTx != nil {
+			if err := onTx(txIndex, tx, receipt); err != nil {
+				return nil, fmt.Errorf("tx %d capture: %w", txIndex, err)
+			}
+		}
 	}
 
 	// Atomic txs ride in the block's ExtData; Fuji has real imports and

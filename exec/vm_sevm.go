@@ -198,7 +198,7 @@ func (sevmVM) newStateDatabase(db ethdb.Database, tdb *triedb.Database) ethstate
 // the block fee, so it cannot move a state root) and minus coreth's atomic-tx
 // block, which has no subnet-evm counterpart at all.
 func (sevmVM) runEVM(cc chainContext, chainCfg *params.ChainConfig, _ *snow.Context,
-	blk *types.Block, parentTime uint64, statedb *ethstate.StateDB,
+	blk *types.Block, parentTime uint64, statedb *ethstate.StateDB, onTx TxHook,
 ) (types.Receipts, error) {
 	header := blk.Header()
 	sc := sevmChainContext{cc}
@@ -223,12 +223,17 @@ func (sevmVM) runEVM(cc chainContext, chainCfg *params.ChainConfig, _ *snow.Cont
 		statedb.SetTxContext(tx.Hash(), txIndex)
 		receipt, err := sevmcore.ApplyTransaction(
 			chainCfg, sc, blockCtx, gp, statedb,
-			header, tx, &usedGas, vm.Config{Tracer: frameTracer()},
+			header, tx, &usedGas, vm.Config{},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("tx %d: %w", txIndex, err)
 		}
 		receipts = append(receipts, receipt)
+		if onTx != nil {
+			if err := onTx(txIndex, tx, receipt); err != nil {
+				return nil, fmt.Errorf("tx %d capture: %w", txIndex, err)
+			}
+		}
 	}
 	return receipts, nil
 }

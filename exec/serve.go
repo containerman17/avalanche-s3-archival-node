@@ -10,7 +10,7 @@ import (
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/store"
 )
 
 // ChainGenesis returns the fully wired genesis (chain config with Avalanche
@@ -40,10 +40,6 @@ func ChainGenesis(c *chain.Chain) (*Genesis, error) {
 // pre-fork) into an eth block, for the read-side tx APIs.
 var ParseEthBlock = parseEthBlock
 
-// EncodeLogsFrame exposes the live capture's event-log record encoder so
-// the log backfill produces byte-identical records.
-var EncodeLogsFrame = encodeLogsFrame
-
 // HasSettledMarkers reports whether a header carries the ACP-194
 // settlement markers, i.e. whether it was built by the SAE VM. Read-side
 // consumers need it because every per-block header invariant changes above
@@ -72,6 +68,6 @@ func NewStateDatabase(db ethdb.Database, tdb *triedb.Database) ethstate.Database
 // NewChainContext exposes the executor's headers-log-backed ChainContext so
 // BLOCKHASH inside historical eth_call resolves real hashes. Not
 // goroutine-safe (bucketLog LRU state): callers serialize.
-func NewChainContext(store *state.Store) corethcore.ChainContext {
-	return chainContext{store: store}
+func NewChainContext(db *store.DB) corethcore.ChainContext {
+	return chainContext{store: db}
 }

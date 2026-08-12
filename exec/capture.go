@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/containerman17/epochdb/store"
+
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
@@ -15,46 +17,39 @@ import (
 	"github.com/ava-labs/libevm/triedb"
 )
 
-// Write-capture record kinds. Unlike the reference (old-value changesets),
-// we record post-images: the NEW value being written. A deleted account or
-// slot is an explicit zero-length value record.
-const (
-	kindAccount byte = 'a' // [kind][addr 20][uvarint vlen][account RLP]
-	kindStorage byte = 's' // [kind][addr 20][slot key 32][uvarint vlen][value RLP]
-	kindCodeUse byte = 'c' // [kind][addr 20][code hash 32][uvarint 0]
-)
-
-// blockFrame accumulates one block's write records.
-type blockFrame struct {
-	buf []byte
-	n   int // record count
+// STATE CAPTURE IS PER TRANSACTION (DESIGN's one amendment): the same trie
+// interceptor as before, drained at every tx boundary instead of once per
+// block, so a slot's key range is its real time series including intra-block
+// ticks. Post-images, never old-value changesets: a deleted account or a
+// cleared slot is an explicit EMPTY value, which is what the EVM means by
+// cleared and is why no tombstone mechanism exists.
+type capture struct {
+	rows []store.StateRow
+	// code is the block's newly seen contract code, by hash. It rides on the
+	// BlockWrite rather than a separate store, so whichever run answers an
+	// account read also carries its code.
+	code map[string][]byte
 }
 
-func (f *blockFrame) recordAccount(addr common.Address, valRLP []byte) {
-	f.buf = append(f.buf, kindAccount)
-	f.buf = append(f.buf, addr[:]...)
-	f.buf = binary.AppendUvarint(f.buf, uint64(len(valRLP)))
-	f.buf = append(f.buf, valRLP...)
-	f.n++
+func (c *capture) recordAccount(addr common.Address, valRLP []byte) {
+	c.rows = append(c.rows, store.StateRow{Kind: 'a', Addr: addr[:], Val: valRLP})
 }
 
-func (f *blockFrame) recordStorage(addr common.Address, key []byte, valRLP []byte) {
-	f.buf = append(f.buf, kindStorage)
-	f.buf = append(f.buf, addr[:]...)
+func (c *capture) recordStorage(addr common.Address, key []byte, valRLP []byte) {
 	var slot common.Hash
 	copy(slot[:], key)
-	f.buf = append(f.buf, slot[:]...)
-	f.buf = binary.AppendUvarint(f.buf, uint64(len(valRLP)))
-	f.buf = append(f.buf, valRLP...)
-	f.n++
+	c.rows = append(c.rows, store.StateRow{Kind: 's', Addr: addr[:], Slot: slot[:], Val: valRLP})
 }
 
-func (f *blockFrame) recordCodeUse(addr common.Address, codeHash common.Hash) {
-	f.buf = append(f.buf, kindCodeUse)
-	f.buf = append(f.buf, addr[:]...)
-	f.buf = append(f.buf, codeHash[:]...)
-	f.buf = binary.AppendUvarint(f.buf, 0)
-	f.n++
+func (c *capture) recordCodeUse(addr common.Address, codeHash common.Hash) {
+	c.rows = append(c.rows, store.StateRow{Kind: 'c', Addr: addr[:], Val: codeHash[:]})
+}
+
+// take hands over the rows drained since the last take and starts a new run.
+func (c *capture) take() []store.StateRow {
+	rows := c.rows
+	c.rows = nil
+	return rows
 }
 
 // encodeLogsFrame builds one block's event-log index record: the block's
@@ -128,11 +123,6 @@ func decodeLogsFrame(rec []byte) (addrs []common.Address, topics []common.Hash, 
 	return addrs, topics, nil
 }
 
-// codeSink receives every contract code blob at write time.
-type codeSink interface {
-	PutCode(hash common.Hash, blob []byte) error
-}
-
 // wrapDatabase wraps an inner state.Database so that every account,
 // storage, and contract-code write passes through a trie interceptor that
 // records post-images into the current blockFrame. A nil frame disables
@@ -146,8 +136,8 @@ type codeSink interface {
 // newRoot != header.Root hard stop keeps detecting any divergence.
 // verify makes every cache hit also do the FFI read and panic on any
 // difference (validation harness, not steady state).
-func wrapDatabase(inner state.Database, code codeSink, cacheBytes uint64, verify bool) *wrappedDatabase {
-	d := &wrappedDatabase{inner: inner, code: code, cacheCap: cacheBytes, verify: verify}
+func wrapDatabase(inner state.Database, cacheBytes uint64, verify bool) *wrappedDatabase {
+	d := &wrappedDatabase{inner: inner, cacheCap: cacheBytes, verify: verify}
 	if cacheBytes > 0 {
 		d.cache = make(map[common.Address]*acctEntry)
 	}
@@ -156,8 +146,15 @@ func wrapDatabase(inner state.Database, code codeSink, cacheBytes uint64, verify
 
 type wrappedDatabase struct {
 	inner state.Database
-	code  codeSink
-	frame *blockFrame
+	cap   *capture
+
+	// midBlock short-circuits the ACCOUNT trie's Hash so a per-tx
+	// IntermediateRoot drains post-images through the interceptor without
+	// asking Firewood for a root it has no use for and would charge for.
+	// Cleared before the block's own Commit, which is the one that must
+	// produce the real root.
+	midBlock bool
+	midRoot  common.Hash
 
 	// ponytail: no locks, the executor is single-goroutine by design;
 	// add a mutex if a prefetcher or parallel EVM ever appears.
@@ -234,7 +231,14 @@ const (
 	slotCost  = 104
 )
 
-func (d *wrappedDatabase) setFrame(f *blockFrame) { d.frame = f }
+func (d *wrappedDatabase) setCapture(c *capture) { d.cap = c }
+
+// beginBlock arms the per-tx drain. root is the parent root, handed back by the
+// account trie's Hash while the block is mid-flight.
+func (d *wrappedDatabase) beginBlock(root common.Hash) { d.midBlock, d.midRoot = true, root }
+
+// endBlock disarms it, so the block's own Commit computes the real root.
+func (d *wrappedDatabase) endBlock() { d.midBlock = false }
 
 // entry returns the cache entry for addr, creating it (and evicting over
 // the cap) as needed. Caller must have checked d.cache != nil.
@@ -290,13 +294,13 @@ func (d *wrappedDatabase) OpenTrie(root common.Hash) (state.Trie, error) {
 			}
 			d.batchTrie = t
 		}
-		return &wrappingTrie{inner: d.batchTrie, db: d, batchAccount: true}, nil
+		return &wrappingTrie{inner: d.batchTrie, db: d, batchAccount: true, account: true}, nil
 	}
 	t, err := d.inner.OpenTrie(root)
 	if err != nil {
 		return nil, err
 	}
-	return &wrappingTrie{inner: t, db: d}, nil
+	return &wrappingTrie{inner: t, db: d, account: true}, nil
 }
 
 func (d *wrappedDatabase) OpenStorageTrie(stateRoot common.Hash, addr common.Address, root common.Hash, parent state.Trie) (state.Trie, error) {
@@ -342,10 +346,13 @@ type wrappingTrie struct {
 	// that zero is embedded in captured account RLP, which must not
 	// change between batch and per-block modes.
 	batchAccount bool
+	// account marks the ACCOUNT trie (OpenTrie, not OpenStorageTrie), the one
+	// whose Hash the per-tx drain must not pay for.
+	account bool
 }
 
 func (t *wrappingTrie) UpdateAccount(addr common.Address, acc *types.StateAccount) error {
-	if f := t.db.frame; f != nil {
+	if f := t.db.cap; f != nil {
 		valRLP, err := rlp.EncodeToBytes(acc)
 		if err != nil {
 			return err
@@ -361,7 +368,7 @@ func (t *wrappingTrie) UpdateAccount(addr common.Address, acc *types.StateAccoun
 }
 
 func (t *wrappingTrie) DeleteAccount(addr common.Address) error {
-	if f := t.db.frame; f != nil {
+	if f := t.db.cap; f != nil {
 		f.recordAccount(addr, nil)
 	}
 	// THE selfdestruct hazard: Firewood prefix-deletes the whole storage
@@ -382,7 +389,7 @@ func (t *wrappingTrie) DeleteAccount(addr common.Address) error {
 }
 
 func (t *wrappingTrie) UpdateStorage(addr common.Address, key, value []byte) error {
-	if f := t.db.frame; f != nil {
+	if f := t.db.cap; f != nil {
 		f.recordStorage(addr, key, value)
 	}
 	if d := t.db; d.cache != nil || d.batchDeleted != nil {
@@ -401,7 +408,7 @@ func (t *wrappingTrie) UpdateStorage(addr common.Address, key, value []byte) err
 }
 
 func (t *wrappingTrie) DeleteStorage(addr common.Address, key []byte) error {
-	if f := t.db.frame; f != nil {
+	if f := t.db.cap; f != nil {
 		f.recordStorage(addr, key, nil)
 	}
 	if d := t.db; d.cache != nil || d.batchDeleted != nil {
@@ -418,14 +425,16 @@ func (t *wrappingTrie) DeleteStorage(addr common.Address, key []byte) error {
 }
 
 func (t *wrappingTrie) UpdateContractCode(addr common.Address, codeHash common.Hash, code []byte) error {
-	if f := t.db.frame; f != nil {
+	if f := t.db.cap; f != nil {
 		f.recordCodeUse(addr, codeHash)
 	}
 	// Capture the blob at write time. The commit-phase rawdb.WriteCode
 	// lands in the same code store via the ethdb adapter; both paths
 	// dedup by hash.
-	if err := t.db.code.PutCode(codeHash, code); err != nil {
-		return err
+	if c := t.db.cap; c != nil {
+		if _, ok := c.code[string(codeHash[:])]; !ok {
+			c.code[string(codeHash[:])] = append([]byte(nil), code...)
+		}
 	}
 	return t.inner.UpdateContractCode(addr, codeHash, code)
 }
@@ -541,6 +550,9 @@ func (t *wrappingTrie) GetKey(k []byte) []byte { return t.inner.GetKey(k) }
 func (t *wrappingTrie) Hash() common.Hash {
 	if t.batchAccount {
 		return t.db.batchRoot
+	}
+	if t.account && t.db.midBlock {
+		return t.db.midRoot
 	}
 	return t.inner.Hash()
 }

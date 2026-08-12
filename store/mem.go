@@ -350,6 +350,11 @@ type BlockWrite struct {
 	Pvm       []byte
 	Txs       []TxWrite
 	Code      map[string][]byte // code blobs first seen in this block, by hash
+	// Tail is state written outside any transaction: a fork upgrade's
+	// activation, coreth's atomic transfers, block finalisation. It lands at
+	// the block's LAST TxNum, or at the TxNum the block would have started at
+	// when it has no transactions of its own.
+	Tail []StateRow
 }
 
 func (m *memtable) write(kind byte, num uint64, payload ...[]byte) (body uint64, n int, err error) {
@@ -465,6 +470,19 @@ func (m *memtable) add(b *BlockWrite) error {
 			}
 			m.putState(string(k), n, r.Val)
 		}
+	}
+	tailAt := first
+	if len(b.Txs) > 0 {
+		tailAt = first + uint64(len(b.Txs)) - 1
+	}
+	for _, r := range b.Tail {
+		k := stateKeyPrefix(r)
+		var kl [2]byte
+		binary.BigEndian.PutUint16(kl[:], uint16(len(k)))
+		if _, _, err := m.write(recState, tailAt, kl[:], k, r.Val); err != nil {
+			return err
+		}
+		m.putState(string(k), tailAt, r.Val)
 	}
 	m.nextTx = first + uint64(len(b.Txs))
 	m.nextHeight = b.Height + 1

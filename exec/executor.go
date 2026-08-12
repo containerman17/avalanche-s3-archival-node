@@ -23,7 +23,7 @@ import (
 
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/state"
+	"github.com/containerman17/epochdb/store"
 )
 
 // flushEvery is the group-fsync cadence in blocks: writelog/headers/code/
@@ -60,8 +60,11 @@ type Config struct {
 	DataDir string
 	// Blocks is the container source (a fetch.Reader over the staging dir).
 	Blocks BlockSource
-	// Store is the flat-file state layer. Required.
-	Store *state.Store
+	// Store is storage v0. Required.
+	Store *store.DB
+	// Misc is the small durable key store rawdb needs beside the runs
+	// (the vm-kind stamp and the few non-code rawdb keys). Required.
+	Misc *store.MiscStore
 	// StateCacheBytes sizes the Go-side EVM read cache (0 disables).
 	StateCacheBytes uint64
 	// VerifyCache re-reads every cache hit through Firewood and panics
@@ -147,6 +150,13 @@ type Executor struct {
 	batchCount     int
 	batchBuf       []batchItem
 
+	// Per-block capture seam: the tx hook needs the block it is inside.
+	capture    *capture
+	curBW      *store.BlockWrite
+	curHeader  *types.Header
+	curStatedb *ethstate.StateDB
+	signer     types.Signer
+
 	// spl accumulates exec-goroutine wall time per status interval:
 	// where the serial thread's time goes (throughput experiment).
 	spl struct{ read, evm, hash, fw, fsync time.Duration }
@@ -169,14 +179,9 @@ type Executor struct {
 // back until the batch boundary root verifies so a bad batch never leaves
 // unverified frames on disk.
 type batchItem struct {
-	num       uint64
-	hash      common.Hash
-	headerRLP []byte
-	frame     []byte
-	hasFrame  bool
-	logsRec   []byte // nil = no logs in this block
-	rcptRec   []byte // nil = no transactions in this block
-	itxRec    []byte // nil = no transactions in this block (call frames)
+	num  uint64
+	hash common.Hash
+	bw   *store.BlockWrite
 }
 
 // chainContext is the minimal coreth ChainContext for
@@ -189,8 +194,8 @@ type batchItem struct {
 // returned the zero hash and diverged execution (second live batch
 // mismatch at Fuji ~7220368, per-block re-execution clean).
 type chainContext struct {
-	e     *Executor    // nil outside the executor (historical eth_call)
-	store *state.Store // headers log
+	e     *Executor // nil outside the executor (historical eth_call)
+	store *store.DB // the chain section
 }
 
 // Engine lives in vm_coreth.go / sevmChainContext: the consensus engine type
@@ -244,7 +249,7 @@ func (e *Executor) batchHeaderRLP(num uint64) ([]byte, bool) {
 	if idx >= uint64(len(e.batchBuf)) {
 		return nil, false
 	}
-	return e.batchBuf[idx].headerRLP, true
+	return e.batchBuf[idx].bw.HeaderRLP, true
 }
 
 // dirBytes is the size of dir on disk, 0 if it does not exist yet. Best
@@ -283,9 +288,9 @@ func New(cfg Config) (*Executor, error) {
 	// bucket, a crash right after a retirement lands on "container missing
 	// from staging" and the node cannot start. Unconditional: seal has the
 	// same latent exposure, it was only ever hidden by a numeric coincidence.
-	if budget := walkBackBudgetFor(cfg.CommitEvery); budget >= state.BucketBlocks {
+	if budget := walkBackBudgetFor(cfg.CommitEvery); budget >= fetch.SegmentBlocks {
 		return nil, fmt.Errorf("config: commit-every %d puts the crash walk-back %d blocks back, past one raw bucket (%d): max is %d",
-			cfg.CommitEvery, budget, state.BucketBlocks, (state.BucketBlocks-1-walkBackBudget)/64)
+			cfg.CommitEvery, budget, fetch.SegmentBlocks, (fetch.SegmentBlocks-1-walkBackBudget)/64)
 	}
 	c := cfg.Chain
 	if c == nil {
@@ -300,7 +305,7 @@ func New(cfg Config) (*Executor, error) {
 	// A data directory is single-kind for life: the two header encodings are
 	// mutually exclusive, so a dir built by one is unreadable by the other and
 	// there is no migration (delete and resync).
-	if err := cfg.Store.BindVMKind(string(c.VMKind)); err != nil {
+	if err := cfg.Misc.BindVMKind(string(c.VMKind)); err != nil {
 		return nil, err
 	}
 	snowCtx, err := snowContextFor(c)
@@ -386,7 +391,7 @@ func New(cfg Config) (*Executor, error) {
 	fwCfg.CacheSizeBytes = uint(fwSize)
 	log.Printf("exec: firewood node cache %d MB (%s)", fwSize>>20, fwWhy)
 
-	ethdbKV := cfg.Store.EthDB()
+	ethdbKV := store.EthDB(cfg.Store, cfg.Misc)
 	memdb := rawdb.NewDatabase(ethdbKV)
 
 	tdb := triedb.NewDatabase(memdb, &triedb.Config{
@@ -412,7 +417,7 @@ func New(cfg Config) (*Executor, error) {
 		log.Printf("exec: state cache %d MB (an eighth of this container's %d MB ceiling, asked for %d MB)",
 			stateCache>>20, limit>>20, cfg.StateCacheBytes>>20)
 	}
-	wrapDB := wrapDatabase(inner, cfg.Store, stateCache, cfg.VerifyCache)
+	wrapDB := wrapDatabase(inner, stateCache, cfg.VerifyCache)
 
 	fwBackend, ok := tdb.Backend().(*firewood.TrieDB)
 	if !ok {
@@ -455,13 +460,6 @@ func New(cfg Config) (*Executor, error) {
 
 	// Event-log capture starts wherever this build first executes; blocks
 	// below the marker are the backfill job's range. Write-once.
-	if _, ok := cfg.Store.LogsStart(); !ok {
-		if err := cfg.Store.SetLogsStart(e.headNum + 1); err != nil {
-			tdb.Close()
-			return nil, fmt.Errorf("set logs.start: %w", err)
-		}
-		log.Printf("exec: event-log capture starts at height %d (backfill range 0..%d)", e.headNum+1, e.headNum)
-	}
 	return e, nil
 }
 
@@ -478,23 +476,14 @@ func New(cfg Config) (*Executor, error) {
 // executeBlock path. All state-layer appends are idempotent (block-frame
 // skip, code dedup, misc same-value skip) so replays are free.
 func (e *Executor) reconcile() error {
-	execN, execOK := e.cfg.Store.ExecHead()
-	hdN, hdOK := e.cfg.Store.HeadersMax()
-
-	if !execOK && !hdOK {
-		// Fresh store: seed exechead=0 so a crash before the first flush
-		// still finds a consistent state file.
-		if err := e.cfg.Store.FlushAndSetExecHead(0); err != nil {
-			return fmt.Errorf("seed exechead: %w", err)
-		}
+	// ONE HEAD, not two. Storage v0 has no separate durable watermark: the
+	// window log is the state layer's own tail and DB.Head is the highest
+	// block in it, run or window alike.
+	top, topOK := e.cfg.Store.Head()
+	if !topOK {
 		e.fwBackend.SetHashAndHeight(e.genesisHash, 0)
 		log.Printf("exec: fresh state, genesis root=%x", e.genesisRoot)
 		return nil
-	}
-
-	top := execN
-	if hdOK && hdN > top {
-		top = hdN
 	}
 
 	rootFW := common.Hash(e.fwBackend.Firewood.Root())
@@ -583,8 +572,8 @@ func (e *Executor) reconcile() error {
 		return nil
 	}
 
-	log.Printf("exec: walk-back reconcile: firewood at %d, state layer at %d (exechead=%d), re-executing %d blocks",
-		fwN, top, execN, top-fwN)
+	log.Printf("exec: walk-back reconcile: firewood at %d, state layer at %d, re-executing %d blocks",
+		fwN, top, top-fwN)
 	for i := fwN + 1; i <= top; i++ {
 		raw, ok, err := e.cfg.Blocks.GetByHeight(i)
 		if err != nil {
@@ -605,7 +594,7 @@ func (e *Executor) reconcile() error {
 			return fmt.Errorf("reconcile: flush tail batch: %w", err)
 		}
 	}
-	if err := e.cfg.Store.FlushAndSetExecHead(e.headNum); err != nil {
+	if err := e.cfg.Store.Sync(); err != nil {
 		return err
 	}
 	log.Printf("exec: resume head=%d root=%x", e.headNum, e.headRoot)
@@ -653,7 +642,7 @@ func (e *Executor) Close() error {
 		e.triedb.Close()
 		return err
 	}
-	if err := e.cfg.Store.FlushAndSetExecHead(e.headNum); err != nil {
+	if err := e.cfg.Store.Sync(); err != nil {
 		e.triedb.Close()
 		return err
 	}
@@ -681,13 +670,13 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 	e.flushDone = make(chan struct{})
 	go func() {
 		defer close(e.flushDone)
-		for n := range e.flushReq {
+		for range e.flushReq {
 			t0 := time.Now()
 			if err := e.ring.sync(); err != nil {
 				e.flushErr <- err
 				return
 			}
-			if err := e.cfg.Store.FlushAndSetExecHead(n); err != nil {
+			if err := e.cfg.Store.Sync(); err != nil {
 				e.flushErr <- err
 				return
 			}
@@ -812,19 +801,20 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 		if since := time.Since(lastLog); since >= 10*time.Second {
 			dt := since.Seconds()
 			hits, misses := e.wrapDB.CacheStats()
+			sz := e.cfg.Store.SectionSizes()
 			var hitPct float64
 			if hits+misses > 0 {
 				hitPct = 100 * float64(hits) / float64(hits+misses)
 			}
-			log.Printf("exec: height=%d blk/s=%.0f tx/s=%.0f mgas/s=%.2f writelog=%.1fMB logs=%.1fMB frames=%.1fMB code_entries=%d cache_hit=%.1f%% cache=%.0fMB",
+			log.Printf("exec: height=%d blk/s=%.0f tx/s=%.0f mgas/s=%.2f chain=%.1fMB state=%.1fMB lookup=%.1fMB runs=%d cache_hit=%.1f%% cache=%.0fMB",
 				e.headNum,
 				float64(blocksDone-lastBlocks)/dt,
 				float64(e.totalTxs-lastTxs)/dt,
 				float64(e.totalGas-lastGas)/dt/1e6,
-				float64(e.cfg.Store.WritelogBytes())/1e6,
-				float64(e.cfg.Store.LogsBytes())/1e6,
-				float64(e.cfg.Store.ItxBytes())/1e6,
-				e.cfg.Store.CodeCount(),
+				float64(sz[store.SecChain])/1e6,
+				float64(sz[store.SecState])/1e6,
+				float64(sz[store.SecLookup])/1e6,
+				len(e.cfg.Store.Manifest().Runs),
 				hitPct,
 				float64(e.wrapDB.cacheSize)/1e6,
 			)
@@ -859,7 +849,10 @@ func (e *Executor) ownRootAt(hdr *types.Header, n uint64) (common.Hash, bool) {
 // executeRaw parses and executes one container at the expected height,
 // picking the engine by the transitionvm boundary rule (see saeExecuted).
 func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
-	blk, err := parseEthBlock(raw)
+	// NO CONTAINER DUPLICATION: the proposervm wrapper is stored beside the
+	// header and the container is reassembled on demand, so this split is the
+	// only place the two halves are told apart.
+	pvm, blk, err := store.SplitContainer(raw)
 	if err != nil {
 		return fmt.Errorf("block %d parse: %w", blockNum, err)
 	}
@@ -879,15 +872,15 @@ func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 				return err
 			}
 		}
-		if err := e.executeSAEBlock(blk); err != nil {
+		if err := e.executeSAEBlock(blk, pvm); err != nil {
 			return fmt.Errorf("block %d: %w", blockNum, err)
 		}
 	case e.cfg.CommitEvery > 1:
-		if err := e.executeBatched(blk); err != nil {
+		if err := e.executeBatched(blk, pvm); err != nil {
 			return fmt.Errorf("block %d: %w", blockNum, err)
 		}
 	default:
-		newRoot, err := e.executeBlock(blk)
+		newRoot, err := e.executeBlock(blk, pvm)
 		if err != nil {
 			return fmt.Errorf("block %d: %w", blockNum, err)
 		}
@@ -950,13 +943,17 @@ func (e *Executor) maybeFlush(blockNum uint64) error {
 	if err := e.ring.sync(); err != nil {
 		return err
 	}
-	return e.cfg.Store.FlushAndSetExecHead(blockNum)
+	return e.cfg.Store.Sync()
 }
 
 // executeBlock runs the EVM + atomic txs for blk, verifies the computed
-// state root against header.Root (hard stop on mismatch), appends the
-// write frame + header to the state layer, then commits Firewood.
-func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
+// state root against header.Root (hard stop on mismatch), hands the block's
+// rows to the state layer, then commits Firewood.
+//
+// THAT ORDER IS THE STANDING RULE: rows first, Firewood last, so a kill -9 can
+// only ever leave Firewood BEHIND the state layer, which is what reconcile's
+// backward walk recovers from.
+func (e *Executor) executeBlock(blk *types.Block, pvm []byte) (common.Hash, error) {
 	header := blk.Header()
 	parentRoot := e.headRoot
 	blockNum := blk.NumberU64()
@@ -965,15 +962,16 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("encode header: %w", err)
 	}
+	bw := &store.BlockWrite{Height: blockNum, HeaderRLP: headerRLP, Pvm: pvm, Code: map[string][]byte{}}
 
 	// Empty-block fast path (HOT on Fuji): if the header claims no state
-	// change, running the EVM would be a no-op and Firewood's Commit
-	// rejects mid-chain identity proposals ("committable proposal not
-	// found" wall in the reference, LOG.md block 33405). Persist the
-	// header only and advance Firewood's in-memory block-hash tracking so
-	// the next non-empty block's Update resolves its parent hash.
-	if header.Root == parentRoot {
-		if err := e.cfg.Store.AppendHeader(blockNum, headerRLP); err != nil {
+	// change AND the block carries no transactions, running the EVM would be a
+	// no-op and Firewood's Commit rejects mid-chain identity proposals
+	// ("committable proposal not found"). Persist the chain rows only and
+	// advance Firewood's in-memory block-hash tracking so the next non-empty
+	// block's Update resolves its parent hash.
+	if header.Root == parentRoot && len(blk.Transactions()) == 0 {
+		if err := e.cfg.Store.WriteBlock(bw); err != nil {
 			return common.Hash{}, err
 		}
 		if err := e.maybeFlush(blockNum); err != nil {
@@ -985,24 +983,29 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 		return parentRoot, nil
 	}
 
-	frame := &blockFrame{}
-	e.wrapDB.setFrame(frame)
-	defer e.wrapDB.setFrame(nil)
+	cap := &capture{code: map[string][]byte{}}
+	e.beginCapture(cap, bw, header, parentRoot)
+	defer e.endCapture()
 
 	statedb, err := ethstate.New(parentRoot, e.wrapDB, nil)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("open statedb: %w", err)
 	}
-	frames.begin()
+	e.curStatedb = statedb
 	receipts, err := e.runEVM(blk, statedb)
 	if err != nil {
 		return common.Hash{}, err
 	}
 
-	// Commit triggers the trie interceptor: post-images accumulate into
-	// frame during this call. The block number handed to Commit is
-	// Firewood's proposal height (tree height + 1), which equals the
-	// real block height in per-block mode.
+	// The block's own Commit must compute the REAL root, so the per-tx
+	// short-circuit comes off first.
+	e.wrapDB.endBlock()
+
+	// Commit triggers the trie interceptor for whatever the last tx boundary
+	// did not already drain (block-final writes: engine finalisation, coreth's
+	// atomic transfers). The block number handed to Commit is Firewood's
+	// proposal height (tree height + 1), which equals the real block height in
+	// per-block mode.
 	triedbOpt := stateconf.WithTrieDBUpdatePayload(header.ParentHash, blk.Hash())
 	newRoot, err := statedb.Commit(
 		e.fwHeight+1,
@@ -1014,30 +1017,14 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	}
 
 	if newRoot != header.Root {
-		dumpMismatch(blk, frame, receipts, statedb, newRoot, header.Root)
+		dumpMismatch(blk, cap.rows, receipts, statedb, newRoot, header.Root)
 		return common.Hash{}, fmt.Errorf("state root mismatch: computed %x, expected %x", newRoot, header.Root)
 	}
 
-	if err := e.cfg.Store.AppendWrites(blockNum, frame.buf); err != nil {
+	bw.Tail = cap.take()
+	bw.Code = cap.code
+	if err := e.cfg.Store.WriteBlock(bw); err != nil {
 		return common.Hash{}, err
-	}
-	if err := e.cfg.Store.AppendHeader(blockNum, headerRLP); err != nil {
-		return common.Hash{}, err
-	}
-	if rec := encodeLogsFrame(receiptLogs(receipts)); rec != nil {
-		if err := e.cfg.Store.AppendLogs(blockNum, rec); err != nil {
-			return common.Hash{}, err
-		}
-	}
-	if rec := storedTailRecord(receipts); rec != nil {
-		if err := e.cfg.Store.AppendRcpt(blockNum, rec); err != nil {
-			return common.Hash{}, err
-		}
-	}
-	if rec := frames.record(); rec != nil {
-		if err := e.cfg.Store.AppendItx(blockNum, rec); err != nil {
-			return common.Hash{}, err
-		}
 	}
 	if err := e.maybeFlush(blockNum); err != nil {
 		return common.Hash{}, err
@@ -1053,6 +1040,72 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 	return newRoot, nil
 }
 
+// beginCapture arms the per-tx drain for one block.
+func (e *Executor) beginCapture(c *capture, bw *store.BlockWrite, header *types.Header, parentRoot common.Hash) {
+	e.capture, e.curBW, e.curHeader = c, bw, header
+	e.signer = types.MakeSigner(e.chainCfg, header.Number, header.Time)
+	e.wrapDB.setCapture(c)
+	e.wrapDB.beginBlock(parentRoot)
+}
+
+func (e *Executor) endCapture() {
+	e.wrapDB.setCapture(nil)
+	e.wrapDB.endBlock()
+	e.capture, e.curBW, e.curHeader, e.curStatedb = nil, nil, nil, nil
+}
+
+// captureTx closes one transaction: it drains that transaction's post-images
+// and turns the execution outputs into the row set the state layer stores.
+//
+// THE DRAIN IS A PER-TX IntermediateRoot. Finalise already runs per tx inside
+// ApplyTransaction; IntermediateRoot adds the trie update pass, which is what
+// pushes the post-images through the capture interceptor. geth itself calls it
+// per transaction on pre-Byzantium chains, so it is a supported operation and
+// not a trick, and the account trie's Hash is short-circuited for the duration
+// so Firewood is never asked for a root nobody wants. The block's final Commit
+// still computes the real root and the executor still hard-stops on a mismatch,
+// which is what makes this safe to assert rather than hope.
+func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) error {
+	e.curStatedb.IntermediateRoot(e.chainCfg.IsEIP158(e.curHeader.Number))
+
+	raw, err := tx.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("encode tx %s: %w", tx.Hash(), err)
+	}
+	tw := store.TxWrite{
+		Hash:    tx.Hash().Bytes(),
+		RLP:     raw,
+		Receipt: store.EncodeTxReceipt(r, r.CumulativeGasUsed),
+		State:   e.capture.take(),
+	}
+	// NO ECDSA RECOVERY HERE: ApplyTransaction already recovered the sender and
+	// cached it on the transaction, so this is a field read.
+	if from, err := types.Sender(e.signer, tx); err == nil {
+		tw.Sender = from.Bytes()
+	}
+	if to := tx.To(); to != nil {
+		tw.To = to.Bytes()
+	} else if r.ContractAddress != (common.Address{}) {
+		tw.Created = r.ContractAddress.Bytes()
+	}
+	seenAddr := make(map[common.Address]struct{}, len(r.Logs))
+	seenTopic := make(map[common.Hash]struct{}, len(r.Logs))
+	for _, l := range r.Logs {
+		if _, ok := seenAddr[l.Address]; !ok {
+			seenAddr[l.Address] = struct{}{}
+			tw.LogAddrs = append(tw.LogAddrs, l.Address.Bytes())
+		}
+		for _, tp := range l.Topics {
+			if _, ok := seenTopic[tp]; !ok {
+				seenTopic[tp] = struct{}{}
+				tw.Topics = append(tw.Topics, tp.Bytes())
+			}
+		}
+	}
+	e.curBW.Txs = append(e.curBW.Txs, tw)
+	return nil
+}
+
 // runEVM applies the block's upgrades and every transaction onto statedb,
 // returning every receipt produced (they already exist in memory: capture is
 // free). Shared by the per-block and batched paths; the VM-specific half
@@ -1061,7 +1114,7 @@ func (e *Executor) executeBlock(blk *types.Block) (common.Hash, error) {
 // e.headTime IS the parent's timestamp here: executeRaw advances it only
 // after the block returns, and bisect rewinds it with batchStartTime.
 func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) (types.Receipts, error) {
-	return e.vm.runEVM(e.chainCtx, e.chainCfg, e.snowCtx, blk, e.headTime, statedb)
+	return e.vm.runEVM(e.chainCtx, e.chainCfg, e.snowCtx, blk, e.headTime, statedb, e.captureTx)
 }
 
 // executeBatched accumulates blk into the open batch (opening one if
@@ -1070,7 +1123,7 @@ func (e *Executor) runEVM(blk *types.Block, statedb *ethstate.StateDB) (types.Re
 // the capture wrapper into the shared trie (Firewood untouched); reads
 // see them via the read cache and the shared trie's dirtyKeys overlay.
 // State-layer appends are buffered until the boundary root verifies.
-func (e *Executor) executeBatched(blk *types.Block) error {
+func (e *Executor) executeBatched(blk *types.Block, pvm []byte) error {
 	header := blk.Header()
 	blockNum := blk.NumberU64()
 
@@ -1089,41 +1142,39 @@ func (e *Executor) executeBatched(blk *types.Block) error {
 		return fmt.Errorf("encode header: %w", err)
 	}
 
-	if header.Root == e.headRoot {
-		// Empty block: header only, no EVM, no Firewood.
-		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, hash: blk.Hash(), headerRLP: headerRLP})
+	bw := &store.BlockWrite{Height: blockNum, HeaderRLP: headerRLP, Pvm: pvm, Code: map[string][]byte{}}
+	if header.Root == e.headRoot && len(blk.Transactions()) == 0 {
+		// Empty block: chain rows only, no EVM, no Firewood.
+		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, hash: blk.Hash(), bw: bw})
 	} else {
 		tEVM := time.Now()
-		frame := &blockFrame{}
-		e.wrapDB.setFrame(frame)
+		cap := &capture{code: map[string][]byte{}}
+		e.beginCapture(cap, bw, header, e.batchStartRoot)
 		statedb, err := ethstate.New(e.batchStartRoot, e.wrapDB, nil)
 		if err != nil {
-			e.wrapDB.setFrame(nil)
+			e.endCapture()
 			return fmt.Errorf("open statedb: %w", err)
 		}
-		frames.begin()
+		e.curStatedb = statedb
 		receipts, err := e.runEVM(blk, statedb)
 		if err != nil {
-			e.wrapDB.setFrame(nil)
+			e.endCapture()
 			return err
 		}
+		_ = receipts
 		// Drain commit: the batch-account trie reports Hash == origin, so
 		// statedb skips TrieDB().Update entirely; writes flow through the
 		// capture wrapper into the shared trie's pending ops.
 		if _, err := statedb.Commit(blockNum, e.chainCfg.IsEIP158(header.Number)); err != nil {
-			e.wrapDB.setFrame(nil)
+			e.endCapture()
 			return fmt.Errorf("statedb drain commit: %w", err)
 		}
-		e.wrapDB.setFrame(nil)
+		bw.Tail = cap.take()
+		bw.Code = cap.code
+		e.endCapture()
 		e.spl.evm += time.Since(tEVM)
 		e.batchDirty = true
-		e.batchBuf = append(e.batchBuf, batchItem{
-			num: blockNum, hash: blk.Hash(), headerRLP: headerRLP,
-			frame: frame.buf, hasFrame: true,
-			logsRec: encodeLogsFrame(receiptLogs(receipts)),
-			rcptRec: storedTailRecord(receipts),
-			itxRec:  frames.record(),
-		})
+		e.batchBuf = append(e.batchBuf, batchItem{num: blockNum, hash: blk.Hash(), bw: bw})
 	}
 
 	// Intra-batch chaining trusts header roots; the boundary proposal
@@ -1167,28 +1218,8 @@ func (e *Executor) flushBatch() error {
 	}
 
 	for _, it := range e.batchBuf {
-		if it.hasFrame {
-			if err := e.cfg.Store.AppendWrites(it.num, it.frame); err != nil {
-				return err
-			}
-		}
-		if err := e.cfg.Store.AppendHeader(it.num, it.headerRLP); err != nil {
+		if err := e.cfg.Store.WriteBlock(it.bw); err != nil {
 			return err
-		}
-		if it.logsRec != nil {
-			if err := e.cfg.Store.AppendLogs(it.num, it.logsRec); err != nil {
-				return err
-			}
-		}
-		if it.rcptRec != nil {
-			if err := e.cfg.Store.AppendRcpt(it.num, it.rcptRec); err != nil {
-				return err
-			}
-		}
-		if it.itxRec != nil {
-			if err := e.cfg.Store.AppendItx(it.num, it.itxRec); err != nil {
-				return err
-			}
 		}
 		if err := e.maybeFlush(it.num); err != nil {
 			return err
@@ -1267,11 +1298,11 @@ func (e *Executor) bisect(computed common.Hash, boundaryNum uint64, boundaryRoot
 			// mismatch.
 			return fmt.Errorf("bisect: container %d is not in staging, so the batch [%d..%d] that just mismatched cannot be re-executed per block", i, from, to)
 		}
-		blk, err := parseEthBlock(raw)
+		pvm, blk, err := store.SplitContainer(raw)
 		if err != nil {
 			return fmt.Errorf("bisect: parse block %d: %w", i, err)
 		}
-		newRoot, err := e.executeBlock(blk)
+		newRoot, err := e.executeBlock(blk, pvm)
 		if err != nil {
 			return fmt.Errorf("bisect: offending block %d: %w", i, err)
 		}

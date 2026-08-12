@@ -68,6 +68,11 @@ func (g *Genesis) Commit(db ethdb.Database, tdb *triedb.Database) error {
 }
 
 // vmBackend is the seam: exactly the symbols where the two VMs differ.
+// TxHook is called after each transaction is applied, on the executor's own
+// goroutine. It is where per-tx state capture drains and where the tx's lookup
+// rows are built from execution outputs.
+type TxHook func(txIndex int, tx *types.Transaction, receipt *types.Receipt) error
+
 type vmBackend interface {
 	// genesis parses the descriptor's genesis bytes and wires the chain's
 	// upgrades EXACTLY as that VM's own plugin/evm parseGenesis does.
@@ -81,7 +86,7 @@ type vmBackend interface {
 	// and returns the receipts. parentTime is the PARENT's timestamp, which is
 	// what makes a precompile activate exactly once.
 	runEVM(cc chainContext, cfg *params.ChainConfig, snowCtx *snow.Context,
-		blk *types.Block, parentTime uint64, statedb *ethstate.StateDB) (types.Receipts, error)
+		blk *types.Block, parentTime uint64, statedb *ethstate.StateDB, onTx TxHook) (types.Receipts, error)
 
 	// transitionTimestamp is the transitionvm switch time and whether the SAE
 	// transition is scheduled at all.
