@@ -365,10 +365,11 @@ type chainNode struct {
 // error the caller reports and exits on, so the same code is usable from a test
 // and the flush on the way out is never skipped.
 func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err error)) (n *chainNode, err error) {
-	// THE JOIN PATH IS GONE WITH THE EPOCHS. Resolving a published chain's
-	// pointer, walking its run footers backwards and frontier-building from the
-	// runs' state family is phase-2 work; until it lands, a data dir either has
-	// its own history or syncs one from genesis over p2p.
+	// THE JOIN PATH runs below, between opening the artifact store and opening
+	// the executor: store.Join resolves this chain's pointer, walks the run
+	// footers backward to the chain root and writes the manifest, and a dir
+	// that came up with runs but no executed state builds its frontier out of
+	// them. Both are no-ops on a warm dir and cost it zero bucket requests.
 
 	// Unwind whatever is already open if a later step fails, so a start that
 	// gives up releases the Firewood handle and the mmaps it took.
@@ -414,6 +415,12 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		return nil, fmt.Errorf("open artifact store: %w", err)
 	}
 	closers = append(closers, func() { cas.Close() })
+	// JOIN BEFORE OPEN: the manifest is what store.Open reads, so a fresh dir
+	// joining a published chain has to have it on disk first. A missing pointer
+	// over a populated prefix is a HARD ERROR here, never a silent re-sync.
+	if err := store.Join(cas, cfg.DataDir, cfg.Chain.Root()); err != nil {
+		return nil, fmt.Errorf("join chain: %w", err)
+	}
 	db, err := store.Open(cfg.DataDir, cas, cfg.Chain.Root())
 	if err != nil {
 		return nil, fmt.Errorf("open storage v0: %w", err)
@@ -424,6 +431,13 @@ func startNode(ctx context.Context, cfg nodeConfig, report func(what string, err
 		return nil, fmt.Errorf("open misc store: %w", err)
 	}
 	closers = append(closers, func() { misc.Close() })
+
+	// THE FRONTIER BUILD, on its own Executor that is closed before the real
+	// one opens: that is what unpins Firewood's in-memory history. A torn build
+	// heals itself first.
+	if err := buildFrontier(cfg, blocks, db, misc); err != nil {
+		return nil, err
+	}
 
 	// onBlock is late-bound: the executor is built before the RPC server, and
 	// exec.New's reconcile must not publish into a nil server.
@@ -674,4 +688,39 @@ func flushedFloor(db *store.DB) uint64 {
 		return 0
 	}
 	return runs[len(runs)-1].ToHeight
+}
+
+// buildFrontier gives a dir that joined a published chain the state to serve
+// it. It is a no-op on every other dir: a dir that executed its own history
+// already has a Firewood, and a dir with no runs has nothing to merge.
+//
+// The build runs on its OWN Executor, opened with FrontierBuild and closed
+// before the serving one opens, which is what unpins Firewood's in-memory
+// history (a merge holds a revision per batch otherwise).
+func buildFrontier(cfg nodeConfig, blocks exec.BlockSource, db *store.DB, misc *store.MiscStore) error {
+	head, ok := db.Head()
+	if !ok || head == 0 {
+		return nil
+	}
+	if _, err := exec.HealTornFrontier(cfg.DataDir, misc); err != nil {
+		return err
+	}
+	need, err := exec.FrontierNeeded(cfg.DataDir)
+	if err != nil || !need {
+		return err
+	}
+	log.Printf("epochdb: this dir holds runs through block %d and no state: building the frontier out of them", head)
+	e, err := exec.New(exec.Config{
+		DataDir:       cfg.DataDir,
+		Blocks:        blocks,
+		Store:         db,
+		Misc:          misc,
+		Chain:         cfg.Chain,
+		FrontierBuild: true,
+	})
+	if err != nil {
+		return fmt.Errorf("frontier build: exec.New: %w", err)
+	}
+	defer e.Close()
+	return e.BuildFrontier()
 }

@@ -35,10 +35,13 @@ func (c *capture) recordAccount(addr common.Address, valRLP []byte) {
 	c.rows = append(c.rows, store.StateRow{Kind: 'a', Addr: addr[:], Val: valRLP})
 }
 
-func (c *capture) recordStorage(addr common.Address, key []byte, valRLP []byte) {
+// recordStorage takes the value libevm hands the trie, which is the RAW
+// LEFT-TRIMMED slot value: StateTrie.UpdateStorage does the RLP itself, so
+// anything rebuilding a trie from these rows (BuildFrontier) has to encode.
+func (c *capture) recordStorage(addr common.Address, key []byte, val []byte) {
 	var slot common.Hash
 	copy(slot[:], key)
-	c.rows = append(c.rows, store.StateRow{Kind: 's', Addr: addr[:], Slot: slot[:], Val: valRLP})
+	c.rows = append(c.rows, store.StateRow{Kind: 's', Addr: addr[:], Slot: slot[:], Val: val})
 }
 
 func (c *capture) recordCodeUse(addr common.Address, codeHash common.Hash) {

@@ -451,9 +451,16 @@ func New(cfg Config) (*Executor, error) {
 
 	e.chainCtx = chainContext{e: e, store: cfg.Store}
 
-	if err := e.reconcile(); err != nil {
-		tdb.Close()
-		return nil, err
+	// A FRONTIER BUILD SKIPS THE WALK-BACK, and it has to: a joined dir holds
+	// runs up to H with an empty Firewood, so reconcile would walk H down
+	// looking for a root nothing here ever produced, and then demand containers
+	// for blocks this node deliberately never fetched. BuildFrontier is about
+	// to write that Firewood and park the head itself.
+	if !cfg.FrontierBuild {
+		if err := e.reconcile(); err != nil {
+			tdb.Close()
+			return nil, err
+		}
 	}
 
 	e.publishLive()

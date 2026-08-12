@@ -553,17 +553,18 @@ func (b *Blob) Close() error {
 
 // ---------- pointers ----------
 
-// Latest is the bucket's one mutable object: the newest epoch, and nothing
-// else since snapshots died (DESIGN.md ruling 1 of 2026-07-31). A HINT, never
-// an authority.
+// Latest is the bucket's one mutable object: the name of the chain's newest
+// MANIFEST artifact, and nothing else. A HINT, never an authority: the manifest
+// is content-addressed and the runs it lists chain back to the chain root by
+// their footers, so a consumer verifies everything the pointer claims.
 type Latest struct {
-	Epoch string
+	Manifest string
 }
 
 func (l Latest) encode() string {
 	var b strings.Builder
-	if l.Epoch != "" {
-		fmt.Fprintf(&b, "epoch %s\n", l.Epoch)
+	if l.Manifest != "" {
+		fmt.Fprintf(&b, "manifest %s\n", l.Manifest)
 	}
 	return b.String()
 }
@@ -572,7 +573,7 @@ func decodeLatest(s string) (Latest, error) {
 	var l Latest
 	// An EMPTY VALUE IS NOT A POINTER. A torn write (or a bucket object
 	// truncated to nothing) would otherwise decode to a perfectly valid
-	// Latest{Epoch: ""}, i.e. "this chain has no epochs", which is the most
+	// Latest{Manifest: ""}, i.e. "this chain has no runs", which is the most
 	// destructive thing this file can say.
 	if strings.TrimSpace(s) == "" {
 		return l, fmt.Errorf("dist: latest pointer is empty")
@@ -586,8 +587,8 @@ func decodeLatest(s string) (Latest, error) {
 			return l, fmt.Errorf("dist: bad latest pointer line %q", line)
 		}
 		switch f[0] {
-		case "epoch":
-			l.Epoch = f[1]
+		case "manifest":
+			l.Manifest = f[1]
 		default:
 			return l, fmt.Errorf("dist: unknown latest pointer field %q", f[0])
 		}

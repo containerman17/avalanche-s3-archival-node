@@ -172,7 +172,7 @@ func TestLatestPointer(t *testing.T) {
 	if _, err := s.Latest(root); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("missing pointer: %v, want fs.ErrNotExist", err)
 	}
-	want := Latest{Epoch: hex.EncodeToString(bytes.Repeat([]byte{1}, 32))}
+	want := Latest{Manifest: hex.EncodeToString(bytes.Repeat([]byte{1}, 32))}
 	if err := s.SetLatest(root, want); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestLatestPointer(t *testing.T) {
 	if err != nil || got != want {
 		t.Fatalf("latest: %+v %v", got, err)
 	}
-	want.Epoch = hex.EncodeToString(bytes.Repeat([]byte{2}, 32))
+	want.Manifest = hex.EncodeToString(bytes.Repeat([]byte{2}, 32))
 	if err := s.SetLatest(root, want); err != nil {
 		t.Fatal(err)
 	}
@@ -194,11 +194,11 @@ func TestLatestPointer(t *testing.T) {
 	}
 
 	// A TORN POINTER IS NOT AN ANSWER. An empty value used to decode to a
-	// valid Latest{Epoch: ""}, which reads as "this chain has no epochs".
+	// valid Latest{Manifest: ""}, which reads as "this chain has no runs".
 	if err := os.WriteFile(filepath.Join(s.dir, LatestPointer(root)), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Latest(root); err == nil {
-		t.Fatal("an empty pointer value decoded as a chain with no epochs")
+		t.Fatal("an empty pointer value decoded as a chain with no runs")
 	}
 }

@@ -29,6 +29,10 @@ type RunRef struct {
 	FromHeight uint64 `json:"from_height"`
 	ToHeight   uint64 `json:"to_height"`
 	Name       string `json:"name"`
+	// Level is the merge level: 0 is a flush, and MergeFanIn runs of one level
+	// become one run of the next. It is manifest bookkeeping, not run content,
+	// so it can never move a merged run's bytes.
+	Level int `json:"level"`
 }
 
 // Manifest is the live run set. It is a hash list, exactly like every other
@@ -95,6 +99,17 @@ func (m *Manifest) save(dir string) error {
 	return d.Sync()
 }
 
+// decodeRoot parses a 32-byte hash out of its hex name.
+func decodeRoot(s string) ([32]byte, error) {
+	var h [32]byte
+	raw, err := hex.DecodeString(s)
+	if err != nil || len(raw) != 32 {
+		return h, fmt.Errorf("store: %q is not a 32-byte hash", s)
+	}
+	copy(h[:], raw)
+	return h, nil
+}
+
 // Head is the name of the newest run: one hash that authenticates all of
 // history.
 func (m *Manifest) Head() string {
@@ -116,6 +131,9 @@ type DB struct {
 	mu   sync.RWMutex
 	man  *Manifest
 	runs []*Run // ascending TxNum range, same order as man.Runs
+	// lastManifest is the published manifest artifact, so the superseded one's
+	// local copy can go once the pointer no longer names it.
+	lastManifest string
 }
 
 // Open opens (or creates) storage v0 inside dir.
@@ -264,12 +282,11 @@ func (d *DB) Flush() error {
 	prev := d.chainRoot
 	d.mu.RLock()
 	if n := len(d.man.Runs); n > 0 {
-		raw, err := hex.DecodeString(d.man.Runs[n-1].Name)
-		if err != nil || len(raw) != 32 {
+		var err error
+		if prev, err = decodeRoot(d.man.Runs[n-1].Name); err != nil {
 			d.mu.RUnlock()
-			return fmt.Errorf("store: previous run name %q is not a 32-byte hash", d.man.Runs[n-1].Name)
+			return err
 		}
-		copy(prev[:], raw)
 	}
 	d.mu.RUnlock()
 
@@ -308,7 +325,16 @@ func (d *DB) Flush() error {
 	d.mu.Unlock()
 
 	// Only now may the window's staging go.
-	return d.mem.reset(nextTx, nextHeight)
+	if err := d.mem.reset(nextTx, nextHeight); err != nil {
+		return err
+	}
+	// THE MERGE BOUNDARY IS THE FLUSH BOUNDARY, known in advance.
+	if err := d.MaybeMerge(); err != nil {
+		return err
+	}
+	// The manifest is published last, and Sync uploads content before
+	// pointers, so a consumer never sees a pointer to runs that are not up yet.
+	return d.Publish()
 }
 
 // writeSections streams the window into the three sections in order. Chain

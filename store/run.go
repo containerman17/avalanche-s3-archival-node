@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/pebble/sstable"
@@ -215,6 +216,7 @@ type Run struct {
 
 	blob   *dist.Blob
 	rd     [numSections]*sstable.Reader
+	sec    [numSections]*sectionReadable
 	filter [numSections][]byte
 }
 
@@ -239,7 +241,9 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 		return nil, fmt.Errorf("store: run %s: %w", name, err)
 	}
 	for s := Section(0); s < numSections; s++ {
-		readable, err := sstable.NewSimpleReadable(&sectionReadable{b: blob, off: r.Footer.Off[s], n: r.Footer.Len[s]})
+		sec := &sectionReadable{b: blob, off: r.Footer.Off[s], n: r.Footer.Len[s]}
+		r.sec[s] = sec
+		readable, err := sstable.NewSimpleReadable(sec)
 		if err != nil {
 			r.Close()
 			return nil, err
@@ -250,15 +254,25 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 			return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
 		}
 		r.rd[s] = rd
-		// THE BLOOM IS ALWAYS RESIDENT (DESIGN, read-through): a cold state
-		// read must cost local bloom probes plus exactly one remote GET, so the
-		// filter block is read once here and never again. pebble's
-		// sstable.Reader has no point-get, so the gate is ours to apply.
 		lay, err := rd.Layout()
 		if err != nil {
 			r.Close()
 			return nil, err
 		}
+		// BLOOMS AND SST INDEX BLOCKS ARE ALWAYS RESIDENT LOCALLY (DESIGN,
+		// read-through): a cold point read must cost local bloom probes plus
+		// EXACTLY ONE remote GET, and an index block re-read from the artifact
+		// would be a second one. They are read once here into the section's
+		// resident overlay, which serves those byte ranges from RAM forever
+		// after; only data blocks ever reach the blob again.
+		for _, bh := range append([]sstable.BlockHandle{lay.TopIndex, lay.Properties, lay.MetaIndex, lay.Filter}, lay.Index...) {
+			if err := sec.reside(bh); err != nil {
+				r.Close()
+				return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
+			}
+		}
+		// pebble's sstable.Reader has no point-get, so the bloom gate is ours
+		// to apply: keep the filter bytes in hand for MayHave.
 		if lay.Filter.Length > 0 {
 			f, err := blob.Read(r.Footer.Off[s]+lay.Filter.Offset, lay.Filter.Length)
 			if err != nil {
@@ -269,6 +283,19 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 		}
 	}
 	return r, nil
+}
+
+// ResidentBytes is what this run costs the node's local budget: its blooms and
+// its SST index blocks, which never leave RAM. Everything else is fetched
+// through the chunk cache on demand.
+func (r *Run) ResidentBytes() uint64 {
+	var n uint64
+	for _, s := range r.sec {
+		if s != nil {
+			n += s.resident
+		}
+	}
+	return n
 }
 
 func (r *Run) Close() error {
@@ -397,10 +424,49 @@ func (r *Run) ScanRange(s Section, loKey, hiKey []byte, fn func(key, val []byte)
 }
 
 // sectionReadable presents [off, off+n) of an artifact as a whole file to
-// pebble's sstable reader.
+// pebble's sstable reader, with a RESIDENT OVERLAY in front of it: the ranges
+// registered by reside are served from RAM and never reach the artifact again.
 type sectionReadable struct {
 	b        *dist.Blob
 	off, n   uint64
+	res      []residentRange // sorted by offset, one entry per index/filter block
+	resident uint64
+}
+
+// residentRange is one section-relative byte range held in RAM for good.
+type residentRange struct {
+	off  uint64
+	data []byte
+}
+
+// blockTrailer is pebble's per-block trailer (compression byte + checksum),
+// which readBlock always asks for on top of the block handle's length. A
+// resident range that stopped at the handle's length would be a partial hit
+// and would send the read to the artifact anyway.
+const blockTrailer = 5
+
+// reside pins one block handle's bytes in RAM.
+func (s *sectionReadable) reside(bh sstable.BlockHandle) error {
+	if bh.Length == 0 {
+		return nil
+	}
+	n := bh.Length + blockTrailer
+	if bh.Offset+n > s.n {
+		return fmt.Errorf("block [%d,%d) is outside a %d byte section", bh.Offset, bh.Offset+n, s.n)
+	}
+	b, err := s.b.Read(s.off+bh.Offset, n)
+	if err != nil {
+		return err
+	}
+	i := sort.Search(len(s.res), func(i int) bool { return s.res[i].off >= bh.Offset })
+	if i < len(s.res) && s.res[i].off == bh.Offset {
+		return nil
+	}
+	s.res = append(s.res, residentRange{})
+	copy(s.res[i+1:], s.res[i:])
+	s.res[i] = residentRange{off: bh.Offset, data: b}
+	s.resident += n
+	return nil
 }
 
 func (s *sectionReadable) ReadAt(p []byte, off int64) (int, error) {
@@ -410,6 +476,11 @@ func (s *sectionReadable) ReadAt(p []byte, off int64) (int, error) {
 	n := uint64(len(p))
 	if n > s.n-uint64(off) {
 		return 0, io.EOF
+	}
+	if i := sort.Search(len(s.res), func(i int) bool { return s.res[i].off > uint64(off) }) - 1; i >= 0 {
+		if r := s.res[i]; uint64(off)+n <= r.off+uint64(len(r.data)) {
+			return copy(p, r.data[uint64(off)-r.off:]), nil
+		}
 	}
 	b, err := s.b.Read(s.off+uint64(off), n)
 	if err != nil {
