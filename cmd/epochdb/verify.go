@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"iter"
 	"log"
 	"time"
 
@@ -82,16 +84,82 @@ func verifyMain(args []string) {
 		blocks, txs, time.Since(start).Round(time.Millisecond))
 }
 
+// cursor is one chain family read SEQUENTIALLY. THIS PASS IS THE WHOLE REASON
+// ChainRows exists: verify touches every hdr/, blk/, pvm/, tx/ and rcpt/ row of
+// the range, and reading them as point Gets decompresses the same 128KB zstd-9
+// block once per row instead of once per block. Five cursors advance in
+// lockstep, each family a contiguous key range of the chain section, so every
+// data block is decoded exactly once for the whole pass.
+type cursor struct {
+	name string
+	next func() (store.ChainRow, error, bool)
+	stop func()
+}
+
+func newCursor(db *store.DB, name string, fam int, from, to uint64) *cursor {
+	next, stop := iter.Pull2(db.ChainRows(fam, from, to))
+	return &cursor{name: name, next: next, stop: stop}
+}
+
+// at returns the row numbered n. The families are dense over a stored range, so
+// anything else is a hole and A CHECK THAT CANNOT RUN IS A FAILURE: it is
+// reported rather than skipped.
+func (c *cursor) at(n uint64) ([]byte, error) {
+	row, err, ok := c.next()
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%s%d missing", c.name, n)
+	}
+	if row.Num != n {
+		return nil, fmt.Errorf("%s%d missing (the next stored row is %d)", c.name, n, row.Num)
+	}
+	return row.Val, nil
+}
+
 func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs uint64, err error) {
+	// The tx-keyed families are bounded by the block range's own TxNums, which
+	// the blk/ rows at either end name.
+	firstTx, _, ok, err := db.BlockTxRange(from)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !ok {
+		return 0, 0, fmt.Errorf("block %d: no blk row", from)
+	}
+	lastFirst, lastCount, ok, err := db.BlockTxRange(to)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !ok {
+		return 0, 0, fmt.Errorf("block %d: no blk row", to)
+	}
+	lastTx := lastFirst + uint64(lastCount) // exclusive
+
+	hdrs := newCursor(db, store.PrefixHdr, store.FamHdr, from, to)
+	defer hdrs.stop()
+	blks := newCursor(db, store.PrefixBlk, store.FamBlk, from, to)
+	defer blks.stop()
+	pvms := newCursor(db, store.PrefixPvm, store.FamPvm, from, to)
+	defer pvms.stop()
+	// The tx-keyed cursors span [firstTx, lastTx). A range with no transactions
+	// at all is expressed as to < from, which yields nothing.
+	txLo, txHi := firstTx, lastTx-1
+	if lastTx <= firstTx {
+		txLo, txHi = 1, 0
+	}
+	rawTx := newCursor(db, store.PrefixTx, store.FamTx, txLo, txHi)
+	defer rawTx.stop()
+	rcpts := newCursor(db, store.PrefixRcpt, store.FamRcpt, txLo, txHi)
+	defer rcpts.stop()
+
 	prevHash := anchor
 	havePrev := anchor != (common.Hash{})
 	for n := from; n <= to; n++ {
-		hdrRLP, ok, err := db.HeaderRLP(n)
+		hdrRLP, err := hdrs.at(n)
 		if err != nil {
 			return blocks, txs, err
-		}
-		if !ok {
-			return blocks, txs, fmt.Errorf("block %d: no header row", n)
 		}
 		var h types.Header
 		if err := rlp.DecodeBytes(hdrRLP, &h); err != nil {
@@ -102,24 +170,23 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 		}
 		prevHash, havePrev = h.Hash(), true
 
-		first, count, ok, err := db.BlockTxRange(n)
+		blkVal, err := blks.at(n)
 		if err != nil {
 			return blocks, txs, err
 		}
-		if !ok {
-			return blocks, txs, fmt.Errorf("block %d: no blk row", n)
+		if len(blkVal) != 12 {
+			return blocks, txs, fmt.Errorf("block %d: blk row is %d bytes, want 12", n, len(blkVal))
 		}
+		first := binary.BigEndian.Uint64(blkVal[:8])
+		count := binary.BigEndian.Uint32(blkVal[8:])
 
 		list := make(types.Transactions, 0, count)
 		rawTxs := make([][]byte, 0, count)
 		receipts := make(types.Receipts, 0, count)
 		for i := uint64(0); i < uint64(count); i++ {
-			raw, ok, err := db.TxRLP(first + i)
+			raw, err := rawTx.at(first + i)
 			if err != nil {
-				return blocks, txs, err
-			}
-			if !ok {
-				return blocks, txs, fmt.Errorf("block %d: tx/%d missing", n, first+i)
+				return blocks, txs, fmt.Errorf("block %d: %w", n, err)
 			}
 			tx := new(types.Transaction)
 			if err := rlp.DecodeBytes(raw, tx); err != nil {
@@ -128,12 +195,9 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 			list = append(list, tx)
 			rawTxs = append(rawTxs, raw)
 
-			rec, ok, err := db.Receipt(first + i)
+			rec, err := rcpts.at(first + i)
 			if err != nil {
-				return blocks, txs, err
-			}
-			if !ok {
-				return blocks, txs, fmt.Errorf("block %d: rcpt/%d missing", n, first+i)
+				return blocks, txs, fmt.Errorf("block %d: %w", n, err)
 			}
 			r, err := decodeReceipt(tx, rec)
 			if err != nil {
@@ -155,12 +219,9 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 
 		// CONTAINER REASSEMBLY, spot-checked on every block of the range: the
 		// pieces must re-form something whose inner block hashes to this header.
-		pvm, ok, err := db.Pvm(n)
+		pvm, err := pvms.at(n)
 		if err != nil {
 			return blocks, txs, err
-		}
-		if !ok {
-			return blocks, txs, fmt.Errorf("block %d: no pvm row", n)
 		}
 		raw, err := store.Reassemble(pvm, hdrRLP, rawTxs)
 		if err != nil {

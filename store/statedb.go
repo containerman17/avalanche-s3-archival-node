@@ -33,7 +33,16 @@ var errOverlayReadOnly = errors.New("epochdb overlay: read-only historical view"
 // none, first is the TxNum the block WOULD have started at, so every row at or
 // below first-1 predates the block and first-1 is exact: no walk down to the
 // nearest writing block is needed.
+//
+// IT IS CACHED IN ONE SLOT, and needs no invalidation: a block's tx range is
+// immutable once the block has landed, so an answer for a height stays true
+// forever. Every account and slot read of one call resolves the same height, so
+// a single slot turns the whole tip workload into one atomic load, which is
+// what keeps this off the descent (and out of the memtable's lock) entirely.
 func (d *DB) txCeiling(height uint64) (at uint64, any bool, err error) {
+	if c := d.ceil.Load(); c != nil && c.height == height {
+		return c.at, c.any, nil
+	}
 	first, count, ok, err := d.BlockTxRange(height)
 	if err != nil {
 		return 0, false, err
@@ -41,13 +50,39 @@ func (d *DB) txCeiling(height uint64) (at uint64, any bool, err error) {
 	if !ok {
 		return 0, false, fmt.Errorf("store: block %d is not stored, so it has no state to read", height)
 	}
-	if count > 0 {
-		return first + uint64(count) - 1, true, nil
+	switch {
+	case count > 0:
+		at, any = first+uint64(count)-1, true
+	case first == 0:
+		at, any = 0, false
+	default:
+		at, any = first-1, true
 	}
-	if first == 0 {
-		return 0, false, nil
+	d.ceil.Store(&txCeil{height: height, at: at, any: any})
+	return at, any, nil
+}
+
+// txCeil is one memoized txCeiling answer.
+type txCeil struct {
+	height uint64
+	at     uint64
+	any    bool
+}
+
+// stateRow is the state-family descent with THE FLAT LATEST-STATE CACHE
+// (flat.go) in front of it. AT THE HEAD ONLY: a read of any other height goes
+// straight down, and a fill that raced a landing block is refused rather than
+// stored. Everything the cache can get wrong is a miss.
+func (d *DB) stateRow(prefix []byte, height, at uint64) ([]byte, bool, error) {
+	if val, found, hit := d.flat.get(prefix, height); hit {
+		return val, found, nil
 	}
-	return first - 1, true, nil
+	val, found, err := d.latest(SecState, prefix, at)
+	if err != nil {
+		return nil, false, err
+	}
+	d.flat.fill(prefix, val, found, height)
+	return val, found, nil
 }
 
 // Account returns the account state of addr as of the end of block height.
@@ -63,7 +98,7 @@ func (d *DB) Account(genesis types.GenesisAlloc, addr common.Address, height uin
 		return nil, err
 	}
 	if any {
-		val, ok, err := d.AccountAt(addr[:], at)
+		val, ok, err := d.stateRow(AccountPrefix(addr[:]), height, at)
 		if err != nil {
 			return nil, err
 		}
@@ -100,7 +135,7 @@ func (d *DB) Storage(genesis types.GenesisAlloc, addr common.Address, slot []byt
 		return nil, err
 	}
 	if any {
-		val, ok, err := d.StorageAt(addr[:], slot, at)
+		val, ok, err := d.stateRow(SlotPrefix(addr[:], slot), height, at)
 		if err != nil {
 			return nil, err
 		}

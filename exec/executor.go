@@ -390,6 +390,14 @@ func New(cfg Config) (*Executor, error) {
 	}
 	fwCfg.CacheSizeBytes = uint(fwSize)
 	log.Printf("exec: firewood node cache %d MB (%s)", fwSize>>20, fwWhy)
+	// THE THIRD ANON GRANT, logged beside the other two so one line says where
+	// every number came from. It is a Go map, so it is spent out of the heap
+	// GOMEMLIMIT already reserved rather than being a fourth claim on the box.
+	if n, why := cfg.Store.FlatCacheBudget(); n > 0 {
+		log.Printf("exec: flat latest-state cache %d MB (%s)", n>>20, why)
+	} else {
+		log.Printf("exec: flat latest-state cache OFF (%s), every state read takes the descent", why)
+	}
 
 	ethdbKV := store.EthDB(cfg.Store, cfg.Misc, g.TrieAlloc)
 	memdb := rawdb.NewDatabase(ethdbKV)

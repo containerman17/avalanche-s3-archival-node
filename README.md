@@ -112,6 +112,11 @@ EPOCHDB_FIREWOOD_CACHE    bytes of Firewood node cache (default an eighth of the
                           container). Raise it when `exec: split` shows fw dominating the
                           wall clock and the container has headroom. A value below the
                           64MB floor, or one with a size suffix, refuses to start.
+EPOCHDB_FLAT_CACHE        bytes of the flat latest-state cache: the in-RAM account/slot map
+                          that serves reads at the head without touching the SSTs (default
+                          an eighth of the container's own memory.max, or 1GB when there is
+                          no container). 0 turns it off; it is a pure read cache, so the
+                          only thing it can cost is speed.
 EPOCHDB_NEW_CHAIN         set to 1 only to start a NEW chain in a prefix that already holds
                           other chains' objects. See "Joining a published chain".
 GOMEMLIMIT                honoured if you set it; otherwise derived as 7/10 of the container ceiling

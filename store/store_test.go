@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/ava-labs/libevm/core/types"
@@ -501,4 +502,152 @@ func TestBlockHashIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("run")
+}
+
+// TestFlatCacheNeverStale is the check the flat latest-state cache exists to
+// pass: THE CACHED ANSWER AT THE HEAD IS THE HEAD'S ANSWER, at every step, and
+// no read at any other height is ever served out of it. It walks the three ways
+// the cache can be wrong: a value read at the head and then overwritten by the
+// next block, a historical read that must not pick up the head's value, and a
+// key the descent says was never written (found=false is cached too, and a
+// later block must invalidate it).
+func TestFlatCacheNeverStale(t *testing.T) {
+	db, _ := testDB(t)
+	slot := SlotPrefix(addr(2), hash32(7))
+
+	// A key nothing has written: cached as "never written", which must not
+	// survive the block that writes it.
+	fresh := SlotPrefix(addr(9), hash32(9))
+
+	for h := uint64(0); h < 12; h++ {
+		if err := db.WriteBlock(block(h, 3)); err != nil {
+			t.Fatal(err)
+		}
+		head, ok := db.Head()
+		if !ok || head != h {
+			t.Fatalf("head %d %v after block %d", head, ok, h)
+		}
+		at, any, err := db.txCeiling(head)
+		if err != nil || !any {
+			t.Fatalf("ceiling at %d: %d %v %v", head, at, any, err)
+		}
+		// Through the cache and around it must agree, every block.
+		got, gotOK, err := db.stateRow(slot, head, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, wantOK, err := db.latest(SecState, slot, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotOK != wantOK || !bytes.Equal(got, want) {
+			t.Fatalf("block %d: cache says %x/%v, descent says %x/%v", h, got, gotOK, want, wantOK)
+		}
+		if want == nil || len(want) != 2 || want[0] != byte(h) {
+			t.Fatalf("block %d: descent value %x is not this block's write", h, want)
+		}
+		// The absent key stays absent, through the cache and around it.
+		if _, ok, err := db.stateRow(fresh, head, at); err != nil || ok {
+			t.Fatalf("block %d: absent slot answered %v %v", h, ok, err)
+		}
+		// A historical read must never be served (or polluted) by the cache.
+		if h > 0 {
+			hAt, _, err := db.txCeiling(h - 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			old, _, err := db.stateRow(slot, h-1, hAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(old) != 2 || old[0] != byte(h-1) {
+				t.Fatalf("block %d: historical read at %d gave %x", h, h-1, old)
+			}
+		}
+	}
+
+	// A block that is not the next one drops the cache whole rather than
+	// arguing about consistency: replaying block 5 must not leave the cache
+	// claiming to be the latest state of block 11.
+	db.flat.apply(block(5, 3))
+	head, _ := db.Head()
+	if _, _, hit := db.flat.get(slot, head); hit {
+		t.Fatal("the cache still serves the head after an out-of-order block")
+	}
+}
+
+// TestFlatCacheBudget: rotation drops entries and never answers, which is a
+// miss and never a wrong answer.
+func TestFlatCacheBudget(t *testing.T) {
+	c := newFlatCache(4 * (flatEntryOverhead + 8)) // half is two entries
+	c.adopt(7)
+	for i := 0; i < 64; i++ {
+		c.fill([]byte(fmt.Sprintf("k%07d", i)), []byte{byte(i)}, true, 7)
+	}
+	if n := len(c.hot) + len(c.cold); n > 6 {
+		t.Fatalf("the cache holds %d entries under a two-entry budget", n)
+	}
+	if _, _, hit := c.get([]byte("k0000063"), 7); !hit {
+		t.Fatal("the newest entry was evicted")
+	}
+	// A height that is not the cache's is a miss, always.
+	if _, _, hit := c.get([]byte("k0000063"), 8); hit {
+		t.Fatal("the cache answered for a height it is not the latest state of")
+	}
+	// A fill at a height the cache has moved past is refused.
+	c.fill([]byte("stale"), []byte{1}, true, 6)
+	if _, _, hit := c.get([]byte("stale"), 7); hit {
+		t.Fatal("a fill from a stale height was accepted")
+	}
+}
+
+// TestConcurrentReadsWhileWriting is the check the memtable's read-lock fast
+// path exists to pass: readers pread the window log while the executor keeps
+// appending to it, so the flushed watermark and the append must not race and a
+// reader must never see a row the writer had not finished. Run it under -race;
+// that is the whole point.
+func TestConcurrentReadsWhileWriting(t *testing.T) {
+	db, _ := testDB(t)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				head, ok := db.Head()
+				if !ok {
+					continue
+				}
+				// Every family, at the tip and behind it.
+				for h := uint64(0); h <= head; h++ {
+					hdr, ok, err := db.HeaderRLP(h)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					if ok && string(hdr) != fmt.Sprintf("header-%d", h) {
+						t.Errorf("torn header %d: %q", h, hdr)
+						return
+					}
+					if _, _, _, err := db.BlockTxRange(h); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}
+		}()
+	}
+	for h := uint64(0); h < 200; h++ {
+		if err := db.WriteBlock(block(h, 3)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }

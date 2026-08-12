@@ -4,10 +4,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/containerman17/epochdb/dist"
 )
@@ -128,6 +130,15 @@ type DB struct {
 
 	mem *memtable
 
+	// ceil memoizes the last txCeiling answer (statedb.go), which is the read
+	// path's entry point for every account and slot.
+	ceil atomic.Pointer[txCeil]
+	// flat is the latest-state cache in front of the descent at the head, and
+	// flatWhy is where its byte budget came from, for the operator's one log
+	// line.
+	flat    *flatCache
+	flatWhy string
+
 	mu   sync.RWMutex
 	man  *Manifest
 	runs []*Run // ascending TxNum range, same order as man.Runs
@@ -154,7 +165,13 @@ func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: dir, cas: cas, chainRoot: chainRoot, mem: mem, man: man}
+	budget, why, err := flatCacheBytes()
+	if err != nil {
+		mem.close()
+		return nil, err
+	}
+	d := &DB{dir: dir, cas: cas, chainRoot: chainRoot, mem: mem, man: man, flat: newFlatCache(budget)}
+	d.flatWhy = why
 	for _, ref := range man.Runs {
 		r, err := OpenRun(cas, ref.Name)
 		if err != nil {
@@ -170,8 +187,18 @@ func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
 		d.Close()
 		return nil, err
 	}
+	// An EMPTY cache is consistent with any head, so pinning it to the head at
+	// open is free and it is the only way a corpus nobody executes into (a
+	// read-only reader, a bench) ever serves out of it.
+	if h, ok := d.Head(); ok {
+		d.flat.adopt(h)
+	}
 	return d, nil
 }
+
+// FlatCacheBudget reports the flat latest-state cache's byte budget and where
+// the number came from, so one log line tells an operator why they got it.
+func (d *DB) FlatCacheBudget() (uint64, string) { return d.flat.budget, d.flatWhy }
 
 func (d *DB) Close() error {
 	d.mu.Lock()
@@ -267,6 +294,10 @@ func (d *DB) WriteBlock(b *BlockWrite) error {
 	if err := d.mem.add(b); err != nil {
 		return err
 	}
+	// THE FLAT LATEST-STATE CACHE MOVES HERE AND NOWHERE ELSE (flat.go): the
+	// same critical path that publishes the block, after the window holds it, so
+	// a reader is never told the head is at a block the descent cannot answer.
+	d.flat.apply(b)
 	return d.MaybeFlush()
 }
 
@@ -454,6 +485,92 @@ func (d *DB) chainRow(fam int, n uint64, byHeight bool) ([]byte, bool, error) {
 		return runs[i].Get(SecChain, numKey(famPrefix[fam], n))
 	}
 	return nil, false, nil
+}
+
+// Chain families, exported for the sequential readers below. Which of the two
+// numbering dimensions a family is keyed by is a property of the family, so
+// nothing outside has to remember it.
+const (
+	FamBlk  = famBlk
+	FamHdr  = famHdr
+	FamItx  = famItx
+	FamPvm  = famPvm
+	FamRcpt = famRcpt
+	FamTx   = famTx
+)
+
+func famByHeight(fam int) bool { return fam == famBlk || fam == famHdr || fam == famPvm }
+
+// ChainRow is one row of a chain family, in number order.
+type ChainRow struct {
+	Num uint64
+	Val []byte
+}
+
+// ChainRows streams one chain family's rows over [from, to] IN ONE SEQUENTIAL
+// PASS: the runs whose range covers it, oldest-first, then the window. This is
+// the only way to read a whole range without paying the codec per row: a chain
+// data block is 128KB of zstd-9, so N point Gets into one block decompress it N
+// times, while one iterator decodes it exactly once. Whole-range readers (the
+// layer 1 verify pass) use this; a single row is still chainRow's job.
+//
+// The range is a pure filter over what is stored: a missing row simply does not
+// appear, so a caller that requires density checks the numbers it gets.
+func (d *DB) ChainRows(fam int, from, to uint64) iter.Seq2[ChainRow, error] {
+	return func(yield func(ChainRow, error) bool) {
+		if to < from {
+			return
+		}
+		byHeight := famByHeight(fam)
+		prefix := famPrefix[fam]
+		next := from
+		for _, r := range d.snapshot() { // ascending; chain ranges never overlap
+			f := r.Footer
+			lo, hi := f.FromTx, f.ToTx-1
+			if byHeight {
+				lo, hi = f.FromHeight, f.ToHeight
+			}
+			if f.ToTx == f.FromTx && !byHeight {
+				continue // a run with no transactions holds no txnum-keyed rows
+			}
+			if hi < next || lo > to {
+				continue
+			}
+			stopped := false
+			err := r.ScanRange(SecChain, numKey(prefix, next), numKey(prefix, to+1), func(k, v []byte) bool {
+				n := TxNumOf(k)
+				next = n + 1
+				if !yield(ChainRow{Num: n, Val: append([]byte(nil), v...)}, nil) {
+					stopped = true
+					return false
+				}
+				return true
+			})
+			if err != nil {
+				yield(ChainRow{}, err)
+				return
+			}
+			if stopped {
+				return
+			}
+		}
+		// The window's rows are uncompressed offsets into the append-only log,
+		// so there is no block to decode once and nothing to iterate: reading
+		// them one by one IS the sequential read.
+		for n := next; n <= to; n++ {
+			v, ok, err := d.mem.chainGet(fam, n)
+			if err != nil {
+				yield(ChainRow{}, err)
+				return
+			}
+			if !ok {
+				continue
+			}
+			if !yield(ChainRow{Num: n, Val: v}, nil) {
+				return
+			}
+		}
+	}
 }
 
 // HeaderRLP returns a block's header RLP verbatim.

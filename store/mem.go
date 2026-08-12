@@ -36,6 +36,11 @@ type memtable struct {
 	f    *os.File
 	bw   *bufio.Writer
 	pos  uint64 // bytes written (including the buffer)
+	// flushed is how much of pos has reached the file. Everything below it is
+	// immutable and pread-safe, which is what lets chainGet serve under the
+	// READ lock; add() flushes at every block boundary so that covers the whole
+	// window in practice.
+	flushed uint64
 
 	// window bounds
 	baseTx     uint64
@@ -154,7 +159,22 @@ func (m *memtable) clear() {
 		m.chain[i].reset()
 	}
 	m.pos = 0
+	m.flushed = 0
 	m.started = false
+}
+
+// flushLocked pushes the write buffer into the file and publishes the new
+// flushed watermark. The caller holds the WRITE lock: two goroutines flushing
+// one bufio.Writer is a data race on the executor's own output.
+func (m *memtable) flushLocked() error {
+	if m.flushed == m.pos {
+		return nil
+	}
+	if err := m.bw.Flush(); err != nil {
+		return err
+	}
+	m.flushed = m.pos
+	return nil
 }
 
 // recover replays the window log, rebuilding the in-memory indexes and cutting
@@ -266,7 +286,7 @@ replay:
 		return err
 	}
 	m.bw.Reset(m.f)
-	m.pos = good
+	m.pos, m.flushed = good, good
 	return nil
 }
 
@@ -304,7 +324,7 @@ func (m *memtable) close() error {
 func (m *memtable) sync() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.bw.Flush(); err != nil {
+	if err := m.flushLocked(); err != nil {
 		return err
 	}
 	return m.f.Sync()
@@ -510,8 +530,14 @@ func (m *memtable) add(b *BlockWrite) error {
 	m.nextHeight = b.Height + 1
 	var endVal [8]byte
 	binary.BigEndian.PutUint64(endVal[:], m.nextTx)
-	_, _, err := m.write(recEnd, b.Height, endVal[:])
-	return err
+	if _, _, err := m.write(recEnd, b.Height, endVal[:]); err != nil {
+		return err
+	}
+	// FLUSH AT THE BLOCK BOUNDARY, ON THE WRITE SIDE. It costs one write(2) per
+	// block and no fsync, and it is what keeps every reader on chainGet's read
+	// lock: a reader that had to flush the buffer itself would need the write
+	// lock, which serialized all readers behind one another.
+	return m.flushLocked()
 }
 
 func (m *memtable) chainRow(fam int, num uint64, val []byte) error {
@@ -543,21 +569,42 @@ func (m *memtable) postRow(key []byte, val byte) error {
 // reads
 // ---------------------------------------------------------------------------
 
-// chainGet takes the WRITE lock, not the read lock: serving a row that is still
-// in the write buffer has to flush it, and two readers flushing a bufio.Writer
-// at once is a data race on the executor's own output.
+// chainGet serves a chain row out of the window log UNDER THE READ LOCK. The
+// log is append-only, so any byte range at or below the flushed watermark is
+// immutable and a pread against it is safe while the executor keeps appending;
+// add() flushes at every block boundary, so a landed block is readable this way
+// the instant it lands. Only a row still sitting in the write buffer falls back
+// to the write lock, because flushing a bufio.Writer from two readers at once
+// is a data race on the executor's own output.
 func (m *memtable) chainGet(fam int, num uint64) ([]byte, bool, error) {
+	m.mu.RLock()
+	off, n, ok := m.chain[fam].find(num)
+	if !ok || n == 0 || off+uint64(n) <= m.flushed {
+		v, found, err := m.readRow(off, n, ok)
+		m.mu.RUnlock()
+		return v, found, err
+	}
+	m.mu.RUnlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	off, n, ok := m.chain[fam].find(num)
+	off, n, ok = m.chain[fam].find(num)
+	if ok && n > 0 {
+		if err := m.flushLocked(); err != nil {
+			return nil, false, err
+		}
+	}
+	return m.readRow(off, n, ok)
+}
+
+// readRow preads one already-flushed row. The caller holds the lock either way,
+// which is what keeps a concurrent reset's Truncate off the file.
+func (m *memtable) readRow(off uint64, n uint32, ok bool) ([]byte, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
 	if n == 0 {
 		return nil, true, nil
-	}
-	if err := m.bw.Flush(); err != nil {
-		return nil, false, err
 	}
 	p := make([]byte, n)
 	if _, err := m.f.ReadAt(p, int64(off)); err != nil && !errors.Is(err, io.EOF) {
@@ -619,7 +666,7 @@ func (m *memtable) window() (baseTx, nextTx, baseHeight, nextHeight uint64, star
 func (m *memtable) eachChain(fam int, fn func(num uint64, val []byte) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.bw.Flush(); err != nil {
+	if err := m.flushLocked(); err != nil {
 		return err
 	}
 	c := &m.chain[fam]
