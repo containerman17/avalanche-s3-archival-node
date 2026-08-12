@@ -391,7 +391,7 @@ func New(cfg Config) (*Executor, error) {
 	fwCfg.CacheSizeBytes = uint(fwSize)
 	log.Printf("exec: firewood node cache %d MB (%s)", fwSize>>20, fwWhy)
 
-	ethdbKV := store.EthDB(cfg.Store, cfg.Misc)
+	ethdbKV := store.EthDB(cfg.Store, cfg.Misc, g.TrieAlloc)
 	memdb := rawdb.NewDatabase(ethdbKV)
 
 	tdb := triedb.NewDatabase(memdb, &triedb.Config{

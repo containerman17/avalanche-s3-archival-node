@@ -219,7 +219,7 @@ func TestEthDBCodeAndMisc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenMisc: %v", err)
 	}
-	kv := EthDB(db, m)
+	kv := EthDB(db, m, nil)
 
 	b := block(1, 1)
 	b.Code[string(hash32(5))] = []byte("CODE")

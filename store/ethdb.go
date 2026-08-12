@@ -14,6 +14,8 @@ import (
 	"sync"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/ethdb"
 )
 
@@ -29,14 +31,31 @@ import (
 // This is the durable backing rawdb needs because Firewood explicitly delegates
 // code storage to rawdb. Lifetime is tied to the DB and the MiscStore, neither
 // of which this closes.
-func EthDB(d *DB, m *MiscStore) ethdb.KeyValueStore {
-	return &ethKV{d: d, misc: m}
+// EthDB routes contract code to the descent and everything else to the small
+// durable misc store beside the runs.
+//
+// GENESIS CODE IS NOT STORED, IT IS RESOLVED. The genesis commit routes its
+// pre-deployed contracts through rawdb.WriteCode, and those writes are no-ops
+// here because a run only ever carries what execution produced. What genesis
+// MATERIALISED is a pure function of the chain root, so the alloc answers for
+// it directly: one map built once at open, the same floor the read descent
+// bottoms at. Without it the first transaction that calls a genesis contract
+// dies with "can't load code hash" (caught live at numine block 1).
+func EthDB(d *DB, m *MiscStore, genesis types.GenesisAlloc) ethdb.KeyValueStore {
+	code := make(map[common.Hash][]byte)
+	for _, a := range genesis {
+		if len(a.Code) > 0 {
+			code[crypto.Keccak256Hash(a.Code)] = a.Code
+		}
+	}
+	return &ethKV{d: d, misc: m, genesis: code}
 }
 
 type ethKV struct {
-	mu   sync.Mutex
-	d    *DB
-	misc *MiscStore
+	mu      sync.Mutex
+	d       *DB
+	misc    *MiscStore
+	genesis map[common.Hash][]byte
 }
 
 // isCodeKey matches libevm rawdb's code key layout: 'c' + 32-byte hash.
@@ -51,6 +70,9 @@ func (a *ethKV) Has(key []byte) (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if h, ok := isCodeKey(key); ok {
+		if _, ok := a.genesis[h]; ok {
+			return true, nil
+		}
 		_, found, err := a.d.Code(h[:])
 		return found, err
 	}
@@ -66,10 +88,13 @@ func (a *ethKV) Get(key []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			return nil, errNotFound
+		if ok {
+			return blob, nil
 		}
-		return blob, nil
+		if blob, ok := a.genesis[h]; ok {
+			return blob, nil
+		}
+		return nil, errNotFound
 	}
 	if v, ok := a.misc.Get(key); ok {
 		return v, nil
