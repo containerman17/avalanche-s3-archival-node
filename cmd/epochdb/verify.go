@@ -37,13 +37,14 @@ import (
 func verifyMain(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "data directory")
-	from := fs.Uint64("from", 0, "first height")
+	from := fs.Uint64("from", 1, "first height (genesis has no stored header: it is a pure function of the chain root)")
 	to := fs.Uint64("to", 0, "last height (0 = the store's head)")
 	_, resolveChain := chainFlags(fs)
 	fs.Parse(args)
 
 	c := resolveChain(*dataDir)
-	if _, err := exec.ChainGenesis(c); err != nil {
+	g, err := exec.ChainGenesis(c)
+	if err != nil {
 		log.Fatalf("epochdb: verify: genesis: %v", err)
 	}
 	cas, err := dist.Local(*dataDir)
@@ -65,7 +66,15 @@ func verifyMain(args []string) {
 		*to = head
 	}
 	start := time.Now()
-	blocks, txs, err := verifyRange(db, *from, *to)
+	// THE CHAIN IS ANCHORED AT GENESIS, not at whatever the first stored header
+	// happens to be: block 1's ParentHash is checked against the genesis hash
+	// the chain root produces, so the hash chain this pass walks is rooted in
+	// the trust anchor rather than in itself.
+	anchor := g.Hash
+	if *from > 1 {
+		anchor = common.Hash{}
+	}
+	blocks, txs, err := verifyRange(db, *from, *to, anchor)
 	if err != nil {
 		log.Fatalf("epochdb: verify: FAIL after %d blocks: %v", blocks, err)
 	}
@@ -73,9 +82,9 @@ func verifyMain(args []string) {
 		blocks, txs, time.Since(start).Round(time.Millisecond))
 }
 
-func verifyRange(db *store.DB, from, to uint64) (blocks, txs uint64, err error) {
-	var prevHash common.Hash
-	havePrev := false
+func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs uint64, err error) {
+	prevHash := anchor
+	havePrev := anchor != (common.Hash{})
 	for n := from; n <= to; n++ {
 		hdrRLP, ok, err := db.HeaderRLP(n)
 		if err != nil {
