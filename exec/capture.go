@@ -137,7 +137,7 @@ func decodeLogsFrame(rec []byte) (addrs []common.Address, topics []common.Hash, 
 // verify makes every cache hit also do the FFI read and panic on any
 // difference (validation harness, not steady state).
 func wrapDatabase(inner state.Database, cacheBytes uint64, verify bool) *wrappedDatabase {
-	d := &wrappedDatabase{inner: inner, cacheCap: cacheBytes, verify: verify}
+	d := &wrappedDatabase{inner: inner, cacheCap: cacheBytes, verify: verify, recent: map[string][]byte{}}
 	if cacheBytes > 0 {
 		d.cache = make(map[common.Address]*acctEntry)
 	}
@@ -147,6 +147,14 @@ func wrapDatabase(inner state.Database, cacheBytes uint64, verify bool) *wrapped
 type wrappedDatabase struct {
 	inner state.Database
 	cap   *capture
+
+	// recent holds contract code whose rows have NOT reached the state layer
+	// yet: the open block, plus every buffered block of an open batch. Nothing
+	// else can answer for it (the BlockWrite lands only after the root
+	// verifies), so a later transaction calling a contract deployed a moment
+	// ago would read straight past it. Caught live at numine block 1. Cleared
+	// by forgetRecentCode once the rows are in, so it is bounded by one batch.
+	recent map[string][]byte
 
 	// midBlock short-circuits the ACCOUNT trie's Hash so a per-tx
 	// IntermediateRoot drains post-images through the interceptor without
@@ -240,6 +248,10 @@ func (d *wrappedDatabase) beginBlock(root common.Hash) { d.midBlock, d.midRoot =
 // endBlock disarms it, so the block's own Commit computes the real root.
 func (d *wrappedDatabase) endBlock() { d.midBlock = false }
 
+// forgetRecentCode drops the open-window code once its rows are in the state
+// layer and the descent can answer for them.
+func (d *wrappedDatabase) forgetRecentCode() { clear(d.recent) }
+
 // entry returns the cache entry for addr, creating it (and evicting over
 // the cap) as needed. Caller must have checked d.cache != nil.
 func (d *wrappedDatabase) entry(addr common.Address) *acctEntry {
@@ -323,11 +335,24 @@ func (d *wrappedDatabase) CopyTrie(t state.Trie) state.Trie {
 	return &wrappingTrie{inner: d.inner.CopyTrie(inner), db: d}
 }
 
+// ContractCode answers from the OPEN BLOCK'S OWN CODE FIRST. A blob deployed
+// earlier in this block is not in any run and not in the memtable yet (the
+// BlockWrite lands after the root verifies), so a later transaction calling that
+// contract would read straight past it. In the epoch build the interceptor wrote
+// each blob into code.log immediately, which hid this; storage v0 carries code
+// on the block instead, so the open block has to be part of the descent.
+// Caught live at numine block 1.
 func (d *wrappedDatabase) ContractCode(addr common.Address, codeHash common.Hash) ([]byte, error) {
+	if blob, ok := d.recent[string(codeHash[:])]; ok {
+		return blob, nil
+	}
 	return d.inner.ContractCode(addr, codeHash)
 }
 
 func (d *wrappedDatabase) ContractCodeSize(addr common.Address, codeHash common.Hash) (int, error) {
+	if blob, ok := d.recent[string(codeHash[:])]; ok {
+		return len(blob), nil
+	}
 	return d.inner.ContractCodeSize(addr, codeHash)
 }
 
@@ -433,7 +458,9 @@ func (t *wrappingTrie) UpdateContractCode(addr common.Address, codeHash common.H
 	// dedup by hash.
 	if c := t.db.cap; c != nil {
 		if _, ok := c.code[string(codeHash[:])]; !ok {
-			c.code[string(codeHash[:])] = append([]byte(nil), code...)
+			blob := append([]byte(nil), code...)
+			c.code[string(codeHash[:])] = blob
+			t.db.recent[string(codeHash[:])] = blob
 		}
 	}
 	return t.inner.UpdateContractCode(addr, codeHash, code)

@@ -1266,6 +1266,7 @@ func (e *Executor) flushBatch() error {
 	e.batchOpen = false
 	e.batchDirty = false
 	e.batchBuf = nil
+	e.wrapDB.forgetRecentCode()
 	e.wrapDB.endBatch()
 	return nil
 }
