@@ -13,7 +13,6 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/trie"
 
-	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/store"
 )
@@ -49,15 +48,11 @@ func verifyMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: verify: genesis: %v", err)
 	}
-	cas, err := dist.Local(*dataDir)
+	cas, db, err := openCorpus(*dataDir, c.Root())
 	if err != nil {
 		log.Fatalf("epochdb: verify: %v", err)
 	}
 	defer cas.Close()
-	db, err := store.Open(*dataDir, cas, c.Root())
-	if err != nil {
-		log.Fatalf("epochdb: verify: %v", err)
-	}
 	defer db.Close()
 
 	head, ok := db.Head()

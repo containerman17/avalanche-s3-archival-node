@@ -67,6 +67,28 @@ func chainFlags(fs *flag.FlagSet) (*string, func(dataDir string) *chain.Chain) {
 	}
 }
 
+// openCorpus opens a data dir the way a SERVING node opens it: READ-THROUGH,
+// never local-only. Publishing releases the producer's local copy once the
+// bucket confirms the upload (dist.Sync -> Release), so on exactly the chains
+// that publish, a dev command that opened with dist.Local found no run file at
+// all and died with "dist: open <name>: no such file or directory". dist.Open
+// reads local first and the bucket second, and with no EPOCHDB_S3_ENDPOINT set
+// it degrades to local-only, so an offline dir behaves as it always did.
+//
+// The caller closes both, db first.
+func openCorpus(dataDir string, root [32]byte) (*dist.Store, *store.DB, error) {
+	cas, err := dist.Open(dataDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	db, err := store.Open(dataDir, cas, root)
+	if err != nil {
+		cas.Close()
+		return nil, nil, err
+	}
+	return cas, db, nil
+}
+
 // mustCChain is the descriptor for --network's primary-network C-chain, for
 // the commands that are C-chain-only by nature (the A/B benches against a
 // public archive RPC, the event-log backfill).

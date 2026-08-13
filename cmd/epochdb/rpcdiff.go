@@ -29,10 +29,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/exec"
 	"github.com/containerman17/epochdb/rpc"
-	"github.com/containerman17/epochdb/store"
 )
 
 func rpcdiffMain(args []string) {
@@ -54,15 +52,11 @@ func rpcdiffMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: rpcdiff: genesis: %v", err)
 	}
-	cas, err := dist.Local(*dataDir)
+	cas, db, err := openCorpus(*dataDir, c.Root())
 	if err != nil {
 		log.Fatalf("epochdb: rpcdiff: %v", err)
 	}
 	defer cas.Close()
-	db, err := store.Open(*dataDir, cas, c.Root())
-	if err != nil {
-		log.Fatalf("epochdb: rpcdiff: %v", err)
-	}
 	defer db.Close()
 	head, ok := db.Head()
 	if !ok {
