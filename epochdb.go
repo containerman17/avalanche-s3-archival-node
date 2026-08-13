@@ -20,7 +20,9 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"time"
 
+	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 
@@ -32,6 +34,18 @@ import (
 	"github.com/containerman17/epochdb/store"
 )
 
+// commitEvery is how many blocks go into one Firewood proposal. It is also
+// how far below the head a crash can leave Firewood, and therefore how far
+// back the fetch restarts (fetchStart).
+const commitEvery = 64
+
+// tipAnchorTimeout bounds the wait for the --tip-override container itself. A
+// seed nobody can serve is a typo, not a slow peer: the fleet once ran 28
+// chains with a MAINNET container ID as their override and every one sat
+// waiting forever, looking merely slow. Generous because peer warmup precedes
+// it.
+const tipAnchorTimeout = 5 * time.Minute
+
 // Config is everything a node needs. `serve` fills exactly one.
 type Config struct {
 	DataDir       string
@@ -40,9 +54,10 @@ type Config struct {
 	VdrSources    []string
 	StateCacheGiB int
 	PerPeer       int
-	// Backfill replaces the consensus follower with a bounded walk
-	// (serve --tip-override). nil follows the live tip.
-	Backfill func(context.Context, *fetch.Fetcher) error
+	// TipOverride replaces the consensus follower with a bounded forward
+	// fetch that stops at this CONTAINER's height (serve --tip-override): a
+	// fixed, reproducible corpus. Empty follows the live tip.
+	TipOverride ids.ID
 	// ReadOnly opens the corpus and the query layer and NOTHING ELSE: no
 	// follower, no executor, no writers, so it neither takes the data dir's
 	// lock nor touches the network. It is what the benches and the adapter
@@ -102,7 +117,7 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 		return nil, err
 	}
 
-	// --- staging: the follower writes it, the executor reads it ---------------
+	// --- the fetch: it dials here, and starts once the runs say where from ---
 	// Chain is what makes the follower track the L1's subnet and register the
 	// subnet-evm extras (M5); nil-equivalent for the C-chain, whose descriptor
 	// carries the primary subnet.
@@ -113,7 +128,6 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 	)
 	if !cfg.ReadOnly {
 		fetcher, err = fetch.New(fetch.Config{
-			DataDir:    cfg.DataDir,
 			NodeURI:    cfg.NodeURI,
 			PerPeer:    cfg.PerPeer,
 			Chain:      cfg.Chain,
@@ -123,12 +137,9 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 			return nil, fmt.Errorf("fetch: %w", err)
 		}
 		closers = append(closers, func() { fetcher.Close() })
-		blocks = fetcher.Store()
-		// The FOLLOWER's accepted head, and only the follower's: the staging
-		// store keeps every index sidecar the dir ever got, so under
-		// --tip-override this is a leftover height and not this run's ceiling.
-		// Nothing reads it in that mode (see Status and liveNode).
-		accepted = func() uint64 { h, _ := fetcher.Store().Head(); return h }
+		// The network's accepted head, which under --tip-override is the
+		// override ceiling. Nothing reads it in that mode (see Status).
+		accepted = fetcher.AcceptedHead
 	}
 
 	// --- storage v0: the executor owns the writer, the RPC shares it ---------
@@ -154,6 +165,31 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 		return nil, fmt.Errorf("open storage v0: %w", err)
 	}
 	closers = append(closers, func() { db.Close() })
+
+	// THE FETCH STARTS HERE, before the executor opens, because the executor's
+	// crash walk-back reads containers inside exec.New and the RAM queue is the
+	// only place they can come from now.
+	if !cfg.ReadOnly {
+		if cfg.TipOverride != ids.Empty {
+			// --tip-override names where forward fetch stops trusting the
+			// network: resolve it BEFORE the window opens, or the fetch would
+			// climb past the ceiling in the seconds it takes to ask.
+			actx, cancel := context.WithTimeout(ctx, tipAnchorTimeout)
+			a, aerr := fetcher.ResolveAnchor(actx, cfg.TipOverride)
+			cancel()
+			if aerr != nil {
+				return nil, fmt.Errorf("--tip-override %s: no peer served this container in %s (is it an ID from a DIFFERENT NETWORK?): %w",
+					cfg.TipOverride, tipAnchorTimeout, aerr)
+			}
+			log.Printf("epochdb: tip-override %s is height %d: fetching forward to it and stopping there, no follower", a.ID, a.Height)
+			fetcher.SetCeiling(a.Height)
+		}
+		from, anchor, ferr := exec.FetchStart(db, g.Hash, commitEvery)
+		if ferr != nil {
+			return nil, ferr
+		}
+		blocks = fetcher.StartForward(ctx, from, anchor)
+	}
 
 	n = &Node{
 		cfg: cfg, fetcher: fetcher, store: db, cas: cas,
@@ -184,13 +220,10 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 	// the other one (state.Store.BindVMKind): that check is what keeps a
 	// subnet-evm node from opening a coreth corpus.
 	e, err := exec.New(exec.Config{
-		DataDir: cfg.DataDir,
-		Blocks:  blocks,
-		Store:   db,
-		Misc:    misc,
-		OnBlock: func(h uint64, hash common.Hash) {
-			n.fetcher.SetFloor(n.store.FlushedFloor())
-		},
+		DataDir:         cfg.DataDir,
+		Blocks:          blocks,
+		Store:           db,
+		Misc:            misc,
 		StateCacheBytes: uint64(cfg.StateCacheGiB) << 30,
 		// UNPINNED 2026-07-29: this was 1 only so the served frontier was a
 		// committed Firewood revision. Nothing reads Firewood any more, so
@@ -198,12 +231,12 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 		// tail overlay all advance together at the batch boundary, because
 		// publishLive/OnBlock and the state-layer appends all happen in
 		// flushBatch. 64 is invisible at tip pace (Run flushes the open batch
-		// the moment staging runs dry, which at the tip is after every block,
+		// the moment the fetch runs dry, which at the tip is after every block,
 		// so a following node still commits and root-verifies per block) and
-		// is what makes catch-up fast. Ceiling is 1498 (exec.New's walk-back
-		// guard); 64 keeps the crash walk-back at 8k blocks, well inside one
-		// 100k raw bucket.
-		CommitEvery: 64,
+		// is what makes catch-up fast. It also sets how far below the head a
+		// crash can leave Firewood, which is how far back the fetch restarts
+		// (fetchStart): at 64 that is 8,192 blocks, seconds of re-fetching.
+		CommitEvery: commitEvery,
 		Chain:       cfg.Chain,
 	})
 	if err != nil {
@@ -212,25 +245,18 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 	closers = append(closers, func() { e.Close() })
 	n.e = e
 
-	// The flushed history IS history: the follower must not walk below it,
-	// whatever the raw staging store still happens to hold. THE FETCH FLOOR IS
-	// THE LAST FLUSHED RUN BOUNDARY, never higher: crash recovery re-executes
-	// out of staging from wherever the reconcile walk-back lands, which is at
-	// worst the last run's end. Flush raises it again, in the
-	// publish-before-delete order: cut, publish, then unlink.
-	fetcher.SetFloor(db.FlushedFloor())
-
 	live := liveNode{live: e.LiveHead, settled: e.SettledHeight}
-	if cfg.Backfill != nil {
+	if cfg.TipOverride != ids.Empty {
 		live.target = fetcher.SyncTarget
 	} else {
 		live.accepted = accepted
 	}
 	n.srv.EnableLive(live)
 
-	if cfg.Backfill != nil {
-		go func() { cfg.OnExit("backfill", cfg.Backfill(ctx, fetcher)) }()
-	} else {
+	// THE FOLLOWER OWNS THE REAL TIP ZONE, and under --tip-override there is no
+	// tip zone to own: the forward fetch stops at the override and the run is a
+	// fixed corpus.
+	if cfg.TipOverride == ids.Empty {
 		go func() { cfg.OnExit("follower", fetcher.Follow(ctx)) }()
 	}
 	go func() {
@@ -307,29 +333,31 @@ func (n *Node) TraceTx(hash common.Hash) (frames []store.Frame, found bool, err 
 //
 // Head IS THE FIX OF 2026-08-05: it is the height execution is measured
 // against, and where it comes from depends on the mode. Following, it is the
-// follower's accepted head. Backfilling (--tip-override) there IS no follower,
-// and the staging store's head is the follower's number: a dir that once
-// followed still holds index sidecars far above a later override's ceiling, so
-// a 10,129,485-block mainnet backfill reported accepted=66854601 and an
-// exec_lag of 59.3M against a height nothing in the run would ever reach. A
-// backfill measures against the ceiling its walk was given.
+// network's accepted head. Under --tip-override there IS no follower and no
+// accepted head to measure against, so a run measures against the ceiling it
+// was given: reporting anything else once put a 59.3M-block exec_lag against a
+// height nothing in the run would ever reach.
 type Status struct {
 	Backfill bool
 	Head     uint64 // accepted head (follow) or override ceiling (backfill)
-	Stored   uint64 // containers in staging; backfill progress toward Head
 	Executed uint64
 	Served   uint64
 	Flushed  uint64
 	Settled  uint64
 	Runs     int
 	Bytes    uint64
-	Staging  uint64 // raw staging retained on disk
+	Fetched  uint64 // highest height in the fetch queue
+	// QueueBytes is the RAM the fetched-not-executed containers occupy right
+	// now, PeakQueueBytes the high-water mark of this run. Nothing
+	// pre-execution touches disk, so this is the whole cost of being ahead.
+	QueueBytes     uint64
+	PeakQueueBytes uint64
 }
 
 func (n *Node) Status() Status {
 	head, _ := n.store.Head()
 	s := Status{
-		Backfill: n.cfg.Backfill != nil,
+		Backfill: n.cfg.TipOverride != ids.Empty,
 		Served:   head,
 		Flushed:  n.store.FlushedFloor(),
 		Runs:     len(n.store.Manifest().Runs),
@@ -339,13 +367,11 @@ func (n *Node) Status() Status {
 		s.Executed, s.Settled = n.e.LiveHead(), n.e.SettledHeight()
 	}
 	if n.fetcher != nil {
-		s.Staging = n.fetcher.StagedBytes()
+		p := n.fetcher.Progress()
+		s.Fetched, s.QueueBytes, s.PeakQueueBytes = p.Head, p.QueueBytes, p.PeakBytes
 	}
 	if s.Backfill {
-		// Count, not a contiguous-run scan: the run above the exec head is
-		// millions of heights wide during a stage-1 walk and probing it every
-		// tick would hold the store's lock against the fetcher.
-		s.Head, s.Stored = n.fetcher.SyncTarget(), n.fetcher.Store().Count()
+		s.Head = n.fetcher.SyncTarget()
 	} else {
 		s.Head = n.accepted()
 	}
@@ -357,13 +383,11 @@ func (n *Node) Status() Status {
 //
 // TWO QUESTIONS, TWO VALUES (2026-08-05), because making one number answer both
 // is what put a leftover height in front of clients. AcceptedHead bounds what a
-// read may NAME (`pending`, the block-number ceiling), so it is only ever a
-// height whose container this node holds; SyncTarget is only the goal, and may
-// sit millions of blocks above anything answerable. Following they coincide, so
-// both funcs below are the follower's accepted head. Under --tip-override there
-// is NO follower: the staging store's head is whatever an earlier run left in
-// the dir, so nothing above the executed head may be named, while the goal is
-// the walk's ceiling.
+// read may NAME (`pending`, the block-number ceiling); SyncTarget is only the
+// goal, and may sit millions of blocks above anything answerable. Following
+// they coincide, so both funcs below are the network's accepted head. Under
+// --tip-override there is NO follower, so nothing above the executed head may
+// be named, while the goal is the fetch ceiling.
 type liveNode struct {
 	live     func() uint64 // executed head
 	settled  func() uint64

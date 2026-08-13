@@ -47,7 +47,11 @@ func TestParseTipOverrideRefusesAHeight(t *testing.T) {
 // retired is every name that used to be operator surface and is not any more
 // (RULING 2026-08-03): the 7 pipeline stages, the 2 verifiers and the 6 benches.
 // They still exist under `dev`, and none of them may appear in `usage`.
-var retired = []string{"fetch", "exec", "verify", "probe"}
+// `fetch` is NOT here any more: it was a stage that filled a staging dir, and
+// there is no staging dir. Fetching is not separable from executing now (the
+// containers live in RAM between the two), so the name is gone rather than
+// retired, and a stale script that says `epochdb fetch` gets the usage.
+var retired = []string{"exec", "verify", "probe"}
 
 // TestUsageIsServeOnly pins the surface: `epochdb serve` and nothing else, with
 // no retired name and no `fleet` anywhere in what an operator is shown.
@@ -120,7 +124,7 @@ func TestRetiredNamesFailLoudly(t *testing.T) {
 	}
 	buf.Reset()
 	dispatch([]string{"dev"}, &buf)
-	for _, name := range []string{"exec", "fetch", "verify"} {
+	for _, name := range []string{"exec", "verify"} {
 		if !strings.Contains(buf.String(), name) {
 			t.Fatalf("dev usage does not list %q:\n%s", name, buf.String())
 		}

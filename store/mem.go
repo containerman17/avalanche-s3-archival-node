@@ -22,7 +22,7 @@ import (
 // found the state layer 50,000 blocks behind Firewood could neither rewind
 // Firewood to the flush boundary nor re-execute forward from it. The window
 // therefore streams into ONE append-only log beside the runs, the same
-// first-class on-disk staging pattern the fetcher uses, fsynced on the
+// first-class on-disk append-only pattern, fsynced on the
 // executor's own cadence. On restart it is replayed back into RAM and the
 // executor resumes exactly where the reconcile walk-back expects it.
 //

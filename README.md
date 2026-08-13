@@ -83,8 +83,8 @@ serve --data <dir>              data directory; ONE chain owns it (default ./dat
       --state-cache <GiB>       executor read cache (default 1, clamped to 1/8 of the container's ceiling)
       --sync-every <dur>        bucket upload cadence (default 5m, no-op without S3)
       --per-peer <n>            max outstanding requests per archival peer (default 1)
-      --tip-override <containerID>  backfill down from a container ID instead of following
-      --walks <n>               concurrent backward walks under --tip-override (default 16)
+      --tip-override <containerID>  fetch forward only up to this container and stop
+                                there, instead of following the live tip
       --pprof <addr>            serve net/http/pprof on a separate address
 ```
 
@@ -103,10 +103,6 @@ EPOCHDB_CACHE_MIN_FREE    bytes of free space the cache stops filling at (defaul
 EPOCHDB_CACHE_MAX_AGE     a cached chunk's ceiling age, Go duration (default 720h)
 EPOCHDB_FETCH_CONCURRENCY parallel sub-range GETs per cold chunk; a property of your NIC
 EPOCHDB_HEAVY_SLOTS       concurrent frontier builds allowed per box (default 1)
-EPOCHDB_MAX_STAGING       bytes of raw staging the backfill walk may retain before it PAUSES
-                          and waits for sealing to drain it (default 25% of the data dir's
-                          free space; 0 disables the bound). Catch-up only: a node at the
-                          tip is never throttled by it.
 EPOCHDB_FIREWOOD_CACHE    bytes of Firewood node cache (default an eighth of the container's
                           own memory.max, or 3% of the Firewood dir when there is no
                           container). Raise it when `exec: split` shows fw dominating the
@@ -331,7 +327,10 @@ The rest of this was learned expensively, from two outages of one box in a singl
 account of itself: `cacheHorizon` (the age of the window it last evicted, i.e. how long a chunk
 really survives on this node), `cacheEvictions`, `cacheRefusals`, `cacheFreeBytes`,
 `cacheMinFreeBytes`, `cacheFillErrors`, `cacheEvictErrors`, `cacheReadErrors`, `cacheLastError`.
-Under `--tip-override` there is no follower, so `target` and `stored` replace `accepted`.
+`fetched` is the highest block the ascending fetch has verified, and `queueBytes`/`peakQueueBytes`
+are the RAM those fetched-not-executed containers hold: nothing pre-execution touches disk, so that
+is the whole cost of running ahead of the executor. Under `--tip-override` there is no follower, so
+`target` replaces `accepted`.
 
 The listener binds **before** the startup work, which on a large corpus can take over an hour, so
 `/status` answers with `serving:false` from the first second and you can watch a cold start rather

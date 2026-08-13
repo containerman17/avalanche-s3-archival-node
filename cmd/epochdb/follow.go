@@ -22,7 +22,6 @@ import (
 	"github.com/containerman17/epochdb"
 	"github.com/containerman17/epochdb/chain"
 	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/fetch"
 	"github.com/containerman17/epochdb/grpcapi"
 	"github.com/containerman17/epochdb/plainhttp"
 )
@@ -47,10 +46,10 @@ import (
 //
 // Who owns what:
 //
-//	fetch.Fetcher   consensus follower goroutine; sole writer of the staging
-//	                store (arrival/index). Its in-RAM store IS the executor's
-//	                block source, so an accepted container is executable the
-//	                moment it is durable.
+//	fetch.Fetcher   the ascending fetch plus the consensus follower. Its
+//	                bounded RAM queue IS the executor's block source, and the
+//	                only place an unexecuted container lives: nothing
+//	                pre-execution touches disk.
 //	exec.Executor   the only holder of the Firewood handle, which it uses ONLY
 //	                to verify roots; sole writer of the state layer and of the
 //	                unflushed window. Runs one goroutine, publishes its executed
@@ -58,8 +57,6 @@ import (
 //	rpc.Server      THE CORE QUERY LAYER, N request goroutines. JSON-RPC,
 //	                gRPC and plain HTTP are three PEER adapters over it, none
 //	                stacked on another.
-//	exec OnBlock    runs ON the executor goroutine: raises the fetch floor to
-//	                the last flushed run boundary.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", "./data", "data directory; ONE chain owns it, and this process serves that one chain")
@@ -72,7 +69,6 @@ func serveMain(args []string) {
 	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
-	walks := fs.Int("walks", 16, "concurrent backward walks (--tip-override)")
 	syncEvery := fs.Duration("sync-every", 5*time.Minute, "cadence for uploading spooled artifacts to the bucket and releasing the local copies (no-op without S3 credentials)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
 	fs.Parse(args)
@@ -166,13 +162,11 @@ func serveMain(args []string) {
 			cfg.VdrSources = strings.Split(*vdrSources, ",")
 		}
 		if *tipOverride != "" {
-			// Same process, same staging store, different source of blocks: a
-			// bounded backfill instead of the consensus tip (fixed-corpus builds
-			// and integration runs). Everything else is identical.
-			log.Printf("epochdb: serve: %s backfills to container %s instead of following", id, tip)
-			cfg.Backfill = func(ctx context.Context, fe *fetch.Fetcher) error {
-				return fe.SyncTo(ctx, resolveTipOverride(ctx, fe, tip), *walks)
-			}
+			// Same process, same forward fetch, a fixed ceiling instead of the
+			// live tip (fixed-corpus builds and integration runs). Everything
+			// else is identical.
+			log.Printf("epochdb: serve: %s fetches forward to container %s and stops there instead of following", id, tip)
+			cfg.TipOverride = tip
 		}
 		n, err := epochdb.Open(ctx, cfg)
 		if err != nil {
@@ -250,7 +244,7 @@ type serveStatus struct {
 	Serving      bool   `json:"serving"`
 	Accepted     uint64 `json:"accepted"`
 	Target       uint64 `json:"target,omitempty"`
-	Stored       uint64 `json:"stored,omitempty"`
+	Fetched      uint64 `json:"fetched"`
 	Executed     uint64 `json:"executed"`
 	Cooked       uint64 `json:"cooked"`
 	CacheHorizon string `json:"cacheHorizon,omitempty"`
@@ -269,9 +263,11 @@ type serveStatus struct {
 	CacheEvictErrors uint64 `json:"cacheEvictErrors,omitempty"`
 	CacheReadErrors  uint64 `json:"cacheReadErrors,omitempty"`
 	CacheLastError   string `json:"cacheLastError,omitempty"`
-	// The retained raw staging the flush has not yet drained. Unbounded by
-	// design: staging drains as flushing retires it, and the disk is the budget.
-	StagingBytes uint64 `json:"stagingBytes,omitempty"`
+	// The RAM the fetched-not-executed containers occupy, and this run's peak.
+	// Nothing pre-execution touches disk, so this is the entire cost of the
+	// fetch running ahead of the executor.
+	QueueBytes     uint64 `json:"queueBytes,omitempty"`
+	PeakQueueBytes uint64 `json:"peakQueueBytes,omitempty"`
 }
 
 // statusOf builds that answer. n is nil between the bind and the moment the
@@ -342,24 +338,22 @@ func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
 func statusLine(s epochdb.Status) string {
 	lead, lag := fmt.Sprintf("accepted=%d", s.Head), fmt.Sprintf("%d", int64(s.Head)-int64(s.Executed))
 	if s.Backfill {
-		lead = fmt.Sprintf("target=%d stored=%d", s.Head, s.Stored)
-		if s.Head == 0 { // the walk has not resolved its anchors yet
-			lead, lag = fmt.Sprintf("target=? stored=%d", s.Stored), "?"
+		lead = fmt.Sprintf("target=%d", s.Head)
+		if s.Head == 0 { // the override container has not resolved yet
+			lead, lag = "target=?", "?"
 		}
 	}
-	line := fmt.Sprintf("%s executed=%d served=%d cooked=%d settled=%d exec_lag=%s tail=%d/%.1fMB",
-		lead, s.Executed, s.Served, s.Flushed, s.Settled, lag, s.Runs, float64(s.Bytes)/1e6)
-	if s.Staging > 0 {
-		line += fmt.Sprintf(" staging=%.1fGB", float64(s.Staging)/1e9)
-	}
+	line := fmt.Sprintf("%s fetched=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%s tail=%d/%.1fMB queue=%.0f/%.0fMB",
+		lead, s.Fetched, s.Executed, s.Served, s.Flushed, s.Settled, lag, s.Runs, float64(s.Bytes)/1e6,
+		float64(s.QueueBytes)/1e6, float64(s.PeakQueueBytes)/1e6)
 	return line
 }
 
 func serveStatusOf(s epochdb.Status, chain string) serveStatus {
 	out := serveStatus{Chain: chain, Serving: true, Executed: s.Executed, Cooked: s.Flushed,
-		StagingBytes: s.Staging}
+		Fetched: s.Fetched, QueueBytes: s.QueueBytes, PeakQueueBytes: s.PeakQueueBytes}
 	if s.Backfill {
-		out.Target, out.Stored = s.Head, s.Stored
+		out.Target = s.Head
 	} else {
 		out.Accepted = s.Head
 	}

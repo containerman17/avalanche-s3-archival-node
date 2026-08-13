@@ -118,7 +118,6 @@ const tipOverrideHowTo = "cb58, or a 0x-hex eth block hash for pre-ProposerVM bl
 // our own release gates and experiments drive them: `epochdb dev seal ...`,
 // `epochdb dev ab-bench ...`. Flag sets are unchanged.
 var devCommands = map[string]func([]string){
-	"fetch":   fetchMain,
 	"exec":    execMain,
 	"verify":  verifyMain,
 	"rpcdiff": rpcdiffMain,
@@ -292,17 +291,20 @@ func devUsage(w io.Writer) {
 	fmt.Fprintln(w, "stages:", strings.Join(names, " "))
 }
 
-// execMain replays blocks ascending from genesis out of the (possibly
-// still filling) staging dir, verifying every state root.
+// execMain fetches the chain forward over p2p and executes it, verifying
+// every state root, with no RPC listener and an optional height ceiling. It is
+// `serve` minus the ports: our own rebuild and determinism gates drive it.
 func execMain(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "shared data directory (staging segments + state layer)")
+	dataDir := fs.String("data", "./data", "data directory")
+	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network)")
+	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address (e.g. localhost:6060)")
-	_, resolveChain := chainFlags(fs)
+	network, resolveChain := chainFlags(fs)
 	stateCacheGiB := fs.Int("state-cache", 6, "Go-side EVM read cache size in GiB (0 disables)")
 	verifyCache := fs.Bool("verify-cache", false, "re-read every cache hit through Firewood and panic on mismatch (slow, validation only)")
 	commitEvery := fs.Int("commit-every", 1000, "blocks per Firewood proposal (root verification at batch boundaries, per-block bisect on mismatch; 1 = classic per-block)")
-	stopAt := fs.Uint64("stop", 0, "stop after executing this height (0 = follow staging forever)")
+	stopAt := fs.Uint64("stop", 0, "stop after executing this height (0 = follow the chain forever)")
 	fs.Parse(args)
 	defer mustLockDataDir("exec", *dataDir)()
 
@@ -312,12 +314,6 @@ func execMain(args []string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	reader, err := fetch.OpenReader(*dataDir)
-	if err != nil {
-		log.Fatalf("epochdb: open staging reader: %v", err)
-	}
-	defer reader.Close()
 
 	cas, err := dist.Open(*dataDir)
 	if err != nil {
@@ -336,9 +332,39 @@ func execMain(args []string) {
 	}
 	defer misc.Close()
 
+	if c.SubnetID != avaconstants.PrimaryNetworkID {
+		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
+	}
+	if *nodeURI == "" {
+		_, *nodeURI, _ = netParams(*network)
+	}
+	g, err := exec.ChainGenesis(c)
+	if err != nil {
+		log.Fatalf("epochdb: genesis: %v", err)
+	}
+	f, err := fetch.New(fetch.Config{NodeURI: *nodeURI, PerPeer: *perPeer, Chain: c})
+	if err != nil {
+		log.Fatalf("epochdb: fetch: %v", err)
+	}
+	defer f.Close()
+	from, anchor, err := exec.FetchStart(db, g.Hash, *commitEvery)
+	if err != nil {
+		log.Fatalf("epochdb: %v", err)
+	}
+	blocks := f.StartForward(ctx, from, anchor)
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			p := f.Progress()
+			log.Printf("epochdb: fetched=%d queue=%.0fMB peak=%.0fMB polls=%d pruned_seeds=%d bad_links=%d archival=%d%s",
+				p.Head, float64(p.QueueBytes)/1e6, float64(p.PeakBytes)/1e6, p.Polls, p.PrunedSeeds, p.BadLinks, p.Archival, p.DropSuffix())
+		}
+	}()
+
 	e, err := exec.New(exec.Config{
 		DataDir:         *dataDir,
-		Blocks:          reader,
+		Blocks:          blocks,
 		Store:           db,
 		Misc:            misc,
 		StateCacheBytes: uint64(*stateCacheGiB) << 30,
@@ -358,180 +384,8 @@ func execMain(args []string) {
 	log.Printf("epochdb: exec stopped at height=%d, state flushed", e.Head())
 }
 
-// resolveTipOverride turns a --tip-override container ID into SyncTo anchors:
-// the container itself, plus every embedded checkpoint below its height as a
-// parallel walk seed (an L1 has no checkpoints and gets the one anchor). Both
-// heights come from the fetched container over p2p, so nothing here depends on
-// an archive RPC, on the ProposerVM activation constant, or on a checkpoint
-// happening to sit at the right height (RULING 2026-08-01).
-// tipAnchorTimeout bounds the wait for the override container itself.
-// getContainer RETRIES UNTIL IT ARRIVES, which never happens for an ID from
-// another network, and the failure is silent: the fleet ran 28 chains with a
-// MAINNET container ID as their --tip-override and every one sat in "waiting
-// for block 1 to land in staging" forever, looking merely slow. A seed nobody
-// can serve is a typo, not a slow peer, so bound it and name the likely cause.
-// Generous because peer warmup precedes it; the checkpoints that follow keep
-// the caller's unbounded ctx, since 86 real fetches legitimately take a while.
-const tipAnchorTimeout = 5 * time.Minute
-
-func resolveTipOverride(ctx context.Context, f *fetch.Fetcher, id ids.ID) []fetch.Anchor {
-	actx, cancel := context.WithTimeout(ctx, tipAnchorTimeout)
-	defer cancel()
-	tip, err := f.ResolveAnchor(actx, id)
-	if err != nil {
-		if ctx.Err() == nil && actx.Err() != nil {
-			log.Fatalf("epochdb: --tip-override %s: no peer served this container in %s. Is it an ID from a DIFFERENT NETWORK than --network?", id, tipAnchorTimeout)
-		}
-		log.Fatalf("epochdb: --tip-override: %v", err)
-	}
-	anchors := []fetch.Anchor{tip}
-	if len(f.Checkpoints()) > 0 {
-		cps, err := f.ResolveCheckpoints(ctx)
-		if err != nil {
-			log.Fatalf("epochdb: --tip-override: %v", err)
-		}
-		for _, cp := range cps {
-			if cp.Height > 0 && cp.Height < tip.Height {
-				anchors = append(anchors, cp)
-			}
-		}
-	}
-	log.Printf("fetch: tip-override %s at height %d, %d seeds below", tip.ID, tip.Height, len(anchors)-1)
-	return anchors
-}
-
 // execNetID maps --network to a network ID.
 func execNetID(network string) uint32 {
 	id, _, _ := netParams(network)
 	return id
-}
-
-func fetchMain(args []string) {
-	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "directory for the segment files")
-	network, resolveChain := chainFlags(fs)
-	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default per --network)")
-	walks := fs.Int("walks", 16, "concurrent backward walks")
-	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
-	tip := fs.String("tip", "", "walk down from this container ID instead of the embedded checkpoints (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
-	fromTip := fs.Bool("from-tip", false, "anchor at the network's accepted frontier, backfill down to stored history, then keep following the live tip")
-	tipOverride := fs.String("tip-override", "", "fixed corpus ceiling replacing frontier following: a CONTAINER ID (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks); backfills [0..that block] using the embedded checkpoints below it as parallel seeds, then exits")
-	follow := fs.Bool("follow", false, "consensus-verified tip following: real snowman polls against the weighted validator set (replaces --from-tip's frontier voting)")
-	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set (--follow); default: --node URI only, with a warning")
-	fs.Parse(args)
-	defer mustLockDataDir("fetch", *dataDir)()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// Bad flag values die before anything dials.
-	var overrideID ids.ID
-	if *tipOverride != "" {
-		var err error
-		if overrideID, err = parseTipOverride(*tipOverride); err != nil {
-			log.Fatalf("epochdb: --tip-override: %v", err)
-		}
-	}
-
-	// The descriptor comes FIRST, and for a cached L1 it, not --network, names
-	// the network to dial: the cache is what the data dir was built with.
-	c := resolveChain(*dataDir)
-	if c.SubnetID != avaconstants.PrimaryNetworkID {
-		*network = avaconstants.NetworkIDToNetworkName[c.NetworkID]
-	}
-	_, defNode, _ := netParams(*network)
-	if *nodeURI == "" {
-		*nodeURI = defNode
-	}
-
-	cfg := fetch.Config{DataDir: *dataDir, NodeURI: *nodeURI, PerPeer: *perPeer, Chain: c}
-	if *vdrSources != "" {
-		cfg.VdrSources = strings.Split(*vdrSources, ",")
-	}
-	f, err := fetch.New(cfg)
-	if err != nil {
-		log.Fatalf("epochdb: %v", err)
-	}
-	if floor := flushedFloor2(*dataDir, c); floor > 0 {
-		// Nothing flushes in this process, so the startup value is the whole
-		// story here: below it the staging is gone and the runs answer.
-		f.SetFloor(floor)
-		log.Printf("epochdb: flushed through %d, backfilling only above it", floor)
-	}
-
-	done := make(chan error, 1)
-	switch {
-	case *follow:
-		go func() { done <- f.Follow(ctx) }()
-	case *tipOverride != "":
-		anchors := resolveTipOverride(ctx, f, overrideID)
-		go func() { done <- f.SyncTo(ctx, anchors, *walks) }()
-	case *fromTip:
-		go func() { done <- f.FollowTip(ctx) }()
-	case *tip != "":
-		id, err := parseContainerID(*tip)
-		if err != nil {
-			log.Fatalf("epochdb: --tip: %v", err)
-		}
-		go func() { done <- f.WalkFrom(ctx, id) }()
-	default:
-		go func() { done <- f.Sync(ctx, *walks) }()
-	}
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	prev := f.Progress()
-	prevT := time.Now()
-	for {
-		select {
-		case err := <-done:
-			// Close flushes the store before releasing it.
-			if cerr := f.Close(); cerr != nil {
-				log.Printf("epochdb: close: %v", cerr)
-			}
-			if err != nil && !errors.Is(err, context.Canceled) {
-				log.Fatalf("epochdb: sync: %v", err)
-			}
-			if err != nil {
-				log.Printf("epochdb: interrupted, state flushed")
-			} else {
-				log.Printf("epochdb: sync complete")
-			}
-			return
-		case <-ticker.C:
-			cur := f.Progress()
-			now := time.Now()
-			dt := now.Sub(prevT).Seconds()
-			rate := float64(cur.Stored-prev.Stored) / dt
-			var pct float64
-			if da := cur.Answers - prev.Answers; da > 0 {
-				pct = 100 * float64(cur.NonEmpty-prev.NonEmpty) / float64(da)
-			}
-			gap := ""
-			if *fromTip {
-				if missing := int64(cur.Head) + 1 - int64(cur.Stored); missing > 0 {
-					gap = fmt.Sprintf(" gap=%d", missing)
-				}
-			}
-			log.Printf("epochdb: stored=%d rate=%.0f blk/s written=%.1f MB raw=%.1f MB walks=%d archival=%d inflight=%d answers_nonempty=%.0f%%%s%s",
-				cur.Stored, rate, float64(cur.SessionBytes)/1e6, float64(cur.SessionRaw)/1e6, cur.ActiveWalks, cur.Archival, cur.InFlight, pct, gap, cur.DropSuffix())
-			prev, prevT = cur, now
-		}
-	}
-}
-
-// flushedFloor2 reads the last flushed run boundary without opening the writer
-// side of the store: `fetch` runs beside an executor, not instead of one.
-func flushedFloor2(dataDir string, c *chain.Chain) uint64 {
-	cas, err := dist.Local(dataDir)
-	if err != nil {
-		return 0
-	}
-	defer cas.Close()
-	db, err := store.Open(dataDir, cas, c.Root())
-	if err != nil {
-		return 0
-	}
-	defer db.Close()
-	return db.FlushedFloor()
 }

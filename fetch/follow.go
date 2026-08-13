@@ -26,14 +26,12 @@ import (
 const vdrRefreshInterval = time.Hour
 
 // Follow runs consensus-verified tip following: real snowman polls (ported
-// flatstate follower engine) find and track the network's accepted frontier;
-// every accepted container is appended to the staging store, and the gap
-// between stored history and the anchor is backfilled by the regular
-// archival-pool walk.
-// followBackfillWalks is the concurrency of the anchor backfill, matching the
-// --walks default of the tip-override path: the two do the same work.
-const followBackfillWalks = 16
-
+// flatstate follower engine) find and track the network's accepted frontier.
+// THE FOLLOWER OWNS THE REAL TIP ZONE and nothing else: its anchor tells the
+// forward fetch where the chain ends, and every accepted container is offered
+// to the RAM queue, which takes it only when the window has climbed to it.
+// Until then the offer is dropped and the forward fetch will ask for that
+// height in its own turn, so the handover needs no state of its own.
 func (f *Fetcher) Follow(ctx context.Context) error {
 	weights, err := crossCheckedWeights(ctx, f.vdrSources(), f.subnetID)
 	if err != nil {
@@ -54,45 +52,18 @@ func (f *Fetcher) Follow(ctx context.Context) error {
 		Net:   cnet,
 		Parse: parseForConsensus,
 		OnAnchor: func(c *consensus.Container) error {
-			// Persist the anchor, then backfill everything below it with the
-			// archival-pool walk until it short-circuits on stored history.
-			// AN ANCHOR THAT DID NOT PERSIST IS FATAL: logging and returning
-			// left the anchor unstored and the backfill never started, on a
-			// node that otherwise looked live.
-			if err := f.appendContainer(c); err != nil {
-				return fmt.Errorf("store anchor at height %d: %w", c.Height, err)
-			}
-			go func() {
-				// SEED FROM THE CHECKPOINTS, like SyncTo does. One walk from the
-				// anchor down to genesis is serial: measured at 139 blk/s on
-				// mainnet C, which is a 6.8-day stall with the executor idle
-				// behind it. The embedded checkpoints split the same history into
-				// spans that walk concurrently. An L1 has none, so anchors is
-				// just the tip there and this is exactly the old behaviour.
-				anchors, err := f.ResolveCheckpoints(ctx)
-				if err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					// Not fatal: one serial walk is slow, not wrong.
-					log.Printf("fetch: anchor backfill: checkpoints unresolved (%v), falling back to a single serial walk", err)
-					anchors = nil
-				}
-				anchors = append(anchors, Anchor{ID: c.ID, Height: c.Height})
-				log.Printf("fetch: anchor backfill height=%d spans=%d walks=%d", c.Height, len(anchors), followBackfillWalks)
-				if err := f.walkSpans(ctx, anchors, followBackfillWalks); err != nil && ctx.Err() == nil {
-					log.Printf("fetch: anchor backfill walk: %v", err)
-					return
-				}
-				log.Printf("fetch: anchor backfill complete height=%d", c.Height)
-			}()
+			// The anchor is where the chain ends, which is the window rule's
+			// ceiling. The forward fetch climbs to it on its own.
+			f.noteTip(c.Height)
+			f.offer(c)
+			log.Printf("fetch: consensus anchor height=%d, forward fetch is at %d", c.Height, f.q.Head())
 			return nil
 		},
 		OnAccept: func(c *consensus.Container) error {
-			if err := f.appendContainer(c); err != nil {
-				return err
+			f.noteTip(c.Height)
+			if f.offer(c) {
+				log.Printf("consensus: accepted height=%d container=%s", c.Height, c.ID)
 			}
-			log.Printf("consensus: accepted height=%d container=%s", c.Height, c.ID)
 			return nil
 		},
 	})
@@ -123,26 +94,30 @@ func (f *Fetcher) Follow(ctx context.Context) error {
 			if s.PeerAcceptedMax > 0 {
 				lag = int64(s.PeerAcceptedMax) - int64(s.AcceptedHeight)
 			}
-			log.Printf("consensus: status live=%v accepted=%d lag=%d processing=%d polls_ok=%d polls_failed=%d parked=%d gets=%d stored=%d%s",
-				s.Live, s.AcceptedHeight, lag, s.Processing, s.PollsOK, s.PollsFailed, s.ParkedVotes, s.OutstandingGets, f.store.Count(),
-				f.Progress().DropSuffix())
+			p := f.Progress()
+			log.Printf("consensus: status live=%v accepted=%d lag=%d processing=%d polls_ok=%d polls_failed=%d parked=%d gets=%d fetched=%d%s",
+				s.Live, s.AcceptedHeight, lag, s.Processing, s.PollsOK, s.PollsFailed, s.ParkedVotes, s.OutstandingGets, p.Head,
+				p.DropSuffix())
 		}
 	}
 }
 
-// appendContainer persists a consensus container into the staging store.
-func (f *Fetcher) appendContainer(c *consensus.Container) error {
-	if err := f.store.Append(parsedContainer{
+// offer hands an accepted container to the RAM queue. It is taken only if it
+// is the next block the executor needs; while the window is still climbing
+// through history the offer is dropped, and the forward fetch asks for that
+// height when it gets there. THAT IS THE WHOLE HANDOVER.
+func (f *Fetcher) offer(c *consensus.Container) bool {
+	if f.q == nil {
+		return false
+	}
+	return f.q.Append(parsedContainer{
 		containerID: c.ID,
 		blockNumber: c.Height,
 		blockHash:   c.EthHash,
 		parentID:    c.ParentID,
 		parentHash:  c.EthParentHash,
 		blockTime:   c.Time,
-	}, c.Bytes); err != nil {
-		return fmt.Errorf("store append %d: %w", c.Height, err)
-	}
-	return f.store.Flush()
+	}, c.Bytes)
 }
 
 func parseForConsensus(raw []byte) (*consensus.Container, error) {

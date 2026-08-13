@@ -18,6 +18,17 @@ type ancestorsResponse struct {
 	blocks    [][]byte
 }
 
+// chitsAnswer is one peer's answer to a height-resolution poll: the block ID
+// it holds at the requested height (its LAST ACCEPTED id when it has pruned
+// that height, which the fetched container's own height exposes) and how far
+// it has accepted, which is the window's ceiling for free.
+type chitsAnswer struct {
+	nodeID         ids.NodeID
+	atHeight       ids.ID
+	accepted       ids.ID
+	acceptedHeight uint64
+}
+
 // Drop counters. Dropping a malformed inbound message is RIGHT (it arrives
 // from an untrusted peer and nothing here can be reconstructed from it), but a
 // silent drop is indistinguishable from a timeout: after an avalanchego
@@ -45,6 +56,10 @@ type inboundHandler struct {
 	routeMu     sync.Mutex
 	routeMap    map[uint32]chan ancestorsResponse
 	frontierMap map[uint32]chan ids.ID
+	// chitsMap routes the forward fetch's own height-resolution polls. A poll
+	// asks several peers under ONE request ID, so its channel stays registered
+	// until the caller unregisters it and takes every answer that arrives.
+	chitsMap map[uint32]chan chitsAnswer
 
 	// Consensus follower callbacks (nil = drop). Set once via
 	// setConsensusCallbacks before the follower starts.
@@ -70,6 +85,7 @@ func newHandler(peers set.Set[ids.NodeID], pool *peerPool) *inboundHandler {
 		pool:        pool,
 		routeMap:    make(map[uint32]chan ancestorsResponse),
 		frontierMap: make(map[uint32]chan ids.ID),
+		chitsMap:    make(map[uint32]chan chitsAnswer),
 	}
 }
 
@@ -127,9 +143,6 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 			h.drops.badPayload.Add(1)
 			return
 		}
-		if cb == nil {
-			return
-		}
 		preferred, err := ids.ToID(p.PreferredId)
 		if err != nil {
 			h.drops.badID.Add(1)
@@ -153,7 +166,22 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 			h.drops.badID.Add(1)
 			return
 		}
-		cb(msg.NodeID, p.RequestId, preferred, preferredAtHeight, accepted, p.AcceptedHeight)
+		// A height-resolution poll owns its request ID; anything else is the
+		// consensus follower's.
+		h.routeMu.Lock()
+		ch, routed := h.chitsMap[p.RequestId]
+		h.routeMu.Unlock()
+		if routed {
+			select {
+			case ch <- chitsAnswer{nodeID: msg.NodeID, atHeight: preferredAtHeight, accepted: accepted, acceptedHeight: p.AcceptedHeight}:
+			default:
+				h.drops.noRoute.Add(1)
+			}
+			return
+		}
+		if cb != nil {
+			cb(msg.NodeID, p.RequestId, preferred, preferredAtHeight, accepted, p.AcceptedHeight)
+		}
 		return
 	}
 
@@ -234,5 +262,17 @@ func (h *inboundHandler) registerFrontierRoute(reqID uint32, ch chan ids.ID) {
 func (h *inboundHandler) unregisterFrontierRoute(reqID uint32) {
 	h.routeMu.Lock()
 	delete(h.frontierMap, reqID)
+	h.routeMu.Unlock()
+}
+
+func (h *inboundHandler) registerChitsRoute(reqID uint32, ch chan chitsAnswer) {
+	h.routeMu.Lock()
+	h.chitsMap[reqID] = ch
+	h.routeMu.Unlock()
+}
+
+func (h *inboundHandler) unregisterChitsRoute(reqID uint32) {
+	h.routeMu.Lock()
+	delete(h.chitsMap, reqID)
 	h.routeMu.Unlock()
 }

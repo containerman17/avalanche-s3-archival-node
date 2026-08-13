@@ -18,9 +18,10 @@
 //
 // Deviations from flatstate's shell (all epochdb adaptations, not semantics):
 //   - No Executor/Sink/Resume: epochdb does not execute blocks at the tip;
-//     accepted containers go to the staging store via OnAccept, and the gap
-//     below the anchor is backfilled by the fetch walk (OnAnchor), not by
-//     the engine. Backfill here fetches only the anchor container itself.
+//     accepted containers are offered to the fetch queue via OnAccept, and
+//     the history below the anchor is fetched forward by the window (which
+//     OnAnchor gives the tip to), not by the engine. Backfill here fetches
+//     only the anchor container itself.
 //   - Containers are parsed by an injected Parse (epochdb's parser), so this
 //     package does not import libevm.
 //

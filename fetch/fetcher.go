@@ -2,7 +2,6 @@ package fetch
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/netip"
@@ -12,9 +11,6 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/api/info"
-	"github.com/ava-labs/avalanchego/genesis"
-	corethcore "github.com/ava-labs/avalanchego/graft/coreth/core"
-	cparams "github.com/ava-labs/avalanchego/graft/coreth/params"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
 	"github.com/ava-labs/avalanchego/network"
@@ -36,8 +32,7 @@ import (
 const (
 	DefaultNodeURI = "https://api.avax-test.network"
 
-	defaultConnectTimeout = 30 * time.Second
-	defaultPeerWarmup     = 5 * time.Second
+	defaultPeerWarmup = 5 * time.Second
 	// Archival peers answer ancient GetAncestors in 0.4-2s (measured);
 	// anything slower than 5s is treated as a miss and the peer demoted.
 	defaultRequestTimeout = 5 * time.Second
@@ -45,17 +40,12 @@ const (
 	probeInterval = 15 * time.Second
 	// probeFanout is how many non-archival peers each probe round asks.
 	probeFanout = 3
-	// tipPollInterval paces GetAcceptedFrontier polling in FollowTip mode.
-	tipPollInterval = 30 * time.Second
 	// frontierFanout is how many peers a frontier query asks.
 	frontierFanout = 8
 )
 
 // Config for opening a Fetcher.
 type Config struct {
-	// DataDir is the on-disk location for the flat-file store holding raw
-	// containers (arrival.log + index.log).
-	DataDir string
 	// NodeURI is an Avalanche public node used only for bootstrap RPC
 	// (network ID, C-Chain ID, validator list, peer IPs). If empty, falls
 	// back to DefaultNodeURI.
@@ -89,14 +79,12 @@ func (c Config) l1() bool {
 	return c.Chain != nil && c.Chain.SubnetID != avaconstants.PrimaryNetworkID
 }
 
-// Fetcher owns a flat-file store of raw C-Chain containers and a P2P
-// connection to the Avalanche Fuji network. Start by calling Sync to
-// populate the store backward from the embedded checkpoints; read with
-// the Store methods once Sync has finished (or in parallel, over whatever
-// range is already stored).
+// Fetcher owns a P2P connection to one Avalanche chain and the ascending
+// fetch over it. StartForward opens the RAM queue the executor reads;
+// Follow runs the consensus follower that owns the real tip zone.
 type Fetcher struct {
 	cfg       Config
-	store     *Store
+	q         *Queue
 	net       network.Network
 	handler   *inboundHandler
 	pool      *peerPool
@@ -109,11 +97,6 @@ type Fetcher struct {
 	// subnet.
 	subnetID ids.ID
 
-	// Genesis block of the C-Chain is not served over GetAncestors, so we
-	// short-circuit the walk when we hit its container ID. Empty on an L1,
-	// where the walk terminates on height 1 instead (see walkSpan).
-	genesisID ids.ID
-
 	dispatchErrCh chan error
 	reqIDCounter  atomic.Uint32
 
@@ -124,49 +107,39 @@ type Fetcher struct {
 	// prober reuses it instead of fabricating ranges.
 	lastTip atomic.Value // ids.ID
 
-	// floor is the sealed end: no walk descends to it and no block at or
-	// below it is ever requested. See SetFloor.
-	floor atomic.Uint64
-
-	// syncTarget is the ceiling of a bounded backfill (SyncTo's highest
-	// anchor), 0 while following or before the anchors resolve. REPORTING
-	// ONLY: nothing in the walk reads it. It exists because the store's head
-	// is the FOLLOWER's number and a backfill has no follower.
+	// tip is the highest accepted height the network has reported: the
+	// follower's own accepted head once it is live, and before that whatever
+	// a Chits answer or the accepted frontier has already said. It is the
+	// window rule's "real tip".
+	tip atomic.Uint64
+	// ceiling is --tip-override: the height forward fetch stops at, 0 when
+	// following. syncTarget is the same number for reporting.
+	ceiling    atomic.Uint64
 	syncTarget atomic.Uint64
 
 	// Stats for progress logging.
 	requestsSent    atomic.Uint64
 	answersTotal    atomic.Uint64
 	answersNonEmpty atomic.Uint64
-	activeWalks     atomic.Int64
+	pollsSent       atomic.Uint64
+	prunedSeeds     atomic.Uint64
+	badLinks        atomic.Uint64
 	inFlight        atomic.Int64
 }
 
-// New opens the flat-file store, dials the network named by cfg (the primary
-// network's C-chain by default, an L1 when cfg.Chain names one), and waits for
-// a peer to connect. It does NOT start syncing; call Sync for that.
+// New dials the network named by cfg (the primary network's C-chain by
+// default, an L1 when cfg.Chain names one) and waits for a peer to connect. It
+// does NOT start fetching; call StartForward for that.
 func New(cfg Config) (*Fetcher, error) {
 	RegisterExtras(cfg.vmKind())
-
 	if cfg.NodeURI == "" {
 		cfg.NodeURI = DefaultNodeURI
 	}
-	if cfg.DataDir == "" {
-		return nil, fmt.Errorf("config: DataDir required")
-	}
-
-	store, err := OpenStore(cfg.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("open store: %w", err)
-	}
-
 	f, err := dial(cfg)
 	if err != nil {
-		store.Close()
 		return nil, err
 	}
 	f.cfg = cfg
-	f.store = store
 	return f, nil
 }
 
@@ -326,19 +299,6 @@ func dial(cfg Config) (*Fetcher, error) {
 		return nil, fmt.Errorf("peer warmup: %w", err)
 	}
 
-	// The C-chain's genesis container ID is computable offline and is the walk
-	// terminator there. An L1's genesis is not needed for that: no chain serves
-	// genesis over GetAncestors, so the walk ends on the block at height 1
-	// whatever the chain (see walkSpan).
-	var genesisID ids.ID
-	if !cfg.l1() {
-		if genesisID, err = computeGenesisID(networkID); err != nil {
-			net.StartClose()
-			return nil, fmt.Errorf("compute genesis id: %w", err)
-		}
-		log.Printf("fetch: genesis_container_id=%s", genesisID)
-	}
-
 	return &Fetcher{
 		net:           net,
 		handler:       handler,
@@ -347,74 +307,74 @@ func dial(cfg Config) (*Fetcher, error) {
 		networkID:     networkID,
 		chainID:       chainID,
 		subnetID:      subnetID,
-		genesisID:     genesisID,
 		dispatchErrCh: dispatchErrCh,
 	}, nil
 }
 
-// computeGenesisID reads the embedded C-Chain genesis for the network from
-// avalanchego's genesis package and returns the container ID (which for
-// the pre-ProposerVM genesis equals the eth block hash). Requires
-// cparams.SetEthUpgrades so Genesis.ToBlock can resolve precompile
-// activations on the chain config.
-func computeGenesisID(networkID uint32) (ids.ID, error) {
-	cfg := genesis.GetConfig(networkID)
-	if cfg == nil {
-		return ids.Empty, fmt.Errorf("no embedded genesis config for network %d", networkID)
-	}
-	var g corethcore.Genesis
-	if err := json.Unmarshal([]byte(cfg.CChainGenesis), &g); err != nil {
-		return ids.Empty, err
-	}
-	if err := cparams.SetEthUpgrades(g.Config); err != nil {
-		return ids.Empty, fmt.Errorf("set eth upgrades: %w", err)
-	}
-	return ids.ID(g.ToBlock().Hash()), nil
-}
-
-// Close tears down the P2P network and closes the store.
+// Close tears down the P2P network.
 func (f *Fetcher) Close() error {
 	f.net.StartClose()
-	if f.store == nil {
-		return nil
-	}
-	return f.store.Close()
+	return nil
 }
 
-// Store exposes the underlying flat-file store for readers.
-func (f *Fetcher) Store() *Store { return f.store }
+// Progress is a snapshot of fetch counters for logging.
+type Progress struct {
+	Head       uint64 // highest height in the RAM queue
+	QueueBytes uint64 // containers held in RAM right now
+	PeakBytes  uint64 // the run's high-water mark
+	Requests   uint64 // GetAncestors requests sent
+	Answers    uint64 // answers received (any content)
+	NonEmpty   uint64 // answers carrying at least one container
+	Polls      uint64 // height-resolution PullQuery polls sent
+	// PrunedSeeds is how often a peer answered a height poll with its last
+	// accepted block instead of the requested height, i.e. the documented
+	// pruned-peer fallback, seen in the wild.
+	PrunedSeeds uint64
+	// BadLinks is spans discarded because a container did not link to the one
+	// below it.
+	BadLinks uint64
+	Archival int   // current archival peer set size
+	InFlight int64 // outstanding GetAncestors requests
+	// Inbound messages dropped at the trust boundary, by reason. See
+	// dropCounts: badPayload is a protocol mismatch, badID a malformed ID
+	// field, noRoute an answer whose waiter was not ready for it.
+	DropsBadPayload uint64
+	DropsBadID      uint64
+	DropsNoRoute    uint64
+}
 
-// SetFloor raises the backfill floor to the SEALED END. Every walk treats it
-// as its floor, so no block at or below it is ever walked or requested.
-//
-// It is what stops a restarted follower re-downloading all of sealed history:
-// walks short-circuit on the STAGING store alone, and seal legitimately
-// deleted the raw buckets those blocks used to live in, so without the floor
-// the walk drops off the bottom of the retained tail and re-fetches to height
-// 1 (DESIGN.md, was OPEN 2026-07-31).
-//
-// The floor RISES while the node runs, because sealing is in-process: the
-// caller sets it at startup from the sealed epoch set and again after every
-// seal. Monotonic, and written by one goroutine (the cook loop).
-func (f *Fetcher) SetFloor(sealedEnd uint64) { f.floor.Store(max(sealedEnd, f.floor.Load())) }
+// DropSuffix is the drop counts as a log fragment, EMPTY when nothing has been
+// dropped, so the normal progress line is unchanged and any non-zero count is
+// visible where the operator already looks. Without it a protocol bump reads
+// as peers timing out.
+func (p Progress) DropSuffix() string {
+	if p.DropsBadPayload|p.DropsBadID|p.DropsNoRoute == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" drops=payload:%d,id:%d,route:%d",
+		p.DropsBadPayload, p.DropsBadID, p.DropsNoRoute)
+}
 
-// StagedBytes is what the node's status line and /status report: the raw
-// staging on disk the seal has not yet retired. There is deliberately NO bound
-// on it (a ceiling that paused walks was removed 2026-08-08): staging drains
-// as sealing retires it, and a disk too small to stage a chain's history is an
-// undersized machine, not a condition to engineer around. The from-genesis
-// fetch is a producer-side job; consumers receive sealed epochs.
-func (f *Fetcher) StagedBytes() uint64 { return f.store.StagedBytes() }
+func (f *Fetcher) Progress() Progress {
+	p := Progress{
+		Requests:    f.requestsSent.Load(),
+		Answers:     f.answersTotal.Load(),
+		NonEmpty:    f.answersNonEmpty.Load(),
+		Polls:       f.pollsSent.Load(),
+		PrunedSeeds: f.prunedSeeds.Load(),
+		BadLinks:    f.badLinks.Load(),
+		Archival:    f.pool.archivalCount(),
+		InFlight:    f.inFlight.Load(),
 
-// WalkFrom walks backward from an arbitrary container ID down to block 0
-// (short-circuiting over already-stored contiguous runs), storing every
-// container on the way. Used to backfill a specific historical range:
-// pre-ProposerVM container IDs equal the eth block hash, so any early
-// block hash from a trusted source is a valid anchor.
-func (f *Fetcher) WalkFrom(ctx context.Context, tip ids.ID) error {
-	f.activeWalks.Add(1)
-	defer f.activeWalks.Add(-1)
-	return f.walkSpan(ctx, tip, 0)
+		DropsBadPayload: f.handler.drops.badPayload.Load(),
+		DropsBadID:      f.handler.drops.badID.Load(),
+		DropsNoRoute:    f.handler.drops.noRoute.Load(),
+	}
+	if f.q != nil {
+		p.Head = f.q.Head()
+		p.QueueBytes, p.PeakBytes = f.q.Bytes()
+	}
+	return p
 }
 
 // ---- peer selection ----
@@ -422,12 +382,12 @@ func (f *Fetcher) WalkFrom(ctx context.Context, tip ids.ID) error {
 // ~15 Fuji peers are stable archival peers that answer every ancient
 // GetAncestors non-empty in 0.4-2s; the rest answer empty fast or never.
 // We keep a self-managed runtime set of archival peers (answered non-empty
-// recently), give each walk the least-busy archival peer with one
+// recently), give each span fetch the least-busy archival peer with one
 // outstanding request per peer by default, and demote peers on an empty
 // answer or timeout. A background probe round over non-archival peers
-// (reusing the last walk tip) discovers new archival peers and re-promotes
-// demoted ones; when the set is empty an initial race-like round over all
-// connected peers bootstraps it.
+// (reusing the last requested container) discovers new archival peers and
+// re-promotes demoted ones; when the set is empty an initial race-like round
+// over all connected peers bootstraps it.
 
 type peerState struct {
 	archival bool
@@ -768,10 +728,10 @@ func (f *Fetcher) bootstrapRound(ctx context.Context, tip ids.ID) (ancestorsResp
 	return best.resp, best.peer, best.good
 }
 
-// probeLoop periodically asks a few non-archival peers the most recent walk
-// tip to discover new archival peers and re-promote demoted ones. Responses
-// are used only for classification; the walk that owns the tip stores its
-// own copy.
+// probeLoop periodically asks a few non-archival peers for the most recently
+// requested container to discover new archival peers and re-promote demoted
+// ones. Responses are used only for classification; the span fetch that asked
+// for it keeps its own copy.
 func (f *Fetcher) probeLoop(ctx context.Context) {
 	t := time.NewTicker(probeInterval)
 	defer t.Stop()
@@ -851,57 +811,6 @@ func (f *Fetcher) acceptedFrontier(ctx context.Context) (ids.ID, error) {
 		return ids.Empty, fmt.Errorf("no frontier answers from %d peers", len(peers))
 	}
 	return best, nil
-}
-
-// FollowTip anchors at the network's accepted frontier and walks backward
-// with the archival-peer pipeline until it connects to already-stored
-// history, then keeps polling the frontier every tipPollInterval and
-// backfilling from each new frontier, so the store continuously tracks the
-// live tip.
-func (f *Fetcher) FollowTip(ctx context.Context) error {
-	go f.probeLoop(ctx)
-	var floor uint64 // first walk connects to the checkpoint-synced history
-	for {
-		select {
-		case err := <-f.dispatchErrCh:
-			return fmt.Errorf("network stopped: %w", err)
-		default:
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		tipID, err := f.acceptedFrontier(ctx)
-		if err != nil {
-			log.Printf("fetch: accepted frontier: %v", err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(5 * time.Second):
-			}
-			continue
-		}
-		parsed, err := f.getContainer(ctx, tipID)
-		if err != nil {
-			return fmt.Errorf("fetch frontier container %s: %w", tipID, err)
-		}
-		tipH := parsed.blockNumber
-		if behind := int64(tipH) + 1 - int64(f.store.Count()); behind > 0 {
-			log.Printf("fetch: tip height=%d gap=%d blocks behind", tipH, behind)
-		}
-		f.activeWalks.Add(1)
-		err = f.walkSpan(ctx, tipID, floor)
-		f.activeWalks.Add(-1)
-		if err != nil {
-			return err
-		}
-		floor = tipH
-		log.Printf("fetch: caught up to tip height=%d stored=%d", tipH, f.store.Count())
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(tipPollInterval):
-		}
-	}
 }
 
 // ---- small helpers ----

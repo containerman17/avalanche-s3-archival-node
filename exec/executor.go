@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/graft/evm/firewood"
+	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
@@ -47,8 +49,49 @@ func walkBackBudgetFor(commitEvery int) uint64 {
 	return budget
 }
 
-// BlockSource yields raw containers by height. ok=false means the height
-// is not available yet (the fetch walk has not landed it).
+// WalkBackBudget is how far below the state layer's head a crash can leave
+// Firewood, and therefore how far below it the FETCH must restart: those
+// containers are re-executed from the queue and no copy of them survives a
+// crash. A run is cut inside the batch loop, BEFORE the batch's Firewood
+// commit, so the last flushed run boundary alone is not far enough back.
+func WalkBackBudget(commitEvery int) uint64 { return walkBackBudgetFor(commitEvery) }
+
+// FetchStart is where the ascending fetch begins and what anchors its first
+// hash link.
+//
+// A CRASH CAN LEAVE FIREWOOD BEHIND THE STATE LAYER, and the executor's
+// reconcile re-executes that gap out of containers nobody kept: nothing
+// pre-execution touches disk any more. So the fetch restarts a walk-back
+// budget below the state layer's head, which is the worst case that gap can
+// be, and the containers between there and the head are simply re-fetched (at
+// commitEvery=64 that is 8,192 blocks, seconds of network). A fresh dir starts
+// at block 1, anchored on the genesis block hash: the chain root of the
+// forward verification.
+func FetchStart(db *store.DB, genesisHash common.Hash, commitEvery int) (from uint64, anchor ids.ID, err error) {
+	head, ok := db.Head()
+	if !ok || head == 0 {
+		return 1, ids.ID(genesisHash), nil
+	}
+	from = 1
+	if back := walkBackBudgetFor(commitEvery); head > back {
+		from = head - back + 1
+	}
+	if from == 1 {
+		return 1, ids.ID(genesisHash), nil
+	}
+	raw, ok, err := db.HeaderRLP(from - 1)
+	if err != nil {
+		return 0, ids.Empty, fmt.Errorf("fetch anchor: header %d: %w", from-1, err)
+	}
+	if !ok {
+		return 0, ids.Empty, fmt.Errorf("fetch anchor: the runs hold block %d but no header at %d", head, from-1)
+	}
+	return from, ids.ID(crypto.Keccak256Hash(raw)), nil
+}
+
+// BlockSource yields raw containers by height. The fetcher's queue BLOCKS
+// until the height lands, so ok=false with no error means the source has
+// nothing to give and never will.
 type BlockSource interface {
 	GetByHeight(n uint64) ([]byte, bool, error)
 }
@@ -58,7 +101,7 @@ type Config struct {
 	// DataDir is the shared data directory. Firewood lives in
 	// DataDir/firewood/, the state layer files at the root.
 	DataDir string
-	// Blocks is the container source (a fetch.Reader over the staging dir).
+	// Blocks is the container source (the fetcher's RAM queue).
 	Blocks BlockSource
 	// Store is storage v0. Required.
 	Store *store.DB
@@ -83,7 +126,7 @@ type Config struct {
 	// New).
 	FrontierBuild bool
 	// StopAt makes Run return cleanly after executing this height
-	// (fixed-corpus builds; staging above it is disposable). 0 = never.
+	// (fixed-corpus builds). 0 = never.
 	StopAt uint64
 	// OnBlock, if set, is called on the executor goroutine right after each
 	// block's frontier is published: serve uses it to advance the
@@ -282,15 +325,14 @@ func New(cfg Config) (*Executor, error) {
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("config: Store required")
 	}
-	// The crash walk-back re-reads containers from staging, and both raw
-	// deleters (seal, and the pruning node's fold) retire whole 100k-block
-	// buckets behind the sealed/folded end. If the budget can reach past one
-	// bucket, a crash right after a retirement lands on "container missing
-	// from staging" and the node cannot start. Unconditional: seal has the
-	// same latent exposure, it was only ever hidden by a numeric coincidence.
-	if budget := walkBackBudgetFor(cfg.CommitEvery); budget >= fetch.SegmentBlocks {
-		return nil, fmt.Errorf("config: commit-every %d puts the crash walk-back %d blocks back, past one raw bucket (%d): max is %d",
-			cfg.CommitEvery, budget, fetch.SegmentBlocks, (fetch.SegmentBlocks-1-walkBackBudget)/64)
+	// A mismatched batch is re-executed PER BLOCK out of the container source
+	// (bisect), and containers now live in the fetcher's RAM queue, which
+	// retains fetch.KeepBehind of them below the executor. A batch bigger than
+	// that could not be bisected at all, so it is refused at open rather than
+	// at the one moment an operator is already staring at a root mismatch.
+	if cfg.CommitEvery > fetch.KeepBehind {
+		return nil, fmt.Errorf("config: commit-every %d is more than the %d containers the fetch queue keeps behind the executor, so a batch root mismatch could not be bisected",
+			cfg.CommitEvery, fetch.KeepBehind)
 	}
 	c := cfg.Chain
 	if c == nil {
@@ -600,7 +642,7 @@ func (e *Executor) reconcile() error {
 			return fmt.Errorf("reconcile: read container %d: %w", i, err)
 		}
 		if !ok {
-			return fmt.Errorf("reconcile: container %d missing from staging", i)
+			return fmt.Errorf("reconcile: container %d never arrived", i)
 		}
 		if err := e.executeRaw(i, raw); err != nil {
 			return fmt.Errorf("reconcile: reexecute block %d: %w", i, err)
@@ -795,14 +837,14 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 		e.spl.read += time.Since(tRead)
 		if !ok {
 			// Stall: close the open batch so tip-following and crash
-			// windows stay bounded even when staging runs dry mid-batch.
+			// windows stay bounded even when the fetch runs dry mid-batch.
 			if e.batchOpen && e.batchCount > 0 {
 				if err := e.flushBatch(); err != nil {
 					return err
 				}
 			}
 			if time.Since(lastWait) > 30*time.Second {
-				log.Printf("exec: waiting for block %d to land in staging", next)
+				log.Printf("exec: waiting for block %d to be fetched", next)
 				lastWait = time.Now()
 			}
 			select {
@@ -1351,7 +1393,7 @@ func (e *Executor) bisect(computed common.Hash, boundaryNum uint64, boundaryRoot
 			// Not an error value: printed as `err=<nil>` it told an operator
 			// nothing, and it fires while they are already staring at a root
 			// mismatch.
-			return fmt.Errorf("bisect: container %d is not in staging, so the batch [%d..%d] that just mismatched cannot be re-executed per block", i, from, to)
+			return fmt.Errorf("bisect: container %d is no longer in the fetch queue, so the batch [%d..%d] that just mismatched cannot be re-executed per block", i, from, to)
 		}
 		pvm, blk, err := store.SplitContainer(raw)
 		if err != nil {
