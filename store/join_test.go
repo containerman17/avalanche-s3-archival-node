@@ -10,13 +10,18 @@ import (
 	"github.com/containerman17/epochdb/dist"
 )
 
-// joinable builds a published corpus in dir and returns its chain root. The
-// spool doubles as the bucket here: without credentials dist keeps everything
-// local, and Join reads exactly the same pointer, manifest and footers.
-func joinable(t *testing.T, dir string, runs int) [32]byte {
+// joinable builds a corpus of `terminals` TERMINAL runs in dir and returns its
+// chain root. The spool doubles as the bucket here: without credentials dist
+// keeps everything local, and Join reads exactly the same pointer, manifest and
+// footers. It is terminals rather than flushes because ONLY TERMINAL RUNS ARE
+// EVER PUBLISHED: a corpus of L0 runs has nothing for a consumer to join.
+func joinable(t *testing.T, dir string, terminals int) [32]byte {
 	t.Helper()
 	root := [32]byte{1}
-	db := buildCorpus(t, dir, runs)
+	db := buildCorpus(t, dir, terminals*MergeFanIn)
+	if got := len(db.Manifest().Runs); got != terminals {
+		t.Fatalf("built %d runs, want %d terminals", got, terminals)
+	}
 	if err := db.Publish(); err != nil {
 		t.Fatal(err)
 	}
@@ -83,12 +88,13 @@ func TestJoinWalksToTheChainRoot(t *testing.T) {
 	}
 	defer db.Close()
 	if got := len(db.Manifest().Runs); got != 3 {
-		t.Fatalf("joined %d runs, want 3", got)
+		t.Fatalf("joined %d terminal runs, want 3", got)
 	}
-	if h, ok := db.Head(); !ok || h != 8 {
-		t.Fatalf("joined head is %d (%v), want 8", h, ok)
+	const head = 3*MergeFanIn*3 - 1
+	if h, ok := db.Head(); !ok || h != head {
+		t.Fatalf("joined head is %d (%v), want %d", h, ok, head)
 	}
-	for h := uint64(0); h < 9; h++ {
+	for h := uint64(0); h <= head; h++ {
 		if _, ok, err := db.HeaderRLP(h); err != nil || !ok {
 			t.Fatalf("joined dir cannot serve header %d: %v %v", h, ok, err)
 		}

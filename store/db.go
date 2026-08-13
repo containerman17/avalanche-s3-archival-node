@@ -33,11 +33,16 @@ type RunRef struct {
 	FromHeight uint64 `json:"from_height"`
 	ToHeight   uint64 `json:"to_height"`
 	Name       string `json:"name"`
-	// Level is the merge level: 0 is a flush, and MergeFanIn runs of one level
-	// become one run of the next. It is manifest bookkeeping, not run content,
-	// so it can never move a merged run's bytes.
+	// Level is the merge level, and there are exactly two: 0 is a flush, which
+	// is LOCAL FOREVER, and TerminalLevel is the merged run, which is the only
+	// thing that ever reaches the bucket. It is manifest bookkeeping, not run
+	// content, so it can never move a merged run's bytes.
 	Level int `json:"level"`
 }
+
+// Terminal reports whether this run is a terminal one: merged, published, and
+// never merged again.
+func (r RunRef) Terminal() bool { return r.Level >= TerminalLevel }
 
 // Manifest is the live run set. It is a hash list, exactly like every other
 // casfs structure here: one head name authenticates all of history through the
@@ -147,12 +152,23 @@ type DB struct {
 	codeBudget uint64
 	codeWhy    string
 
+	// flushTxs, flushBlocks and terminalTxs ARE the format constants in every
+	// build there is. They live on the DB because a test in this package lowers
+	// them (export_test.go): a real terminal is eight million transactions and
+	// no test is going to execute eight million transactions to prove the
+	// publish path. Nothing in a production path writes them, there is no env
+	// knob, and the constants themselves stay pinned.
+	flushTxs, flushBlocks, terminalTxs uint64
+
 	mu   sync.RWMutex
 	man  *Manifest
 	runs []*Run // ascending TxNum range, same order as man.Runs
 	// lastManifest is the published manifest artifact, so the superseded one's
 	// local copy can go once the pointer no longer names it.
 	lastManifest string
+	// published is the terminal run the pointer currently names. The pointer
+	// advances ONCE PER TERMINAL and nothing else moves it.
+	published RunName
 }
 
 // Open opens (or creates) storage v0 inside dir.
@@ -184,6 +200,7 @@ func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{dir: dir, cas: cas, chainRoot: chainRoot, mem: mem, man: man, flat: newFlatCache(budget)}
+	d.flushTxs, d.flushBlocks, d.terminalTxs = FlushTxs, FlushBlocks, TerminalTxs
 	d.flatWhy, d.codeBudget, d.codeWhy = why, codeBudget, codeWhy
 	if codeBudget > 0 {
 		d.code = lru.NewSizeConstrainedCache[common.Hash, []byte](codeBudget)
@@ -328,7 +345,7 @@ func (d *DB) MaybeFlush() error {
 	if !started {
 		return nil
 	}
-	if nextTx-baseTx < FlushTxs && nextHeight-baseHeight < FlushBlocks {
+	if nextTx-baseTx < d.flushTxs && nextHeight-baseHeight < d.flushBlocks {
 		return nil
 	}
 	return d.Flush()
@@ -354,8 +371,11 @@ func (d *DB) Flush() error {
 	}
 	d.mu.RUnlock()
 
-	path := RunFileName(d.cas.SpoolDir(), baseTx, nextTx)
-	w, err := NewRunWriter(path, prev)
+	// AN L0 RUN IS BUILT IN THE LOCAL DIRECTORY AND STAYS THERE. It is the
+	// machine's own working set: only the terminal run it eventually merges into
+	// is ever uploaded, so nothing in the bucket is ever superseded.
+	path := RunFileName(d.cas.LocalDir(), 0, baseTx, nextTx)
+	w, err := NewRunWriter(path, prev, 0)
 	if err != nil {
 		return err
 	}
@@ -392,12 +412,13 @@ func (d *DB) Flush() error {
 	if err := d.mem.reset(nextTx, nextHeight); err != nil {
 		return err
 	}
-	// THE MERGE BOUNDARY IS THE FLUSH BOUNDARY, known in advance.
+	// THE MERGE BOUNDARY IS A FLUSH BOUNDARY, known in advance.
 	if err := d.MaybeMerge(); err != nil {
 		return err
 	}
-	// The manifest is published last, and Sync uploads content before
-	// pointers, so a consumer never sees a pointer to runs that are not up yet.
+	// The manifest is published last, and Sync uploads content before pointers,
+	// so a consumer never sees a pointer to runs that are not up yet. Publish is
+	// a no-op except on the flush that just earned a terminal run.
 	return d.Publish()
 }
 

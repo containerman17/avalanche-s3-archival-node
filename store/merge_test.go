@@ -12,6 +12,11 @@ import (
 	"github.com/containerman17/epochdb/dist"
 )
 
+// testTerminalTxs is the TEST-ONLY terminal boundary (export_test.go): exactly
+// what MergeFanIn of buildCorpus's runs hold, so a test cuts a terminal every
+// sixteen flushes the way mainnet does every 8M transactions.
+const testTerminalTxs = 3 * 2 * MergeFanIn
+
 // buildCorpus fills dir with n L0 runs of 3 blocks each and returns the store.
 // MergeFanIn runs later it merges itself, which is the point.
 func buildCorpus(t *testing.T, dir string, runs int) *DB {
@@ -24,6 +29,7 @@ func buildCorpus(t *testing.T, dir string, runs int) *DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.scaleTriggers(FlushTxs, FlushBlocks, testTerminalTxs)
 	t.Cleanup(func() { db.Close(); cas.Close() })
 	h := uint64(0)
 	for r := 0; r < runs; r++ {
@@ -41,19 +47,24 @@ func buildCorpus(t *testing.T, dir string, runs int) *DB {
 }
 
 // TestMergeIsDeterministic: two independent builders that saw the same blocks
-// produce the same merged run, byte for byte and name for name (DESIGN's core
-// promise). It also pins the trigger: MergeFanIn L0 runs become one L1 run.
+// produce the same TERMINAL run, byte for byte and name for name, under the
+// same name on disk (DESIGN's core promise). It also pins the trigger: the L0
+// tail reaching a terminal's worth of transactions, which at these scaled
+// triggers is MergeFanIn runs, becomes one terminal run.
 func TestMergeIsDeterministic(t *testing.T) {
 	dirA, dirB := t.TempDir(), t.TempDir()
 	a := buildCorpus(t, dirA, MergeFanIn)
 	b := buildCorpus(t, dirB, MergeFanIn)
 
 	manA, manB := a.Manifest(), b.Manifest()
-	if len(manA.Runs) != 1 || manA.Runs[0].Level != 1 {
-		t.Fatalf("%d L0 runs did not merge into one L1 run: %+v", MergeFanIn, manA.Runs)
+	if len(manA.Runs) != 1 || !manA.Runs[0].Terminal() {
+		t.Fatalf("%d L0 runs did not merge into one terminal run: %+v", MergeFanIn, manA.Runs)
 	}
 	if manA.Runs[0].Name != manB.Runs[0].Name {
 		t.Fatalf("two independent merges of the same blocks disagree:\n  %s\n  %s", manA.Runs[0].Name, manB.Runs[0].Name)
+	}
+	if got, want := RunLabel(manA.Runs[0].Level, manA.Runs[0].FromTx, manA.Runs[0].ToTx), "t-0000000000000000-0000000000000096"; got != want {
+		t.Fatalf("terminal run label is %q, want %q", got, want)
 	}
 	ba, err := os.ReadFile(filepath.Join(dirA, "cas", manA.Runs[0].Name))
 	if err != nil {
@@ -81,8 +92,11 @@ func TestMergeIsDeterministic(t *testing.T) {
 	if live != 2 {
 		t.Fatalf("%d hash-named files left in the spool, want 2 (the merged run and the live manifest)", live)
 	}
+	if ents, err := os.ReadDir(filepath.Join(dirA, "runs")); err != nil || len(ents) != 0 {
+		t.Fatalf("the local run directory is not empty after the merge: %v %v", ents, err)
+	}
 
-	// EVERY ROW SURVIVED THE MERGE: the merged run answers what the eight runs
+	// EVERY ROW SURVIVED THE MERGE: the terminal run answers what the L0 runs
 	// answered, through the same descent.
 	for h := uint64(0); h < 3*MergeFanIn; h++ {
 		hdr, ok, err := a.HeaderRLP(h)
@@ -112,8 +126,8 @@ func TestMergeIsDeterministic(t *testing.T) {
 // a consumer holding the small runs recomputes the merged run locally instead
 // of downloading it, and the name it lands on is a pure function of the inputs.
 func TestRecomputeMergeFromInputs(t *testing.T) {
-	// Build MergeFanIn runs WITHOUT letting the trigger fire, by keeping the
-	// inputs in a dir that never reaches the fan-in, then merging by hand.
+	// Build the inputs WITHOUT letting the trigger fire, by stopping one run
+	// short of a terminal's worth of transactions, then merging by hand.
 	src := t.TempDir()
 	scas, err := dist.Local(src)
 	if err != nil {
@@ -124,6 +138,7 @@ func TestRecomputeMergeFromInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.scaleTriggers(FlushTxs, FlushBlocks, testTerminalTxs)
 	defer db.Close()
 	h := uint64(0)
 	for r := 0; r < MergeFanIn-1; r++ {
@@ -201,6 +216,7 @@ func TestMergeCrashPoints(t *testing.T) {
 			if err != nil {
 				t.Fatalf("after a kill at %q the dir does not open: %v", stage, err)
 			}
+			db.scaleTriggers(FlushTxs, FlushBlocks, testTerminalTxs)
 			defer db.Close()
 			man := db.Manifest()
 			switch stage {
@@ -209,7 +225,7 @@ func TestMergeCrashPoints(t *testing.T) {
 					t.Fatalf("a kill before the swap must leave the %d inputs live, got %d", MergeFanIn, len(man.Runs))
 				}
 			case "swapped", "deleted":
-				if len(man.Runs) != 1 || man.Runs[0].Level != 1 {
+				if len(man.Runs) != 1 || !man.Runs[0].Terminal() {
 					t.Fatalf("a kill at or after the swap must leave the merged run live, got %+v", man.Runs)
 				}
 			}
@@ -245,6 +261,7 @@ func crashChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.scaleTriggers(FlushTxs, FlushBlocks, testTerminalTxs)
 	h := uint64(0)
 	for r := 0; r < MergeFanIn; r++ {
 		for i := 0; i < 3; i++ {

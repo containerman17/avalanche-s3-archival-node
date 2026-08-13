@@ -11,23 +11,50 @@ import (
 	"github.com/containerman17/epochdb/dist"
 )
 
-// THE DETERMINISTIC MERGER (DESIGN rule 4): eight same-level runs merge into
-// one next-level run at the tx boundary known in advance. A merge is a PURE
+// THE DETERMINISTIC MERGER (DESIGN rule 4): THERE IS ONE MERGE LEVEL. The L0
+// runs since the last terminal merge into one TERMINAL run at the tx boundary
+// known in advance, and a terminal run NEVER MERGES AGAIN. A merge is a PURE
 // FUNCTION of its inputs, so two independent builders produce the same bytes
 // and the same casfs name, and a consumer holding the small runs can recompute
 // the merged run locally instead of downloading it.
 //
-// THE SPAN IS ALWAYS THE NEWEST EIGHT, and that is not a preference: a run's
+// THE BOUNDARY IS EIGHT MILLION TRANSACTIONS, and the fan-in is what that comes
+// to at the flush trigger: 8,000,000 / 500,000 = SIXTEEN L0 runs on a chain
+// dense enough to flush by transactions, which is every chain that will ever
+// earn a terminal (mainnet C: ~190 terminals over 1.5B txs, artifacts of
+// 5-10GB). TxNum is the trigger rather than the run count because TxNum is THE
+// dimension: a sparse chain flushes on the 50,000-block trigger instead, and
+// counting runs there would cut tiny terminals out of a chain that has not
+// earned one. numine at 1.07M txs has twenty L0 runs and no terminal, which is
+// exactly the intent: it publishes nothing and a joiner takes it over p2p in
+// twenty minutes.
+//
+// THE SPAN IS ALWAYS THE NEWEST RUNS, and that is not a preference: a run's
 // footer names the PREVIOUS run, so the live set is a prev-linked list, and
 // replacing a span in the middle of a linked list orphans its successor. The
 // newest span has no successor, so merging there keeps the list intact at every
-// instant, which is what the join walk (join.go) reads.
+// instant, which is what the join walk (join.go) reads. It is also why the span
+// is EVERY L0 since the last terminal rather than a fixed count: the terminals
+// then tile the chain from TxNum 0 with no gap, which is what lets the
+// published manifest list terminals alone and still walk back to the chain
+// root.
 //
 // RETIREMENT IS PUBLISH-BEFORE-DELETE (DESIGN, "all data must always be safe"):
 // the merged run is written, fsynced, reopened and verified against the rows
 // that went into it; only then does the manifest swap; only after the swap do
-// the inputs' local copies go.
-const MergeFanIn = 8
+// the inputs' LOCAL copies go. Nothing in the bucket is ever deleted, because
+// nothing superseded was ever uploaded.
+const (
+	// TerminalTxs is the terminal boundary, a pinned format constant: move it
+	// and two builders cut different runs.
+	TerminalTxs = 8_000_000
+	// MergeFanIn is that boundary in runs on a tx-triggered chain. It is a
+	// derived number, stated because it is the shape everything is sized for.
+	MergeFanIn = TerminalTxs / FlushTxs
+	// TerminalLevel is the level a merged run carries. There is exactly one
+	// merge level, so "level 1" and "terminal" are the same statement.
+	TerminalLevel = 1
+)
 
 // mergeCrash is a TEST HOOK and nothing else. A crash test re-executes this
 // binary with EPOCHDB_MERGE_CRASH set to a stage name and the process dies
@@ -40,44 +67,40 @@ var mergeCrash = func(stage string) {
 	}
 }
 
-// MaybeMerge merges while the newest MergeFanIn live runs share a level. One
-// merge can complete the next level, so it loops.
+// MaybeMerge cuts a terminal run when the L0 tail has reached the boundary.
+// There is one level, so one merge is all there can ever be to do.
 func (d *DB) MaybeMerge() error {
-	for {
-		start, level, ok := d.mergeSpan()
-		if !ok {
-			return nil
-		}
-		if err := d.merge(start, level); err != nil {
-			return err
-		}
+	start, ok := d.mergeSpan()
+	if !ok {
+		return nil
 	}
+	return d.merge(start)
 }
 
-// mergeSpan reports the newest MergeFanIn runs when they are all the same
-// level, which is the trigger and the whole schedule.
-func (d *DB) mergeSpan() (start int, level int, ok bool) {
+// mergeSpan reports where the L0 tail starts, once that tail holds a terminal
+// run's worth of transactions. That is the trigger and the whole schedule.
+func (d *DB) mergeSpan() (start int, ok bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	n := len(d.man.Runs)
-	if n < MergeFanIn {
-		return 0, 0, false
+	runs := d.man.Runs
+	start = len(runs)
+	for start > 0 && runs[start-1].Level == 0 {
+		start--
 	}
-	start = n - MergeFanIn
-	level = d.man.Runs[start].Level
-	for _, r := range d.man.Runs[start:] {
-		if r.Level != level {
-			return 0, 0, false
-		}
+	if start == len(runs) {
+		return 0, false
 	}
-	return start, level, true
+	if runs[len(runs)-1].ToTx-runs[start].FromTx < d.terminalTxs {
+		return 0, false
+	}
+	return start, true
 }
 
-// merge folds runs[start:start+MergeFanIn] into one run of level+1.
-func (d *DB) merge(start, level int) error {
+// merge folds every L0 run from start onward into one terminal run.
+func (d *DB) merge(start int) error {
 	d.mu.RLock()
-	refs := append([]RunRef(nil), d.man.Runs[start:start+MergeFanIn]...)
-	inputs := append([]*Run(nil), d.runs[start:start+MergeFanIn]...)
+	refs := append([]RunRef(nil), d.man.Runs[start:]...)
+	inputs := append([]*Run(nil), d.runs[start:]...)
 	prev := d.chainRoot
 	if start > 0 {
 		var err error
@@ -96,8 +119,11 @@ func (d *DB) merge(start, level int) error {
 	}
 
 	t0 := time.Now()
-	path := RunFileName(d.cas.SpoolDir(), from.FromTx, to.ToTx)
-	w, err := NewRunWriter(path, prev)
+	// A TERMINAL RUN IS BUILT IN THE SPOOL, which is the one directory Sync
+	// uploads from: this run is the only artifact of the whole engine that ever
+	// reaches the bucket.
+	path := RunFileName(d.cas.SpoolDir(), TerminalLevel, from.FromTx, to.ToTx)
+	w, err := NewRunWriter(path, prev, TerminalLevel)
 	if err != nil {
 		return err
 	}
@@ -140,7 +166,7 @@ func (d *DB) merge(start, level int) error {
 	mergeCrash("verified")
 
 	// PUBLISH: the manifest lands durably, then the in-memory snapshot swaps.
-	ref := RunRef{FromTx: from.FromTx, ToTx: to.ToTx, FromHeight: from.FromHeight, ToHeight: to.ToHeight, Name: name, Level: level + 1}
+	ref := RunRef{FromTx: from.FromTx, ToTx: to.ToTx, FromHeight: from.FromHeight, ToHeight: to.ToHeight, Name: name, Level: TerminalLevel}
 	d.mu.Lock()
 	old := d.man.Runs
 	d.man.Runs = append(append([]RunRef(nil), old[:start]...), ref)
@@ -154,17 +180,18 @@ func (d *DB) merge(start, level int) error {
 	d.mu.Unlock()
 	mergeCrash("swapped")
 
-	// ONLY NOW may the inputs go, and only their LOCAL copies: the bucket keeps
-	// every artifact it was ever handed.
+	// ONLY NOW may the inputs go. They only ever existed locally, so this is an
+	// unlink of files nobody else has a copy of, and there is nothing in any
+	// bucket to reconcile: what is published is final, forever.
 	for i, r := range inputs {
 		r.Close()
-		if err := os.Remove(d.cas.SpoolPath(refs[i].Name)); err != nil && !os.IsNotExist(err) {
+		if err := d.cas.DropLocal(refs[i].Name); err != nil {
 			return fmt.Errorf("store: retire run %s: %w", refs[i].Name, err)
 		}
 	}
 	mergeCrash("deleted")
-	log.Printf("store: merged %d level-%d runs into level-%d run %s [tx %d..%d, blocks %d..%d]: %d chain + %d state + %d lookup rows in %s",
-		MergeFanIn, level, level+1, name, from.FromTx, to.ToTx, from.FromHeight, to.ToHeight,
+	log.Printf("store: merged %d L0 runs into terminal run %s [tx %d..%d, blocks %d..%d]: %d chain + %d state + %d lookup rows in %s",
+		len(inputs), name, from.FromTx, to.ToTx, from.FromHeight, to.ToHeight,
 		rows[SecChain], rows[SecState], rows[SecLookup], time.Since(t0).Round(time.Millisecond))
 	return nil
 }
@@ -323,7 +350,7 @@ func RecomputeMerge(cas *dist.Store, dir string, prev [32]byte, names []RunName)
 		inputs = append(inputs, r)
 	}
 	first, last := inputs[0].Footer, inputs[len(inputs)-1].Footer
-	w, err := NewRunWriter(RunFileName(dir, first.FromTx, last.ToTx), prev)
+	w, err := NewRunWriter(RunFileName(dir, TerminalLevel, first.FromTx, last.ToTx), prev, TerminalLevel)
 	if err != nil {
 		return "", err
 	}

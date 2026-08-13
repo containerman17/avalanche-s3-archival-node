@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -200,5 +201,48 @@ func TestLatestPointer(t *testing.T) {
 	}
 	if _, err := s.Latest(root); err == nil {
 		t.Fatal("an empty pointer value decoded as a chain with no runs")
+	}
+}
+
+// TestNothingCanDeleteAnObject is a GREP, and it is the right shape for this
+// rule: THE BUCKET IS WRITE-ONCE AND FOREVER (DESIGN, storage v0). There is no
+// delete, recycle or garbage-collection concept anywhere, so the check is not
+// "does the delete path behave" but "does a delete path exist at all". It reads
+// every non-test Go file in this repository AND in casfs, which is the only
+// code that ever speaks to a bucket.
+//
+// THE ONE ALLOWED DELETE IS AN ABORT OF A MULTIPART UPLOAD (`uploadId`), which
+// cancels bytes that never became an object. Anything else fails here.
+func TestNothingCanDeleteAnObject(t *testing.T) {
+	roots := []string{".."}
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/containerman17/casfs").Output()
+	if err != nil {
+		t.Fatalf("locate casfs: %v", err)
+	}
+	roots = append(roots, strings.TrimSpace(string(out)))
+
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return err
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			for i, line := range strings.Split(string(b), "\n") {
+				if !strings.Contains(line, "MethodDelete") && !strings.Contains(line, `"DELETE"`) {
+					continue
+				}
+				if strings.Contains(line, "uploadId") {
+					continue // aborting a multipart upload deletes no object
+				}
+				t.Errorf("%s:%d speaks DELETE to a bucket: %s", path, i+1, strings.TrimSpace(line))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

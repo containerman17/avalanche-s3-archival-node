@@ -191,7 +191,13 @@ func TestDeterminism(t *testing.T) {
 		if len(m.Runs) != 1 {
 			t.Fatalf("want 1 run, got %d", len(m.Runs))
 		}
-		return m.Runs[0].Name, filepath.Join(dir, "cas", m.Runs[0].Name)
+		// An L0 run is LOCAL FOREVER, so its file is in the local directory and
+		// its name there carries the level and tx range beside the hash.
+		p := cas.LocalPath(m.Runs[0].Name)
+		if want := "l0-0000000000000000-0000000000000030-" + m.Runs[0].Name; filepath.Base(p) != want {
+			t.Fatalf("L0 run file is %q, want %q", filepath.Base(p), want)
+		}
+		return m.Runs[0].Name, p
 	}
 	nameA, pathA := build()
 	nameB, pathB := build()

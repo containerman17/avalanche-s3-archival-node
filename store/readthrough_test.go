@@ -127,8 +127,9 @@ func fatBlock(height uint64, n int) *BlockWrite {
 	return b
 }
 
-// publishRuns builds a corpus in a producer dir and uploads it, releasing every
-// local copy, so a consumer cannot read a single byte without the bucket.
+// publishRuns builds a corpus of `runs` L0 flushes in a producer dir, merges
+// them into the ONE TERMINAL RUN THAT UPLOADS, and syncs, releasing every local
+// copy so a consumer cannot read a single byte without the bucket.
 func publishRuns(t *testing.T, endpoint, prefix string, runs int) (dir string, root [32]byte) {
 	t.Helper()
 	dir = t.TempDir()
@@ -143,10 +144,12 @@ func publishRuns(t *testing.T, endpoint, prefix string, runs int) (dir string, r
 	if err != nil {
 		t.Fatal(err)
 	}
+	const blocks, txs = 40, 8
+	db.scaleTriggers(FlushTxs, FlushBlocks, uint64(blocks*txs*runs))
 	h := uint64(0)
 	for r := 0; r < runs; r++ {
-		for i := 0; i < 140; i++ {
-			if err := db.WriteBlock(fatBlock(h, 8)); err != nil {
+		for i := 0; i < blocks; i++ {
+			if err := db.WriteBlock(fatBlock(h, txs)); err != nil {
 				t.Fatal(err)
 			}
 			h++
@@ -154,6 +157,9 @@ func publishRuns(t *testing.T, endpoint, prefix string, runs int) (dir string, r
 		if err := db.Flush(); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if got := db.Manifest().Runs; len(got) != 1 || !got[0].Terminal() {
+		t.Fatalf("the corpus did not merge into one terminal run: %+v", got)
 	}
 	db.Close()
 	if err := cas.Sync(); err != nil {
@@ -178,8 +184,10 @@ func TestReadThroughFromS3(t *testing.T) {
 	c := newCounter(t, endpoint)
 	prefix := fmt.Sprintf("readthrough/%d/", time.Now().UnixNano())
 
-	const runs = 4
-	prod, root := publishRuns(t, c.srv.URL, prefix, runs)
+	// SIXTEEN L0 FLUSHES, ONE TERMINAL RUN: the terminal is the only artifact
+	// in the bucket, so this measures read-through against exactly what a
+	// consumer of a real chain would find there.
+	prod, root := publishRuns(t, c.srv.URL, prefix, MergeFanIn)
 	man, err := os.ReadFile(filepath.Join(prod, manifestFile))
 	if err != nil {
 		t.Fatal(err)
@@ -292,7 +300,7 @@ func TestReadThroughFromS3(t *testing.T) {
 	}
 
 	// READ-THROUGH CORRECTNESS: what the cold bucket serves is what was written.
-	for h := uint64(0); h < 160; h += 37 {
+	for h := uint64(0); h < 640; h += 37 {
 		want, ok, err := db.HeaderRLP(h)
 		if err != nil || !ok {
 			t.Fatalf("header %d: %v %v", h, ok, err)

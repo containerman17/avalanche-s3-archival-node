@@ -91,11 +91,12 @@ type RunName = string
 // caller who knows whether the rows arrive sorted (chain) or have to be sorted
 // at flush (state, lookup).
 type RunWriter struct {
-	path string
-	f    *os.File
-	bw   *bufio.Writer
-	h    *dist.Hasher
-	off  uint64
+	path  string
+	level int
+	f     *os.File
+	bw    *bufio.Writer
+	h     *dist.Hasher
+	off   uint64
 
 	footer Footer
 	cur    Section
@@ -106,14 +107,15 @@ type RunWriter struct {
 	Bytes [numSections]uint64
 }
 
-// NewRunWriter starts a run at path (which must be on the artifact store's
-// filesystem, because Adopt renames it into the spool).
-func NewRunWriter(path string, prev [32]byte) (*RunWriter, error) {
+// NewRunWriter starts a run of level at path, which must sit in the directory
+// the finished run lands in (the rename that adopts it cannot cross a
+// filesystem): the LOCAL directory for an L0 run, the spool for a terminal.
+func NewRunWriter(path string, prev [32]byte, level int) (*RunWriter, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	w := &RunWriter{path: path, f: f, bw: bufio.NewWriterSize(f, 1<<20), h: dist.NewHasher(), cur: -1}
+	w := &RunWriter{path: path, level: level, f: f, bw: bufio.NewWriterSize(f, 1<<20), h: dist.NewHasher(), cur: -1}
 	w.footer.Prev = prev
 	w.footer.Version = StorageVersion
 	return w, nil
@@ -170,8 +172,13 @@ func (w *RunWriter) End() error {
 	return nil
 }
 
-// Finish writes the footer, fsyncs, and hands the file to the artifact store,
-// which renames it into the spool under the name its hash list commits to.
+// Finish writes the footer, fsyncs, and hands the file to the artifact store
+// under the name its hash list commits to.
+//
+// THIS IS THE UPLOAD GATE, and it is one branch: a TERMINAL run is adopted into
+// the spool, which Sync uploads; an L0 run is adopted into the local directory,
+// which Sync never looks at. L0 runs and the window never leave the machine, so
+// nothing in the bucket is ever superseded.
 func (w *RunWriter) Finish(cas *dist.Store, fromTx, toTx, fromHeight, toHeight uint64) (RunName, *Footer, error) {
 	w.footer.FromTx, w.footer.ToTx = fromTx, toTx
 	w.footer.FromHeight, w.footer.ToHeight = fromHeight, toHeight
@@ -192,7 +199,13 @@ func (w *RunWriter) Finish(cas *dist.Store, fromTx, toTx, fromHeight, toHeight u
 		return "", nil, err
 	}
 	w.f = nil
-	name, err := cas.Adopt(w.path, w.h)
+	var name string
+	var err error
+	if w.level >= TerminalLevel {
+		name, err = cas.Adopt(w.path, w.h)
+	} else {
+		name, err = cas.AdoptLocal(w.path, RunLabel(w.level, fromTx, toTx), w.h)
+	}
 	if err != nil {
 		return "", nil, err
 	}
@@ -557,11 +570,21 @@ func (s sectionStat) DeviceID() vfs.DeviceID { return vfs.DeviceID{} }
 
 var _ sstable.ReadableFile = (*sectionReadable)(nil)
 
-// RunFileName is the human-readable staging name of a run under construction:
-// runs ARE named by their TxNum range, and the casfs name is what the manifest
-// records once the bytes exist.
-func RunFileName(dir string, fromTx, toTx uint64) string {
-	return filepath.Join(dir, fmt.Sprintf("run-%016d-%016d.tmp", fromTx, toTx))
+// RunLabel is what a run is called beside its casfs hash: its LEVEL and its
+// TxNum range, which is everything an operator or an agent needs to read a
+// directory listing. `l0-...` is a flush, `t-...` is a terminal.
+func RunLabel(level int, fromTx, toTx uint64) string {
+	kind := fmt.Sprintf("l%d", level)
+	if level >= TerminalLevel {
+		kind = "t"
+	}
+	return fmt.Sprintf("%s-%016d-%016d", kind, fromTx, toTx)
+}
+
+// RunFileName is the staging name of a run under construction, in the directory
+// the finished run lands in.
+func RunFileName(dir string, level int, fromTx, toTx uint64) string {
+	return filepath.Join(dir, "run-"+RunLabel(level, fromTx, toTx)+".tmp")
 }
 
 func hexName(b [32]byte) string { return hex.EncodeToString(b[:]) }

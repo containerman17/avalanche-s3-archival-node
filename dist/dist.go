@@ -9,6 +9,12 @@
 // call, Open(hash), and every 4MB chunk they touch is verified against the
 // list before it is served.
 //
+// AN ARTIFACT THAT MUST NEVER REACH THE BUCKET GOES TO <data>/runs INSTEAD OF
+// THE SPOOL, and that placement is the entire upload gate: Sync only ever looks
+// at the spool. Reads try the local directory first, so a local-only artifact
+// is a normal artifact in every other respect (same tail, same name, same
+// Blob). It is what keeps L0 runs on the machine while terminal runs publish.
+//
 // THE EPOCH FORMAT IS UNCHANGED BY ANY OF THAT. The tail is casfs's metadata,
 // so an epoch is still L bytes with its footer LAST: Blob.Size() is L on both
 // roads, and a reader seeking the footer seeks from L rather than from the end
@@ -63,6 +69,12 @@ const (
 	ChunkSize = casfs.DefaultChunkSize
 
 	spoolName = "cas" // <data>/cas/<hash>: durable until uploaded
+	// localName is <data>/runs/<label>-<hash>: artifacts that are LOCAL FOREVER.
+	// THE BUCKET IS WRITE-ONCE AND FOREVER (DESIGN, storage v0): only terminal
+	// runs upload, and Sync uploads whatever the SPOOL holds, so an artifact
+	// that must never leave the machine simply is not adopted into the spool.
+	// This directory is the only difference between the two roads.
+	localName = "runs"
 	// cacheName is the casfs chunk cache, disposable, laid out as
 	// <data>/cache/<window>/<chain>/<hash>.<index>. It must NOT collide with a
 	// pointer name: casfs owns its cache directory and deletes everything in it
@@ -103,6 +115,7 @@ func LatestPointer(chainRoot [32]byte) string { return "latest-" + hex.EncodeToS
 type Store struct {
 	dir   string
 	spool string
+	local string
 	cas   *sharedCas
 }
 
@@ -281,8 +294,11 @@ func Open(dataDir string) (*Store, error) {
 // Local builds a store that never talks to S3 whatever the environment says
 // (tests, tools, and any node run without credentials).
 func Local(dataDir string) (*Store, error) {
-	s := &Store{dir: dataDir, spool: filepath.Join(dataDir, spoolName)}
+	s := &Store{dir: dataDir, spool: filepath.Join(dataDir, spoolName), local: filepath.Join(dataDir, localName)}
 	if err := os.MkdirAll(s.spool, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.local, 0o755); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -315,6 +331,66 @@ func (s *Store) SpoolPath(hash string) string { return filepath.Join(s.spool, ha
 // the adopting rename cannot fail with EXDEV, and casfs ignores whatever is
 // not a hash-named file (a half-built epoch is `epoch-*.tmp`).
 func (s *Store) SpoolDir() string { return s.spool }
+
+// LocalDir holds the artifacts that NEVER reach the bucket. Sync only ever
+// looks at the spool, so being here is the whole upload gate: no flag, no
+// filter, no policy to get wrong.
+//
+// A file here is named `<label>-<hash>`, so `ls` reads a run's level and tx
+// range beside its casfs hash instead of a wall of hex. The hash is the
+// identity and the suffix is what LocalPath resolves; the label is legibility
+// and nothing else depends on it.
+func (s *Store) LocalDir() string { return s.local }
+
+// LocalPath is where the local-only artifact for hash lives, "" if this store
+// has none. The directory holds a handful of entries (one run per unmerged
+// flush), so a scan of it is cheaper than carrying an index that could go
+// stale.
+func (s *Store) LocalPath(hash string) string {
+	if !ValidHash(hash) {
+		return ""
+	}
+	ents, err := os.ReadDir(s.local)
+	if err != nil {
+		return ""
+	}
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), hash) {
+			return filepath.Join(s.local, e.Name())
+		}
+	}
+	return ""
+}
+
+// AdoptLocal seals a written file exactly like Adopt and renames it into the
+// LOCAL directory instead of the spool: the artifact is durable, readable by
+// name and never uploaded. path must already be in that directory (so the
+// rename cannot cross filesystems).
+func (s *Store) AdoptLocal(path, label string, h *Hasher) (string, error) {
+	name, err := s.seal(path, h)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(path, filepath.Join(s.local, label+"-"+name)); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// DropLocal unlinks a local-only artifact. It is the merge's retirement step
+// (a terminal run replaced its inputs), and it is the ONLY delete in the
+// artifact layer: NOTHING IN THE BUCKET IS EVER DELETED, by design and by the
+// absence of any code that could.
+func (s *Store) DropLocal(hash string) error {
+	p := s.LocalPath(hash)
+	if p == "" {
+		return nil
+	}
+	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
 
 // ---------- publishing ----------
 
@@ -349,6 +425,20 @@ func (s *Store) Put(b []byte) (string, error) {
 // NOTHING IS HELD IN MEMORY, which is the sealer's hard-won property: the tail
 // is kilobytes and the multi-GB content was never in RAM at all.
 func (s *Store) Adopt(path string, h *Hasher) (string, error) {
+	name, err := s.seal(path, h)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(path, s.SpoolPath(name)); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// seal appends the hash-list tail to a written file and fsyncs it, which is
+// everything Adopt and AdoptLocal share; only the destination differs, and that
+// destination is the whole upload gate.
+func (s *Store) seal(path string, h *Hasher) (string, error) {
 	name, tail, err := h.Finish()
 	if err != nil {
 		return "", err
@@ -365,9 +455,6 @@ func (s *Store) Adopt(path string, h *Hasher) (string, error) {
 		err = cerr
 	}
 	if err != nil {
-		return "", err
-	}
-	if err := os.Rename(path, s.SpoolPath(name)); err != nil {
 		return "", err
 	}
 	return name, nil
@@ -434,6 +521,17 @@ func (s *Store) Close() error {
 // of the spool file; with them it is casfs, reading the window chunk cache and
 // filling it from the spool or a ranged GET.
 func (s *Store) Open(hash string) (*Blob, error) {
+	// A LOCAL-ONLY ARTIFACT IS READ FIRST AND READ FROM DISK. It is not in the
+	// bucket and never will be, so asking casfs for it would be a HEAD that can
+	// only 404. Everything else about it is a normal artifact: same tail, same
+	// name, same Blob.
+	if p := s.LocalPath(hash); p != "" {
+		b, err := mmapArtifact(p)
+		if err != nil {
+			return nil, fmt.Errorf("dist: open local %s: %w", hash, err)
+		}
+		return b, nil
+	}
 	if s.cas == nil {
 		b, err := mmapArtifact(s.SpoolPath(hash))
 		if err != nil {

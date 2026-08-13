@@ -55,12 +55,33 @@ func ReadFooter(cas *dist.Store, name RunName) (*Footer, error) {
 	return f, nil
 }
 
-// Publish writes the live manifest into the artifact store and points the
+// Publish writes the PUBLISHED manifest into the artifact store and points the
 // chain's `latest` at it. Content goes up before pointers on every Sync, so a
 // consumer never sees a pointer to runs that are not in the bucket yet.
+//
+// THE PUBLISHED MANIFEST LISTS TERMINAL RUNS AND NOTHING ELSE, because they are
+// the only artifacts that ever upload (run.go's gate). The local live manifest
+// stays ahead with its L0 tail and its window; the bucket's view of the chain
+// ends at the last terminal boundary and is COMPLETE AND FINAL there, which is
+// the whole point of a write-once bucket: everything the pointer names is
+// resident, nothing it names will ever be superseded, and a consumer that lands
+// mid-flight sees an older complete corpus rather than a newer torn one.
+//
+// THE POINTER THEREFORE ADVANCES ONCE PER TERMINAL RUN. A chain that has not
+// earned one publishes NOTHING AT ALL: no manifest object, no pointer, an empty
+// prefix. That is not a degraded state, it is the answer for every chain under
+// eight million transactions, which joins over p2p in minutes.
 func (d *DB) Publish() error {
 	m := d.Manifest()
+	m.Runs = publishable(m.Runs)
 	if len(m.Runs) == 0 {
+		return nil
+	}
+	head := m.Runs[len(m.Runs)-1].Name
+	d.mu.RLock()
+	unchanged := head == d.published
+	d.mu.RUnlock()
+	if unchanged {
 		return nil
 	}
 	raw, err := json.Marshal(m)
@@ -78,7 +99,7 @@ func (d *DB) Publish() error {
 	// moved: the same publish-before-delete order everything else here uses.
 	d.mu.Lock()
 	old := d.lastManifest
-	d.lastManifest = name
+	d.lastManifest, d.published = name, head
 	d.mu.Unlock()
 	if old != "" && old != name {
 		if err := os.Remove(d.cas.SpoolPath(old)); err != nil && !os.IsNotExist(err) {
@@ -86,6 +107,19 @@ func (d *DB) Publish() error {
 		}
 	}
 	return nil
+}
+
+// publishable is the leading run of terminals: the part of the live set that is
+// in the bucket. It stops at the first L0 rather than filtering, because the
+// published set must be a CONTIGUOUS PREFIX FROM TxNum 0 for the join walk to
+// reach the chain root, and a gap would be a corpus nobody can verify.
+func publishable(runs []RunRef) []RunRef {
+	for i, r := range runs {
+		if !r.Terminal() {
+			return runs[:i]
+		}
+	}
+	return runs
 }
 
 // Join makes dir able to serve a published chain. It is a no-op on a dir that
