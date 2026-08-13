@@ -411,12 +411,22 @@ func (m *memtable) write(kind byte, num uint64, payload ...[]byte) (body uint64,
 }
 
 // add folds one block into the window. Blocks arrive in height order; a block
-// the window already holds is skipped, because re-execution after a walk-back
-// reconcile replays blocks that are already here and the rows are identical.
+// THE STORE ALREADY HOLDS is skipped, because re-execution after a walk-back
+// reconcile replays blocks that are already stored and the rows are identical.
+//
+// THE FLOOR IS nextHeight WHETHER OR NOT THE WINDOW HAS STARTED, and that is
+// the whole rule. An empty window sits at the last SEALED RUN's end (reset and
+// recover both park it there), so a crash whose state layer stopped exactly on
+// a flush boundary resumes with a walk-back into territory the run already
+// holds. Guarding only a started window let those rows be appended a SECOND
+// time, at fresh TxNums, and every tx row from the boundary onward was then out
+// of step with its blk row: layer 1 caught it in production on apertum at
+// 12,800,000 = 256 x 50,000 (2026-08-13). Chain-section rows for a block are
+// written EXACTLY ONCE.
 func (m *memtable) add(b *BlockWrite) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.started && b.Height < m.nextHeight {
+	if b.Height < m.nextHeight {
 		return nil
 	}
 	if !m.started {

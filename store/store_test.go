@@ -2,7 +2,9 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"iter"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -696,4 +698,115 @@ func TestConcurrentReadsWhileWriting(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// chainDensity is verification layer 1's density check in miniature: walk the
+// blk/ rows in order and pull the tx/ rows sequentially beside them, through
+// the SAME sequential iterator `epochdb dev verify` uses (runs oldest-first,
+// then the window). A corpus whose rows were appended twice skips a tx range
+// here, and the message is the one production reported.
+func chainDensity(db *DB, from, to uint64) error {
+	last := db.NextTx()
+	if last > 0 {
+		last--
+	}
+	blkNext, blkStop := iter.Pull2(db.ChainRows(FamBlk, from, to))
+	defer blkStop()
+	txNext, txStop := iter.Pull2(db.ChainRows(FamTx, 0, last))
+	defer txStop()
+	for n := from; n <= to; n++ {
+		row, err, ok := blkNext()
+		if err != nil {
+			return err
+		}
+		if !ok || row.Num != n {
+			return fmt.Errorf("blk/%d missing", n)
+		}
+		first := binary.BigEndian.Uint64(row.Val[:8])
+		count := binary.BigEndian.Uint32(row.Val[8:])
+		for i := uint64(0); i < uint64(count); i++ {
+			tx, err, ok := txNext()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("block %d: tx/%d missing", n, first+i)
+			}
+			if tx.Num != first+i {
+				return fmt.Errorf("block %d: tx/%d missing (the next stored row is %d)", n, first+i, tx.Num)
+			}
+		}
+	}
+	return nil
+}
+
+// TestResumeOnAFlushBoundaryNeverReappendsSealedRows is apertum's production
+// failure at small scale (found by layer 1, 2026-08-13): the process died with
+// the state layer sitting EXACTLY on a flush boundary, so its window was empty
+// and every block it held was already sealed into a run. The resume's walk-back
+// re-executed the last few of those blocks, and their chain rows were appended
+// a second time at fresh TxNums, leaving the corpus's tx rows skipping a range
+// from the boundary onward.
+func TestResumeOnAFlushBoundaryNeverReappendsSealedRows(t *testing.T) {
+	dir := t.TempDir()
+	cas, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cas.Close() })
+	open := func() *DB {
+		t.Helper()
+		db, err := Open(dir, cas, [32]byte{1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.scaleTriggers(1<<40, 8, 1<<40)
+		return db
+	}
+	write := func(db *DB, lo, hi uint64) {
+		t.Helper()
+		for h := lo; h <= hi; h++ {
+			if err := db.WriteBlock(block(h, 1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Sync blocks 0..7. The 8-block trigger seals them into a run and leaves the
+	// window EMPTY, which is the whole precondition.
+	db := open()
+	write(db, 0, 7)
+	if got := db.FlushedFloor(); got != 7 {
+		t.Fatalf("the run was not cut at the boundary: flushed floor %d, want 7", got)
+	}
+	if _, _, _, _, started := db.mem.window(); started {
+		t.Fatal("the window is not empty, so this is not the boundary crash")
+	}
+	db.Close() // the OOM kill
+
+	// Resume. Firewood is two blocks behind the state layer, so the reconcile
+	// walk-back re-executes 6 and 7, which the sealed run already holds, and
+	// then execution carries on forward.
+	db = open()
+	defer db.Close()
+	write(db, 6, 7)
+	write(db, 8, 10)
+
+	if err := chainDensity(db, 0, 10); err != nil {
+		t.Fatalf("layer 1 density: %v", err)
+	}
+	// The walk-back consumed no TxNums: 11 blocks of one tx each.
+	if got := db.NextTx(); got != 11 {
+		t.Fatalf("NextTx is %d, want 11: the replayed blocks took TxNums of their own", got)
+	}
+	// And the sealed rows still read back as themselves, not as a second copy.
+	for h := uint64(6); h <= 7; h++ {
+		first, count, ok, err := db.BlockTxRange(h)
+		if err != nil || !ok {
+			t.Fatalf("blk/%d: %v %v", h, ok, err)
+		}
+		if first != h || count != 1 {
+			t.Fatalf("blk/%d says first=%d count=%d, want first=%d count=1", h, first, count, h)
+		}
+	}
 }
