@@ -3,7 +3,6 @@ package store
 import (
 	"bufio"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,7 +34,17 @@ type memtable struct {
 	path string
 	f    *os.File
 	bw   *bufio.Writer
-	pos  uint64 // bytes written (including the buffer)
+	// readOnly opens the window beside a LIVE WRITER (DESIGN operations: the
+	// sole writer holds the flock and "read-only openers cohabit freely"). It
+	// suppresses the one destructive thing replay does: cutting the torn tail.
+	// A reader that truncates a log the writer is still appending to cuts away
+	// bytes the writer has already written, and because the writer's own file
+	// offset does not move, its next append re-extends the file and the kernel
+	// ZERO-FILLS the hole it left. The writer's in-RAM row offsets then point
+	// into NULs, it serves them without an error, and the flush seals them into
+	// a run. `epochdb dev verify` against a live chain's dir did exactly this.
+	readOnly bool
+	pos      uint64 // bytes written (including the buffer)
 	// flushed is how much of pos has reached the file. Everything below it is
 	// immutable and pread-safe, which is what lets chainGet serve under the
 	// READ lock; add() flushes at every block boundary so that covers the whole
@@ -135,11 +144,11 @@ var famRec = [6]byte{recBlk, recHdr, recItx, recPvm, recRcpt, recTx}
 
 const recHeader = 1 + 8 + 4 // kind, num, payload length
 
-func newMemtable(dir string) (*memtable, error) {
+func newMemtable(dir string, readOnly bool) (*memtable, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	m := &memtable{path: filepath.Join(dir, "window.log")}
+	m := &memtable{path: filepath.Join(dir, "window.log"), readOnly: readOnly}
 	m.clear()
 	f, err := os.OpenFile(m.path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
@@ -198,13 +207,22 @@ func (m *memtable) recover(baseTx, baseHeight uint64) error {
 		off    uint64
 		good   uint64 // end offset of the last complete block
 		hdrBuf [recHeader]byte
-		pend   []func()
+		pend   []func() error
 	)
-	commit := func() {
+	// A NON-CONTIGUOUS WINDOW LOG IS A HARD STOP, not a skipped row.
+	// chainIndex.add refuses a row that does not follow the previous one, and
+	// that error used to be discarded inside the closure: the first refusal
+	// dropped its row AND every later row of that family, while nextTx and
+	// nextHeight kept climbing off the end records, so the flush sealed a run
+	// with a whole tail of tx/ or hdr/ rows missing.
+	commit := func() error {
 		for _, f := range pend {
-			f()
+			if err := f(); err != nil {
+				return fmt.Errorf("store: window log replay: %w", err)
+			}
 		}
 		pend = nil
+		return nil
 	}
 	// A TORN TAIL IS CUT AT A BLOCK BOUNDARY, never inside one: mutations
 	// accumulate as closures and are applied only when the block's end record
@@ -238,7 +256,7 @@ replay:
 				}
 			}
 			f, b, l := fam, body, int(n)
-			pend = append(pend, func() { m.chain[f].add(num, b, l) })
+			pend = append(pend, func() error { return m.chain[f].add(num, b, l) })
 		case recState:
 			if len(payload) < 2 {
 				break replay
@@ -248,30 +266,61 @@ replay:
 				break replay
 			}
 			key, val := string(payload[2:2+kl]), append([]byte(nil), payload[2+kl:]...)
-			pend = append(pend, func() { m.putState(key, num, val) })
+			pend = append(pend, func() error { m.putState(key, num, val); return nil })
 		case recPost:
 			if len(payload) < 1 {
 				break replay
 			}
 			key, v := append([]byte(nil), payload[1:]...), payload[0]
-			pend = append(pend, func() { m.post = append(m.post, posting{key: key, val: v}) })
+			pend = append(pend, func() error { m.post = append(m.post, posting{key: key, val: v}); return nil })
 		case recNum:
 			k := string(payload)
-			pend = append(pend, func() { m.nums[k] = num })
+			pend = append(pend, func() error { m.nums[k] = num; return nil })
 		case recCode:
 			if len(payload) < 32 {
 				break replay
 			}
 			h, blob := string(payload[:32]), append([]byte(nil), payload[32:]...)
-			pend = append(pend, func() { m.code[h] = blob })
+			pend = append(pend, func() error { m.code[h] = blob; return nil })
 		case recEnd:
 			if n != 8 {
 				break replay
 			}
+			// A BLOCK A RUN ALREADY HOLDS IS DROPPED, the same floor rule add()
+			// enforces and for the same reason: chain rows are written EXACTLY
+			// ONCE. recover had no floor at all, and the log outlives its own
+			// sealing in two ordinary ways.
+			//
+			// (1) Flush saves the manifest and only then resets the window, and
+			// the reset's truncate is not fsynced, so a crash (or power loss
+			// inside the filesystem's commit interval) leaves the manifest
+			// naming the run while the log still holds every block in it.
+			// Replaying them appended a SECOND copy at the run's own heights:
+			// the next flush cut a run overlapping the first, run boundaries
+			// stopped being a function of chain content, and merge refused the
+			// pair forever, so the chain could never earn a terminal run.
+			//
+			// (2) The join path writes a published manifest over a dir that
+			// already had an unflushed window (a node that synced over p2p
+			// before the producer earned its first terminal, then restarted
+			// once it published). Rebasing onto that log put nextTx BELOW
+			// baseTx, and the next MaybeFlush underflowed that unsigned
+			// subtraction and cut a run with an inverted tx range.
+			//
+			// Dropping rather than refusing is what keeps an ordinary crash
+			// recoverable: the rows are in the run, so the log's copy is
+			// redundant, not contradictory.
+			if num < m.baseHeight {
+				pend = nil
+				good = off
+				continue
+			}
 			if !m.started {
 				m.baseHeight, m.started = num, true
 			}
-			commit()
+			if err := commit(); err != nil {
+				return err
+			}
 			m.nextHeight = num + 1
 			m.nextTx = binary.BigEndian.Uint64(payload)
 			good = off
@@ -279,13 +328,18 @@ replay:
 			break replay
 		}
 	}
-	if err := m.f.Truncate(int64(good)); err != nil {
-		return err
+	// ONLY THE WRITER CUTS THE LOG. A reader has the same in-RAM view either
+	// way (every index entry it built stops at good), so the truncate buys it
+	// nothing and costs the live writer its tail: see the readOnly field.
+	if !m.readOnly {
+		if err := m.f.Truncate(int64(good)); err != nil {
+			return err
+		}
+		if _, err := m.f.Seek(int64(good), io.SeekStart); err != nil {
+			return err
+		}
+		m.bw.Reset(m.f)
 	}
-	if _, err := m.f.Seek(int64(good), io.SeekStart); err != nil {
-		return err
-	}
-	m.bw.Reset(m.f)
 	m.pos, m.flushed = good, good
 	return nil
 }
@@ -298,6 +352,15 @@ func (m *memtable) reset(baseTx, baseHeight uint64) error {
 	m.baseTx, m.nextTx = baseTx, baseTx
 	m.baseHeight, m.nextHeight = baseHeight, baseHeight
 	if err := m.f.Truncate(0); err != nil {
+		return err
+	}
+	// FSYNC THE TRUNCATE. The run is already on disk and the manifest already
+	// names it, so this is the second half of publish-before-delete: without it
+	// a crash here leaves the manifest naming the run AND the log still holding
+	// every block in it. The replay floor now drops those blocks rather than
+	// re-appending them, so this is belt to that brace, and it costs one fsync
+	// per flush (one per 500,000 txs).
+	if err := m.f.Sync(); err != nil {
 		return err
 	}
 	if _, err := m.f.Seek(0, io.SeekStart); err != nil {
@@ -430,6 +493,18 @@ func (m *memtable) add(b *BlockWrite) error {
 		return nil
 	}
 	if !m.started {
+		// A FRESH WINDOW STARTS EXACTLY WHERE THE SEALED RUNS END, and the one
+		// legitimate jump is the empty store's: genesis is block 0 and is never
+		// stored, so the first block a fresh dir writes is 1. Anywhere else a
+		// start above nextHeight is a HOLE, and re-basing the window onto it
+		// disabled the ordering check below for the first block after EVERY
+		// flush and every open, which is the same shape of defect as the
+		// apertum one above: an invariant that holds inside a window and
+		// evaporates at its boundary.
+		if m.nextHeight != 0 && b.Height != m.nextHeight {
+			return fmt.Errorf("store: block %d would start a fresh window over sealed runs ending at %d, so blocks %d..%d would be missing from the chain",
+				b.Height, m.nextHeight-1, m.nextHeight, b.Height-1)
+		}
 		m.baseHeight, m.nextHeight, m.started = b.Height, b.Height, true
 	}
 	if b.Height != m.nextHeight {
@@ -617,8 +692,13 @@ func (m *memtable) readRow(off uint64, n uint32, ok bool) ([]byte, bool, error) 
 		return nil, true, nil
 	}
 	p := make([]byte, n)
-	if _, err := m.f.ReadAt(p, int64(off)); err != nil && !errors.Is(err, io.EOF) {
-		return nil, false, err
+	// A SHORT READ IS AN ERROR, and the io.EOF exemption that used to be here
+	// said the opposite. ReadAt returns io.EOF only when it got FEWER bytes than
+	// asked for, so exempting it handed the caller a ZERO-PADDED buffer as a
+	// real row: the amplifier that turns any truncation of the window log into
+	// silent zeros in a sealed run rather than a loud failure.
+	if _, err := m.f.ReadAt(p, int64(off)); err != nil {
+		return nil, false, fmt.Errorf("store: window row at %d (%d bytes): %w", off, n, err)
 	}
 	return p, true, nil
 }

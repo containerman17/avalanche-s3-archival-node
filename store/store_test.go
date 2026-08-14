@@ -810,3 +810,221 @@ func TestResumeOnAFlushBoundaryNeverReappendsSealedRows(t *testing.T) {
 		}
 	}
 }
+
+// TestAFreshWindowNeverStartsOverAGap is the apertum defect's SIBLING, and it
+// is the same shape: the ordering rule held inside a window and evaporated at
+// its boundary. add() re-based an unstarted window onto whatever height arrived
+// first, which set nextHeight to that height and made the out-of-order check
+// below it a tautology. So the first block after EVERY flush and every open
+// could skip an arbitrary range and the store took it without a word: Head()
+// jumped, the run was cut naming the post-gap height as its floor, and the
+// blocks in between simply did not exist.
+func TestAFreshWindowNeverStartsOverAGap(t *testing.T) {
+	db, _ := testDB(t)
+	db.scaleTriggers(1<<40, 4, 1<<40)
+
+	for h := uint64(0); h < 4; h++ {
+		if err := db.WriteBlock(block(h, 2)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, _, _, started := db.mem.window(); started {
+		t.Fatal("the window is not empty, so this is not the boundary case")
+	}
+
+	if err := db.WriteBlock(block(10, 2)); err == nil {
+		head, _ := db.Head()
+		t.Fatalf("GAP ACCEPTED: blocks 4..9 are missing, head is now %d and nothing complained", head)
+	}
+
+	// The refusal must not have moved the window, so the correct next block
+	// still lands and the chain stays dense.
+	for h := uint64(4); h <= 6; h++ {
+		if err := db.WriteBlock(block(h, 2)); err != nil {
+			t.Fatalf("block %d after the refused gap: %v", h, err)
+		}
+	}
+	if err := chainDensity(db, 0, 6); err != nil {
+		t.Fatalf("layer 1 density: %v", err)
+	}
+}
+
+// TestReplayDropsBlocksARunAlreadyHolds. recover() rebased an unstarted window
+// onto whatever height its log began at, with no floor of its own: add() got
+// the floor in 75daff6 and replay never did. The log outlives its own sealing
+// two ordinary ways, and both ended in a corpus that disagreed with itself.
+//
+// (1) Flush saves the manifest and only then resets the window, so a crash
+// between them leaves the manifest naming the run while the log still holds
+// every block in it. Replaying appended a second copy at the run's own heights,
+// the next flush cut a run overlapping the first, and merge then refused that
+// pair forever, so the chain could never earn a terminal run.
+//
+// (2) A join writes a published manifest over a dir that already had an
+// unflushed window (synced over p2p before the producer earned its first
+// terminal, then restarted once it published). Rebasing onto that log left
+// nextTx BELOW baseTx, and the next MaybeFlush underflowed that unsigned
+// subtraction into a run with an inverted tx range.
+func TestReplayDropsBlocksARunAlreadyHolds(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newMemtable(filepath.Join(dir, "window"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.close()
+
+	for h := uint64(0); h < 4; h++ {
+		if err := m.add(block(h, 2)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.flushLocked(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replay against runs that already reach block 49 / TxNum 500, which is
+	// both the crashed-reset state and what a join writes over this dir.
+	if err := m.recover(500, 50); err != nil {
+		t.Fatalf("replay over sealed runs errored instead of dropping them: %v", err)
+	}
+	baseTx, nextTx, baseHeight, nextHeight, started := m.window()
+	if started {
+		t.Error("the stale window was adopted instead of dropped")
+	}
+	if nextTx != baseTx || nextTx != 500 {
+		t.Errorf("baseTx=%d nextTx=%d, want both 500 (nextTx below baseTx underflows the flush trigger)", baseTx, nextTx)
+	}
+	if baseHeight != 50 || nextHeight != 50 {
+		t.Errorf("baseHeight=%d nextHeight=%d, want both 50", baseHeight, nextHeight)
+	}
+
+	// The window that DOES belong to a boundary still replays whole: same log,
+	// read against the boundary it was actually cut at.
+	if err := m.recover(0, 0); err != nil {
+		t.Fatalf("the window's own boundary was refused: %v", err)
+	}
+	if _, _, _, nextHeight, started := m.window(); !started || nextHeight != 4 {
+		t.Fatalf("replay landed at nextHeight=%d started=%v, want 4/true", nextHeight, started)
+	}
+}
+
+// TestAReaderNeverCutsTheWindowLog. DESIGN's operations rule is one writer
+// under flock and "read-only openers cohabit freely", and `dev verify`, `dev
+// rpcdiff`, `dev probe` and the library's ReadOnly handle all open a LIVE
+// chain's dir without the lock. Replay cut the torn tail unconditionally, so
+// those readers truncated the running writer's log. The writer's own file
+// offset does not move with someone else's truncate, so its next append
+// re-extends the file and the kernel zero-fills the gap: its in-RAM row offsets
+// then point into NULs, it serves them with ok=true and no error, and the next
+// flush seals them into a run. For itx/ rows that is invisible to every
+// verification layer there is.
+func TestAReaderNeverCutsTheWindowLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "window", "window.log")
+
+	w, err := newMemtable(filepath.Join(dir, "window"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(0); h < 3; h++ {
+		if err := w.add(block(h, 2)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A block in flight: records on disk with no end record yet, which is
+	// exactly what a live writer's log tail looks like at any instant.
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	full, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The reader replays the same three complete blocks and leaves the file
+	// alone.
+	r, err := newMemtable(filepath.Join(dir, "window"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.recover(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, nextHeight, _ := r.window(); nextHeight != 3 {
+		t.Fatalf("the reader replayed to nextHeight %d, want 3", nextHeight)
+	}
+	if err := r.close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != full.Size() {
+		t.Fatalf("A READER CUT THE LOG: %d bytes before, %d after; a live writer's tail would be gone and its next append would zero-fill the hole",
+			full.Size(), after.Size())
+	}
+
+	// The WRITER still cuts it, because that is its job.
+	w2, err := newMemtable(filepath.Join(dir, "window"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.close()
+	if err := w2.recover(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cut.Size() >= full.Size() {
+		t.Fatalf("the writer did not cut the torn tail: %d bytes, was %d", cut.Size(), full.Size())
+	}
+}
+
+// A PARTIALLY SEALED LOG KEEPS ITS TAIL: the blocks a run holds are dropped and
+// the ones above it replay, which is the same rule add() applies to a walk-back.
+func TestReplayKeepsTheTailAboveASealedRun(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newMemtable(filepath.Join(dir, "window"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.close()
+
+	for h := uint64(0); h < 6; h++ {
+		if err := m.add(block(h, 2)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.flushLocked(); err != nil {
+		t.Fatal(err)
+	}
+	// A run sealed blocks 0..3 (8 txs); the log still holds 0..5.
+	if err := m.recover(8, 4); err != nil {
+		t.Fatal(err)
+	}
+	_, nextTx, baseHeight, nextHeight, started := m.window()
+	if !started || baseHeight != 4 || nextHeight != 6 {
+		t.Fatalf("baseHeight=%d nextHeight=%d started=%v, want 4/6/true", baseHeight, nextHeight, started)
+	}
+	if nextTx != 12 {
+		t.Fatalf("nextTx=%d, want 12: blocks 4 and 5 carry two txs each", nextTx)
+	}
+	if _, ok, err := m.chainGet(famHdr, 4); err != nil || !ok {
+		t.Fatalf("hdr/4 did not survive the replay: ok=%v err=%v", ok, err)
+	}
+	if _, ok, _ := m.chainGet(famHdr, 3); ok {
+		t.Error("hdr/3 replayed even though the run already holds it")
+	}
+}

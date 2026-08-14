@@ -173,6 +173,21 @@ type DB struct {
 
 // Open opens (or creates) storage v0 inside dir.
 func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
+	return open(dir, cas, chainRoot, false)
+}
+
+// OpenReadOnly opens a corpus BESIDE ITS LIVE WRITER, which is what every
+// opener that does not hold the dir's flock must use: `dev verify`, `dev
+// rpcdiff`, `dev probe` and the library's Config.ReadOnly. The difference is
+// one thing and it is not a policy: the window log's torn tail is NOT cut.
+// Cutting it is a write, and a reader that writes to a log the sole writer is
+// still appending to silently zero-fills the writer's own rows (see
+// memtable.readOnly).
+func OpenReadOnly(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
+	return open(dir, cas, chainRoot, true)
+}
+
+func open(dir string, cas *dist.Store, chainRoot [32]byte, readOnly bool) (*DB, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -185,7 +200,7 @@ func Open(dir string, cas *dist.Store, chainRoot [32]byte) (*DB, error) {
 	} else if man.ChainRoot != hexName(chainRoot) {
 		return nil, fmt.Errorf("store: data dir holds chain root %s, refusing to open it as %s", man.ChainRoot, hexName(chainRoot))
 	}
-	mem, err := newMemtable(filepath.Join(dir, "window"))
+	mem, err := newMemtable(filepath.Join(dir, "window"), readOnly)
 	if err != nil {
 		return nil, err
 	}

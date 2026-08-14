@@ -160,7 +160,14 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 			return nil, fmt.Errorf("join chain: %w", err)
 		}
 	}
-	db, err := store.Open(cfg.DataDir, cas, cfg.Chain.Root())
+	// A ReadOnly handle TAKES NO LOCK and is opened beside a live writer on
+	// purpose, so it must not cut that writer's window log: store.OpenReadOnly
+	// is the same open minus that one write.
+	openStore := store.Open
+	if cfg.ReadOnly {
+		openStore = store.OpenReadOnly
+	}
+	db, err := openStore(cfg.DataDir, cas, cfg.Chain.Root())
 	if err != nil {
 		return nil, fmt.Errorf("open storage v0: %w", err)
 	}

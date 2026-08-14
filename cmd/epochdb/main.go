@@ -75,13 +75,18 @@ func chainFlags(fs *flag.FlagSet) (*string, func(dataDir string) *chain.Chain) {
 // reads local first and the bucket second, and with no EPOCHDB_S3_ENDPOINT set
 // it degrades to local-only, so an offline dir behaves as it always did.
 //
+// IT ALSO OPENS READ-ONLY, and that is not a preference. These commands take no
+// flock by design (lock.go), so they run beside a live writer, and the ordinary
+// open CUTS the window log's torn tail. Doing that to a running node truncates
+// away bytes it has already written and its next append zero-fills the hole.
+//
 // The caller closes both, db first.
 func openCorpus(dataDir string, root [32]byte) (*dist.Store, *store.DB, error) {
 	cas, err := dist.Open(dataDir)
 	if err != nil {
 		return nil, nil, err
 	}
-	db, err := store.Open(dataDir, cas, root)
+	db, err := store.OpenReadOnly(dataDir, cas, root)
 	if err != nil {
 		cas.Close()
 		return nil, nil, err
