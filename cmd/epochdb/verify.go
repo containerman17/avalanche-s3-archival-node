@@ -24,10 +24,24 @@ import (
 //
 //   - the header hash chain: every header's ParentHash is the previous header's
 //     hash, so one head hash pins every header below it;
+//   - TxNum contiguity: each block's `blk/` row starts exactly where the
+//     previous block's ended, so the one dimension has no hole and no overlap;
 //   - txRoot: derived from the `tx/` rows of the block;
 //   - receiptsRoot and logsBloom: derived from the `rcpt/` rows;
+//   - the `itx/` call frames: one row per transaction, and it decodes;
 //   - container reassembly: `hdr` + `pvm` + `tx` rows re-form the container
 //     byte for byte (the day-one invariant, also unit-tested in store).
+//
+// FRAMES HAVE NO CRYPTOGRAPHIC ORACLE and cannot get one: no root commits to
+// them, so nothing here can say a stored frame is the frame execution produced.
+// What this pass CAN say is that the family is DENSE and WELL FORMED, which is
+// the difference between "these frames are the chain's" and "some transactions
+// have no frames at all". A capture hole is refused at execution (the fail-stop
+// in exec/frames.go), and this is the second reader: it catches a corpus whose
+// itx/ rows went missing after the fact, or which some earlier binary wrote
+// without them. An EMPTY row is a real answer (a transaction that made no
+// nested call) and only an ABSENT one is a hole, which is exactly the
+// distinction the store keeps.
 //
 // State roots are layer 1 too and are checked WHERE THEY ARE PRODUCED: the
 // executor hard-stops on any block whose Firewood root differs from the
@@ -75,8 +89,21 @@ func verifyMain(args []string) {
 	if err != nil {
 		log.Fatalf("epochdb: verify: FAIL after %d blocks: %v", blocks, err)
 	}
-	log.Printf("epochdb: verify: PASS, %d blocks / %d txs in %s (header chain, txRoot, receiptsRoot, logsBloom, container reassembly)",
-		blocks, txs, time.Since(start).Round(time.Millisecond))
+	// A CHECK THAT CANNOT RUN IS A FAILURE. An empty range walked zero blocks
+	// and proved nothing, so it must not print the word PASS: --from above --to
+	// used to do exactly that.
+	if blocks == 0 {
+		log.Fatalf("epochdb: verify: the range [%d..%d] holds no blocks, so nothing was verified: that is a FAILURE, not a pass", *from, *to)
+	}
+	// THE ANCHOR IS MANDATORY, so a run without one says so rather than
+	// claiming the header chain. Unanchored, the walk proves only that the
+	// stored headers chain to EACH OTHER, which is a property of any chain.
+	anchored := "anchored at genesis"
+	if anchor == (common.Hash{}) {
+		anchored = "UNANCHORED (--from above 1 drops the genesis anchor, so the header chain is only self-consistent)"
+	}
+	log.Printf("epochdb: verify: PASS, %d blocks / %d txs in %s (header chain %s, TxNum contiguity, txRoot, receiptsRoot, logsBloom, frames present, container reassembly)",
+		blocks, txs, time.Since(start).Round(time.Millisecond), anchored)
 }
 
 // cursor is one chain family read SEQUENTIALLY. THIS PASS IS THE WHOLE REASON
@@ -148,9 +175,12 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 	defer rawTx.stop()
 	rcpts := newCursor(db, store.PrefixRcpt, store.FamRcpt, txLo, txHi)
 	defer rcpts.stop()
+	itxs := newCursor(db, store.PrefixItx, store.FamItx, txLo, txHi)
+	defer itxs.stop()
 
 	prevHash := anchor
 	havePrev := anchor != (common.Hash{})
+	wantFirst := firstTx
 	for n := from; n <= to; n++ {
 		hdrRLP, err := hdrs.at(n)
 		if err != nil {
@@ -174,6 +204,16 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 		}
 		first := binary.BigEndian.Uint64(blkVal[:8])
 		count := binary.BigEndian.Uint32(blkVal[8:])
+
+		// TxNum IS THE ONE DIMENSION, so it must have neither hole nor overlap.
+		// Aiming the tx cursors at each block's OWN blk/ row made every block
+		// self-consistent and left the joins between them unchecked: a range of
+		// TxNums belonging to no block passed, because the iterator simply
+		// yields the next stored row and the cursor asked for exactly that.
+		if first != wantFirst {
+			return blocks, txs, fmt.Errorf("block %d starts at TxNum %d, but the previous block ended at %d", n, first, wantFirst)
+		}
+		wantFirst = first + uint64(count)
 
 		list := make(types.Transactions, 0, count)
 		rawTxs := make([][]byte, 0, count)
@@ -199,6 +239,18 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 				return blocks, txs, fmt.Errorf("block %d: rcpt/%d: %w", n, first+i, err)
 			}
 			receipts = append(receipts, r)
+
+			// THE FRAMES, the one family that can never be backfilled by IO.
+			// The row must EXIST (an absent one is a transaction whose trace
+			// this corpus does not have) and it must decode. An empty row is a
+			// transaction that made no nested call, which is a real answer.
+			itxRec, err := itxs.at(first + i)
+			if err != nil {
+				return blocks, txs, fmt.Errorf("block %d: %w", n, err)
+			}
+			if _, err := store.DecodeFrames(itxRec); err != nil {
+				return blocks, txs, fmt.Errorf("block %d: itx/%d: %w", n, first+i, err)
+			}
 		}
 		txs += uint64(count)
 
