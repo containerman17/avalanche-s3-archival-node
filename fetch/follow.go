@@ -17,13 +17,23 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/platformvm"
 
+	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/fetch/consensus"
 )
 
 // vdrRefreshInterval is how often the validator set is re-fetched and
-// cross-checked. RPC is never on the tip-latency path: the engine samples
-// the in-memory manager; this loop runs in the background.
-const vdrRefreshInterval = time.Hour
+// cross-checked, JITTERED per round (dist.Jitter). RPC is never on the
+// tip-latency path: the engine samples the in-memory manager; this loop runs
+// in the background.
+//
+// FOUR HOURS, NOT ONE (2026-08-14). `platform.getCurrentValidators` on the
+// primary network is the heaviest call this node makes of a public endpoint,
+// and dozens of containers on one box made it every hour on the same tick,
+// which is a self-inflicted rate limit for data that moves in days. A stake
+// change we miss for a few hours changes nothing: the manager only has to be
+// a fair sample of who is validating, and a mid-refresh failure keeps the
+// last-good set anyway.
+const vdrRefreshInterval = 4 * time.Hour
 
 // Follow runs consensus-verified tip following: real snowman polls (ported
 // flatstate follower engine) find and track the network's accepted frontier.
@@ -140,7 +150,9 @@ func (f *Fetcher) vdrSources() []string {
 	if len(f.cfg.VdrSources) > 0 {
 		return f.cfg.VdrSources
 	}
-	return []string{f.cfg.NodeURI}
+	// A comma-separated --node is already several sources, so it cross-checks
+	// like --vdr-sources does. One host is still one host, and still warns.
+	return f.cfg.sources()
 }
 
 // consensusNet adapts the fetcher's transport and peer pool to the consensus
@@ -230,6 +242,15 @@ func fetchWeights(ctx context.Context, uri string, subnetID ids.ID) (map[ids.Nod
 //     joining can blow past 5% while a large one leaving cannot be
 //     distinguished from a lying source). Exact agreement is the honest rule:
 //     any difference is a real registration event, and the caller retries.
+//
+// THE WHOLE PASS IS THE RETRY UNIT, not the individual source (2026-08-14).
+// Retrying each source in turn would let one dead endpoint spend the entire
+// budget before the healthy one is ever asked, which is a slow start for a
+// node that had a good answer waiting. So a round asks everyone once, and only
+// a round that produced NO usable answer is retried: a source that fails is
+// skipped exactly as it always was, loudly, and the cross-check rule below it
+// is untouched. A disagreement is retried too, because on an L1 it is most
+// often a registration landing mid-round.
 func crossCheckedWeights(ctx context.Context, uris []string, subnetID ids.ID) (map[ids.NodeID]uint64, error) {
 	var (
 		first    map[ids.NodeID]uint64
@@ -237,25 +258,32 @@ func crossCheckedWeights(ctx context.Context, uris []string, subnetID ids.ID) (m
 		ok       int
 	)
 	exact := subnetID != avaconstants.PrimaryNetworkID
-	for _, uri := range uris {
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		w, err := fetchWeights(cctx, uri, subnetID)
-		cancel()
-		if err != nil {
-			log.Printf("fetch: validator source %s failed: %v", uri, err)
-			continue
+	err := dist.Try(ctx, "cross-checked validator set", []string{strings.Join(uris, " ")}, func(ctx context.Context, _ string) error {
+		first, firstURI, ok = nil, "", 0
+		for _, uri := range uris {
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			w, err := fetchWeights(cctx, uri, subnetID)
+			cancel()
+			if err != nil {
+				log.Printf("fetch: validator source %s failed: %v", uri, err)
+				continue
+			}
+			ok++
+			if first == nil {
+				first, firstURI = w, uri
+				continue
+			}
+			if err := weightsAgree(first, w, exact); err != nil {
+				return fmt.Errorf("validator sets disagree between %s and %s: %w", firstURI, uri, err)
+			}
 		}
-		ok++
 		if first == nil {
-			first, firstURI = w, uri
-			continue
+			return fmt.Errorf("all %d validator sources failed", len(uris))
 		}
-		if err := weightsAgree(first, w, exact); err != nil {
-			return nil, fmt.Errorf("validator sets disagree between %s and %s: %w", firstURI, uri, err)
-		}
-	}
-	if first == nil {
-		return nil, fmt.Errorf("all %d validator sources failed", len(uris))
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	if ok < 2 {
 		log.Printf("fetch: WARNING: validator set from a single source (%s), cross-check unavailable", firstURI)
@@ -316,7 +344,7 @@ func managerFor(weights map[ids.NodeID]uint64, subnetID ids.ID) (validators.Mana
 }
 
 func (f *Fetcher) refreshValidators(ctx context.Context, cnet *consensusNet) {
-	t := time.NewTicker(vdrRefreshInterval)
+	t := time.NewTimer(dist.Jitter(vdrRefreshInterval))
 	defer t.Stop()
 	for {
 		select {
@@ -324,6 +352,7 @@ func (f *Fetcher) refreshValidators(ctx context.Context, cnet *consensusNet) {
 			return
 		case <-t.C:
 		}
+		t.Reset(dist.Jitter(vdrRefreshInterval))
 		weights, err := crossCheckedWeights(ctx, f.vdrSources(), f.subnetID)
 		if err != nil {
 			log.Printf("fetch: validator refresh failed (keeping last-good set): %v", err)

@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/containerman17/epochdb/chain"
+	"github.com/containerman17/epochdb/dist"
 )
 
 const (
@@ -42,13 +43,18 @@ const (
 	probeFanout = 3
 	// frontierFanout is how many peers a frontier query asks.
 	frontierFanout = 8
+	// upstreamBudget is the ceiling on the WHOLE bootstrap RPC phase, retries
+	// over every source included. Startup is allowed to be slow while a public
+	// endpoint is rate-limiting this box; it is not allowed to be endless.
+	upstreamBudget = 5 * time.Minute
 )
 
 // Config for opening a Fetcher.
 type Config struct {
 	// NodeURI is an Avalanche public node used only for bootstrap RPC
-	// (network ID, C-Chain ID, validator list, peer IPs). If empty, falls
-	// back to DefaultNodeURI.
+	// (validator list, peer IPs). A COMMA-SEPARATED LIST is several of them,
+	// tried in turn: one rate-limited or broken host must not stop a node.
+	// Empty falls back to DefaultNodeURI.
 	NodeURI string
 	// PerPeer is the max outstanding GetAncestors requests per archival
 	// peer. 0 means 1.
@@ -62,6 +68,15 @@ type Config struct {
 	// SubnetID is the primary network) keeps the C-chain path exactly as it
 	// was: ids come from the bootstrap node's RPC, no tracked subnets, coreth.
 	Chain *chain.Chain
+}
+
+// sources is NodeURI as the list it is: every bootstrap call tries them in
+// turn (dist.Try), so a 429 from one endpoint costs a request, not a node.
+func (c Config) sources() []string {
+	if out := dist.Sources(c.NodeURI); len(out) > 0 {
+		return out
+	}
+	return []string{DefaultNodeURI}
 }
 
 // vmKind is the libevm extras registration this config needs.
@@ -158,44 +173,72 @@ func dial(cfg Config) (*Fetcher, error) {
 	if cfg.l1() {
 		dialTimeout = 90 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
 
-	infoClient := info.NewClient(cfg.NodeURI)
-	pClient := platformvm.NewClient(cfg.NodeURI)
+	// THE BOOTSTRAP RPC GETS ITS OWN BUDGET, not the dial timeout: a public
+	// endpoint that rate-limits this box is retried over every source (see
+	// dist.Try), which is minutes in the worst case, while the p2p dial below
+	// still has to fail in 30s when nothing answers.
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), upstreamBudget)
+	defer rpcCancel()
+	sources := cfg.sources()
 
-	networkID, err := infoClient.GetNetworkID(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("info.getNetworkID: %w", err)
-	}
 	var (
-		chainID  ids.ID
-		subnetID = avaconstants.PrimaryNetworkID
+		networkID uint32
+		chainID   ids.ID
+		subnetID  = avaconstants.PrimaryNetworkID
 	)
-	if cfg.l1() {
-		if cfg.Chain.NetworkID != networkID {
-			return nil, fmt.Errorf("chain descriptor is network %d but %s is network %d",
-				cfg.Chain.NetworkID, cfg.NodeURI, networkID)
+	if cfg.Chain != nil {
+		// THE DESCRIPTOR ALREADY KNOWS, so nothing is asked. A network ID is a
+		// constant per network and the C-chain's blockchainID comes out of
+		// avalanchego's embedded genesis, so the two calls that used to open
+		// every chain's startup (info.getNetworkID, info.getBlockchainID) are
+		// gone: they were two public-API requests per container per restart
+		// for values that cannot change. A --node pointing at the wrong
+		// network is no longer named by a startup error; it surfaces as the
+		// peer-connect timeout below, because no peer of that network will
+		// complete a handshake with us.
+		networkID, chainID, subnetID = cfg.Chain.NetworkID, cfg.Chain.BlockchainID, cfg.Chain.SubnetID
+	} else {
+		if err := dist.Try(rpcCtx, "info.getNetworkID", sources, func(ctx context.Context, uri string) (err error) {
+			networkID, err = info.NewClient(uri).GetNetworkID(ctx)
+			return
+		}); err != nil {
+			return nil, err
 		}
-		chainID, subnetID = cfg.Chain.BlockchainID, cfg.Chain.SubnetID
-	} else if chainID, err = infoClient.GetBlockchainID(ctx, "C"); err != nil {
-		return nil, fmt.Errorf("info.getBlockchainID(C): %w", err)
+		if err := dist.Try(rpcCtx, "info.getBlockchainID(C)", sources, func(ctx context.Context, uri string) (err error) {
+			chainID, err = info.NewClient(uri).GetBlockchainID(ctx, "C")
+			return
+		}); err != nil {
+			return nil, err
+		}
 	}
 	log.Printf("fetch: network_id=%d chain_id=%s subnet_id=%s", networkID, chainID, subnetID)
 
-	vdrList, err := pClient.GetCurrentValidators(ctx, subnetID, nil)
-	if err != nil {
-		return nil, fmt.Errorf("get validators: %w", err)
+	var vdrList []platformvm.ClientPermissionlessValidator
+	if err := dist.Try(rpcCtx, "platform.getCurrentValidators", sources, func(ctx context.Context, uri string) (err error) {
+		vdrList, err = platformvm.NewClient(uri).GetCurrentValidators(ctx, subnetID, nil)
+		return
+	}); err != nil {
+		return nil, err
 	}
 	validatorIDs := sortedNodeIDs(vdrList)
 	log.Printf("fetch: validator_set_size=%d", len(validatorIDs))
 
-	peerInfos, err := discoverPeers(ctx, infoClient, validatorIDs)
-	if err != nil {
-		return nil, fmt.Errorf("discover peers: %w", err)
-	}
-	if len(peerInfos) == 0 {
-		return nil, fmt.Errorf("no peers returned from info.peers")
+	var peerInfos []info.Peer
+	if err := dist.Try(rpcCtx, "info.peers", sources, func(ctx context.Context, uri string) error {
+		p, err := discoverPeers(ctx, info.NewClient(uri), validatorIDs)
+		if err != nil {
+			return err
+		}
+		// An empty list is a source that cannot seed this dial, not a network
+		// without peers: try the next one rather than dying on it.
+		if len(p) == 0 {
+			return fmt.Errorf("no peers returned from info.peers")
+		}
+		peerInfos = p
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	log.Printf("fetch: peer_candidates=%d", len(peerInfos))
 
@@ -290,6 +333,10 @@ func dial(cfg Config) (*Fetcher, error) {
 		net.ManuallyTrack(p.ID, peerAddr(p))
 	}
 
+	// The dial budget starts HERE, after the bootstrap RPC: a retried upstream
+	// must not eat the time the peers get to connect.
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
 	if err := waitForPeer(ctx, dispatchErrCh, handler.connectedCh, peerIDs, dialTimeout); err != nil {
 		net.StartClose()
 		return nil, fmt.Errorf("connect peer: %w", err)

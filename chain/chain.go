@@ -149,7 +149,11 @@ type cachedChain struct {
 // subnet-evm under its own plugin ID), and a wrong guess cannot be silent: the
 // data dir's vmkind stamp refuses it and the first executed header fails to
 // decode.
-func Resolve(ctx context.Context, spec string, networkID uint32, dataDir string) (*Chain, error) {
+//
+// sources are P-chain node base URLs, tried in turn and retried (dist.Try);
+// empty means the public endpoint for networkID. Only a FIRST resolution
+// touches them at all: after that chain.json answers.
+func Resolve(ctx context.Context, spec string, networkID uint32, dataDir string, sources ...string) (*Chain, error) {
 	var (
 		c   *Chain
 		err error
@@ -157,7 +161,7 @@ func Resolve(ctx context.Context, spec string, networkID uint32, dataDir string)
 	if spec == "" || strings.EqualFold(spec, "C") {
 		c, err = CChain(networkID)
 	} else {
-		c, err = resolveL1(ctx, spec, networkID, dataDir)
+		c, err = resolveL1(ctx, spec, networkID, dataDir, sources)
 	}
 	if err != nil {
 		return nil, err
@@ -173,7 +177,7 @@ func Resolve(ctx context.Context, spec string, networkID uint32, dataDir string)
 	return c, nil
 }
 
-func resolveL1(ctx context.Context, spec string, networkID uint32, dataDir string) (*Chain, error) {
+func resolveL1(ctx context.Context, spec string, networkID uint32, dataDir string, sources []string) (*Chain, error) {
 	blockchainID, err := ids.FromString(spec)
 	if err != nil {
 		return nil, fmt.Errorf("chain: %q is neither \"C\" nor a blockchainID: %w", spec, err)
@@ -187,22 +191,29 @@ func resolveL1(ctx context.Context, spec string, networkID uint32, dataDir strin
 		return nil, fmt.Errorf("chain: %w", err)
 	}
 
-	var api string
-	switch networkID {
-	case avaconstants.MainnetID:
-		api = "https://api.avax.network"
-	case avaconstants.FujiID:
-		api = "https://api.avax-test.network"
-	default:
-		return nil, fmt.Errorf("chain: %s: no public P-chain endpoint for network %d", spec, networkID)
+	if len(sources) == 0 {
+		switch networkID {
+		case avaconstants.MainnetID:
+			sources = []string{"https://api.avax.network"}
+		case avaconstants.FujiID:
+			sources = []string{"https://api.avax-test.network"}
+		default:
+			return nil, fmt.Errorf("chain: %s: no public P-chain endpoint for network %d", spec, networkID)
+		}
 	}
-	genesisData, subnetID, err := dist.CreateChainTx(ctx, api, spec)
-	if err != nil {
-		return nil, err
+	var (
+		genesisData []byte
+		subnetID    string
+	)
+	if err := dist.Try(ctx, "platform.getTx "+spec, sources, func(ctx context.Context, api string) (err error) {
+		genesisData, subnetID, err = dist.CreateChainTx(ctx, api, spec)
+		return
+	}); err != nil {
+		return nil, fmt.Errorf("chain: %w", err)
 	}
 	sub, err := ids.FromString(subnetID)
 	if err != nil {
-		return nil, fmt.Errorf("chain: %s: subnetID from %s: %w", spec, api, err)
+		return nil, fmt.Errorf("chain: %s: subnetID %q: %w", spec, subnetID, err)
 	}
 	c := &Chain{
 		GenesisJSON:  genesisData,

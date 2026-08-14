@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -64,8 +63,8 @@ func serveMain(args []string) {
 	grpcPort := fs.Int("grpc-port", 9660, "gRPC listen port, THE PRIMARY REMOTE API (0 disables)")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (the network --chain lives on)")
 	chainSpec := fs.String("chain", "C", "chain: C for --network's primary C-chain, or an L1's blockchainID")
-	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: --node URI only, with a warning")
-	nodeURI := fs.String("node", "", "bootstrap RPC node URI (default: the public endpoint for the chain's networkID)")
+	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: the --node URIs, with a warning when that is one host")
+	nodeURI := fs.String("node", "", "comma-separated bootstrap RPC node URIs, tried in turn (default: the public endpoint for the chain's networkID)")
 	stateCacheGiB := fs.Int("state-cache", 1, "executor Go-side read cache in GiB (0 disables)")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
 	tipOverride := fs.String("tip-override", "", "run the in-process fetcher as a BACKFILL down from this CONTAINER ID instead of a consensus follower (cb58, or 0x-hex eth block hash for pre-ProposerVM blocks)")
@@ -90,8 +89,9 @@ func serveMain(args []string) {
 	if *pprofAddr != "" {
 		go func() { log.Printf("epochdb: pprof: %v", http.ListenAndServe(*pprofAddr, nil)) }()
 	}
-	if *vdrSources == "" && *tipOverride == "" {
-		log.Printf("epochdb: serve: no --vdr-sources, validator set cross-checked against the --node URI only")
+	if *vdrSources == "" && *tipOverride == "" && len(dist.Sources(*nodeURI)) < 2 {
+		log.Printf("epochdb: serve: no --vdr-sources and one --node URI, so the validator set is cross-checked against nothing. " +
+			"Several endpoints are also the failover the bootstrap RPC uses when one of them rate-limits this box.")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -135,8 +135,13 @@ func serveMain(args []string) {
 			}
 		}()
 
-		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		c, err := chain.Resolve(rctx, *chainSpec, execNetID(*network), *dataDir)
+		// Minutes, not 30 seconds: a first resolution asks a public P-chain
+		// endpoint for the CreateChainTx, and that endpoint rate-limits a box
+		// running dozens of chains, so the call is retried over every source
+		// (dist.Try) instead of killing the process. A resolved dir answers
+		// from chain.json and never gets here.
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		c, err := chain.Resolve(rctx, *chainSpec, execNetID(*network), *dataDir, dist.Sources(*nodeURI)...)
 		cancel()
 		if err != nil {
 			log.Fatalf("epochdb: serve: --chain %s: %v", *chainSpec, err)
@@ -159,7 +164,7 @@ func serveMain(args []string) {
 			_, cfg.NodeURI, _ = netParams(avaconstants.NetworkIDToNetworkName[c.NetworkID])
 		}
 		if *vdrSources != "" {
-			cfg.VdrSources = strings.Split(*vdrSources, ",")
+			cfg.VdrSources = dist.Sources(*vdrSources)
 		}
 		if *tipOverride != "" {
 			// Same process, same forward fetch, a fixed ceiling instead of the
