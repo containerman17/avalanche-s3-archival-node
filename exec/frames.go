@@ -24,6 +24,7 @@ package exec
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/big"
 
 	"github.com/ava-labs/libevm/common"
@@ -76,11 +77,26 @@ func (c *frameCapture) resetTx() {
 
 // take serialises the transaction in flight and starts the next one. The bytes
 // are a fresh copy, so the batched executor can hold one per buffered block
-// while the capture moves on. ok=false means the tracer never ran, which is a
-// hole and is handled as death by the caller.
-func (c *frameCapture) take() (rec []byte, addrs [][]byte, ok bool) {
+// while the capture moves on.
+//
+// A NON-EMPTY why IS A HOLE AND THE CALLER TURNS IT INTO DEATH. There are two
+// of them, and both are "the trace is not what execution did":
+//
+//   - the tracer never ran at all (armed is false), which at this pin means the
+//     saexec seam;
+//   - the tracer ran but the enter/exit stack did not close, so the open frames
+//     carry gasUsed 0, no output and no error flag. That is INDISTINGUISHABLE
+//     from a real zero-gas success once stored, which makes it exactly the
+//     silent hole the fail-stop exists to refuse. An unbalanced stack cannot
+//     happen at this dependency pin (libevm pairs CaptureEnter with a deferred
+//     CaptureExit), so this guard costs one comparison per transaction and its
+//     whole job is to make a future dep bump loud instead of quiet.
+func (c *frameCapture) take() (rec []byte, addrs [][]byte, why string) {
 	if !c.armed {
-		return nil, nil, false
+		return nil, nil, "the frame tracer never ran for this transaction"
+	}
+	if len(c.stack) != 0 {
+		return nil, nil, fmt.Sprintf("the call stack did not close: %d of %d frames never got a CaptureExit", len(c.stack), len(c.cur))
 	}
 	if len(c.cur) > 0 {
 		rec = binary.AppendUvarint(nil, uint64(len(c.cur)))
@@ -92,7 +108,7 @@ func (c *frameCapture) take() (rec []byte, addrs [][]byte, ok bool) {
 		addrs = append(addrs, a.Bytes())
 	}
 	c.resetTx()
-	return rec, addrs, true
+	return rec, addrs, ""
 }
 
 // intern copies b into the per-tx arena.

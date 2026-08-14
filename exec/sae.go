@@ -426,7 +426,7 @@ func (e *Executor) appendSAETxs(bw *store.BlockWrite, blk *types.Block, receipts
 	txs := blk.Transactions()
 	if len(txs) > 0 {
 		e.curHeader = blk.Header()
-		e.dieOnUncapturedTrace("SAE block, saexec owns the transaction loop")
+		e.dieOnUncapturedTrace("SAE block", "saexec owns the transaction loop and was handed no tracer")
 	}
 	if len(receipts) != len(txs) {
 		return fmt.Errorf("sae block %d: %d receipts for %d txs", blk.NumberU64(), len(receipts), len(txs))
