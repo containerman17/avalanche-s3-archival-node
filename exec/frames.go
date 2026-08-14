@@ -21,8 +21,13 @@ package exec
 // never by capture); SELFDESTRUCT has no hook at this pin. Frames follow
 // execution exactly, so a config that would change them diverges the state root
 // first, which the executor hard-stops on.
+//
+// ONE CALL IS ANNOUNCED TWICE when a stateful precompile calls back into the
+// EVM: see reannounced below. That is a libevm shape, not a capture defect, and
+// collapsing it is what keeps a NativeAssetCall transaction honest.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -87,16 +92,21 @@ func (c *frameCapture) resetTx() {
 //   - the tracer ran but the enter/exit stack did not close, so the open frames
 //     carry gasUsed 0, no output and no error flag. That is INDISTINGUISHABLE
 //     from a real zero-gas success once stored, which makes it exactly the
-//     silent hole the fail-stop exists to refuse. An unbalanced stack cannot
-//     happen at this dependency pin (libevm pairs CaptureEnter with a deferred
-//     CaptureExit), so this guard costs one comparison per transaction and its
-//     whole job is to make a future dep bump loud instead of quiet.
+//     silent hole the fail-stop exists to refuse. The one shape at this pin
+//     that reaches it legitimately is the precompile re-announcement, and
+//     reannounced below folds that away rather than storing it, so anything
+//     still open here is an enter/exit contract this capture does not model.
 func (c *frameCapture) take() (rec []byte, addrs [][]byte, why string) {
 	if !c.armed {
 		return nil, nil, "the frame tracer never ran for this transaction"
 	}
 	if len(c.stack) != 0 {
-		return nil, nil, fmt.Sprintf("the call stack did not close: %d of %d frames never got a CaptureExit", len(c.stack), len(c.cur))
+		// NAME THE FRAME. "some frame never closed" cost a full wrong-turn
+		// diagnosis once; its kind and its two addresses point straight at the
+		// execution path that owes the CaptureExit.
+		f := &c.cur[c.stack[len(c.stack)-1]]
+		return nil, nil, fmt.Sprintf("the call stack did not close: %d of %d frames never got a CaptureExit, innermost is %s from %s to %s at depth %d",
+			len(c.stack), len(c.cur), vm.OpCode(f.kind), f.from, f.to, f.depth)
 	}
 	if len(c.cur) > 0 {
 		rec = binary.AppendUvarint(nil, uint64(len(c.cur)))
@@ -172,15 +182,55 @@ func (l frameLogger) CaptureStart(_ *vm.EVM, from, to common.Address, _ bool, _ 
 
 func (l frameLogger) CaptureEnd([]byte, uint64, error) {}
 
+// reannounced reports whether this CaptureEnter is libevm announcing a call it
+// has ALREADY announced, in which case the frame is already open and pushing a
+// second one would both duplicate a call that happened once and leave the stack
+// one deep at the end of the transaction.
+//
+// THE SHAPE, exactly as pinned (this is what halted mainnet C at 5,456,905, a
+// NativeAssetCall transaction): a stateful precompile that calls back into the
+// EVM goes through libevm's precompile environment, which fires CaptureEnter
+// itself (core/vm/environment.libevm.go:131) and then hands the very same call
+// to evm.call, which fires CaptureEnter again (core/vm/evm.go:230). The
+// environment then closes ITS announcement with CaptureEnd rather than
+// CaptureExit (environment.libevm.go:135), so one of the two enters can never
+// be paired. Only coreth reaches this: nativeasset.NativeAssetCall is the only
+// caller of PrecompileEnvironment.Call in the pinned dependency set.
+//
+// THE TEST IS THE FORWARDED GAS and it cannot false-positive on a real call. A
+// genuine nested call is always given strictly less gas than the frame that
+// makes it, because that frame pays at least the CALL/CREATE opcode's own cost
+// before forwarding and EIP-150 then withholds a 64th. Equal gas, equal
+// participants, equal input and equal value, with no event in between, is only
+// ever the same call named twice.
+func (c *frameCapture) reannounced(typ vm.OpCode, from, to common.Address, input []byte, gas uint64, value []byte) bool {
+	// The open frame must also be the most recent one: anything nested in
+	// between means execution moved on and this is a new call.
+	if len(c.stack) == 0 || c.stack[len(c.stack)-1] != len(c.cur)-1 {
+		return false
+	}
+	f := &c.cur[len(c.cur)-1]
+	return f.kind == byte(typ) && f.gas == gas && f.from == from && f.to == to &&
+		bytes.Equal(c.arena[f.inOff:f.inOff+f.inLen], input) &&
+		bytes.Equal(c.arena[f.valOff:f.valOff+f.valLen], value)
+}
+
 func (l frameLogger) CaptureEnter(typ vm.OpCode, from, to common.Address, input []byte, gas uint64, value *big.Int) {
 	c := l.c
 	c.participant(from)
 	c.participant(to)
-	f := openFrame{kind: byte(typ), depth: byte(len(c.stack)), from: from, to: to, gas: gas}
+	var valBytes []byte
 	if value != nil && value.Sign() != 0 {
+		valBytes = value.Bytes()
+	}
+	if c.reannounced(typ, from, to, input, gas, valBytes) {
+		return
+	}
+	f := openFrame{kind: byte(typ), depth: byte(len(c.stack)), from: from, to: to, gas: gas}
+	if len(valBytes) != 0 {
 		// DELEGATECALL carries the PARENT's value by design: excluded by a
 		// read-time transfer filter, never by capture (DESIGN).
-		f.valOff, f.valLen = c.intern(value.Bytes())
+		f.valOff, f.valLen = c.intern(valBytes)
 	}
 	f.inOff, f.inLen = c.intern(input)
 	c.stack = append(c.stack, len(c.cur))

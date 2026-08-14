@@ -1146,7 +1146,10 @@ func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) err
 	// design refuses to produce.
 	frameRec, frameAddrs, why := frames.take()
 	if why != "" {
-		e.dieOnUncapturedTrace(tx.Hash().String(), why)
+		e.dieOnUncapturedTrace(tx.Hash().String(), why,
+			"The contract this capture models is in exec/frames.go: every CaptureEnter is paired with a CaptureExit, except the "+
+				"precompile re-announcement that reannounced() folds away. A new unpaired shape is an execution path the capture "+
+				"does not model yet: find the frame named above in the pinned libevm before changing anything.")
 	}
 	tw := store.TxWrite{
 		Hash:       tx.Hash().Bytes(),
@@ -1188,19 +1191,22 @@ func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) err
 // accident (DESIGN principles, "traces are stored, and capture failure is
 // death"; user, verbatim: "We can just die... we are going to reach the Fuji
 // C-chain block at a certain height, and we are going to die. And this is
-// okay."). It is reached when a transaction executed without the frame tracer
-// attached, which at this dependency pin means the SAE path: saexec.Execute
-// hardcodes vm.Config{}, so a post-Helicon C-chain block has no tracer seam.
-// The upstream passthrough PR is what unblocks it; until then this death is
-// expected at Fuji C-chain's Helicon activation height and surprises nobody.
-func (e *Executor) dieOnUncapturedTrace(what, why string) {
+// okay.").
+//
+// THE MESSAGE MUST NAME THE CONDITION IT ACTUALLY OBSERVED, and nothing else.
+// It used to assert the saexec seam unconditionally, so when the unbalanced
+// enter/exit guard fired on mainnet C block 5,456,905 (a NativeAssetCall
+// transaction, a chain that CANNOT take the SAE path in this dep set) the
+// message sent the diagnosis a full step down the wrong road. Every caller now
+// supplies both what it saw and what would fix it; this function only frames
+// them.
+func (e *Executor) dieOnUncapturedTrace(what, why, fix string) {
 	log.Fatalf("epochdb: exec: block %d (%s): THE CALL TRACE WAS NOT CAPTURED, so this block cannot be stored.\n"+
 		"  Cause: %s.\n"+
-		"  Cause at this dependency pin: saexec.Execute hardcodes vm.Config{}, so a post-Helicon C-chain block has no tracer seam.\n"+
 		"  This death is the design, written in advance: see DESIGN.md, the principles section, \"TRACES ARE STORED, AND CAPTURE FAILURE IS DEATH\".\n"+
 		"  Frames can never be backfilled by IO, so storing the block without them would produce exactly the corpus that rule forbids.\n"+
-		"  The fix is the upstream vm.Config/tracer passthrough for saexec; L1s and pre-Helicon blocks capture fine today.",
-		e.curHeader.Number, what, why)
+		"  %s",
+		e.curHeader.Number, what, why, fix)
 }
 
 // runEVM applies the block's upgrades and every transaction onto statedb,

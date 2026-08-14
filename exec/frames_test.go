@@ -77,6 +77,29 @@ func TestFrameCaptureRefusesAHoleAndAccountsForAWholeTx(t *testing.T) {
 	if _, _, why := c.take(); why == "" {
 		t.Error("PARTIAL FRAMES ACCEPTED: the call stack never closed and take() reported a good trace")
 	}
+
+	// 5. THE COLLAPSE MUST NOT EAT A REAL CALL. reannounced() folds two enters
+	// into one only when they name the SAME call, and the forwarded gas is what
+	// separates them: a frame's first nested call is always given strictly less
+	// gas than the frame itself. Same participants, same input, one gas apart
+	// is two frames, and the sole real difference from case 4 is the exit.
+	l.CaptureTxStart(21000)
+	l.CaptureStart(nil, common.Address{1}, common.Address{2}, false, nil, 0, nil)
+	l.CaptureEnter(vm.CALL, common.Address{2}, common.Address{3}, []byte("in"), 500, nil)
+	l.CaptureEnter(vm.CALL, common.Address{2}, common.Address{3}, []byte("in"), 499, nil)
+	l.CaptureExit([]byte("inner"), 100, nil)
+	l.CaptureExit([]byte("outer"), 200, nil)
+	rec, _, why = c.take()
+	if why != "" {
+		t.Fatalf("two real calls one gas apart were refused: %s", why)
+	}
+	frames, err = store.DecodeFrames(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 2 || frames[0].Gas != 500 || frames[1].Gas != 499 || frames[1].Depth != 1 {
+		t.Errorf("a real nested call was collapsed into its parent: %+v", frames)
+	}
 }
 
 // A REFUSED TRANSACTION MUST NOT POISON THE NEXT ONE: take() resets on the way

@@ -426,7 +426,8 @@ func (e *Executor) appendSAETxs(bw *store.BlockWrite, blk *types.Block, receipts
 	txs := blk.Transactions()
 	if len(txs) > 0 {
 		e.curHeader = blk.Header()
-		e.dieOnUncapturedTrace("SAE block", "saexec owns the transaction loop and was handed no tracer")
+		e.dieOnUncapturedTrace("SAE block", "saexec.Execute hardcodes vm.Config{}, so it owns the transaction loop and was handed no tracer",
+			"The fix is the upstream vm.Config/tracer passthrough for saexec; L1s and pre-Helicon blocks capture fine today.")
 	}
 	if len(receipts) != len(txs) {
 		return fmt.Errorf("sae block %d: %d receipts for %d txs", blk.NumberU64(), len(receipts), len(txs))
