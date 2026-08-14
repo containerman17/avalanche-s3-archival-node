@@ -21,11 +21,31 @@ import (
 	sstblock "github.com/cockroachdb/pebble/v2/sstable/block"
 )
 
-// StorageVersion is recorded in the manifest. A version bump plus a reindex
-// pass is how a new index family arrives (DESIGN, storage versioning).
-const StorageVersion = 0
+// StorageVersion is recorded in the manifest and in every run's footer.
+//
+// IT IS 1 BECAUSE THE TxNum LAYOUT CHANGED: every block now owns a boundary
+// slot, so the same TxNum names a different thing in a version 0 artifact than
+// it does here. There is NO migration and no compatibility reader anywhere
+// (DESIGN's clean-slate ruling); the bump exists so the handful of already
+// published v0 prefixes are REFUSED BY NAME at join and at open instead of
+// being read with v1 semantics and silently answering the wrong state.
+const StorageVersion = 1
 
 // ---------------------------------------------------------------------------
+// THE ONE DIMENSION IS TxNum, AND EVERY BLOCK OWNS A SLOT OF ITS OWN.
+//
+// A block with `first` and `count` from its blk/ row occupies the slots
+// [first, first+count]: its transactions take first .. first+count-1, and
+// first+count is its BOUNDARY SLOT, which no transaction owns and which carries
+// the state the block wrote outside any transaction (coreth's atomic transfers,
+// a fork activation, block finalisation). The next block starts at
+// first+count+1, so TxNum stays monotone, a run's [FromTx, ToTx) still tiles
+// the space with no gap and routes a lookup by range check alone, and no two
+// blocks can ever share a slot.
+//
+// The tx-keyed families are therefore DENSE PER BLOCK, not dense over the run:
+// tx/, rcpt/ and itx/ have a row at every slot except the boundary ones.
+//
 // KEY SCHEMA (DESIGN, "Storage v0")
 //
 // Chain section, height/TxNum ordered, arrives sorted:

@@ -14,8 +14,10 @@ import (
 
 // testTerminalTxs is the TEST-ONLY terminal boundary (export_test.go): exactly
 // what MergeFanIn of buildCorpus's runs hold, so a test cuts a terminal every
-// sixteen flushes the way mainnet does every 8M transactions.
-const testTerminalTxs = 3 * 2 * MergeFanIn
+// sixteen flushes the way mainnet does every 8M transactions. A run of three
+// blocks holds 3 x (2 txs + ONE BOUNDARY SLOT) = 9 slots, because the boundary
+// is a TxNum like any other and the trigger counts TxNums.
+const testTerminalTxs = 3 * (2 + 1) * MergeFanIn
 
 // buildCorpus fills dir with n L0 runs of 3 blocks each and returns the store.
 // MergeFanIn runs later it merges itself, which is the point.
@@ -63,7 +65,7 @@ func TestMergeIsDeterministic(t *testing.T) {
 	if manA.Runs[0].Name != manB.Runs[0].Name {
 		t.Fatalf("two independent merges of the same blocks disagree:\n  %s\n  %s", manA.Runs[0].Name, manB.Runs[0].Name)
 	}
-	if got, want := RunLabel(manA.Runs[0].Level, manA.Runs[0].FromTx, manA.Runs[0].ToTx), "t-0000000000000000-0000000000000096"; got != want {
+	if got, want := RunLabel(manA.Runs[0].Level, manA.Runs[0].FromTx, manA.Runs[0].ToTx), "t-0000000000000000-0000000000000144"; got != want {
 		t.Fatalf("terminal run label is %q, want %q", got, want)
 	}
 	ba, err := os.ReadFile(filepath.Join(dirA, "cas", manA.Runs[0].Name))
@@ -235,15 +237,30 @@ func TestMergeCrashPoints(t *testing.T) {
 					t.Fatalf("after a kill at %q, header %d: %q %v %v", stage, h, hdr, ok, err)
 				}
 			}
-			// And the merge finishes on the next attempt, landing on the name
-			// a clean run would have produced.
-			if err := db.MaybeMerge(); err != nil {
-				t.Fatalf("after a kill at %q the retry failed: %v", stage, err)
+			// AND EXECUTION CARRIES ON, which is where the retry really has to
+			// happen: a resumed node does not call MaybeMerge, it executes and
+			// flushes. THE NEXT FLUSH MERGES THE SPAN IT FOUND BEFORE IT CUTS A
+			// RUN OF ITS OWN, so the terminal covers the sixteen runs the
+			// boundary names. Merging afterwards instead would swallow the
+			// seventeenth, move every later terminal boundary, and leave this
+			// builder's artifacts unequal to everyone else's forever.
+			h := uint64(3 * MergeFanIn)
+			for i := 0; i < 3; i++ {
+				if err := db.WriteBlock(block(h, 2)); err != nil {
+					t.Fatal(err)
+				}
+				h++
+			}
+			if err := db.Flush(); err != nil {
+				t.Fatalf("after a kill at %q the next flush failed: %v", stage, err)
 			}
 			clean := t.TempDir()
 			ref := buildCorpus(t, clean, MergeFanIn)
 			if got, want := db.Manifest().Runs[0].Name, ref.Manifest().Runs[0].Name; got != want {
 				t.Fatalf("after a kill at %q the retried merge is %s, a clean merge is %s", stage, got, want)
+			}
+			if got := db.Manifest().Runs[0].ToTx; got != testTerminalTxs {
+				t.Fatalf("after a kill at %q the terminal ends at tx %d, the boundary is %d", stage, got, testTerminalTxs)
 			}
 		})
 	}

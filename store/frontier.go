@@ -106,18 +106,16 @@ func (d *DB) MergeFrontier(atTx uint64, fn func(FrontierRow) error) error {
 	return emit()
 }
 
-// TxNumAtEndOf is the highest TxNum that belongs to a block: the bound a
-// frontier at that height merges to. State written outside any transaction
-// lands there too, including in a block with no transactions at all.
+// TxNumAtEndOf is the highest TxNum that belongs to a block: its BOUNDARY SLOT,
+// the one slot past its transactions that every block owns. It is the bound a
+// frontier at that height merges to, and the ceiling every state read at that
+// height uses, because state written outside any transaction lives there.
 func (d *DB) TxNumAtEndOf(height uint64) (uint64, bool, error) {
 	first, count, ok, err := d.BlockTxRange(height)
 	if err != nil || !ok {
 		return 0, ok, err
 	}
-	if count == 0 {
-		return first, true, nil
-	}
-	return first + uint64(count) - 1, true, nil
+	return first + uint64(count), true, nil
 }
 
 // SplitStateKey takes a state row key (without its TxNum suffix) apart into its

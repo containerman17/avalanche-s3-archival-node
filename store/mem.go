@@ -108,7 +108,26 @@ func (c *chainIndex) find(num uint64) (off uint64, n uint32, ok bool) {
 		return 0, 0, false
 	}
 	i := num - c.base
+	if c.off[i] == 0 {
+		return 0, 0, false // a block-boundary slot: this family has no row there
+	}
 	return c.off[i], c.n[i], true
+}
+
+// padTo parks a tx-keyed family at a block's BOUNDARY SLOT, which no
+// transaction owns and which therefore has no tx/, rcpt/ or itx/ row. The
+// entries it appends are ABSENT ones, marked by offset 0: a real row's body
+// always sits past its own 13-byte record header, so 0 is a value no stored row
+// can have. Padding here rather than loosening add() is what keeps the
+// contiguity refusal exact: every number in between still has to arrive.
+func (c *chainIndex) padTo(next uint64) {
+	if !c.set {
+		c.base, c.set = next-1, true
+	}
+	for c.base+uint64(len(c.off)) < next {
+		c.off = append(c.off, 0)
+		c.n = append(c.n, 0)
+	}
 }
 
 func (c *chainIndex) reset() { c.base, c.set, c.off, c.n = 0, false, c.off[:0], c.n[:0] }
@@ -124,6 +143,10 @@ const (
 )
 
 var famPrefix = [6]string{PrefixBlk, PrefixHdr, PrefixItx, PrefixPvm, PrefixRcpt, PrefixTx}
+
+// txKeyedFams are the families keyed by TxNum rather than by height. They are
+// the ones that skip every block-boundary slot.
+var txKeyedFams = [3]int{famItx, famRcpt, famTx}
 
 // window-log record kinds.
 const (
@@ -318,11 +341,21 @@ replay:
 			if !m.started {
 				m.baseHeight, m.started = num, true
 			}
+			// The end record names the next block's first TxNum, so the slot
+			// below it is this block's BOUNDARY SLOT and the tx-keyed families
+			// are parked past it exactly as add() parks them.
+			nt := binary.BigEndian.Uint64(payload)
+			pend = append(pend, func() error {
+				for _, fam := range txKeyedFams {
+					m.chain[fam].padTo(nt)
+				}
+				return nil
+			})
 			if err := commit(); err != nil {
 				return err
 			}
 			m.nextHeight = num + 1
-			m.nextTx = binary.BigEndian.Uint64(payload)
+			m.nextTx = nt
 			good = off
 		default:
 			break replay
@@ -446,9 +479,11 @@ type BlockWrite struct {
 	Txs       []TxWrite
 	Code      map[string][]byte // code blobs first seen in this block, by hash
 	// Tail is state written outside any transaction: a fork upgrade's
-	// activation, coreth's atomic transfers, block finalisation. It lands at
-	// the block's LAST TxNum, or at the TxNum the block would have started at
-	// when it has no transactions of its own.
+	// activation, coreth's atomic transfers, block finalisation. It lands at the
+	// block's own BOUNDARY SLOT, the TxNum past its transactions, which every
+	// block owns whether or not it has any. It is captured at the block's end
+	// drain, so it is the last write of the block and the boundary slot is
+	// therefore the last slot of the block.
 	Tail []StateRow
 }
 
@@ -598,10 +633,13 @@ func (m *memtable) add(b *BlockWrite) error {
 			m.putState(string(k), n, r.Val)
 		}
 	}
-	tailAt := first
-	if len(b.Txs) > 0 {
-		tailAt = first + uint64(len(b.Txs)) - 1
-	}
+	// THE BLOCK-BOUNDARY SLOT, one TxNum per block and no transaction's (Erigon's
+	// pattern). It sits past the block's transactions, it belongs to that block
+	// alone, and it is where state written OUTSIDE any transaction lands. Two
+	// consecutive transaction-less blocks therefore cannot share a TxNum, and a
+	// block-level write cannot overwrite the last transaction's post-image at the
+	// transaction's own number.
+	tailAt := first + uint64(len(b.Txs))
 	for _, r := range b.Tail {
 		k := stateKeyPrefix(r)
 		var kl [2]byte
@@ -611,7 +649,12 @@ func (m *memtable) add(b *BlockWrite) error {
 		}
 		m.putState(string(k), tailAt, r.Val)
 	}
-	m.nextTx = first + uint64(len(b.Txs))
+	// The tx-keyed families hold no row at the boundary slot, so their indexes
+	// are parked past it: the block occupies [first, tailAt] whatever it holds.
+	for _, fam := range txKeyedFams {
+		m.chain[fam].padTo(tailAt + 1)
+	}
+	m.nextTx = tailAt + 1
 	m.nextHeight = b.Height + 1
 	var endVal [8]byte
 	binary.BigEndian.PutUint64(endVal[:], m.nextTx)
@@ -704,13 +747,14 @@ func (m *memtable) readRow(off uint64, n uint32, ok bool) ([]byte, bool, error) 
 }
 
 // putState appends one post-tx row, or REPLACES the row already at that TxNum.
-// A block with no transactions of its own still writes state (an upgrade
-// activation, a coreth atomic tx), and its rows land at the TxNum the block
-// would have started at, which the next such block shares. The post-image at a
-// TxNum is by definition the last write at it, so later wins. The alternative
-// is Erigon's block-boundary pseudo-txnums, which would buy the distinction at
-// the cost of making `tx/<txnum>` non-dense; not worth it until something needs
-// to tell two empty blocks' writes apart.
+// The post-image at a TxNum is by definition the last write at it, so later
+// wins, and the only writer that can hit the same TxNum twice is one
+// transaction (or one block's own tail) writing a key more than once.
+//
+// EVERY BLOCK OWNS A BOUNDARY SLOT of its own, so a block that writes state
+// without any transaction of its own can no longer be overwritten by the next
+// such block: that collision silently destroyed the earlier block's writes, and
+// coreth's atomic import/export transfers land in exactly such blocks.
 func (m *memtable) putState(key string, txnum uint64, val []byte) {
 	h := m.state[key]
 	if n := len(h); n > 0 && h[n-1].txnum == txnum {
@@ -761,6 +805,9 @@ func (m *memtable) eachChain(fam int, fn func(num uint64, val []byte) error) err
 	}
 	c := &m.chain[fam]
 	for i := range c.off {
+		if c.off[i] == 0 {
+			continue // a block-boundary slot: nothing of this family to seal
+		}
 		p := make([]byte, c.n[i])
 		if c.n[i] > 0 {
 			if _, err := m.f.ReadAt(p, int64(c.off[i])); err != nil {

@@ -24,8 +24,11 @@ import (
 //
 //   - the header hash chain: every header's ParentHash is the previous header's
 //     hash, so one head hash pins every header below it;
-//   - TxNum contiguity: each block's `blk/` row starts exactly where the
-//     previous block's ended, so the one dimension has no hole and no overlap;
+//   - TxNum contiguity: each block's `blk/` row starts exactly one slot past
+//     where the previous block ended, so the one dimension has no hole and no
+//     overlap and every slot belongs to exactly one block;
+//   - state rows: a block whose header Root differs from its parent's changed
+//     the state, so it must own a state row inside its own TxNum slots;
 //   - txRoot: derived from the `tx/` rows of the block;
 //   - receiptsRoot and logsBloom: derived from the `rcpt/` rows;
 //   - the `itx/` call frames: one row per transaction, and it decodes;
@@ -43,10 +46,13 @@ import (
 // nested call) and only an ABSENT one is a hole, which is exactly the
 // distinction the store keeps.
 //
-// State roots are layer 1 too and are checked WHERE THEY ARE PRODUCED: the
-// executor hard-stops on any block whose Firewood root differs from the
-// header's, so a corpus that exists has already had every state root verified
-// against consensus math. There is nothing left for this pass to add there.
+// STATE ROOTS THEMSELVES are checked WHERE THEY ARE PRODUCED: the executor
+// hard-stops on any block whose Firewood root differs from the header's, and a
+// JOINED corpus has the frontier build's one root at the height it joined at.
+// Rebuilding every historical root here would mean feeding a throwaway trie in
+// TxNum order out of a family sorted by key, i.e. an external sort of every row
+// in the corpus, so what this pass adds instead is the cheap half that catches
+// a whole class: a block that changed the root and stored nothing for it.
 //
 // A CHECK THAT CANNOT RUN IS A FAILURE, never a pass.
 func verifyMain(args []string) {
@@ -102,7 +108,7 @@ func verifyMain(args []string) {
 	if anchor == (common.Hash{}) {
 		anchored = "UNANCHORED (--from above 1 drops the genesis anchor, so the header chain is only self-consistent)"
 	}
-	log.Printf("epochdb: verify: PASS, %d blocks / %d txs in %s (header chain %s, TxNum contiguity, txRoot, receiptsRoot, logsBloom, frames present, container reassembly)",
+	log.Printf("epochdb: verify: PASS, %d blocks / %d txs in %s (header chain %s, TxNum contiguity, txRoot, receiptsRoot, logsBloom, frames present, state rows present, container reassembly)",
 		blocks, txs, time.Since(start).Round(time.Millisecond), anchored)
 }
 
@@ -140,7 +146,39 @@ func (c *cursor) at(n uint64) ([]byte, error) {
 	return row.Val, nil
 }
 
+// stateSlots is one bit per TxNum slot in the verified range: set means at
+// least one state row sits at that slot. The state family is sorted by KEY, so
+// its TxNums arrive in no order at all and there is nothing to walk in lockstep
+// with the block loop; one bit per slot is the smallest thing that answers "did
+// this block write anything" for every block in one pass (25MB per 200M slots).
+type stateSlots struct {
+	base uint64
+	bits []uint64
+}
+
+func newStateSlots(lo, hi uint64) *stateSlots {
+	return &stateSlots{base: lo, bits: make([]uint64, (hi-lo)/64+1)}
+}
+
+func (s *stateSlots) set(n uint64) {
+	i := n - s.base
+	s.bits[i/64] |= 1 << (i % 64)
+}
+
+func (s *stateSlots) any(lo, hi uint64) bool {
+	for n := lo; n <= hi; n++ {
+		i := n - s.base
+		if i/64 < uint64(len(s.bits)) && s.bits[i/64]&(1<<(i%64)) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs uint64, err error) {
+	if to < from {
+		return 0, 0, nil // an inverted range walks nothing; verifyMain calls that a FAILURE
+	}
 	// The tx-keyed families are bounded by the block range's own TxNums, which
 	// the blk/ rows at either end name.
 	firstTx, _, ok, err := db.BlockTxRange(from)
@@ -157,7 +195,16 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 	if !ok {
 		return 0, 0, fmt.Errorf("block %d: no blk row", to)
 	}
-	lastTx := lastFirst + uint64(lastCount) // exclusive
+	// lastTx is the last block's BOUNDARY SLOT: the end of the tx rows and the
+	// last slot of the whole range.
+	lastTx := lastFirst + uint64(lastCount)
+
+	// The state family in one sequential pass, before the block walk: which
+	// slots carry a row.
+	state := newStateSlots(firstTx, lastTx)
+	if err := db.StateTxNums(firstTx, lastTx, state.set); err != nil {
+		return 0, 0, fmt.Errorf("read the state family over TxNums [%d,%d]: %w", firstTx, lastTx, err)
+	}
 
 	hdrs := newCursor(db, store.PrefixHdr, store.FamHdr, from, to)
 	defer hdrs.stop()
@@ -181,6 +228,7 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 	prevHash := anchor
 	havePrev := anchor != (common.Hash{})
 	wantFirst := firstTx
+	var prevRoot common.Hash
 	for n := from; n <= to; n++ {
 		hdrRLP, err := hdrs.at(n)
 		if err != nil {
@@ -213,7 +261,24 @@ func verifyRange(db *store.DB, from, to uint64, anchor common.Hash) (blocks, txs
 		if first != wantFirst {
 			return blocks, txs, fmt.Errorf("block %d starts at TxNum %d, but the previous block ended at %d", n, first, wantFirst)
 		}
-		wantFirst = first + uint64(count)
+		// A block owns [first, first+count]: its transactions, then its BOUNDARY
+		// SLOT. The next block therefore starts one past that, and every slot in
+		// the range belongs to exactly one block.
+		bound := first + uint64(count)
+		wantFirst = bound + 1
+
+		// STATE ROWS, and this is the only check in layer 1 that reads one. A
+		// block whose header Root differs from its parent's CHANGED STATE, which
+		// is consensus math and not our bookkeeping, so it must own at least one
+		// state row inside its own slots. That is exactly what a block-level
+		// write losing its slot looks like from outside: the block changed the
+		// state and the corpus has nothing to show for it. The first block of the
+		// range has no stored parent root to compare against, so it is exempt.
+		if n > from && h.Root != prevRoot && !state.any(first, bound) {
+			return blocks, txs, fmt.Errorf("block %d changed the state root from %x to %x but wrote no state row in its own TxNum slots [%d,%d]",
+				n, prevRoot, h.Root, first, bound)
+		}
+		prevRoot = h.Root
 
 		list := make(types.Transactions, 0, count)
 		rawTxs := make([][]byte, 0, count)

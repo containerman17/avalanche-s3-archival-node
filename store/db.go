@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,13 @@ import (
 // first, aligned to a block boundary. Both are format constants: the run
 // boundaries are a pure function of chain content, so two builders cut at the
 // same places.
+//
+// THE TX TRIGGER COUNTS SLOTS, and a slot is a transaction OR a block boundary,
+// because TxNum is the dimension and every block owns a boundary slot. So a run
+// holds 500,000 minus its own block count in transactions: at mainnet C's ~16
+// txs/block that is ~6% fewer txs per run, and the same 6% at the terminal
+// boundary. It is still a pure function of chain content, which is all the
+// determinism promise asks of it.
 const (
 	FlushTxs    = 500_000
 	FlushBlocks = 50_000
@@ -70,7 +78,28 @@ func loadManifest(dir string) (*Manifest, error) {
 	if m.StorageVersion != StorageVersion {
 		return nil, fmt.Errorf("store: manifest is storage version %d, this binary is %d", m.StorageVersion, StorageVersion)
 	}
+	if err := m.checkTiling(); err != nil {
+		return nil, err
+	}
 	return m, nil
+}
+
+// checkTiling refuses a run set that does not TILE both dimensions: run i must
+// start exactly where run i-1 ended. Overlapping runs are not a survivable
+// state, they are a state where two readers disagree: the point read walks the
+// runs newest-first and the sequential ChainRows walks them oldest-first, so
+// under an overlap verify validates rows no query will ever return. Merge
+// already refuses such a pair forever; refusing it at open is where the corpus
+// says so out loud instead of serving on.
+func (m *Manifest) checkTiling() error {
+	for i := 1; i < len(m.Runs); i++ {
+		a, b := m.Runs[i-1], m.Runs[i]
+		if b.FromTx != a.ToTx || b.FromHeight != a.ToHeight+1 {
+			return fmt.Errorf("store: runs do not tile: %s covers tx [%d,%d) blocks [%d,%d] and %s starts at tx %d block %d",
+				a.Name, a.FromTx, a.ToTx, a.FromHeight, a.ToHeight, b.Name, b.FromTx, b.FromHeight)
+		}
+	}
+	return nil
 }
 
 // save lands the manifest by tmp+fsync+rename. This IS the publish step: until
@@ -374,6 +403,16 @@ func (d *DB) Flush() error {
 	if !started || nextHeight == baseHeight {
 		return nil
 	}
+	// A MERGE THAT DID NOT FINISH RUNS BEFORE THE NEXT RUN IS CUT. The span is
+	// every L0 since the last terminal, so a crash between the boundary and the
+	// manifest swap would otherwise hand the retry a SEVENTEENTH run: the
+	// terminal would cover more than the boundary says, and every terminal after
+	// it would sit at a different TxNum than another builder's. Byte identity is
+	// the core promise, so the retry happens here, before a new run can widen the
+	// span. It is a manifest scan and a no-op on every ordinary flush.
+	if err := d.MaybeMerge(); err != nil {
+		return err
+	}
 
 	prev := d.chainRoot
 	d.mu.RLock()
@@ -639,7 +678,8 @@ func (d *DB) Pvm(height uint64) ([]byte, bool, error) {
 	return d.chainRow(famPvm, height, true)
 }
 
-// BlockTxRange returns a block's first TxNum and tx count.
+// BlockTxRange returns a block's first TxNum and tx count. The block occupies
+// the slots [first, first+count]: its transactions, then its BOUNDARY SLOT.
 func (d *DB) BlockTxRange(height uint64) (first uint64, count uint32, ok bool, err error) {
 	v, ok, err := d.chainRow(famBlk, height, true)
 	if err != nil || !ok {
@@ -759,6 +799,40 @@ func (d *DB) Code(hash []byte) ([]byte, bool, error) {
 		}
 	}
 	return nil, false, nil
+}
+
+// StateTxNums calls fn with the TxNum of every state row in [lo, hi]: the runs
+// whose range covers it, then the window. It is what layer 1 reads to answer
+// "did this block's state writes actually land at this block's own slots", and
+// it is a SEQUENTIAL PASS of the state family: that family is sorted by key
+// rather than by TxNum, so the numbers arrive in no useful order and the caller
+// collects them. Code rows carry no TxNum and are skipped.
+func (d *DB) StateTxNums(lo, hi uint64, fn func(txnum uint64)) error {
+	for _, r := range d.snapshot() {
+		if r.Footer.ToTx <= lo || r.Footer.FromTx > hi {
+			continue
+		}
+		if err := r.ScanRange(SecState, nil, nil, func(k, _ []byte) bool {
+			if bytes.HasPrefix(k, []byte(PrefixState)) {
+				if n := TxNumOf(k); n >= lo && n <= hi {
+					fn(n)
+				}
+			}
+			return true
+		}); err != nil {
+			return err
+		}
+	}
+	d.mem.mu.RLock()
+	defer d.mem.mu.RUnlock()
+	for _, h := range d.mem.state {
+		for _, e := range h {
+			if e.txnum >= lo && e.txnum <= hi {
+				fn(e.txnum)
+			}
+		}
+	}
+	return nil
 }
 
 // Postings scans one lookup family's posting rows in [loTx, hiTx] ascending.

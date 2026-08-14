@@ -26,47 +26,36 @@ var SentinelStorageRoot = crypto.Keccak256Hash([]byte("epochdb: sentinel storage
 var errOverlayReadOnly = errors.New("epochdb overlay: read-only historical view")
 
 // txCeiling converts a block height into the TxNum ceiling of a read of the
-// state at the END of that block. any=false means no stored row can predate the
-// block, so the read goes straight to the genesis floor.
-//
-// When the block has transactions the ceiling is its last TxNum. When it has
-// none, first is the TxNum the block WOULD have started at, so every row at or
-// below first-1 predates the block and first-1 is exact: no walk down to the
-// nearest writing block is needed.
+// state at the END of that block: the block's BOUNDARY SLOT, which is its last
+// slot and is where anything it wrote outside a transaction lives. One formula
+// for every block, with or without transactions, and that is the whole point of
+// the boundary slot: the old "first-1 when the block has none" excluded exactly
+// the rows such a block had just written.
 //
 // IT IS CACHED IN ONE SLOT, and needs no invalidation: a block's tx range is
 // immutable once the block has landed, so an answer for a height stays true
 // forever. Every account and slot read of one call resolves the same height, so
 // a single slot turns the whole tip workload into one atomic load, which is
 // what keeps this off the descent (and out of the memtable's lock) entirely.
-func (d *DB) txCeiling(height uint64) (at uint64, any bool, err error) {
+func (d *DB) txCeiling(height uint64) (at uint64, err error) {
 	if c := d.ceil.Load(); c != nil && c.height == height {
-		return c.at, c.any, nil
+		return c.at, nil
 	}
-	first, count, ok, err := d.BlockTxRange(height)
+	at, ok, err := d.TxNumAtEndOf(height)
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
 	if !ok {
-		return 0, false, fmt.Errorf("store: block %d is not stored, so it has no state to read", height)
+		return 0, fmt.Errorf("store: block %d is not stored, so it has no state to read", height)
 	}
-	switch {
-	case count > 0:
-		at, any = first+uint64(count)-1, true
-	case first == 0:
-		at, any = 0, false
-	default:
-		at, any = first-1, true
-	}
-	d.ceil.Store(&txCeil{height: height, at: at, any: any})
-	return at, any, nil
+	d.ceil.Store(&txCeil{height: height, at: at})
+	return at, nil
 }
 
 // txCeil is one memoized txCeiling answer.
 type txCeil struct {
 	height uint64
 	at     uint64
-	any    bool
 }
 
 // stateRow is the state-family descent with THE FLAT LATEST-STATE CACHE
@@ -93,18 +82,16 @@ func (d *DB) stateRow(prefix []byte, height, at uint64) ([]byte, bool, error) {
 // Handing the alloc literal here answers a read of such an address with "does
 // not exist".
 func (d *DB) Account(genesis types.GenesisAlloc, addr common.Address, height uint64) (*types.StateAccount, error) {
-	at, any, err := d.txCeiling(height)
+	at, err := d.txCeiling(height)
 	if err != nil {
 		return nil, err
 	}
-	if any {
-		val, ok, err := d.stateRow(AccountPrefix(addr[:]), height, at)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return decodeAccount(val, addr) // empty value = explicit delete, account gone
-		}
+	val, ok, err := d.stateRow(AccountPrefix(addr[:]), height, at)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return decodeAccount(val, addr) // empty value = explicit delete, account gone
 	}
 	// Never written at or below here: the genesis trie-state floor.
 	ga, ok := genesis[addr]
@@ -130,18 +117,16 @@ func (d *DB) Account(genesis types.GenesisAlloc, addr common.Address, height uin
 // (addr, slot) as of the end of block height; nil = zero. A stored empty value
 // is a cleared slot, which the EVM defines as zero.
 func (d *DB) Storage(genesis types.GenesisAlloc, addr common.Address, slot []byte, height uint64) ([]byte, error) {
-	at, any, err := d.txCeiling(height)
+	at, err := d.txCeiling(height)
 	if err != nil {
 		return nil, err
 	}
-	if any {
-		val, ok, err := d.stateRow(SlotPrefix(addr[:], slot), height, at)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return val, nil
-		}
+	val, ok, err := d.stateRow(SlotPrefix(addr[:], slot), height, at)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return val, nil
 	}
 	// Never written at or below here: the genesis trie state.
 	ga, ok := genesis[addr]

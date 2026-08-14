@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
@@ -91,7 +92,7 @@ func TestRoundTrip(t *testing.T) {
 				t.Fatalf("%s: pvm %d: %q %v %v", where, h, pvm, ok, err)
 			}
 			first, n, ok, err := db.BlockTxRange(h)
-			if err != nil || !ok || n != 3 || first != h*3 {
+			if err != nil || !ok || n != 3 || first != h*4 {
 				t.Fatalf("%s: blk %d: %d %d %v %v", where, h, first, n, ok, err)
 			}
 			for i := uint64(0); i < 3; i++ {
@@ -196,7 +197,7 @@ func TestDeterminism(t *testing.T) {
 		// An L0 run is LOCAL FOREVER, so its file is in the local directory and
 		// its name there carries the level and tx range beside the hash.
 		p := cas.LocalPath(m.Runs[0].Name)
-		if want := "l0-0000000000000000-0000000000000030-" + m.Runs[0].Name; filepath.Base(p) != want {
+		if want := "l0-0000000000000000-0000000000000036-" + m.Runs[0].Name; filepath.Base(p) != want {
 			t.Fatalf("L0 run file is %q, want %q", filepath.Base(p), want)
 		}
 		return m.Runs[0].Name, p
@@ -326,8 +327,8 @@ func TestPrevLink(t *testing.T) {
 	if hexName(r1.Footer.Prev) != m.Runs[0].Name {
 		t.Fatalf("second run prev = %s, want %s", hexName(r1.Footer.Prev), m.Runs[0].Name)
 	}
-	if r1.Footer.FromTx != 8 || r1.Footer.ToTx != 16 {
-		t.Fatalf("second run tx range = [%d,%d), want [8,16)", r1.Footer.FromTx, r1.Footer.ToTx)
+	if r1.Footer.FromTx != 12 || r1.Footer.ToTx != 24 {
+		t.Fatalf("second run tx range = [%d,%d), want [12,24)", r1.Footer.FromTx, r1.Footer.ToTx)
 	}
 }
 
@@ -445,8 +446,8 @@ func TestWindowRecovery(t *testing.T) {
 	if got := db2.NextHeight(); got != 5 {
 		t.Fatalf("recovered next height = %d, want 5", got)
 	}
-	if got := db2.NextTx(); got != 15 {
-		t.Fatalf("recovered next tx = %d, want 15", got)
+	if got := db2.NextTx(); got != 20 {
+		t.Fatalf("recovered next tx = %d, want 20", got)
 	}
 	for h := uint64(0); h < 5; h++ {
 		hdr, ok, err := db2.HeaderRLP(h)
@@ -454,19 +455,19 @@ func TestWindowRecovery(t *testing.T) {
 			t.Fatalf("recovered hdr %d: %q %v %v", h, hdr, ok, err)
 		}
 	}
-	v, ok, err := db2.StorageAt(addr(2), hash32(7), 14)
+	v, ok, err := db2.StorageAt(addr(2), hash32(7), 18)
 	if err != nil || !ok || !bytes.Equal(v, []byte{4, 2}) {
 		t.Fatalf("recovered slot: %x %v %v", v, ok, err)
 	}
-	if n, ok, err := db2.TxNumByHash(hash32(42)); err != nil || !ok || n != 14 {
+	if n, ok, err := db2.TxNumByHash(hash32(42)); err != nil || !ok || n != 18 {
 		t.Fatalf("recovered txh: %d %v %v", n, ok, err)
 	}
 	// The recovered window still flushes into a run.
 	if err := db2.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if got := db2.Manifest().Runs[0].ToTx; got != 15 {
-		t.Fatalf("flushed run to_tx = %d, want 15", got)
+	if got := db2.Manifest().Runs[0].ToTx; got != 20 {
+		t.Fatalf("flushed run to_tx = %d, want 20", got)
 	}
 }
 
@@ -535,9 +536,9 @@ func TestFlatCacheNeverStale(t *testing.T) {
 		if !ok || head != h {
 			t.Fatalf("head %d %v after block %d", head, ok, h)
 		}
-		at, any, err := db.txCeiling(head)
-		if err != nil || !any {
-			t.Fatalf("ceiling at %d: %d %v %v", head, at, any, err)
+		at, err := db.txCeiling(head)
+		if err != nil {
+			t.Fatalf("ceiling at %d: %d %v", head, at, err)
 		}
 		// Through the cache and around it must agree, every block.
 		got, gotOK, err := db.stateRow(slot, head, at)
@@ -560,7 +561,7 @@ func TestFlatCacheNeverStale(t *testing.T) {
 		}
 		// A historical read must never be served (or polluted) by the cache.
 		if h > 0 {
-			hAt, _, err := db.txCeiling(h - 1)
+			hAt, err := db.txCeiling(h - 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -795,9 +796,10 @@ func TestResumeOnAFlushBoundaryNeverReappendsSealedRows(t *testing.T) {
 	if err := chainDensity(db, 0, 10); err != nil {
 		t.Fatalf("layer 1 density: %v", err)
 	}
-	// The walk-back consumed no TxNums: 11 blocks of one tx each.
-	if got := db.NextTx(); got != 11 {
-		t.Fatalf("NextTx is %d, want 11: the replayed blocks took TxNums of their own", got)
+	// The walk-back consumed no TxNums: 11 blocks of one tx and one boundary
+	// slot each.
+	if got := db.NextTx(); got != 22 {
+		t.Fatalf("NextTx is %d, want 22: the replayed blocks took TxNums of their own", got)
 	}
 	// And the sealed rows still read back as themselves, not as a second copy.
 	for h := uint64(6); h <= 7; h++ {
@@ -805,8 +807,8 @@ func TestResumeOnAFlushBoundaryNeverReappendsSealedRows(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("blk/%d: %v %v", h, ok, err)
 		}
-		if first != h || count != 1 {
-			t.Fatalf("blk/%d says first=%d count=%d, want first=%d count=1", h, first, count, h)
+		if first != h*2 || count != 1 {
+			t.Fatalf("blk/%d says first=%d count=%d, want first=%d count=1", h, first, count, h*2)
 		}
 	}
 }
@@ -1010,16 +1012,17 @@ func TestReplayKeepsTheTailAboveASealedRun(t *testing.T) {
 	if err := m.flushLocked(); err != nil {
 		t.Fatal(err)
 	}
-	// A run sealed blocks 0..3 (8 txs); the log still holds 0..5.
-	if err := m.recover(8, 4); err != nil {
+	// A run sealed blocks 0..3 (12 slots: 8 txs and 4 boundaries); the log still
+	// holds 0..5.
+	if err := m.recover(12, 4); err != nil {
 		t.Fatal(err)
 	}
 	_, nextTx, baseHeight, nextHeight, started := m.window()
 	if !started || baseHeight != 4 || nextHeight != 6 {
 		t.Fatalf("baseHeight=%d nextHeight=%d started=%v, want 4/6/true", baseHeight, nextHeight, started)
 	}
-	if nextTx != 12 {
-		t.Fatalf("nextTx=%d, want 12: blocks 4 and 5 carry two txs each", nextTx)
+	if nextTx != 18 {
+		t.Fatalf("nextTx=%d, want 18: blocks 4 and 5 carry two txs and a boundary slot each", nextTx)
 	}
 	if _, ok, err := m.chainGet(famHdr, 4); err != nil || !ok {
 		t.Fatalf("hdr/4 did not survive the replay: ok=%v err=%v", ok, err)
@@ -1027,4 +1030,93 @@ func TestReplayKeepsTheTailAboveASealedRun(t *testing.T) {
 	if _, ok, _ := m.chainGet(famHdr, 3); ok {
 		t.Error("hdr/3 replayed even though the run already holds it")
 	}
+}
+
+// TestATxLessBlockKeepsItsOwnStateRows is the mainnet-C defect at unit scale.
+// A BLOCK WITH NO TRANSACTIONS STILL CHANGES STATE: on coreth an atomic import
+// or export moves balances in a block that carries no EVM transaction at all.
+// Before every block owned a boundary slot, such a block's rows landed at the
+// TxNum it WOULD have started at while the read of that height stopped one
+// below it, so the rows were written and never readable; and the next tx-less
+// block reused the same TxNum, so putState replaced the earlier block's writes
+// and they were gone from the corpus for good.
+//
+// The three assertions are the three halves of that: each tx-less block reads
+// back its OWN value, two consecutive ones do not share a slot, and a block's
+// tail write no longer sits on top of its last transaction's post-image.
+func TestATxLessBlockKeepsItsOwnStateRows(t *testing.T) {
+	db, _ := testDB(t)
+	slot := hash32(7)
+	tailRow := func(v byte) []StateRow {
+		return []StateRow{{Kind: 's', Addr: addr(2), Slot: slot, Val: []byte{v}}}
+	}
+	txLess := func(height uint64, v byte) *BlockWrite {
+		b := block(height, 0)
+		b.Tail = tailRow(v)
+		return b
+	}
+	// A normal block, then TWO CONSECUTIVE transaction-less blocks that each
+	// change state, then a block with transactions AND a block-level write.
+	if err := db.WriteBlock(block(0, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteBlock(txLess(1, 0x11)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteBlock(txLess(2, 0x22)); err != nil {
+		t.Fatal(err)
+	}
+	b3 := block(3, 2)
+	b3.Tail = tailRow(0x33)
+	if err := db.WriteBlock(b3); err != nil {
+		t.Fatal(err)
+	}
+
+	// The two tx-less blocks own DIFFERENT slots, which is the whole fix.
+	end1, _, err := db.TxNumAtEndOf(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	end2, _, err := db.TxNumAtEndOf(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end1 == end2 {
+		t.Fatalf("blocks 1 and 2 both end at TxNum %d, so one of them cannot store anything", end1)
+	}
+
+	check := func(where string) {
+		t.Helper()
+		for _, tc := range []struct {
+			height uint64
+			want   byte
+		}{{1, 0x11}, {2, 0x22}, {3, 0x33}} {
+			got, err := db.Storage(nil, common.BytesToAddress(addr(2)), slot, tc.height)
+			if err != nil {
+				t.Fatalf("%s: read slot at block %d: %v", where, tc.height, err)
+			}
+			if len(got) != 1 || got[0] != tc.want {
+				t.Fatalf("%s: slot at the end of block %d is %x, want %02x: that block's own write is not readable at its own height",
+					where, tc.height, got, tc.want)
+			}
+		}
+		// The block-level write is the block's LAST write and no earlier one:
+		// the last transaction's own post-image still answers at its own TxNum.
+		first, count, ok, err := db.BlockTxRange(3)
+		if err != nil || !ok {
+			t.Fatalf("%s: blk/3: %v %v", where, ok, err)
+		}
+		v, ok, err := db.StorageAt(addr(2), slot, first+uint64(count)-1)
+		if err != nil || !ok {
+			t.Fatalf("%s: slot at block 3's last tx: %v %v", where, ok, err)
+		}
+		if !bytes.Equal(v, []byte{3, 1}) {
+			t.Fatalf("%s: block 3's last transaction reads back %x, want 0301: the tail overwrote it", where, v)
+		}
+	}
+	check("window")
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	check("run")
 }

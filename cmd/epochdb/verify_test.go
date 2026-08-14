@@ -2,6 +2,7 @@ package main
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ava-labs/libevm/common"
@@ -24,8 +25,10 @@ import (
 // or fails everything.
 
 // verifyCorpus writes nBlocks blocks of nTxs transactions each and returns the
-// open DB.
-func verifyCorpus(t *testing.T, nBlocks, nTxs int) *store.DB {
+// open DB. When tail is non-nil every block CHANGES ITS STATE ROOT and stores
+// whatever tail returns as its block-level write, which is the coreth
+// atomic-transfer shape: a block that moves balances outside any transaction.
+func verifyCorpus(t *testing.T, nBlocks, nTxs int, tail func(h int) []store.StateRow) *store.DB {
 	t.Helper()
 	dir := t.TempDir()
 	cas, err := dist.Local(dir)
@@ -73,11 +76,17 @@ func verifyCorpus(t *testing.T, nBlocks, nTxs int) *store.DB {
 			ReceiptHash: types.DeriveSha(receipts, trie.NewStackTrie(nil)),
 			Bloom:       types.CreateBloom(receipts),
 		}
+		if tail != nil {
+			hdr.Root = common.Hash{byte(h + 1)}
+		}
 		hdrRLP, err := rlp.EncodeToBytes(hdr)
 		if err != nil {
 			t.Fatal(err)
 		}
 		bw := &store.BlockWrite{Height: uint64(h), HeaderRLP: hdrRLP, Code: map[string][]byte{}}
+		if tail != nil {
+			bw.Tail = tail(h)
+		}
 
 		var txRLPs [][]byte
 		for i, tx := range txs {
@@ -137,7 +146,7 @@ func frameRec(t *testing.T, seed byte) []byte {
 }
 
 func TestVerifyRangeWalksARealCorpus(t *testing.T) {
-	db := verifyCorpus(t, 6, 3)
+	db := verifyCorpus(t, 6, 3, nil)
 
 	// Unanchored on purpose: this corpus has no chain root behind it, and the
 	// header chain still has to link block to block.
@@ -166,7 +175,7 @@ func TestVerifyRangeWalksARealCorpus(t *testing.T) {
 // A BAD ANCHOR MUST FAIL. The genesis hash is the trust anchor, and block 0's
 // ParentHash is where it is spent; nothing else in the pass looks at it.
 func TestVerifyRangeRefusesAWrongAnchor(t *testing.T) {
-	db := verifyCorpus(t, 3, 2)
+	db := verifyCorpus(t, 3, 2, nil)
 	if _, _, err := verifyRange(db, 0, 2, common.Hash{0xAA}); err == nil {
 		t.Fatal("a corpus that does not chain to the anchor passed layer 1")
 	}
@@ -175,12 +184,52 @@ func TestVerifyRangeRefusesAWrongAnchor(t *testing.T) {
 // AN EMPTY RANGE PROVES NOTHING, which is why verifyMain refuses a zero-block
 // result rather than printing PASS.
 func TestVerifyRangeOverAnEmptyRangeWalksNothing(t *testing.T) {
-	db := verifyCorpus(t, 3, 2)
+	db := verifyCorpus(t, 3, 2, nil)
 	blocks, _, err := verifyRange(db, 2, 1, common.Hash{})
 	if err != nil {
 		t.Fatalf("an inverted range errored instead of walking nothing: %v", err)
 	}
 	if blocks != 0 {
 		t.Fatalf("walked %d blocks over an inverted range", blocks)
+	}
+}
+
+// A BLOCK THAT CHANGED THE STATE ROOT AND STORED NOTHING IS A FAILURE, and this
+// is the check layer 1 did not have: before it, verify never read a state row
+// at all, so a block whose writes went to a TxNum another block owned passed
+// silently and served the wrong history forever. The header roots are the
+// oracle: they are consensus math, and they say the state moved.
+func TestVerifyCatchesAStateChangeWithNoRows(t *testing.T) {
+	row := func(v byte) []store.StateRow {
+		return []store.StateRow{{Kind: 's', Addr: make([]byte, 20), Slot: make([]byte, 32), Val: []byte{v}}}
+	}
+	// Transaction-less blocks that each move the root: every one of them writes.
+	ok := verifyCorpus(t, 4, 0, func(h int) []store.StateRow { return row(byte(h)) })
+	if _, _, err := verifyRange(ok, 0, 3, common.Hash{}); err != nil {
+		t.Fatalf("a corpus whose tx-less blocks all stored their writes failed layer 1: %v", err)
+	}
+
+	// The same corpus with block 2's write missing, which is exactly what the
+	// lost boundary slot produced.
+	bad := verifyCorpus(t, 4, 0, func(h int) []store.StateRow {
+		if h == 2 {
+			return nil
+		}
+		return row(byte(h))
+	})
+	_, _, err := verifyRange(bad, 0, 3, common.Hash{})
+	if err == nil {
+		t.Fatal("a block that changed the state root and stored no state row passed layer 1")
+	}
+	if !strings.Contains(err.Error(), "block 2") {
+		t.Fatalf("layer 1 failed on the wrong block: %v", err)
+	}
+
+	// It must survive a flush: the same rows read back out of a sealed run.
+	if err := ok.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := verifyRange(ok, 0, 3, common.Hash{}); err != nil {
+		t.Fatalf("the same corpus failed layer 1 once sealed into a run: %v", err)
 	}
 }
