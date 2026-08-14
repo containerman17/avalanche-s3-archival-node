@@ -107,3 +107,24 @@ func TestServeBindsBeforeStartupWork(t *testing.T) {
 		t.Fatalf("the port collision took %s to surface", d)
 	}
 }
+
+// A node that is polling hard and landing nothing must not read like an idle
+// one. The counters that tell the two apart are absent while they are zero
+// (gunz, 2026-08-14: 20 minutes of zero blocks with nothing in the log).
+func TestStalledFetchIsVisible(t *testing.T) {
+	healthy := statusLine(epochdb.Status{Head: 100, Fetched: 100, Executed: 100})
+	if strings.Contains(healthy, "pruned_seeds") {
+		t.Fatalf("a healthy line grew a counter: %s", healthy)
+	}
+	stalled := statusLine(epochdb.Status{Head: 100, Fetched: 12, Executed: 12, PrunedSeeds: 4070, BadLinks: 2})
+	if !strings.Contains(stalled, "pruned_seeds=4070") || !strings.Contains(stalled, "bad_links=2") {
+		t.Fatalf("a stalled fetch is invisible in the log: %s", stalled)
+	}
+	b, err := json.Marshal(serveStatusOf(epochdb.Status{PrunedSeeds: 4070}, "C"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"prunedSeeds":4070`) {
+		t.Fatalf("/status hides the stall: %s", b)
+	}
+}

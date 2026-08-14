@@ -63,6 +63,12 @@ const (
 	fetchSpans = 16
 	// pollFanout is how many peers one height-resolution poll asks.
 	pollFanout = 4
+	// seedStallAfter is how long a height may resist being seeded before the
+	// log says so, and seedStallEvery the repeat. Ten seconds is longer than
+	// any healthy seed (a poll round is one 5s request timeout at worst) and
+	// short enough that an operator watching a start sees it immediately.
+	seedStallAfter = 10 * time.Second
+	seedStallEvery = time.Minute
 )
 
 // Queue is the bounded RAM handoff between the fetcher and the executor, and
@@ -437,12 +443,34 @@ func (f *Fetcher) fetchSpan(ctx context.Context, s span) (spanResult, bool) {
 // its LAST ACCEPTED id instead (the documented fallback in sendChits), which
 // is detectable for free because the container says what height it is; that
 // candidate is dropped and the next one tried.
+//
+// IT SAYS SO WHEN IT CANNOT SEED (2026-08-14, after step, dexalot and gunz).
+// When EVERY peer serves the pruned fallback at h this loop cannot terminate,
+// and it used to spin in complete silence: gunz sat at polls_ok=4,070 and zero
+// containers for 20 minutes, and the only visible symptom was the executor
+// repeating "waiting for block N". A node that cannot make progress must never
+// read like a node with nothing to do, so the loop keeps trying (a peer that
+// has the height can connect at any moment) and says what it is seeing, with
+// the height, on a cadence an operator will notice. It does NOT kill the
+// process: the height is unavailable from these peers, and a restart would
+// come back to exactly the same peers.
 func (f *Fetcher) seedSpan(ctx context.Context, h uint64) (ancestorsResponse, ids.ID, bool) {
+	var (
+		rounds   int
+		pruned   int
+		unpolled int
+		warned   bool
+		nextLog  = time.Now().Add(seedStallAfter)
+	)
 	for {
 		if ctx.Err() != nil {
 			return ancestorsResponse{}, ids.Empty, false
 		}
-		for _, id := range f.pollIDAt(ctx, h) {
+		candidates := f.pollIDAt(ctx, h)
+		if len(candidates) == 0 {
+			unpolled++
+		}
+		for _, id := range candidates {
 			resp, _, ok := f.fetchAncestors(ctx, id)
 			if !ok {
 				return ancestorsResponse{}, ids.Empty, false
@@ -454,10 +482,23 @@ func (f *Fetcher) seedSpan(ctx context.Context, h uint64) (ancestorsResponse, id
 			if p.blockNumber != h {
 				// The pruned-peer fallback, in the wild.
 				f.prunedSeeds.Add(1)
+				pruned++
 				continue
+			}
+			if warned {
+				log.Printf("fetch: height %d seeded at last after %d poll rounds", h, rounds+1)
 			}
 			return resp, id, true
 		}
+		rounds++
+		if time.Now().Before(nextLog) {
+			continue
+		}
+		log.Printf("fetch: STALLED: no peer will serve height %d. %d poll rounds, %d answers were the pruned fallback "+
+			"(the peer's own last accepted block, i.e. it no longer has this height), %d rounds nobody answered at all, %d archival peers connected. "+
+			"Nothing will be fetched until a peer that still holds this height connects.",
+			h, rounds, pruned, unpolled, f.pool.archivalCount())
+		warned, nextLog = true, time.Now().Add(seedStallEvery)
 	}
 }
 

@@ -359,6 +359,14 @@ type Status struct {
 	// pre-execution touches disk, so this is the whole cost of being ahead.
 	QueueBytes     uint64
 	PeakQueueBytes uint64
+	// PrunedSeeds and BadLinks are the two ways the fetch can be BUSY AND
+	// GETTING NOWHERE: peers answering a height poll with their own last
+	// accepted block because they pruned the height, and spans thrown away
+	// because a container did not link to the one below it. Both were visible
+	// only in `dev exec` until 2026-08-14, so a node that could not seed a
+	// height looked exactly like a node with nothing to do.
+	PrunedSeeds uint64
+	BadLinks    uint64
 }
 
 func (n *Node) Status() Status {
@@ -376,6 +384,7 @@ func (n *Node) Status() Status {
 	if n.fetcher != nil {
 		p := n.fetcher.Progress()
 		s.Fetched, s.QueueBytes, s.PeakQueueBytes = p.Head, p.QueueBytes, p.PeakBytes
+		s.PrunedSeeds, s.BadLinks = p.PrunedSeeds, p.BadLinks
 	}
 	if s.Backfill {
 		s.Head = n.fetcher.SyncTarget()

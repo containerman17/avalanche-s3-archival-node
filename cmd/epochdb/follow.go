@@ -273,6 +273,13 @@ type serveStatus struct {
 	// fetch running ahead of the executor.
 	QueueBytes     uint64 `json:"queueBytes,omitempty"`
 	PeakQueueBytes uint64 `json:"peakQueueBytes,omitempty"`
+	// The fetch-plane equivalents of the cache failures above: a node that is
+	// polling hard and landing nothing. PrunedSeeds counts peers answering a
+	// height poll with their own last accepted block (they pruned the height),
+	// BadLinks spans discarded for not linking. Both omitempty, so a healthy
+	// answer is byte-identical to what it always was.
+	PrunedSeeds uint64 `json:"prunedSeeds,omitempty"`
+	BadLinks    uint64 `json:"badLinks,omitempty"`
 }
 
 // statusOf builds that answer. n is nil between the bind and the moment the
@@ -351,12 +358,19 @@ func statusLine(s epochdb.Status) string {
 	line := fmt.Sprintf("%s fetched=%d executed=%d served=%d cooked=%d settled=%d exec_lag=%s tail=%d/%.1fMB queue=%.0f/%.0fMB",
 		lead, s.Fetched, s.Executed, s.Served, s.Flushed, s.Settled, lag, s.Runs, float64(s.Bytes)/1e6,
 		float64(s.QueueBytes)/1e6, float64(s.PeakQueueBytes)/1e6)
+	// The two counters that separate "fetching nothing because there is
+	// nothing to fetch" from "fetching nothing because no peer will serve
+	// it". Absent while both are zero, so a healthy line is unchanged.
+	if s.PrunedSeeds|s.BadLinks != 0 {
+		line += fmt.Sprintf(" pruned_seeds=%d bad_links=%d", s.PrunedSeeds, s.BadLinks)
+	}
 	return line
 }
 
 func serveStatusOf(s epochdb.Status, chain string) serveStatus {
 	out := serveStatus{Chain: chain, Serving: true, Executed: s.Executed, Cooked: s.Flushed,
-		Fetched: s.Fetched, QueueBytes: s.QueueBytes, PeakQueueBytes: s.PeakQueueBytes}
+		Fetched: s.Fetched, QueueBytes: s.QueueBytes, PeakQueueBytes: s.PeakQueueBytes,
+		PrunedSeeds: s.PrunedSeeds, BadLinks: s.BadLinks}
 	if s.Backfill {
 		out.Target = s.Head
 	} else {
