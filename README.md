@@ -216,9 +216,15 @@ One process, four surfaces over one core query layer, none stacked on another:
 - **The Go library.** `epochdb.Open(ctx, epochdb.Config{...})` starts the same full node `serve`
   runs and hands back `Head`, `StateAt`, `CallAt`, `TraceTx`, `Core()` and `Store()`, with nothing
   serialized on the way. `serve` is a thin main over it.
-- **gRPC** on `--grpc-port`: `GetHead`, `StreamHeads`, `GetBlock`, `GetTransaction`, `Call`,
-  `GetState`, `SearchTransactionsByAddress`, `GetLogs`. Proto and generated code in `grpcapi/`.
-- **Plain HTTP** at `/v0/<method>`: the same method set, parameters in any form, JSON out.
+- **gRPC** on `--grpc-port`, the primary remote API, and it covers the whole capability set:
+  `GetHead`, `StreamHeads`, `GetNodeInfo`, `GetBlock`, `GetTransaction`, `GetState`, `Call`,
+  `EstimateGas`, `Trace`, `GetLogs`, `StreamLogs`, `StreamTransactions`,
+  `SearchTransactionsByAddress`, `GetContractCreator`, `GetFeeHistory`, `GetGasPrice`. Streams
+  replace the install-and-poll filter model, and `GetNodeInfo` publishes every capability this node
+  refuses by design, with the reason. Proto and generated code in `grpcapi/`.
+- **Plain HTTP** at `/v0/<method>`: the browser-debuggable subset (`head`, `getBlock`,
+  `getTransaction`, `call`, `getState`, `searchTransactionsByAddress`, `getLogs`), parameters in any
+  form, JSON out.
 
   ```
   curl 'localhost:9650/v0/getBlock?number=1036467'

@@ -364,9 +364,19 @@ func (s *Server) otsTxBySenderAndNonce(params []json.RawMessage) (any, *rpcError
 	if rerr != nil {
 		return nil, rerr
 	}
+	hash, found, rerr := s.txBySenderAndNonce(sender, nonce)
+	if rerr != nil || !found {
+		return nil, rerr // a null is "this account never sent that nonce"
+	}
+	return &hash, nil
+}
+
+// txBySenderAndNonce is the core-layer half: found=false is the clean "no such
+// transaction on this chain".
+func (s *Server) txBySenderAndNonce(sender common.Address, nonce uint64) (common.Hash, bool, *rpcError) {
 	head, ok := s.otsHeadTx()
 	if !ok {
-		return nil, nil
+		return common.Hash{}, false, nil
 	}
 	var (
 		found *common.Hash
@@ -376,9 +386,9 @@ func (s *Server) otsTxBySenderAndNonce(params []json.RawMessage) (any, *rpcError
 		if role&store.RoleSender == 0 {
 			return true
 		}
-		tx, rerr := s.txAt(num)
-		if rerr != nil {
-			fail = rerr
+		tx, terr := s.txAt(num)
+		if terr != nil {
+			fail = terr
 			return false
 		}
 		switch {
@@ -391,15 +401,15 @@ func (s *Server) otsTxBySenderAndNonce(params []json.RawMessage) (any, *rpcError
 		return false // at or past the target: nonces never come back down
 	})
 	if err != nil {
-		return nil, &rpcError{Code: -32000, Message: err.Error()}
+		return common.Hash{}, false, &rpcError{Code: -32000, Message: err.Error()}
 	}
 	if fail != nil {
-		return nil, fail
+		return common.Hash{}, false, fail
 	}
 	if found == nil {
-		return nil, nil
+		return common.Hash{}, false, nil
 	}
-	return found, nil
+	return *found, true, nil
 }
 
 // txAt decodes one transaction by TxNum without assembling its block.
@@ -442,6 +452,16 @@ func (s *Server) otsContractCreator(params []json.RawMessage) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
+	out, rerr := s.contractCreator(addr)
+	if rerr != nil || out == nil {
+		return nil, rerr // a null is "not a contract on this chain"
+	}
+	return out, nil
+}
+
+// contractCreator is the core-layer half. out == nil is the clean "no contract
+// at this address", never a read failure.
+func (s *Server) contractCreator(addr common.Address) (*otsCreator, *rpcError) {
 	head, ok := s.otsHeadTx()
 	if !ok {
 		return nil, nil
@@ -517,9 +537,6 @@ func (s *Server) otsContractCreator(params []json.RawMessage) (any, *rpcError) {
 	}
 	if fail != nil {
 		return nil, fail
-	}
-	if out == nil {
-		return nil, nil
 	}
 	return out, nil
 }

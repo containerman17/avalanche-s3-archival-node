@@ -99,32 +99,59 @@ var (
 // the base fee doubled used to be the CURRENT head's rather than the next
 // block's, since nothing projected one.
 func (s *Server) suggestPriceOptions() (any, *rpcError) {
-	base, rerr := s.nextBaseFee(s.head())
+	p, rerr := s.gasPrices()
 	if rerr != nil {
 		return nil, rerr
 	}
-	if base == nil {
+	if p.Slow == nil {
 		return nil, nil // pre-dynamic-fee head: coreth returns null too
 	}
-	estimate, rerr := s.suggestTip()
+	price := func(o *PriceOption) *priceOption {
+		return &priceOption{
+			GasTip: (*hexutil.Big)(o.MaxPriorityFee),
+			GasFee: (*hexutil.Big)(o.MaxFee),
+		}
+	}
+	return &priceOptions{Slow: price(p.Slow), Normal: price(p.Normal), Fast: price(p.Fast)}, nil
+}
+
+// gasPrices is the core-layer fee answer: the whole gas-price surface
+// (eth_gasPrice, eth_maxPriorityFeePerGas, eth_baseFee and coreth's three
+// speed options) out of ONE sample, so no two of them can disagree.
+func (s *Server) gasPrices() (*GasPrices, *rpcError) {
+	price, rerr := s.gasOracle()
 	if rerr != nil {
 		return nil, rerr
 	}
-	capped := math.BigMin(estimate, priceOptMaxTip)
-
+	tip, rerr := s.suggestTip()
+	if rerr != nil {
+		return nil, rerr
+	}
+	head := s.head()
+	baseNow, rerr := s.baseFeeAt(head)
+	if rerr != nil {
+		return nil, rerr
+	}
+	base, rerr := s.nextBaseFee(head)
+	if rerr != nil {
+		return nil, rerr
+	}
+	out := &GasPrices{GasPrice: price, MaxPriorityFee: tip, BaseFee: baseNow, NextBaseFee: base}
+	if base == nil {
+		return out, nil // pre-dynamic-fee head: there are no speed options
+	}
+	capped := math.BigMin(tip, priceOptMaxTip)
 	slow := new(big.Int).Div(new(big.Int).Mul(capped, priceOptSlowPct), priceOptDenom)
 	slow = math.BigMax(slow, priceOptMinTip)
 	normal := new(big.Int).Set(capped)
-	fast := new(big.Int).Div(new(big.Int).Mul(estimate, priceOptFastPct), priceOptDenom)
+	fast := new(big.Int).Div(new(big.Int).Mul(tip, priceOptFastPct), priceOptDenom)
 
-	base = new(big.Int).Lsh(base, 1)
-	price := func(tip *big.Int) *priceOption {
-		return &priceOption{
-			GasTip: (*hexutil.Big)(tip),
-			GasFee: (*hexutil.Big)(new(big.Int).Add(base, tip)),
-		}
+	doubled := new(big.Int).Lsh(base, 1)
+	opt := func(t *big.Int) *PriceOption {
+		return &PriceOption{MaxPriorityFee: t, MaxFee: new(big.Int).Add(doubled, t)}
 	}
-	return &priceOptions{Slow: price(slow), Normal: price(normal), Fast: price(fast)}, nil
+	out.Slow, out.Normal, out.Fast = opt(slow), opt(normal), opt(fast)
+	return out, nil
 }
 
 // --- eth_getChainConfig / debug_chainConfig -----------------------------------

@@ -8,11 +8,23 @@
 // to access it"). It is a PEER adapter over the core query layer (rpc.Server's
 // direct methods), never a proxy to JSON-RPC.
 //
+// IT COVERS THE WHOLE CAPABILITY SET. Everything the node can actually do is
+// reachable here; the JSON-RPC surface's 90-odd method spellings collapse onto
+// these methods because most of that count is spelling variety over one
+// primitive (by-number and by-hash, filter-install plus poll, four names for
+// the same fee answer). What is NOT here is the permanent refusal set, and it
+// is not here BY ABSENCE PLUS A NAMED REASON: GetNodeInfo lists every refused
+// capability with the reason, and calling one of them is Unimplemented rather
+// than a plausible empty answer (DESIGN: "null means not on this chain, never
+// I could not read it").
+//
 // BYTES ARE VERBATIM CONSENSUS RLP wherever the corpus stores RLP: a header, a
-// transaction. Nothing is re-serialized into a field-by-field shape that could
-// disagree with the stored bytes, and a caller that wants fields decodes with
-// the EVM library it already links. Numbers that are not RLP (heights, TxNums,
-// gas) are plain integers, and big integers travel as big-endian bytes.
+// transaction, a container. Nothing is re-serialized into a field-by-field
+// shape that could disagree with the stored bytes, and a caller that wants
+// fields decodes with the EVM library it already links. Numbers that are not
+// RLP (heights, TxNums, gas) are plain integers, and big integers travel as
+// big-endian bytes. A TRACER'S CONFIG AND RESULT ARE JSON, verbatim, because
+// that is what a geth tracer takes and emits.
 
 package grpcapi
 
@@ -31,12 +43,20 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	EpochDB_GetHead_FullMethodName                     = "/epochdb.v0.EpochDB/GetHead"
 	EpochDB_StreamHeads_FullMethodName                 = "/epochdb.v0.EpochDB/StreamHeads"
+	EpochDB_GetNodeInfo_FullMethodName                 = "/epochdb.v0.EpochDB/GetNodeInfo"
 	EpochDB_GetBlock_FullMethodName                    = "/epochdb.v0.EpochDB/GetBlock"
 	EpochDB_GetTransaction_FullMethodName              = "/epochdb.v0.EpochDB/GetTransaction"
-	EpochDB_Call_FullMethodName                        = "/epochdb.v0.EpochDB/Call"
 	EpochDB_GetState_FullMethodName                    = "/epochdb.v0.EpochDB/GetState"
-	EpochDB_SearchTransactionsByAddress_FullMethodName = "/epochdb.v0.EpochDB/SearchTransactionsByAddress"
+	EpochDB_Call_FullMethodName                        = "/epochdb.v0.EpochDB/Call"
+	EpochDB_EstimateGas_FullMethodName                 = "/epochdb.v0.EpochDB/EstimateGas"
+	EpochDB_Trace_FullMethodName                       = "/epochdb.v0.EpochDB/Trace"
 	EpochDB_GetLogs_FullMethodName                     = "/epochdb.v0.EpochDB/GetLogs"
+	EpochDB_StreamLogs_FullMethodName                  = "/epochdb.v0.EpochDB/StreamLogs"
+	EpochDB_StreamTransactions_FullMethodName          = "/epochdb.v0.EpochDB/StreamTransactions"
+	EpochDB_SearchTransactionsByAddress_FullMethodName = "/epochdb.v0.EpochDB/SearchTransactionsByAddress"
+	EpochDB_GetContractCreator_FullMethodName          = "/epochdb.v0.EpochDB/GetContractCreator"
+	EpochDB_GetFeeHistory_FullMethodName               = "/epochdb.v0.EpochDB/GetFeeHistory"
+	EpochDB_GetGasPrice_FullMethodName                 = "/epochdb.v0.EpochDB/GetGasPrice"
 )
 
 // EpochDBClient is the client API for EpochDB service.
@@ -48,12 +68,29 @@ type EpochDBClient interface {
 	// StreamHeads pushes one HeadResponse per new block until the caller goes
 	// away.
 	StreamHeads(ctx context.Context, in *HeadRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[HeadResponse], error)
+	// GetNodeInfo is the chain, the build, the sync state and the refusal list.
+	GetNodeInfo(ctx context.Context, in *NodeInfoRequest, opts ...grpc.CallOption) (*NodeInfoResponse, error)
 	GetBlock(ctx context.Context, in *BlockRequest, opts ...grpc.CallOption) (*BlockResponse, error)
 	GetTransaction(ctx context.Context, in *TransactionRequest, opts ...grpc.CallOption) (*TransactionResponse, error)
-	Call(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*CallResponse, error)
 	GetState(ctx context.Context, in *StateRequest, opts ...grpc.CallOption) (*StateResponse, error)
-	SearchTransactionsByAddress(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
+	Call(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*CallResponse, error)
+	EstimateGas(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*EstimateGasResponse, error)
+	// Trace re-executes a transaction, a block or a call under a named tracer.
+	Trace(ctx context.Context, in *TraceRequest, opts ...grpc.CallOption) (*TraceResponse, error)
 	GetLogs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (*LogsResponse, error)
+	// StreamLogs REPLACES the whole poll-and-filter-id model: there is nothing
+	// to install and nothing to uninstall, the stream IS the filter, and
+	// cancelling it is uninstalling it.
+	StreamLogs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogsResponse], error)
+	// StreamTransactions pushes each new block's transactions. There is no
+	// mempool on this node, so these are ACCEPTED transactions, never pending
+	// ones.
+	StreamTransactions(ctx context.Context, in *StreamTransactionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TransactionBatch], error)
+	SearchTransactionsByAddress(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
+	GetContractCreator(ctx context.Context, in *ContractCreatorRequest, opts ...grpc.CallOption) (*ContractCreatorResponse, error)
+	GetFeeHistory(ctx context.Context, in *FeeHistoryRequest, opts ...grpc.CallOption) (*FeeHistoryResponse, error)
+	// GetGasPrice is the whole fee-suggestion surface out of one sample.
+	GetGasPrice(ctx context.Context, in *GasPriceRequest, opts ...grpc.CallOption) (*GasPriceResponse, error)
 }
 
 type epochDBClient struct {
@@ -93,6 +130,16 @@ func (c *epochDBClient) StreamHeads(ctx context.Context, in *HeadRequest, opts .
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type EpochDB_StreamHeadsClient = grpc.ServerStreamingClient[HeadResponse]
 
+func (c *epochDBClient) GetNodeInfo(ctx context.Context, in *NodeInfoRequest, opts ...grpc.CallOption) (*NodeInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NodeInfoResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetNodeInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *epochDBClient) GetBlock(ctx context.Context, in *BlockRequest, opts ...grpc.CallOption) (*BlockResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BlockResponse)
@@ -113,16 +160,6 @@ func (c *epochDBClient) GetTransaction(ctx context.Context, in *TransactionReque
 	return out, nil
 }
 
-func (c *epochDBClient) Call(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*CallResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CallResponse)
-	err := c.cc.Invoke(ctx, EpochDB_Call_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *epochDBClient) GetState(ctx context.Context, in *StateRequest, opts ...grpc.CallOption) (*StateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateResponse)
@@ -133,10 +170,30 @@ func (c *epochDBClient) GetState(ctx context.Context, in *StateRequest, opts ...
 	return out, nil
 }
 
-func (c *epochDBClient) SearchTransactionsByAddress(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
+func (c *epochDBClient) Call(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*CallResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(SearchResponse)
-	err := c.cc.Invoke(ctx, EpochDB_SearchTransactionsByAddress_FullMethodName, in, out, cOpts...)
+	out := new(CallResponse)
+	err := c.cc.Invoke(ctx, EpochDB_Call_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) EstimateGas(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*EstimateGasResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EstimateGasResponse)
+	err := c.cc.Invoke(ctx, EpochDB_EstimateGas_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) Trace(ctx context.Context, in *TraceRequest, opts ...grpc.CallOption) (*TraceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TraceResponse)
+	err := c.cc.Invoke(ctx, EpochDB_Trace_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +210,84 @@ func (c *epochDBClient) GetLogs(ctx context.Context, in *LogsRequest, opts ...gr
 	return out, nil
 }
 
+func (c *epochDBClient) StreamLogs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &EpochDB_ServiceDesc.Streams[1], EpochDB_StreamLogs_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[LogsRequest, LogsResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EpochDB_StreamLogsClient = grpc.ServerStreamingClient[LogsResponse]
+
+func (c *epochDBClient) StreamTransactions(ctx context.Context, in *StreamTransactionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TransactionBatch], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &EpochDB_ServiceDesc.Streams[2], EpochDB_StreamTransactions_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamTransactionsRequest, TransactionBatch]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EpochDB_StreamTransactionsClient = grpc.ServerStreamingClient[TransactionBatch]
+
+func (c *epochDBClient) SearchTransactionsByAddress(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SearchResponse)
+	err := c.cc.Invoke(ctx, EpochDB_SearchTransactionsByAddress_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetContractCreator(ctx context.Context, in *ContractCreatorRequest, opts ...grpc.CallOption) (*ContractCreatorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ContractCreatorResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetContractCreator_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetFeeHistory(ctx context.Context, in *FeeHistoryRequest, opts ...grpc.CallOption) (*FeeHistoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FeeHistoryResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetFeeHistory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetGasPrice(ctx context.Context, in *GasPriceRequest, opts ...grpc.CallOption) (*GasPriceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GasPriceResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetGasPrice_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EpochDBServer is the server API for EpochDB service.
 // All implementations must embed UnimplementedEpochDBServer
 // for forward compatibility.
@@ -162,12 +297,29 @@ type EpochDBServer interface {
 	// StreamHeads pushes one HeadResponse per new block until the caller goes
 	// away.
 	StreamHeads(*HeadRequest, grpc.ServerStreamingServer[HeadResponse]) error
+	// GetNodeInfo is the chain, the build, the sync state and the refusal list.
+	GetNodeInfo(context.Context, *NodeInfoRequest) (*NodeInfoResponse, error)
 	GetBlock(context.Context, *BlockRequest) (*BlockResponse, error)
 	GetTransaction(context.Context, *TransactionRequest) (*TransactionResponse, error)
-	Call(context.Context, *CallRequest) (*CallResponse, error)
 	GetState(context.Context, *StateRequest) (*StateResponse, error)
-	SearchTransactionsByAddress(context.Context, *SearchRequest) (*SearchResponse, error)
+	Call(context.Context, *CallRequest) (*CallResponse, error)
+	EstimateGas(context.Context, *CallRequest) (*EstimateGasResponse, error)
+	// Trace re-executes a transaction, a block or a call under a named tracer.
+	Trace(context.Context, *TraceRequest) (*TraceResponse, error)
 	GetLogs(context.Context, *LogsRequest) (*LogsResponse, error)
+	// StreamLogs REPLACES the whole poll-and-filter-id model: there is nothing
+	// to install and nothing to uninstall, the stream IS the filter, and
+	// cancelling it is uninstalling it.
+	StreamLogs(*LogsRequest, grpc.ServerStreamingServer[LogsResponse]) error
+	// StreamTransactions pushes each new block's transactions. There is no
+	// mempool on this node, so these are ACCEPTED transactions, never pending
+	// ones.
+	StreamTransactions(*StreamTransactionsRequest, grpc.ServerStreamingServer[TransactionBatch]) error
+	SearchTransactionsByAddress(context.Context, *SearchRequest) (*SearchResponse, error)
+	GetContractCreator(context.Context, *ContractCreatorRequest) (*ContractCreatorResponse, error)
+	GetFeeHistory(context.Context, *FeeHistoryRequest) (*FeeHistoryResponse, error)
+	// GetGasPrice is the whole fee-suggestion surface out of one sample.
+	GetGasPrice(context.Context, *GasPriceRequest) (*GasPriceResponse, error)
 	mustEmbedUnimplementedEpochDBServer()
 }
 
@@ -184,23 +336,47 @@ func (UnimplementedEpochDBServer) GetHead(context.Context, *HeadRequest) (*HeadR
 func (UnimplementedEpochDBServer) StreamHeads(*HeadRequest, grpc.ServerStreamingServer[HeadResponse]) error {
 	return status.Error(codes.Unimplemented, "method StreamHeads not implemented")
 }
+func (UnimplementedEpochDBServer) GetNodeInfo(context.Context, *NodeInfoRequest) (*NodeInfoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNodeInfo not implemented")
+}
 func (UnimplementedEpochDBServer) GetBlock(context.Context, *BlockRequest) (*BlockResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlock not implemented")
 }
 func (UnimplementedEpochDBServer) GetTransaction(context.Context, *TransactionRequest) (*TransactionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTransaction not implemented")
 }
+func (UnimplementedEpochDBServer) GetState(context.Context, *StateRequest) (*StateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetState not implemented")
+}
 func (UnimplementedEpochDBServer) Call(context.Context, *CallRequest) (*CallResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Call not implemented")
 }
-func (UnimplementedEpochDBServer) GetState(context.Context, *StateRequest) (*StateResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetState not implemented")
+func (UnimplementedEpochDBServer) EstimateGas(context.Context, *CallRequest) (*EstimateGasResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EstimateGas not implemented")
+}
+func (UnimplementedEpochDBServer) Trace(context.Context, *TraceRequest) (*TraceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Trace not implemented")
+}
+func (UnimplementedEpochDBServer) GetLogs(context.Context, *LogsRequest) (*LogsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLogs not implemented")
+}
+func (UnimplementedEpochDBServer) StreamLogs(*LogsRequest, grpc.ServerStreamingServer[LogsResponse]) error {
+	return status.Error(codes.Unimplemented, "method StreamLogs not implemented")
+}
+func (UnimplementedEpochDBServer) StreamTransactions(*StreamTransactionsRequest, grpc.ServerStreamingServer[TransactionBatch]) error {
+	return status.Error(codes.Unimplemented, "method StreamTransactions not implemented")
 }
 func (UnimplementedEpochDBServer) SearchTransactionsByAddress(context.Context, *SearchRequest) (*SearchResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SearchTransactionsByAddress not implemented")
 }
-func (UnimplementedEpochDBServer) GetLogs(context.Context, *LogsRequest) (*LogsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetLogs not implemented")
+func (UnimplementedEpochDBServer) GetContractCreator(context.Context, *ContractCreatorRequest) (*ContractCreatorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetContractCreator not implemented")
+}
+func (UnimplementedEpochDBServer) GetFeeHistory(context.Context, *FeeHistoryRequest) (*FeeHistoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFeeHistory not implemented")
+}
+func (UnimplementedEpochDBServer) GetGasPrice(context.Context, *GasPriceRequest) (*GasPriceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetGasPrice not implemented")
 }
 func (UnimplementedEpochDBServer) mustEmbedUnimplementedEpochDBServer() {}
 func (UnimplementedEpochDBServer) testEmbeddedByValue()                 {}
@@ -252,6 +428,24 @@ func _EpochDB_StreamHeads_Handler(srv interface{}, stream grpc.ServerStream) err
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type EpochDB_StreamHeadsServer = grpc.ServerStreamingServer[HeadResponse]
 
+func _EpochDB_GetNodeInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NodeInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetNodeInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetNodeInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetNodeInfo(ctx, req.(*NodeInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _EpochDB_GetBlock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(BlockRequest)
 	if err := dec(in); err != nil {
@@ -288,24 +482,6 @@ func _EpochDB_GetTransaction_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
-func _EpochDB_Call_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CallRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(EpochDBServer).Call(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: EpochDB_Call_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EpochDBServer).Call(ctx, req.(*CallRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _EpochDB_GetState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StateRequest)
 	if err := dec(in); err != nil {
@@ -324,20 +500,56 @@ func _EpochDB_GetState_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
-func _EpochDB_SearchTransactionsByAddress_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SearchRequest)
+func _EpochDB_Call_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CallRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(EpochDBServer).SearchTransactionsByAddress(ctx, in)
+		return srv.(EpochDBServer).Call(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: EpochDB_SearchTransactionsByAddress_FullMethodName,
+		FullMethod: EpochDB_Call_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EpochDBServer).SearchTransactionsByAddress(ctx, req.(*SearchRequest))
+		return srv.(EpochDBServer).Call(ctx, req.(*CallRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_EstimateGas_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CallRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).EstimateGas(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_EstimateGas_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).EstimateGas(ctx, req.(*CallRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_Trace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TraceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).Trace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_Trace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).Trace(ctx, req.(*TraceRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -360,6 +572,100 @@ func _EpochDB_GetLogs_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EpochDB_StreamLogs_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(LogsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(EpochDBServer).StreamLogs(m, &grpc.GenericServerStream[LogsRequest, LogsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EpochDB_StreamLogsServer = grpc.ServerStreamingServer[LogsResponse]
+
+func _EpochDB_StreamTransactions_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamTransactionsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(EpochDBServer).StreamTransactions(m, &grpc.GenericServerStream[StreamTransactionsRequest, TransactionBatch]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EpochDB_StreamTransactionsServer = grpc.ServerStreamingServer[TransactionBatch]
+
+func _EpochDB_SearchTransactionsByAddress_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SearchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).SearchTransactionsByAddress(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_SearchTransactionsByAddress_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).SearchTransactionsByAddress(ctx, req.(*SearchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetContractCreator_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ContractCreatorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetContractCreator(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetContractCreator_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetContractCreator(ctx, req.(*ContractCreatorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetFeeHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FeeHistoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetFeeHistory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetFeeHistory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetFeeHistory(ctx, req.(*FeeHistoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetGasPrice_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GasPriceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetGasPrice(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetGasPrice_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetGasPrice(ctx, req.(*GasPriceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EpochDB_ServiceDesc is the grpc.ServiceDesc for EpochDB service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -372,6 +678,10 @@ var EpochDB_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _EpochDB_GetHead_Handler,
 		},
 		{
+			MethodName: "GetNodeInfo",
+			Handler:    _EpochDB_GetNodeInfo_Handler,
+		},
+		{
 			MethodName: "GetBlock",
 			Handler:    _EpochDB_GetBlock_Handler,
 		},
@@ -380,26 +690,56 @@ var EpochDB_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _EpochDB_GetTransaction_Handler,
 		},
 		{
+			MethodName: "GetState",
+			Handler:    _EpochDB_GetState_Handler,
+		},
+		{
 			MethodName: "Call",
 			Handler:    _EpochDB_Call_Handler,
 		},
 		{
-			MethodName: "GetState",
-			Handler:    _EpochDB_GetState_Handler,
+			MethodName: "EstimateGas",
+			Handler:    _EpochDB_EstimateGas_Handler,
+		},
+		{
+			MethodName: "Trace",
+			Handler:    _EpochDB_Trace_Handler,
+		},
+		{
+			MethodName: "GetLogs",
+			Handler:    _EpochDB_GetLogs_Handler,
 		},
 		{
 			MethodName: "SearchTransactionsByAddress",
 			Handler:    _EpochDB_SearchTransactionsByAddress_Handler,
 		},
 		{
-			MethodName: "GetLogs",
-			Handler:    _EpochDB_GetLogs_Handler,
+			MethodName: "GetContractCreator",
+			Handler:    _EpochDB_GetContractCreator_Handler,
+		},
+		{
+			MethodName: "GetFeeHistory",
+			Handler:    _EpochDB_GetFeeHistory_Handler,
+		},
+		{
+			MethodName: "GetGasPrice",
+			Handler:    _EpochDB_GetGasPrice_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "StreamHeads",
 			Handler:       _EpochDB_StreamHeads_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamLogs",
+			Handler:       _EpochDB_StreamLogs_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamTransactions",
+			Handler:       _EpochDB_StreamTransactions_Handler,
 			ServerStreams: true,
 		},
 	},

@@ -8,11 +8,23 @@
 // to access it"). It is a PEER adapter over the core query layer (rpc.Server's
 // direct methods), never a proxy to JSON-RPC.
 //
+// IT COVERS THE WHOLE CAPABILITY SET. Everything the node can actually do is
+// reachable here; the JSON-RPC surface's 90-odd method spellings collapse onto
+// these methods because most of that count is spelling variety over one
+// primitive (by-number and by-hash, filter-install plus poll, four names for
+// the same fee answer). What is NOT here is the permanent refusal set, and it
+// is not here BY ABSENCE PLUS A NAMED REASON: GetNodeInfo lists every refused
+// capability with the reason, and calling one of them is Unimplemented rather
+// than a plausible empty answer (DESIGN: "null means not on this chain, never
+// I could not read it").
+//
 // BYTES ARE VERBATIM CONSENSUS RLP wherever the corpus stores RLP: a header, a
-// transaction. Nothing is re-serialized into a field-by-field shape that could
-// disagree with the stored bytes, and a caller that wants fields decodes with
-// the EVM library it already links. Numbers that are not RLP (heights, TxNums,
-// gas) are plain integers, and big integers travel as big-endian bytes.
+// transaction, a container. Nothing is re-serialized into a field-by-field
+// shape that could disagree with the stored bytes, and a caller that wants
+// fields decodes with the EVM library it already links. Numbers that are not
+// RLP (heights, TxNums, gas) are plain integers, and big integers travel as
+// big-endian bytes. A TRACER'S CONFIG AND RESULT ARE JSON, verbatim, because
+// that is what a geth tracer takes and emits.
 
 package grpcapi
 
@@ -143,20 +155,214 @@ func (x *HeadResponse) GetSettled() uint64 {
 	return 0
 }
 
-// BlockRequest names a block by hash if hash is set, by number otherwise.
-// full=false answers with the header and the transaction COUNT only.
+type NodeInfoRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeInfoRequest) Reset() {
+	*x = NodeInfoRequest{}
+	mi := &file_epochdb_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeInfoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeInfoRequest) ProtoMessage() {}
+
+func (x *NodeInfoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeInfoRequest.ProtoReflect.Descriptor instead.
+func (*NodeInfoRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{2}
+}
+
+type NodeInfoResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ChainId         []byte                 `protobuf:"bytes,1,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"` // big-endian
+	ClientVersion   string                 `protobuf:"bytes,2,opt,name=client_version,json=clientVersion,proto3" json:"client_version,omitempty"`
+	Syncing         bool                   `protobuf:"varint,3,opt,name=syncing,proto3" json:"syncing,omitempty"`
+	CurrentBlock    uint64                 `protobuf:"varint,4,opt,name=current_block,json=currentBlock,proto3" json:"current_block,omitempty"`           // the executed head
+	HighestBlock    uint64                 `protobuf:"varint,5,opt,name=highest_block,json=highestBlock,proto3" json:"highest_block,omitempty"`           // the height this node is syncing toward
+	ChainConfigJson []byte                 `protobuf:"bytes,6,opt,name=chain_config_json,json=chainConfigJson,proto3" json:"chain_config_json,omitempty"` // the VM's own marshalling of its config
+	OtsApiLevel     uint32                 `protobuf:"varint,7,opt,name=ots_api_level,json=otsApiLevel,proto3" json:"ots_api_level,omitempty"`
+	Refusals        []*Refusal             `protobuf:"bytes,8,rep,name=refusals,proto3" json:"refusals,omitempty"` // what this node will NEVER answer, and why
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *NodeInfoResponse) Reset() {
+	*x = NodeInfoResponse{}
+	mi := &file_epochdb_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeInfoResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeInfoResponse) ProtoMessage() {}
+
+func (x *NodeInfoResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeInfoResponse.ProtoReflect.Descriptor instead.
+func (*NodeInfoResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *NodeInfoResponse) GetChainId() []byte {
+	if x != nil {
+		return x.ChainId
+	}
+	return nil
+}
+
+func (x *NodeInfoResponse) GetClientVersion() string {
+	if x != nil {
+		return x.ClientVersion
+	}
+	return ""
+}
+
+func (x *NodeInfoResponse) GetSyncing() bool {
+	if x != nil {
+		return x.Syncing
+	}
+	return false
+}
+
+func (x *NodeInfoResponse) GetCurrentBlock() uint64 {
+	if x != nil {
+		return x.CurrentBlock
+	}
+	return 0
+}
+
+func (x *NodeInfoResponse) GetHighestBlock() uint64 {
+	if x != nil {
+		return x.HighestBlock
+	}
+	return 0
+}
+
+func (x *NodeInfoResponse) GetChainConfigJson() []byte {
+	if x != nil {
+		return x.ChainConfigJson
+	}
+	return nil
+}
+
+func (x *NodeInfoResponse) GetOtsApiLevel() uint32 {
+	if x != nil {
+		return x.OtsApiLevel
+	}
+	return 0
+}
+
+func (x *NodeInfoResponse) GetRefusals() []*Refusal {
+	if x != nil {
+		return x.Refusals
+	}
+	return nil
+}
+
+// Refusal is a capability refused BY DESIGN, with the reason. None of these is
+// a phase gap, and none of them has a method above.
+type Refusal struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Capability    string                 `protobuf:"bytes,1,opt,name=capability,proto3" json:"capability,omitempty"`
+	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Refusal) Reset() {
+	*x = Refusal{}
+	mi := &file_epochdb_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Refusal) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Refusal) ProtoMessage() {}
+
+func (x *Refusal) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Refusal.ProtoReflect.Descriptor instead.
+func (*Refusal) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Refusal) GetCapability() string {
+	if x != nil {
+		return x.Capability
+	}
+	return ""
+}
+
+func (x *Refusal) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+// BlockRequest names a block by hash if hash is set, by number otherwise
+// (number 0 with no hash means the serving head). The flags say how much of
+// the block to assemble: nothing extra by default.
 type BlockRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Number        uint64                 `protobuf:"varint,1,opt,name=number,proto3" json:"number,omitempty"`
 	Hash          []byte                 `protobuf:"bytes,2,opt,name=hash,proto3" json:"hash,omitempty"`
-	Full          bool                   `protobuf:"varint,3,opt,name=full,proto3" json:"full,omitempty"`
+	Full          bool                   `protobuf:"varint,3,opt,name=full,proto3" json:"full,omitempty"`                         // the transactions, as stored RLP
+	TxHashes      bool                   `protobuf:"varint,4,opt,name=tx_hashes,json=txHashes,proto3" json:"tx_hashes,omitempty"` // the transaction hashes, in block order
+	Receipts      bool                   `protobuf:"varint,5,opt,name=receipts,proto3" json:"receipts,omitempty"`                 // the receipts, decoded and as consensus RLP
+	Raw           bool                   `protobuf:"varint,6,opt,name=raw,proto3" json:"raw,omitempty"`                           // the VERBATIM container bytes (header + extras + txs)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BlockRequest) Reset() {
 	*x = BlockRequest{}
-	mi := &file_epochdb_proto_msgTypes[2]
+	mi := &file_epochdb_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -168,7 +374,7 @@ func (x *BlockRequest) String() string {
 func (*BlockRequest) ProtoMessage() {}
 
 func (x *BlockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[2]
+	mi := &file_epochdb_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -181,7 +387,7 @@ func (x *BlockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BlockRequest.ProtoReflect.Descriptor instead.
 func (*BlockRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{2}
+	return file_epochdb_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *BlockRequest) GetNumber() uint64 {
@@ -205,20 +411,47 @@ func (x *BlockRequest) GetFull() bool {
 	return false
 }
 
+func (x *BlockRequest) GetTxHashes() bool {
+	if x != nil {
+		return x.TxHashes
+	}
+	return false
+}
+
+func (x *BlockRequest) GetReceipts() bool {
+	if x != nil {
+		return x.Receipts
+	}
+	return false
+}
+
+func (x *BlockRequest) GetRaw() bool {
+	if x != nil {
+		return x.Raw
+	}
+	return false
+}
+
 type BlockResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Number        uint64                 `protobuf:"varint,1,opt,name=number,proto3" json:"number,omitempty"`
 	Hash          []byte                 `protobuf:"bytes,2,opt,name=hash,proto3" json:"hash,omitempty"`
 	HeaderRlp     []byte                 `protobuf:"bytes,3,opt,name=header_rlp,json=headerRlp,proto3" json:"header_rlp,omitempty"` // the stored consensus bytes, verbatim
 	TxCount       uint32                 `protobuf:"varint,4,opt,name=tx_count,json=txCount,proto3" json:"tx_count,omitempty"`
-	TxRlp         [][]byte               `protobuf:"bytes,5,rep,name=tx_rlp,json=txRlp,proto3" json:"tx_rlp,omitempty"` // full=true only, in block order
+	TxRlp         [][]byte               `protobuf:"bytes,5,rep,name=tx_rlp,json=txRlp,proto3" json:"tx_rlp,omitempty"`                  // full only, in block order
+	TxHash        [][]byte               `protobuf:"bytes,6,rep,name=tx_hash,json=txHash,proto3" json:"tx_hash,omitempty"`               // tx_hashes only, in block order
+	Receipts      []*Receipt             `protobuf:"bytes,7,rep,name=receipts,proto3" json:"receipts,omitempty"`                         // receipts only
+	ReceiptRlp    [][]byte               `protobuf:"bytes,8,rep,name=receipt_rlp,json=receiptRlp,proto3" json:"receipt_rlp,omitempty"`   // receipts only: the consensus encoding
+	BlockRlp      []byte                 `protobuf:"bytes,9,opt,name=block_rlp,json=blockRlp,proto3" json:"block_rlp,omitempty"`         // raw only: the verbatim container
+	TotalFees     []byte                 `protobuf:"bytes,10,opt,name=total_fees,json=totalFees,proto3" json:"total_fees,omitempty"`     // receipts only: what this block's txs paid, big-endian
+	UncleCount    uint32                 `protobuf:"varint,11,opt,name=uncle_count,json=uncleCount,proto3" json:"uncle_count,omitempty"` // always 0: Avalanche has no uncles
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BlockResponse) Reset() {
 	*x = BlockResponse{}
-	mi := &file_epochdb_proto_msgTypes[3]
+	mi := &file_epochdb_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -230,7 +463,7 @@ func (x *BlockResponse) String() string {
 func (*BlockResponse) ProtoMessage() {}
 
 func (x *BlockResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[3]
+	mi := &file_epochdb_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -243,7 +476,7 @@ func (x *BlockResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BlockResponse.ProtoReflect.Descriptor instead.
 func (*BlockResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{3}
+	return file_epochdb_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *BlockResponse) GetNumber() uint64 {
@@ -281,16 +514,66 @@ func (x *BlockResponse) GetTxRlp() [][]byte {
 	return nil
 }
 
+func (x *BlockResponse) GetTxHash() [][]byte {
+	if x != nil {
+		return x.TxHash
+	}
+	return nil
+}
+
+func (x *BlockResponse) GetReceipts() []*Receipt {
+	if x != nil {
+		return x.Receipts
+	}
+	return nil
+}
+
+func (x *BlockResponse) GetReceiptRlp() [][]byte {
+	if x != nil {
+		return x.ReceiptRlp
+	}
+	return nil
+}
+
+func (x *BlockResponse) GetBlockRlp() []byte {
+	if x != nil {
+		return x.BlockRlp
+	}
+	return nil
+}
+
+func (x *BlockResponse) GetTotalFees() []byte {
+	if x != nil {
+		return x.TotalFees
+	}
+	return nil
+}
+
+func (x *BlockResponse) GetUncleCount() uint32 {
+	if x != nil {
+		return x.UncleCount
+	}
+	return 0
+}
+
+// TransactionRequest names a transaction three ways, in this order: by hash;
+// by sender and nonce; by position in a block (index set, with block_number or
+// block_hash). nonce and index are `optional` because 0 is a real value.
 type TransactionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Hash          []byte                 `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`
+	Sender        []byte                 `protobuf:"bytes,2,opt,name=sender,proto3" json:"sender,omitempty"`
+	Nonce         *uint64                `protobuf:"varint,3,opt,name=nonce,proto3,oneof" json:"nonce,omitempty"`
+	BlockNumber   uint64                 `protobuf:"varint,4,opt,name=block_number,json=blockNumber,proto3" json:"block_number,omitempty"`
+	BlockHash     []byte                 `protobuf:"bytes,5,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"`
+	Index         *uint32                `protobuf:"varint,6,opt,name=index,proto3,oneof" json:"index,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TransactionRequest) Reset() {
 	*x = TransactionRequest{}
-	mi := &file_epochdb_proto_msgTypes[4]
+	mi := &file_epochdb_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -302,7 +585,7 @@ func (x *TransactionRequest) String() string {
 func (*TransactionRequest) ProtoMessage() {}
 
 func (x *TransactionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[4]
+	mi := &file_epochdb_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -315,7 +598,7 @@ func (x *TransactionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionRequest.ProtoReflect.Descriptor instead.
 func (*TransactionRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{4}
+	return file_epochdb_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *TransactionRequest) GetHash() []byte {
@@ -323,6 +606,41 @@ func (x *TransactionRequest) GetHash() []byte {
 		return x.Hash
 	}
 	return nil
+}
+
+func (x *TransactionRequest) GetSender() []byte {
+	if x != nil {
+		return x.Sender
+	}
+	return nil
+}
+
+func (x *TransactionRequest) GetNonce() uint64 {
+	if x != nil && x.Nonce != nil {
+		return *x.Nonce
+	}
+	return 0
+}
+
+func (x *TransactionRequest) GetBlockNumber() uint64 {
+	if x != nil {
+		return x.BlockNumber
+	}
+	return 0
+}
+
+func (x *TransactionRequest) GetBlockHash() []byte {
+	if x != nil {
+		return x.BlockHash
+	}
+	return nil
+}
+
+func (x *TransactionRequest) GetIndex() uint32 {
+	if x != nil && x.Index != nil {
+		return *x.Index
+	}
+	return 0
 }
 
 // found=false is a clean "unknown transaction", never an error.
@@ -335,13 +653,14 @@ type TransactionResponse struct {
 	Index         uint32                 `protobuf:"varint,5,opt,name=index,proto3" json:"index,omitempty"`
 	Receipt       *Receipt               `protobuf:"bytes,6,opt,name=receipt,proto3" json:"receipt,omitempty"`
 	Frames        []*Frame               `protobuf:"bytes,7,rep,name=frames,proto3" json:"frames,omitempty"` // the STORED call frames, never a re-execution
+	Hash          []byte                 `protobuf:"bytes,8,opt,name=hash,proto3" json:"hash,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TransactionResponse) Reset() {
 	*x = TransactionResponse{}
-	mi := &file_epochdb_proto_msgTypes[5]
+	mi := &file_epochdb_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -353,7 +672,7 @@ func (x *TransactionResponse) String() string {
 func (*TransactionResponse) ProtoMessage() {}
 
 func (x *TransactionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[5]
+	mi := &file_epochdb_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -366,7 +685,7 @@ func (x *TransactionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionResponse.ProtoReflect.Descriptor instead.
 func (*TransactionResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{5}
+	return file_epochdb_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *TransactionResponse) GetFound() bool {
@@ -418,6 +737,13 @@ func (x *TransactionResponse) GetFrames() []*Frame {
 	return nil
 }
 
+func (x *TransactionResponse) GetHash() []byte {
+	if x != nil {
+		return x.Hash
+	}
+	return nil
+}
+
 type Receipt struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	Status            uint64                 `protobuf:"varint,1,opt,name=status,proto3" json:"status,omitempty"`
@@ -425,13 +751,16 @@ type Receipt struct {
 	CumulativeGasUsed uint64                 `protobuf:"varint,3,opt,name=cumulative_gas_used,json=cumulativeGasUsed,proto3" json:"cumulative_gas_used,omitempty"`
 	ContractAddress   []byte                 `protobuf:"bytes,4,opt,name=contract_address,json=contractAddress,proto3" json:"contract_address,omitempty"` // empty unless the tx created one
 	Logs              []*Log                 `protobuf:"bytes,5,rep,name=logs,proto3" json:"logs,omitempty"`
+	EffectiveGasPrice []byte                 `protobuf:"bytes,6,opt,name=effective_gas_price,json=effectiveGasPrice,proto3" json:"effective_gas_price,omitempty"` // big-endian
+	Type              uint32                 `protobuf:"varint,7,opt,name=type,proto3" json:"type,omitempty"`
+	TxHash            []byte                 `protobuf:"bytes,8,opt,name=tx_hash,json=txHash,proto3" json:"tx_hash,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Receipt) Reset() {
 	*x = Receipt{}
-	mi := &file_epochdb_proto_msgTypes[6]
+	mi := &file_epochdb_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -443,7 +772,7 @@ func (x *Receipt) String() string {
 func (*Receipt) ProtoMessage() {}
 
 func (x *Receipt) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[6]
+	mi := &file_epochdb_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -456,7 +785,7 @@ func (x *Receipt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Receipt.ProtoReflect.Descriptor instead.
 func (*Receipt) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{6}
+	return file_epochdb_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Receipt) GetStatus() uint64 {
@@ -494,6 +823,27 @@ func (x *Receipt) GetLogs() []*Log {
 	return nil
 }
 
+func (x *Receipt) GetEffectiveGasPrice() []byte {
+	if x != nil {
+		return x.EffectiveGasPrice
+	}
+	return nil
+}
+
+func (x *Receipt) GetType() uint32 {
+	if x != nil {
+		return x.Type
+	}
+	return 0
+}
+
+func (x *Receipt) GetTxHash() []byte {
+	if x != nil {
+		return x.TxHash
+	}
+	return nil
+}
+
 type Log struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Address       []byte                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
@@ -509,7 +859,7 @@ type Log struct {
 
 func (x *Log) Reset() {
 	*x = Log{}
-	mi := &file_epochdb_proto_msgTypes[7]
+	mi := &file_epochdb_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -521,7 +871,7 @@ func (x *Log) String() string {
 func (*Log) ProtoMessage() {}
 
 func (x *Log) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[7]
+	mi := &file_epochdb_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -534,7 +884,7 @@ func (x *Log) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Log.ProtoReflect.Descriptor instead.
 func (*Log) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{7}
+	return file_epochdb_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Log) GetAddress() []byte {
@@ -587,7 +937,9 @@ func (x *Log) GetIndex() uint32 {
 }
 
 // Frame is one stored call frame in enter order. kind is the vm.OpCode of the
-// call that opened it.
+// call that opened it, which is also Otterscan's internal-operation kind:
+// CREATE/CREATE2 frames are deployments, and a CALL frame with a non-zero
+// value is a transfer.
 type Frame struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Kind          uint32                 `protobuf:"varint,1,opt,name=kind,proto3" json:"kind,omitempty"`
@@ -606,7 +958,7 @@ type Frame struct {
 
 func (x *Frame) Reset() {
 	*x = Frame{}
-	mi := &file_epochdb_proto_msgTypes[8]
+	mi := &file_epochdb_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -618,7 +970,7 @@ func (x *Frame) String() string {
 func (*Frame) ProtoMessage() {}
 
 func (x *Frame) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[8]
+	mi := &file_epochdb_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -631,7 +983,7 @@ func (x *Frame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Frame.ProtoReflect.Descriptor instead.
 func (*Frame) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{8}
+	return file_epochdb_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *Frame) GetKind() uint32 {
@@ -706,21 +1058,27 @@ func (x *Frame) GetOutput() []byte {
 
 // CallRequest is an eth_call at a height. height 0 means the serving head.
 type CallRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	From          []byte                 `protobuf:"bytes,1,opt,name=from,proto3" json:"from,omitempty"`
-	To            []byte                 `protobuf:"bytes,2,opt,name=to,proto3" json:"to,omitempty"`       // empty is a contract creation
-	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"` // big-endian
-	Gas           uint64                 `protobuf:"varint,4,opt,name=gas,proto3" json:"gas,omitempty"`    // 0 takes the server's cap
-	GasPrice      []byte                 `protobuf:"bytes,5,opt,name=gas_price,json=gasPrice,proto3" json:"gas_price,omitempty"`
-	Data          []byte                 `protobuf:"bytes,6,opt,name=data,proto3" json:"data,omitempty"`
-	Height        uint64                 `protobuf:"varint,7,opt,name=height,proto3" json:"height,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	From     []byte                 `protobuf:"bytes,1,opt,name=from,proto3" json:"from,omitempty"`
+	To       []byte                 `protobuf:"bytes,2,opt,name=to,proto3" json:"to,omitempty"`       // empty is a contract creation
+	Value    []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"` // big-endian
+	Gas      uint64                 `protobuf:"varint,4,opt,name=gas,proto3" json:"gas,omitempty"`    // 0 takes the server's cap; for EstimateGas it is the ceiling
+	GasPrice []byte                 `protobuf:"bytes,5,opt,name=gas_price,json=gasPrice,proto3" json:"gas_price,omitempty"`
+	Data     []byte                 `protobuf:"bytes,6,opt,name=data,proto3" json:"data,omitempty"`
+	Height   uint64                 `protobuf:"varint,7,opt,name=height,proto3" json:"height,omitempty"`
+	// detailed makes a REVERT a result rather than an error: gas_used, output
+	// and revert come back filled in and error carries the EVM's own message.
+	Detailed bool `protobuf:"varint,8,opt,name=detailed,proto3" json:"detailed,omitempty"`
+	// access_list additionally runs geth's access-list fixed point.
+	AccessList    bool    `protobuf:"varint,9,opt,name=access_list,json=accessList,proto3" json:"access_list,omitempty"`
+	Nonce         *uint64 `protobuf:"varint,10,opt,name=nonce,proto3,oneof" json:"nonce,omitempty"` // access_list on a creation: the deployment nonce
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CallRequest) Reset() {
 	*x = CallRequest{}
-	mi := &file_epochdb_proto_msgTypes[9]
+	mi := &file_epochdb_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -732,7 +1090,7 @@ func (x *CallRequest) String() string {
 func (*CallRequest) ProtoMessage() {}
 
 func (x *CallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[9]
+	mi := &file_epochdb_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -745,7 +1103,7 @@ func (x *CallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallRequest.ProtoReflect.Descriptor instead.
 func (*CallRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{9}
+	return file_epochdb_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *CallRequest) GetFrom() []byte {
@@ -797,16 +1155,41 @@ func (x *CallRequest) GetHeight() uint64 {
 	return 0
 }
 
+func (x *CallRequest) GetDetailed() bool {
+	if x != nil {
+		return x.Detailed
+	}
+	return false
+}
+
+func (x *CallRequest) GetAccessList() bool {
+	if x != nil {
+		return x.AccessList
+	}
+	return false
+}
+
+func (x *CallRequest) GetNonce() uint64 {
+	if x != nil && x.Nonce != nil {
+		return *x.Nonce
+	}
+	return 0
+}
+
 type CallResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Output        []byte                 `protobuf:"bytes,1,opt,name=output,proto3" json:"output,omitempty"`
+	GasUsed       uint64                 `protobuf:"varint,2,opt,name=gas_used,json=gasUsed,proto3" json:"gas_used,omitempty"` // detailed or access_list only
+	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`                     // detailed or access_list only: the EVM's own failure
+	Revert        []byte                 `protobuf:"bytes,4,opt,name=revert,proto3" json:"revert,omitempty"`                   // detailed only: the revert data
+	AccessList    []*AccessTuple         `protobuf:"bytes,5,rep,name=access_list,json=accessList,proto3" json:"access_list,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CallResponse) Reset() {
 	*x = CallResponse{}
-	mi := &file_epochdb_proto_msgTypes[10]
+	mi := &file_epochdb_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -818,7 +1201,7 @@ func (x *CallResponse) String() string {
 func (*CallResponse) ProtoMessage() {}
 
 func (x *CallResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[10]
+	mi := &file_epochdb_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -831,12 +1214,326 @@ func (x *CallResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallResponse.ProtoReflect.Descriptor instead.
 func (*CallResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{10}
+	return file_epochdb_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *CallResponse) GetOutput() []byte {
 	if x != nil {
 		return x.Output
+	}
+	return nil
+}
+
+func (x *CallResponse) GetGasUsed() uint64 {
+	if x != nil {
+		return x.GasUsed
+	}
+	return 0
+}
+
+func (x *CallResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *CallResponse) GetRevert() []byte {
+	if x != nil {
+		return x.Revert
+	}
+	return nil
+}
+
+func (x *CallResponse) GetAccessList() []*AccessTuple {
+	if x != nil {
+		return x.AccessList
+	}
+	return nil
+}
+
+type AccessTuple struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       []byte                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	StorageKeys   [][]byte               `protobuf:"bytes,2,rep,name=storage_keys,json=storageKeys,proto3" json:"storage_keys,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AccessTuple) Reset() {
+	*x = AccessTuple{}
+	mi := &file_epochdb_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AccessTuple) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AccessTuple) ProtoMessage() {}
+
+func (x *AccessTuple) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AccessTuple.ProtoReflect.Descriptor instead.
+func (*AccessTuple) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *AccessTuple) GetAddress() []byte {
+	if x != nil {
+		return x.Address
+	}
+	return nil
+}
+
+func (x *AccessTuple) GetStorageKeys() [][]byte {
+	if x != nil {
+		return x.StorageKeys
+	}
+	return nil
+}
+
+type EstimateGasResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Gas           uint64                 `protobuf:"varint,1,opt,name=gas,proto3" json:"gas,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EstimateGasResponse) Reset() {
+	*x = EstimateGasResponse{}
+	mi := &file_epochdb_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EstimateGasResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EstimateGasResponse) ProtoMessage() {}
+
+func (x *EstimateGasResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EstimateGasResponse.ProtoReflect.Descriptor instead.
+func (*EstimateGasResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *EstimateGasResponse) GetGas() uint64 {
+	if x != nil {
+		return x.Gas
+	}
+	return 0
+}
+
+// TraceRequest re-executes under a tracer. tracer is a name from geth's
+// directory ("callTracer", "prestateTracer", "flatCallTracer", ...); empty is
+// the struct logger. tracer_config is that tracer's OWN JSON, verbatim.
+//
+// TRACING IS RE-EXECUTION. The stored call frames, which are never a
+// re-execution, come back with GetTransaction.
+type TraceRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Target:
+	//
+	//	*TraceRequest_TxHash
+	//	*TraceRequest_BlockNumber
+	//	*TraceRequest_BlockHash
+	//	*TraceRequest_Call
+	Target        isTraceRequest_Target `protobuf_oneof:"target"`
+	Tracer        string                `protobuf:"bytes,5,opt,name=tracer,proto3" json:"tracer,omitempty"`
+	TracerConfig  []byte                `protobuf:"bytes,6,opt,name=tracer_config,json=tracerConfig,proto3" json:"tracer_config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TraceRequest) Reset() {
+	*x = TraceRequest{}
+	mi := &file_epochdb_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TraceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TraceRequest) ProtoMessage() {}
+
+func (x *TraceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TraceRequest.ProtoReflect.Descriptor instead.
+func (*TraceRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *TraceRequest) GetTarget() isTraceRequest_Target {
+	if x != nil {
+		return x.Target
+	}
+	return nil
+}
+
+func (x *TraceRequest) GetTxHash() []byte {
+	if x != nil {
+		if x, ok := x.Target.(*TraceRequest_TxHash); ok {
+			return x.TxHash
+		}
+	}
+	return nil
+}
+
+func (x *TraceRequest) GetBlockNumber() uint64 {
+	if x != nil {
+		if x, ok := x.Target.(*TraceRequest_BlockNumber); ok {
+			return x.BlockNumber
+		}
+	}
+	return 0
+}
+
+func (x *TraceRequest) GetBlockHash() []byte {
+	if x != nil {
+		if x, ok := x.Target.(*TraceRequest_BlockHash); ok {
+			return x.BlockHash
+		}
+	}
+	return nil
+}
+
+func (x *TraceRequest) GetCall() *CallRequest {
+	if x != nil {
+		if x, ok := x.Target.(*TraceRequest_Call); ok {
+			return x.Call
+		}
+	}
+	return nil
+}
+
+func (x *TraceRequest) GetTracer() string {
+	if x != nil {
+		return x.Tracer
+	}
+	return ""
+}
+
+func (x *TraceRequest) GetTracerConfig() []byte {
+	if x != nil {
+		return x.TracerConfig
+	}
+	return nil
+}
+
+type isTraceRequest_Target interface {
+	isTraceRequest_Target()
+}
+
+type TraceRequest_TxHash struct {
+	TxHash []byte `protobuf:"bytes,1,opt,name=tx_hash,json=txHash,proto3,oneof"`
+}
+
+type TraceRequest_BlockNumber struct {
+	BlockNumber uint64 `protobuf:"varint,2,opt,name=block_number,json=blockNumber,proto3,oneof"`
+}
+
+type TraceRequest_BlockHash struct {
+	BlockHash []byte `protobuf:"bytes,3,opt,name=block_hash,json=blockHash,proto3,oneof"`
+}
+
+type TraceRequest_Call struct {
+	Call *CallRequest `protobuf:"bytes,4,opt,name=call,proto3,oneof"`
+}
+
+func (*TraceRequest_TxHash) isTraceRequest_Target() {}
+
+func (*TraceRequest_BlockNumber) isTraceRequest_Target() {}
+
+func (*TraceRequest_BlockHash) isTraceRequest_Target() {}
+
+func (*TraceRequest_Call) isTraceRequest_Target() {}
+
+type TraceResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// One JSON document per traced transaction, in block order (one entry for a
+	// transaction or a call target).
+	ResultJson    [][]byte `protobuf:"bytes,1,rep,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"`
+	TxHash        [][]byte `protobuf:"bytes,2,rep,name=tx_hash,json=txHash,proto3" json:"tx_hash,omitempty"` // block targets: the transaction each result is for
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TraceResponse) Reset() {
+	*x = TraceResponse{}
+	mi := &file_epochdb_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TraceResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TraceResponse) ProtoMessage() {}
+
+func (x *TraceResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TraceResponse.ProtoReflect.Descriptor instead.
+func (*TraceResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *TraceResponse) GetResultJson() [][]byte {
+	if x != nil {
+		return x.ResultJson
+	}
+	return nil
+}
+
+func (x *TraceResponse) GetTxHash() [][]byte {
+	if x != nil {
+		return x.TxHash
 	}
 	return nil
 }
@@ -855,7 +1552,7 @@ type StateRequest struct {
 
 func (x *StateRequest) Reset() {
 	*x = StateRequest{}
-	mi := &file_epochdb_proto_msgTypes[11]
+	mi := &file_epochdb_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -867,7 +1564,7 @@ func (x *StateRequest) String() string {
 func (*StateRequest) ProtoMessage() {}
 
 func (x *StateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[11]
+	mi := &file_epochdb_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -880,7 +1577,7 @@ func (x *StateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateRequest.ProtoReflect.Descriptor instead.
 func (*StateRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{11}
+	return file_epochdb_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *StateRequest) GetAddress() []byte {
@@ -924,7 +1621,7 @@ type StateResponse struct {
 
 func (x *StateResponse) Reset() {
 	*x = StateResponse{}
-	mi := &file_epochdb_proto_msgTypes[12]
+	mi := &file_epochdb_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -936,7 +1633,7 @@ func (x *StateResponse) String() string {
 func (*StateResponse) ProtoMessage() {}
 
 func (x *StateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[12]
+	mi := &file_epochdb_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -949,7 +1646,7 @@ func (x *StateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateResponse.ProtoReflect.Descriptor instead.
 func (*StateResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{12}
+	return file_epochdb_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *StateResponse) GetNonce() uint64 {
@@ -1002,7 +1699,7 @@ type SearchRequest struct {
 
 func (x *SearchRequest) Reset() {
 	*x = SearchRequest{}
-	mi := &file_epochdb_proto_msgTypes[13]
+	mi := &file_epochdb_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1014,7 +1711,7 @@ func (x *SearchRequest) String() string {
 func (*SearchRequest) ProtoMessage() {}
 
 func (x *SearchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[13]
+	mi := &file_epochdb_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1027,7 +1724,7 @@ func (x *SearchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchRequest.ProtoReflect.Descriptor instead.
 func (*SearchRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{13}
+	return file_epochdb_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SearchRequest) GetAddress() []byte {
@@ -1068,7 +1765,7 @@ type SearchResponse struct {
 
 func (x *SearchResponse) Reset() {
 	*x = SearchResponse{}
-	mi := &file_epochdb_proto_msgTypes[14]
+	mi := &file_epochdb_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1080,7 +1777,7 @@ func (x *SearchResponse) String() string {
 func (*SearchResponse) ProtoMessage() {}
 
 func (x *SearchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[14]
+	mi := &file_epochdb_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1093,7 +1790,7 @@ func (x *SearchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchResponse.ProtoReflect.Descriptor instead.
 func (*SearchResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{14}
+	return file_epochdb_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SearchResponse) GetHits() []*AddrHit {
@@ -1122,7 +1819,7 @@ type AddrHit struct {
 
 func (x *AddrHit) Reset() {
 	*x = AddrHit{}
-	mi := &file_epochdb_proto_msgTypes[15]
+	mi := &file_epochdb_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1134,7 +1831,7 @@ func (x *AddrHit) String() string {
 func (*AddrHit) ProtoMessage() {}
 
 func (x *AddrHit) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[15]
+	mi := &file_epochdb_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1147,7 +1844,7 @@ func (x *AddrHit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddrHit.ProtoReflect.Descriptor instead.
 func (*AddrHit) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{15}
+	return file_epochdb_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *AddrHit) GetTxNum() uint64 {
@@ -1178,6 +1875,111 @@ func (x *AddrHit) GetRoles() uint32 {
 	return 0
 }
 
+type ContractCreatorRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       []byte                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ContractCreatorRequest) Reset() {
+	*x = ContractCreatorRequest{}
+	mi := &file_epochdb_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ContractCreatorRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ContractCreatorRequest) ProtoMessage() {}
+
+func (x *ContractCreatorRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ContractCreatorRequest.ProtoReflect.Descriptor instead.
+func (*ContractCreatorRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *ContractCreatorRequest) GetAddress() []byte {
+	if x != nil {
+		return x.Address
+	}
+	return nil
+}
+
+// found=false is a clean "no contract at this address", never an error.
+type ContractCreatorResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Found         bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	TxHash        []byte                 `protobuf:"bytes,2,opt,name=tx_hash,json=txHash,proto3" json:"tx_hash,omitempty"`
+	Creator       []byte                 `protobuf:"bytes,3,opt,name=creator,proto3" json:"creator,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ContractCreatorResponse) Reset() {
+	*x = ContractCreatorResponse{}
+	mi := &file_epochdb_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ContractCreatorResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ContractCreatorResponse) ProtoMessage() {}
+
+func (x *ContractCreatorResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ContractCreatorResponse.ProtoReflect.Descriptor instead.
+func (*ContractCreatorResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ContractCreatorResponse) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+func (x *ContractCreatorResponse) GetTxHash() []byte {
+	if x != nil {
+		return x.TxHash
+	}
+	return nil
+}
+
+func (x *ContractCreatorResponse) GetCreator() []byte {
+	if x != nil {
+		return x.Creator
+	}
+	return nil
+}
+
 type LogsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	FromBlock     uint64                 `protobuf:"varint,1,opt,name=from_block,json=fromBlock,proto3" json:"from_block,omitempty"`
@@ -1190,7 +1992,7 @@ type LogsRequest struct {
 
 func (x *LogsRequest) Reset() {
 	*x = LogsRequest{}
-	mi := &file_epochdb_proto_msgTypes[16]
+	mi := &file_epochdb_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1202,7 +2004,7 @@ func (x *LogsRequest) String() string {
 func (*LogsRequest) ProtoMessage() {}
 
 func (x *LogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[16]
+	mi := &file_epochdb_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1215,7 +2017,7 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{16}
+	return file_epochdb_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *LogsRequest) GetFromBlock() uint64 {
@@ -1255,7 +2057,7 @@ type TopicSet struct {
 
 func (x *TopicSet) Reset() {
 	*x = TopicSet{}
-	mi := &file_epochdb_proto_msgTypes[17]
+	mi := &file_epochdb_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1267,7 +2069,7 @@ func (x *TopicSet) String() string {
 func (*TopicSet) ProtoMessage() {}
 
 func (x *TopicSet) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[17]
+	mi := &file_epochdb_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1280,7 +2082,7 @@ func (x *TopicSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TopicSet.ProtoReflect.Descriptor instead.
 func (*TopicSet) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{17}
+	return file_epochdb_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *TopicSet) GetValues() [][]byte {
@@ -1293,13 +2095,14 @@ func (x *TopicSet) GetValues() [][]byte {
 type LogsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Logs          []*Log                 `protobuf:"bytes,1,rep,name=logs,proto3" json:"logs,omitempty"`
+	ToBlock       uint64                 `protobuf:"varint,2,opt,name=to_block,json=toBlock,proto3" json:"to_block,omitempty"` // streams: the highest block this batch covers
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *LogsResponse) Reset() {
 	*x = LogsResponse{}
-	mi := &file_epochdb_proto_msgTypes[18]
+	mi := &file_epochdb_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1311,7 +2114,7 @@ func (x *LogsResponse) String() string {
 func (*LogsResponse) ProtoMessage() {}
 
 func (x *LogsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[18]
+	mi := &file_epochdb_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1324,12 +2127,494 @@ func (x *LogsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsResponse.ProtoReflect.Descriptor instead.
 func (*LogsResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{18}
+	return file_epochdb_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *LogsResponse) GetLogs() []*Log {
 	if x != nil {
 		return x.Logs
+	}
+	return nil
+}
+
+func (x *LogsResponse) GetToBlock() uint64 {
+	if x != nil {
+		return x.ToBlock
+	}
+	return 0
+}
+
+type StreamTransactionsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	FromBlock     uint64                 `protobuf:"varint,1,opt,name=from_block,json=fromBlock,proto3" json:"from_block,omitempty"` // 0 starts at the block after the current head
+	ToBlock       uint64                 `protobuf:"varint,2,opt,name=to_block,json=toBlock,proto3" json:"to_block,omitempty"`       // 0 follows the head forever
+	Full          bool                   `protobuf:"varint,3,opt,name=full,proto3" json:"full,omitempty"`                            // the transaction RLP, not just the hashes
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamTransactionsRequest) Reset() {
+	*x = StreamTransactionsRequest{}
+	mi := &file_epochdb_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamTransactionsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamTransactionsRequest) ProtoMessage() {}
+
+func (x *StreamTransactionsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamTransactionsRequest.ProtoReflect.Descriptor instead.
+func (*StreamTransactionsRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *StreamTransactionsRequest) GetFromBlock() uint64 {
+	if x != nil {
+		return x.FromBlock
+	}
+	return 0
+}
+
+func (x *StreamTransactionsRequest) GetToBlock() uint64 {
+	if x != nil {
+		return x.ToBlock
+	}
+	return 0
+}
+
+func (x *StreamTransactionsRequest) GetFull() bool {
+	if x != nil {
+		return x.Full
+	}
+	return false
+}
+
+type TransactionBatch struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BlockNumber   uint64                 `protobuf:"varint,1,opt,name=block_number,json=blockNumber,proto3" json:"block_number,omitempty"`
+	TxHash        [][]byte               `protobuf:"bytes,2,rep,name=tx_hash,json=txHash,proto3" json:"tx_hash,omitempty"`
+	TxRlp         [][]byte               `protobuf:"bytes,3,rep,name=tx_rlp,json=txRlp,proto3" json:"tx_rlp,omitempty"` // full only
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TransactionBatch) Reset() {
+	*x = TransactionBatch{}
+	mi := &file_epochdb_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransactionBatch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransactionBatch) ProtoMessage() {}
+
+func (x *TransactionBatch) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransactionBatch.ProtoReflect.Descriptor instead.
+func (*TransactionBatch) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *TransactionBatch) GetBlockNumber() uint64 {
+	if x != nil {
+		return x.BlockNumber
+	}
+	return 0
+}
+
+func (x *TransactionBatch) GetTxHash() [][]byte {
+	if x != nil {
+		return x.TxHash
+	}
+	return nil
+}
+
+func (x *TransactionBatch) GetTxRlp() [][]byte {
+	if x != nil {
+		return x.TxRlp
+	}
+	return nil
+}
+
+type FeeHistoryRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	BlockCount        uint64                 `protobuf:"varint,1,opt,name=block_count,json=blockCount,proto3" json:"block_count,omitempty"`
+	NewestBlock       uint64                 `protobuf:"varint,2,opt,name=newest_block,json=newestBlock,proto3" json:"newest_block,omitempty"` // 0 means the serving head
+	RewardPercentiles []float64              `protobuf:"fixed64,3,rep,packed,name=reward_percentiles,json=rewardPercentiles,proto3" json:"reward_percentiles,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *FeeHistoryRequest) Reset() {
+	*x = FeeHistoryRequest{}
+	mi := &file_epochdb_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FeeHistoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FeeHistoryRequest) ProtoMessage() {}
+
+func (x *FeeHistoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FeeHistoryRequest.ProtoReflect.Descriptor instead.
+func (*FeeHistoryRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *FeeHistoryRequest) GetBlockCount() uint64 {
+	if x != nil {
+		return x.BlockCount
+	}
+	return 0
+}
+
+func (x *FeeHistoryRequest) GetNewestBlock() uint64 {
+	if x != nil {
+		return x.NewestBlock
+	}
+	return 0
+}
+
+func (x *FeeHistoryRequest) GetRewardPercentiles() []float64 {
+	if x != nil {
+		return x.RewardPercentiles
+	}
+	return nil
+}
+
+type FeeHistoryResponse struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	OldestBlock uint64                 `protobuf:"varint,1,opt,name=oldest_block,json=oldestBlock,proto3" json:"oldest_block,omitempty"`
+	// One entry per block PLUS a trailing entry for the block after the range,
+	// read below the head and projected at it. Big-endian.
+	BaseFeePerGas [][]byte     `protobuf:"bytes,2,rep,name=base_fee_per_gas,json=baseFeePerGas,proto3" json:"base_fee_per_gas,omitempty"`
+	GasUsedRatio  []float64    `protobuf:"fixed64,3,rep,packed,name=gas_used_ratio,json=gasUsedRatio,proto3" json:"gas_used_ratio,omitempty"`
+	Reward        []*RewardRow `protobuf:"bytes,4,rep,name=reward,proto3" json:"reward,omitempty"` // one row per block, when percentiles were asked for
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FeeHistoryResponse) Reset() {
+	*x = FeeHistoryResponse{}
+	mi := &file_epochdb_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FeeHistoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FeeHistoryResponse) ProtoMessage() {}
+
+func (x *FeeHistoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FeeHistoryResponse.ProtoReflect.Descriptor instead.
+func (*FeeHistoryResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *FeeHistoryResponse) GetOldestBlock() uint64 {
+	if x != nil {
+		return x.OldestBlock
+	}
+	return 0
+}
+
+func (x *FeeHistoryResponse) GetBaseFeePerGas() [][]byte {
+	if x != nil {
+		return x.BaseFeePerGas
+	}
+	return nil
+}
+
+func (x *FeeHistoryResponse) GetGasUsedRatio() []float64 {
+	if x != nil {
+		return x.GasUsedRatio
+	}
+	return nil
+}
+
+func (x *FeeHistoryResponse) GetReward() []*RewardRow {
+	if x != nil {
+		return x.Reward
+	}
+	return nil
+}
+
+type RewardRow struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Values        [][]byte               `protobuf:"bytes,1,rep,name=values,proto3" json:"values,omitempty"` // big-endian, one per requested percentile
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RewardRow) Reset() {
+	*x = RewardRow{}
+	mi := &file_epochdb_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RewardRow) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RewardRow) ProtoMessage() {}
+
+func (x *RewardRow) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RewardRow.ProtoReflect.Descriptor instead.
+func (*RewardRow) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *RewardRow) GetValues() [][]byte {
+	if x != nil {
+		return x.Values
+	}
+	return nil
+}
+
+type GasPriceRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GasPriceRequest) Reset() {
+	*x = GasPriceRequest{}
+	mi := &file_epochdb_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GasPriceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GasPriceRequest) ProtoMessage() {}
+
+func (x *GasPriceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GasPriceRequest.ProtoReflect.Descriptor instead.
+func (*GasPriceRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{33}
+}
+
+type GasPriceResponse struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	GasPrice             []byte                 `protobuf:"bytes,1,opt,name=gas_price,json=gasPrice,proto3" json:"gas_price,omitempty"`                                           // the sampled price
+	MaxPriorityFeePerGas []byte                 `protobuf:"bytes,2,opt,name=max_priority_fee_per_gas,json=maxPriorityFeePerGas,proto3" json:"max_priority_fee_per_gas,omitempty"` // the tip above the base fee
+	BaseFee              []byte                 `protobuf:"bytes,3,opt,name=base_fee,json=baseFee,proto3" json:"base_fee,omitempty"`                                              // the head's; empty where the chain has none
+	NextBaseFee          []byte                 `protobuf:"bytes,4,opt,name=next_base_fee,json=nextBaseFee,proto3" json:"next_base_fee,omitempty"`                                // projected for the block above the head
+	// The three speeds, empty on a chain with no base fee at the head.
+	Slow          *PriceOption `protobuf:"bytes,5,opt,name=slow,proto3" json:"slow,omitempty"`
+	Normal        *PriceOption `protobuf:"bytes,6,opt,name=normal,proto3" json:"normal,omitempty"`
+	Fast          *PriceOption `protobuf:"bytes,7,opt,name=fast,proto3" json:"fast,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GasPriceResponse) Reset() {
+	*x = GasPriceResponse{}
+	mi := &file_epochdb_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GasPriceResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GasPriceResponse) ProtoMessage() {}
+
+func (x *GasPriceResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GasPriceResponse.ProtoReflect.Descriptor instead.
+func (*GasPriceResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *GasPriceResponse) GetGasPrice() []byte {
+	if x != nil {
+		return x.GasPrice
+	}
+	return nil
+}
+
+func (x *GasPriceResponse) GetMaxPriorityFeePerGas() []byte {
+	if x != nil {
+		return x.MaxPriorityFeePerGas
+	}
+	return nil
+}
+
+func (x *GasPriceResponse) GetBaseFee() []byte {
+	if x != nil {
+		return x.BaseFee
+	}
+	return nil
+}
+
+func (x *GasPriceResponse) GetNextBaseFee() []byte {
+	if x != nil {
+		return x.NextBaseFee
+	}
+	return nil
+}
+
+func (x *GasPriceResponse) GetSlow() *PriceOption {
+	if x != nil {
+		return x.Slow
+	}
+	return nil
+}
+
+func (x *GasPriceResponse) GetNormal() *PriceOption {
+	if x != nil {
+		return x.Normal
+	}
+	return nil
+}
+
+func (x *GasPriceResponse) GetFast() *PriceOption {
+	if x != nil {
+		return x.Fast
+	}
+	return nil
+}
+
+type PriceOption struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	MaxPriorityFeePerGas []byte                 `protobuf:"bytes,1,opt,name=max_priority_fee_per_gas,json=maxPriorityFeePerGas,proto3" json:"max_priority_fee_per_gas,omitempty"`
+	MaxFeePerGas         []byte                 `protobuf:"bytes,2,opt,name=max_fee_per_gas,json=maxFeePerGas,proto3" json:"max_fee_per_gas,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *PriceOption) Reset() {
+	*x = PriceOption{}
+	mi := &file_epochdb_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PriceOption) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PriceOption) ProtoMessage() {}
+
+func (x *PriceOption) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PriceOption.ProtoReflect.Descriptor instead.
+func (*PriceOption) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *PriceOption) GetMaxPriorityFeePerGas() []byte {
+	if x != nil {
+		return x.MaxPriorityFeePerGas
+	}
+	return nil
+}
+
+func (x *PriceOption) GetMaxFeePerGas() []byte {
+	if x != nil {
+		return x.MaxFeePerGas
 	}
 	return nil
 }
@@ -1346,20 +2631,56 @@ const file_epochdb_proto_rawDesc = "" +
 	"\x04hash\x18\x02 \x01(\fR\x04hash\x12\x1c\n" +
 	"\ttimestamp\x18\x03 \x01(\x04R\ttimestamp\x12\x1a\n" +
 	"\baccepted\x18\x04 \x01(\x04R\baccepted\x12\x18\n" +
-	"\asettled\x18\x05 \x01(\x04R\asettled\"N\n" +
+	"\asettled\x18\x05 \x01(\x04R\asettled\"\x11\n" +
+	"\x0fNodeInfoRequest\"\xb9\x02\n" +
+	"\x10NodeInfoResponse\x12\x19\n" +
+	"\bchain_id\x18\x01 \x01(\fR\achainId\x12%\n" +
+	"\x0eclient_version\x18\x02 \x01(\tR\rclientVersion\x12\x18\n" +
+	"\asyncing\x18\x03 \x01(\bR\asyncing\x12#\n" +
+	"\rcurrent_block\x18\x04 \x01(\x04R\fcurrentBlock\x12#\n" +
+	"\rhighest_block\x18\x05 \x01(\x04R\fhighestBlock\x12*\n" +
+	"\x11chain_config_json\x18\x06 \x01(\fR\x0fchainConfigJson\x12\"\n" +
+	"\rots_api_level\x18\a \x01(\rR\votsApiLevel\x12/\n" +
+	"\brefusals\x18\b \x03(\v2\x13.epochdb.v0.RefusalR\brefusals\"A\n" +
+	"\aRefusal\x12\x1e\n" +
+	"\n" +
+	"capability\x18\x01 \x01(\tR\n" +
+	"capability\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\"\x99\x01\n" +
 	"\fBlockRequest\x12\x16\n" +
 	"\x06number\x18\x01 \x01(\x04R\x06number\x12\x12\n" +
 	"\x04hash\x18\x02 \x01(\fR\x04hash\x12\x12\n" +
-	"\x04full\x18\x03 \x01(\bR\x04full\"\x8c\x01\n" +
+	"\x04full\x18\x03 \x01(\bR\x04full\x12\x1b\n" +
+	"\ttx_hashes\x18\x04 \x01(\bR\btxHashes\x12\x1a\n" +
+	"\breceipts\x18\x05 \x01(\bR\breceipts\x12\x10\n" +
+	"\x03raw\x18\x06 \x01(\bR\x03raw\"\xd4\x02\n" +
 	"\rBlockResponse\x12\x16\n" +
 	"\x06number\x18\x01 \x01(\x04R\x06number\x12\x12\n" +
 	"\x04hash\x18\x02 \x01(\fR\x04hash\x12\x1d\n" +
 	"\n" +
 	"header_rlp\x18\x03 \x01(\fR\theaderRlp\x12\x19\n" +
 	"\btx_count\x18\x04 \x01(\rR\atxCount\x12\x15\n" +
-	"\x06tx_rlp\x18\x05 \x03(\fR\x05txRlp\"(\n" +
+	"\x06tx_rlp\x18\x05 \x03(\fR\x05txRlp\x12\x17\n" +
+	"\atx_hash\x18\x06 \x03(\fR\x06txHash\x12/\n" +
+	"\breceipts\x18\a \x03(\v2\x13.epochdb.v0.ReceiptR\breceipts\x12\x1f\n" +
+	"\vreceipt_rlp\x18\b \x03(\fR\n" +
+	"receiptRlp\x12\x1b\n" +
+	"\tblock_rlp\x18\t \x01(\fR\bblockRlp\x12\x1d\n" +
+	"\n" +
+	"total_fees\x18\n" +
+	" \x01(\fR\ttotalFees\x12\x1f\n" +
+	"\vuncle_count\x18\v \x01(\rR\n" +
+	"uncleCount\"\xcc\x01\n" +
 	"\x12TransactionRequest\x12\x12\n" +
-	"\x04hash\x18\x01 \x01(\fR\x04hash\"\xf4\x01\n" +
+	"\x04hash\x18\x01 \x01(\fR\x04hash\x12\x16\n" +
+	"\x06sender\x18\x02 \x01(\fR\x06sender\x12\x19\n" +
+	"\x05nonce\x18\x03 \x01(\x04H\x00R\x05nonce\x88\x01\x01\x12!\n" +
+	"\fblock_number\x18\x04 \x01(\x04R\vblockNumber\x12\x1d\n" +
+	"\n" +
+	"block_hash\x18\x05 \x01(\fR\tblockHash\x12\x19\n" +
+	"\x05index\x18\x06 \x01(\rH\x01R\x05index\x88\x01\x01B\b\n" +
+	"\x06_nonceB\b\n" +
+	"\x06_index\"\x88\x02\n" +
 	"\x13TransactionResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x15\n" +
 	"\x06tx_rlp\x18\x02 \x01(\fR\x05txRlp\x12!\n" +
@@ -1368,13 +2689,17 @@ const file_epochdb_proto_rawDesc = "" +
 	"block_hash\x18\x04 \x01(\fR\tblockHash\x12\x14\n" +
 	"\x05index\x18\x05 \x01(\rR\x05index\x12-\n" +
 	"\areceipt\x18\x06 \x01(\v2\x13.epochdb.v0.ReceiptR\areceipt\x12)\n" +
-	"\x06frames\x18\a \x03(\v2\x11.epochdb.v0.FrameR\x06frames\"\xbc\x01\n" +
+	"\x06frames\x18\a \x03(\v2\x11.epochdb.v0.FrameR\x06frames\x12\x12\n" +
+	"\x04hash\x18\b \x01(\fR\x04hash\"\x99\x02\n" +
 	"\aReceipt\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\x04R\x06status\x12\x19\n" +
 	"\bgas_used\x18\x02 \x01(\x04R\agasUsed\x12.\n" +
 	"\x13cumulative_gas_used\x18\x03 \x01(\x04R\x11cumulativeGasUsed\x12)\n" +
 	"\x10contract_address\x18\x04 \x01(\fR\x0fcontractAddress\x12#\n" +
-	"\x04logs\x18\x05 \x03(\v2\x0f.epochdb.v0.LogR\x04logs\"\xb8\x01\n" +
+	"\x04logs\x18\x05 \x03(\v2\x0f.epochdb.v0.LogR\x04logs\x12.\n" +
+	"\x13effective_gas_price\x18\x06 \x01(\fR\x11effectiveGasPrice\x12\x12\n" +
+	"\x04type\x18\a \x01(\rR\x04type\x12\x17\n" +
+	"\atx_hash\x18\b \x01(\fR\x06txHash\"\xb8\x01\n" +
 	"\x03Log\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\fR\aaddress\x12\x16\n" +
 	"\x06topics\x18\x02 \x03(\fR\x06topics\x12\x12\n" +
@@ -1394,7 +2719,7 @@ const file_epochdb_proto_rawDesc = "" +
 	"\x06failed\x18\b \x01(\bR\x06failed\x12\x14\n" +
 	"\x05input\x18\t \x01(\fR\x05input\x12\x16\n" +
 	"\x06output\x18\n" +
-	" \x01(\fR\x06output\"\xa2\x01\n" +
+	" \x01(\fR\x06output\"\x84\x02\n" +
 	"\vCallRequest\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\fR\x04from\x12\x0e\n" +
 	"\x02to\x18\x02 \x01(\fR\x02to\x12\x14\n" +
@@ -1402,9 +2727,38 @@ const file_epochdb_proto_rawDesc = "" +
 	"\x03gas\x18\x04 \x01(\x04R\x03gas\x12\x1b\n" +
 	"\tgas_price\x18\x05 \x01(\fR\bgasPrice\x12\x12\n" +
 	"\x04data\x18\x06 \x01(\fR\x04data\x12\x16\n" +
-	"\x06height\x18\a \x01(\x04R\x06height\"&\n" +
+	"\x06height\x18\a \x01(\x04R\x06height\x12\x1a\n" +
+	"\bdetailed\x18\b \x01(\bR\bdetailed\x12\x1f\n" +
+	"\vaccess_list\x18\t \x01(\bR\n" +
+	"accessList\x12\x19\n" +
+	"\x05nonce\x18\n" +
+	" \x01(\x04H\x00R\x05nonce\x88\x01\x01B\b\n" +
+	"\x06_nonce\"\xa9\x01\n" +
 	"\fCallResponse\x12\x16\n" +
-	"\x06output\x18\x01 \x01(\fR\x06output\"q\n" +
+	"\x06output\x18\x01 \x01(\fR\x06output\x12\x19\n" +
+	"\bgas_used\x18\x02 \x01(\x04R\agasUsed\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12\x16\n" +
+	"\x06revert\x18\x04 \x01(\fR\x06revert\x128\n" +
+	"\vaccess_list\x18\x05 \x03(\v2\x17.epochdb.v0.AccessTupleR\n" +
+	"accessList\"J\n" +
+	"\vAccessTuple\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\fR\aaddress\x12!\n" +
+	"\fstorage_keys\x18\x02 \x03(\fR\vstorageKeys\"'\n" +
+	"\x13EstimateGasResponse\x12\x10\n" +
+	"\x03gas\x18\x01 \x01(\x04R\x03gas\"\xe5\x01\n" +
+	"\fTraceRequest\x12\x19\n" +
+	"\atx_hash\x18\x01 \x01(\fH\x00R\x06txHash\x12#\n" +
+	"\fblock_number\x18\x02 \x01(\x04H\x00R\vblockNumber\x12\x1f\n" +
+	"\n" +
+	"block_hash\x18\x03 \x01(\fH\x00R\tblockHash\x12-\n" +
+	"\x04call\x18\x04 \x01(\v2\x17.epochdb.v0.CallRequestH\x00R\x04call\x12\x16\n" +
+	"\x06tracer\x18\x05 \x01(\tR\x06tracer\x12#\n" +
+	"\rtracer_config\x18\x06 \x01(\fR\ftracerConfigB\b\n" +
+	"\x06target\"I\n" +
+	"\rTraceResponse\x12\x1f\n" +
+	"\vresult_json\x18\x01 \x03(\fR\n" +
+	"resultJson\x12\x17\n" +
+	"\atx_hash\x18\x02 \x03(\fR\x06txHash\"q\n" +
 	"\fStateRequest\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\fR\aaddress\x12\x12\n" +
 	"\x04slot\x18\x02 \x01(\fR\x04slot\x12\x16\n" +
@@ -1429,7 +2783,13 @@ const file_epochdb_proto_rawDesc = "" +
 	"\x06tx_num\x18\x01 \x01(\x04R\x05txNum\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\x04R\x06height\x12\x12\n" +
 	"\x04hash\x18\x03 \x01(\fR\x04hash\x12\x14\n" +
-	"\x05roles\x18\x04 \x01(\rR\x05roles\"\x93\x01\n" +
+	"\x05roles\x18\x04 \x01(\rR\x05roles\"2\n" +
+	"\x16ContractCreatorRequest\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\fR\aaddress\"b\n" +
+	"\x17ContractCreatorResponse\x12\x14\n" +
+	"\x05found\x18\x01 \x01(\bR\x05found\x12\x17\n" +
+	"\atx_hash\x18\x02 \x01(\fR\x06txHash\x12\x18\n" +
+	"\acreator\x18\x03 \x01(\fR\acreator\"\x93\x01\n" +
 	"\vLogsRequest\x12\x1d\n" +
 	"\n" +
 	"from_block\x18\x01 \x01(\x04R\tfromBlock\x12\x19\n" +
@@ -1437,18 +2797,61 @@ const file_epochdb_proto_rawDesc = "" +
 	"\taddresses\x18\x03 \x03(\fR\taddresses\x12,\n" +
 	"\x06topics\x18\x04 \x03(\v2\x14.epochdb.v0.TopicSetR\x06topics\"\"\n" +
 	"\bTopicSet\x12\x16\n" +
-	"\x06values\x18\x01 \x03(\fR\x06values\"3\n" +
+	"\x06values\x18\x01 \x03(\fR\x06values\"N\n" +
 	"\fLogsResponse\x12#\n" +
-	"\x04logs\x18\x01 \x03(\v2\x0f.epochdb.v0.LogR\x04logs2\xaf\x04\n" +
+	"\x04logs\x18\x01 \x03(\v2\x0f.epochdb.v0.LogR\x04logs\x12\x19\n" +
+	"\bto_block\x18\x02 \x01(\x04R\atoBlock\"i\n" +
+	"\x19StreamTransactionsRequest\x12\x1d\n" +
+	"\n" +
+	"from_block\x18\x01 \x01(\x04R\tfromBlock\x12\x19\n" +
+	"\bto_block\x18\x02 \x01(\x04R\atoBlock\x12\x12\n" +
+	"\x04full\x18\x03 \x01(\bR\x04full\"e\n" +
+	"\x10TransactionBatch\x12!\n" +
+	"\fblock_number\x18\x01 \x01(\x04R\vblockNumber\x12\x17\n" +
+	"\atx_hash\x18\x02 \x03(\fR\x06txHash\x12\x15\n" +
+	"\x06tx_rlp\x18\x03 \x03(\fR\x05txRlp\"\x86\x01\n" +
+	"\x11FeeHistoryRequest\x12\x1f\n" +
+	"\vblock_count\x18\x01 \x01(\x04R\n" +
+	"blockCount\x12!\n" +
+	"\fnewest_block\x18\x02 \x01(\x04R\vnewestBlock\x12-\n" +
+	"\x12reward_percentiles\x18\x03 \x03(\x01R\x11rewardPercentiles\"\xb5\x01\n" +
+	"\x12FeeHistoryResponse\x12!\n" +
+	"\foldest_block\x18\x01 \x01(\x04R\voldestBlock\x12'\n" +
+	"\x10base_fee_per_gas\x18\x02 \x03(\fR\rbaseFeePerGas\x12$\n" +
+	"\x0egas_used_ratio\x18\x03 \x03(\x01R\fgasUsedRatio\x12-\n" +
+	"\x06reward\x18\x04 \x03(\v2\x15.epochdb.v0.RewardRowR\x06reward\"#\n" +
+	"\tRewardRow\x12\x16\n" +
+	"\x06values\x18\x01 \x03(\fR\x06values\"\x11\n" +
+	"\x0fGasPriceRequest\"\xb1\x02\n" +
+	"\x10GasPriceResponse\x12\x1b\n" +
+	"\tgas_price\x18\x01 \x01(\fR\bgasPrice\x126\n" +
+	"\x18max_priority_fee_per_gas\x18\x02 \x01(\fR\x14maxPriorityFeePerGas\x12\x19\n" +
+	"\bbase_fee\x18\x03 \x01(\fR\abaseFee\x12\"\n" +
+	"\rnext_base_fee\x18\x04 \x01(\fR\vnextBaseFee\x12+\n" +
+	"\x04slow\x18\x05 \x01(\v2\x17.epochdb.v0.PriceOptionR\x04slow\x12/\n" +
+	"\x06normal\x18\x06 \x01(\v2\x17.epochdb.v0.PriceOptionR\x06normal\x12+\n" +
+	"\x04fast\x18\a \x01(\v2\x17.epochdb.v0.PriceOptionR\x04fast\"l\n" +
+	"\vPriceOption\x126\n" +
+	"\x18max_priority_fee_per_gas\x18\x01 \x01(\fR\x14maxPriorityFeePerGas\x12%\n" +
+	"\x0fmax_fee_per_gas\x18\x02 \x01(\fR\fmaxFeePerGas2\x99\t\n" +
 	"\aEpochDB\x12<\n" +
 	"\aGetHead\x12\x17.epochdb.v0.HeadRequest\x1a\x18.epochdb.v0.HeadResponse\x12B\n" +
-	"\vStreamHeads\x12\x17.epochdb.v0.HeadRequest\x1a\x18.epochdb.v0.HeadResponse0\x01\x12?\n" +
+	"\vStreamHeads\x12\x17.epochdb.v0.HeadRequest\x1a\x18.epochdb.v0.HeadResponse0\x01\x12H\n" +
+	"\vGetNodeInfo\x12\x1b.epochdb.v0.NodeInfoRequest\x1a\x1c.epochdb.v0.NodeInfoResponse\x12?\n" +
 	"\bGetBlock\x12\x18.epochdb.v0.BlockRequest\x1a\x19.epochdb.v0.BlockResponse\x12Q\n" +
-	"\x0eGetTransaction\x12\x1e.epochdb.v0.TransactionRequest\x1a\x1f.epochdb.v0.TransactionResponse\x129\n" +
-	"\x04Call\x12\x17.epochdb.v0.CallRequest\x1a\x18.epochdb.v0.CallResponse\x12?\n" +
-	"\bGetState\x12\x18.epochdb.v0.StateRequest\x1a\x19.epochdb.v0.StateResponse\x12T\n" +
-	"\x1bSearchTransactionsByAddress\x12\x19.epochdb.v0.SearchRequest\x1a\x1a.epochdb.v0.SearchResponse\x12<\n" +
-	"\aGetLogs\x12\x17.epochdb.v0.LogsRequest\x1a\x18.epochdb.v0.LogsResponseB+Z)github.com/containerman17/epochdb/grpcapib\x06proto3"
+	"\x0eGetTransaction\x12\x1e.epochdb.v0.TransactionRequest\x1a\x1f.epochdb.v0.TransactionResponse\x12?\n" +
+	"\bGetState\x12\x18.epochdb.v0.StateRequest\x1a\x19.epochdb.v0.StateResponse\x129\n" +
+	"\x04Call\x12\x17.epochdb.v0.CallRequest\x1a\x18.epochdb.v0.CallResponse\x12G\n" +
+	"\vEstimateGas\x12\x17.epochdb.v0.CallRequest\x1a\x1f.epochdb.v0.EstimateGasResponse\x12<\n" +
+	"\x05Trace\x12\x18.epochdb.v0.TraceRequest\x1a\x19.epochdb.v0.TraceResponse\x12<\n" +
+	"\aGetLogs\x12\x17.epochdb.v0.LogsRequest\x1a\x18.epochdb.v0.LogsResponse\x12A\n" +
+	"\n" +
+	"StreamLogs\x12\x17.epochdb.v0.LogsRequest\x1a\x18.epochdb.v0.LogsResponse0\x01\x12[\n" +
+	"\x12StreamTransactions\x12%.epochdb.v0.StreamTransactionsRequest\x1a\x1c.epochdb.v0.TransactionBatch0\x01\x12T\n" +
+	"\x1bSearchTransactionsByAddress\x12\x19.epochdb.v0.SearchRequest\x1a\x1a.epochdb.v0.SearchResponse\x12]\n" +
+	"\x12GetContractCreator\x12\".epochdb.v0.ContractCreatorRequest\x1a#.epochdb.v0.ContractCreatorResponse\x12N\n" +
+	"\rGetFeeHistory\x12\x1d.epochdb.v0.FeeHistoryRequest\x1a\x1e.epochdb.v0.FeeHistoryResponse\x12H\n" +
+	"\vGetGasPrice\x12\x1b.epochdb.v0.GasPriceRequest\x1a\x1c.epochdb.v0.GasPriceResponseB+Z)github.com/containerman17/epochdb/grpcapib\x06proto3"
 
 var (
 	file_epochdb_proto_rawDescOnce sync.Once
@@ -1462,56 +2865,97 @@ func file_epochdb_proto_rawDescGZIP() []byte {
 	return file_epochdb_proto_rawDescData
 }
 
-var file_epochdb_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_epochdb_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_epochdb_proto_goTypes = []any{
-	(*HeadRequest)(nil),         // 0: epochdb.v0.HeadRequest
-	(*HeadResponse)(nil),        // 1: epochdb.v0.HeadResponse
-	(*BlockRequest)(nil),        // 2: epochdb.v0.BlockRequest
-	(*BlockResponse)(nil),       // 3: epochdb.v0.BlockResponse
-	(*TransactionRequest)(nil),  // 4: epochdb.v0.TransactionRequest
-	(*TransactionResponse)(nil), // 5: epochdb.v0.TransactionResponse
-	(*Receipt)(nil),             // 6: epochdb.v0.Receipt
-	(*Log)(nil),                 // 7: epochdb.v0.Log
-	(*Frame)(nil),               // 8: epochdb.v0.Frame
-	(*CallRequest)(nil),         // 9: epochdb.v0.CallRequest
-	(*CallResponse)(nil),        // 10: epochdb.v0.CallResponse
-	(*StateRequest)(nil),        // 11: epochdb.v0.StateRequest
-	(*StateResponse)(nil),       // 12: epochdb.v0.StateResponse
-	(*SearchRequest)(nil),       // 13: epochdb.v0.SearchRequest
-	(*SearchResponse)(nil),      // 14: epochdb.v0.SearchResponse
-	(*AddrHit)(nil),             // 15: epochdb.v0.AddrHit
-	(*LogsRequest)(nil),         // 16: epochdb.v0.LogsRequest
-	(*TopicSet)(nil),            // 17: epochdb.v0.TopicSet
-	(*LogsResponse)(nil),        // 18: epochdb.v0.LogsResponse
+	(*HeadRequest)(nil),               // 0: epochdb.v0.HeadRequest
+	(*HeadResponse)(nil),              // 1: epochdb.v0.HeadResponse
+	(*NodeInfoRequest)(nil),           // 2: epochdb.v0.NodeInfoRequest
+	(*NodeInfoResponse)(nil),          // 3: epochdb.v0.NodeInfoResponse
+	(*Refusal)(nil),                   // 4: epochdb.v0.Refusal
+	(*BlockRequest)(nil),              // 5: epochdb.v0.BlockRequest
+	(*BlockResponse)(nil),             // 6: epochdb.v0.BlockResponse
+	(*TransactionRequest)(nil),        // 7: epochdb.v0.TransactionRequest
+	(*TransactionResponse)(nil),       // 8: epochdb.v0.TransactionResponse
+	(*Receipt)(nil),                   // 9: epochdb.v0.Receipt
+	(*Log)(nil),                       // 10: epochdb.v0.Log
+	(*Frame)(nil),                     // 11: epochdb.v0.Frame
+	(*CallRequest)(nil),               // 12: epochdb.v0.CallRequest
+	(*CallResponse)(nil),              // 13: epochdb.v0.CallResponse
+	(*AccessTuple)(nil),               // 14: epochdb.v0.AccessTuple
+	(*EstimateGasResponse)(nil),       // 15: epochdb.v0.EstimateGasResponse
+	(*TraceRequest)(nil),              // 16: epochdb.v0.TraceRequest
+	(*TraceResponse)(nil),             // 17: epochdb.v0.TraceResponse
+	(*StateRequest)(nil),              // 18: epochdb.v0.StateRequest
+	(*StateResponse)(nil),             // 19: epochdb.v0.StateResponse
+	(*SearchRequest)(nil),             // 20: epochdb.v0.SearchRequest
+	(*SearchResponse)(nil),            // 21: epochdb.v0.SearchResponse
+	(*AddrHit)(nil),                   // 22: epochdb.v0.AddrHit
+	(*ContractCreatorRequest)(nil),    // 23: epochdb.v0.ContractCreatorRequest
+	(*ContractCreatorResponse)(nil),   // 24: epochdb.v0.ContractCreatorResponse
+	(*LogsRequest)(nil),               // 25: epochdb.v0.LogsRequest
+	(*TopicSet)(nil),                  // 26: epochdb.v0.TopicSet
+	(*LogsResponse)(nil),              // 27: epochdb.v0.LogsResponse
+	(*StreamTransactionsRequest)(nil), // 28: epochdb.v0.StreamTransactionsRequest
+	(*TransactionBatch)(nil),          // 29: epochdb.v0.TransactionBatch
+	(*FeeHistoryRequest)(nil),         // 30: epochdb.v0.FeeHistoryRequest
+	(*FeeHistoryResponse)(nil),        // 31: epochdb.v0.FeeHistoryResponse
+	(*RewardRow)(nil),                 // 32: epochdb.v0.RewardRow
+	(*GasPriceRequest)(nil),           // 33: epochdb.v0.GasPriceRequest
+	(*GasPriceResponse)(nil),          // 34: epochdb.v0.GasPriceResponse
+	(*PriceOption)(nil),               // 35: epochdb.v0.PriceOption
 }
 var file_epochdb_proto_depIdxs = []int32{
-	6,  // 0: epochdb.v0.TransactionResponse.receipt:type_name -> epochdb.v0.Receipt
-	8,  // 1: epochdb.v0.TransactionResponse.frames:type_name -> epochdb.v0.Frame
-	7,  // 2: epochdb.v0.Receipt.logs:type_name -> epochdb.v0.Log
-	15, // 3: epochdb.v0.SearchResponse.hits:type_name -> epochdb.v0.AddrHit
-	17, // 4: epochdb.v0.LogsRequest.topics:type_name -> epochdb.v0.TopicSet
-	7,  // 5: epochdb.v0.LogsResponse.logs:type_name -> epochdb.v0.Log
-	0,  // 6: epochdb.v0.EpochDB.GetHead:input_type -> epochdb.v0.HeadRequest
-	0,  // 7: epochdb.v0.EpochDB.StreamHeads:input_type -> epochdb.v0.HeadRequest
-	2,  // 8: epochdb.v0.EpochDB.GetBlock:input_type -> epochdb.v0.BlockRequest
-	4,  // 9: epochdb.v0.EpochDB.GetTransaction:input_type -> epochdb.v0.TransactionRequest
-	9,  // 10: epochdb.v0.EpochDB.Call:input_type -> epochdb.v0.CallRequest
-	11, // 11: epochdb.v0.EpochDB.GetState:input_type -> epochdb.v0.StateRequest
-	13, // 12: epochdb.v0.EpochDB.SearchTransactionsByAddress:input_type -> epochdb.v0.SearchRequest
-	16, // 13: epochdb.v0.EpochDB.GetLogs:input_type -> epochdb.v0.LogsRequest
-	1,  // 14: epochdb.v0.EpochDB.GetHead:output_type -> epochdb.v0.HeadResponse
-	1,  // 15: epochdb.v0.EpochDB.StreamHeads:output_type -> epochdb.v0.HeadResponse
-	3,  // 16: epochdb.v0.EpochDB.GetBlock:output_type -> epochdb.v0.BlockResponse
-	5,  // 17: epochdb.v0.EpochDB.GetTransaction:output_type -> epochdb.v0.TransactionResponse
-	10, // 18: epochdb.v0.EpochDB.Call:output_type -> epochdb.v0.CallResponse
-	12, // 19: epochdb.v0.EpochDB.GetState:output_type -> epochdb.v0.StateResponse
-	14, // 20: epochdb.v0.EpochDB.SearchTransactionsByAddress:output_type -> epochdb.v0.SearchResponse
-	18, // 21: epochdb.v0.EpochDB.GetLogs:output_type -> epochdb.v0.LogsResponse
-	14, // [14:22] is the sub-list for method output_type
-	6,  // [6:14] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	4,  // 0: epochdb.v0.NodeInfoResponse.refusals:type_name -> epochdb.v0.Refusal
+	9,  // 1: epochdb.v0.BlockResponse.receipts:type_name -> epochdb.v0.Receipt
+	9,  // 2: epochdb.v0.TransactionResponse.receipt:type_name -> epochdb.v0.Receipt
+	11, // 3: epochdb.v0.TransactionResponse.frames:type_name -> epochdb.v0.Frame
+	10, // 4: epochdb.v0.Receipt.logs:type_name -> epochdb.v0.Log
+	14, // 5: epochdb.v0.CallResponse.access_list:type_name -> epochdb.v0.AccessTuple
+	12, // 6: epochdb.v0.TraceRequest.call:type_name -> epochdb.v0.CallRequest
+	22, // 7: epochdb.v0.SearchResponse.hits:type_name -> epochdb.v0.AddrHit
+	26, // 8: epochdb.v0.LogsRequest.topics:type_name -> epochdb.v0.TopicSet
+	10, // 9: epochdb.v0.LogsResponse.logs:type_name -> epochdb.v0.Log
+	32, // 10: epochdb.v0.FeeHistoryResponse.reward:type_name -> epochdb.v0.RewardRow
+	35, // 11: epochdb.v0.GasPriceResponse.slow:type_name -> epochdb.v0.PriceOption
+	35, // 12: epochdb.v0.GasPriceResponse.normal:type_name -> epochdb.v0.PriceOption
+	35, // 13: epochdb.v0.GasPriceResponse.fast:type_name -> epochdb.v0.PriceOption
+	0,  // 14: epochdb.v0.EpochDB.GetHead:input_type -> epochdb.v0.HeadRequest
+	0,  // 15: epochdb.v0.EpochDB.StreamHeads:input_type -> epochdb.v0.HeadRequest
+	2,  // 16: epochdb.v0.EpochDB.GetNodeInfo:input_type -> epochdb.v0.NodeInfoRequest
+	5,  // 17: epochdb.v0.EpochDB.GetBlock:input_type -> epochdb.v0.BlockRequest
+	7,  // 18: epochdb.v0.EpochDB.GetTransaction:input_type -> epochdb.v0.TransactionRequest
+	18, // 19: epochdb.v0.EpochDB.GetState:input_type -> epochdb.v0.StateRequest
+	12, // 20: epochdb.v0.EpochDB.Call:input_type -> epochdb.v0.CallRequest
+	12, // 21: epochdb.v0.EpochDB.EstimateGas:input_type -> epochdb.v0.CallRequest
+	16, // 22: epochdb.v0.EpochDB.Trace:input_type -> epochdb.v0.TraceRequest
+	25, // 23: epochdb.v0.EpochDB.GetLogs:input_type -> epochdb.v0.LogsRequest
+	25, // 24: epochdb.v0.EpochDB.StreamLogs:input_type -> epochdb.v0.LogsRequest
+	28, // 25: epochdb.v0.EpochDB.StreamTransactions:input_type -> epochdb.v0.StreamTransactionsRequest
+	20, // 26: epochdb.v0.EpochDB.SearchTransactionsByAddress:input_type -> epochdb.v0.SearchRequest
+	23, // 27: epochdb.v0.EpochDB.GetContractCreator:input_type -> epochdb.v0.ContractCreatorRequest
+	30, // 28: epochdb.v0.EpochDB.GetFeeHistory:input_type -> epochdb.v0.FeeHistoryRequest
+	33, // 29: epochdb.v0.EpochDB.GetGasPrice:input_type -> epochdb.v0.GasPriceRequest
+	1,  // 30: epochdb.v0.EpochDB.GetHead:output_type -> epochdb.v0.HeadResponse
+	1,  // 31: epochdb.v0.EpochDB.StreamHeads:output_type -> epochdb.v0.HeadResponse
+	3,  // 32: epochdb.v0.EpochDB.GetNodeInfo:output_type -> epochdb.v0.NodeInfoResponse
+	6,  // 33: epochdb.v0.EpochDB.GetBlock:output_type -> epochdb.v0.BlockResponse
+	8,  // 34: epochdb.v0.EpochDB.GetTransaction:output_type -> epochdb.v0.TransactionResponse
+	19, // 35: epochdb.v0.EpochDB.GetState:output_type -> epochdb.v0.StateResponse
+	13, // 36: epochdb.v0.EpochDB.Call:output_type -> epochdb.v0.CallResponse
+	15, // 37: epochdb.v0.EpochDB.EstimateGas:output_type -> epochdb.v0.EstimateGasResponse
+	17, // 38: epochdb.v0.EpochDB.Trace:output_type -> epochdb.v0.TraceResponse
+	27, // 39: epochdb.v0.EpochDB.GetLogs:output_type -> epochdb.v0.LogsResponse
+	27, // 40: epochdb.v0.EpochDB.StreamLogs:output_type -> epochdb.v0.LogsResponse
+	29, // 41: epochdb.v0.EpochDB.StreamTransactions:output_type -> epochdb.v0.TransactionBatch
+	21, // 42: epochdb.v0.EpochDB.SearchTransactionsByAddress:output_type -> epochdb.v0.SearchResponse
+	24, // 43: epochdb.v0.EpochDB.GetContractCreator:output_type -> epochdb.v0.ContractCreatorResponse
+	31, // 44: epochdb.v0.EpochDB.GetFeeHistory:output_type -> epochdb.v0.FeeHistoryResponse
+	34, // 45: epochdb.v0.EpochDB.GetGasPrice:output_type -> epochdb.v0.GasPriceResponse
+	30, // [30:46] is the sub-list for method output_type
+	14, // [14:30] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_epochdb_proto_init() }
@@ -1519,13 +2963,21 @@ func file_epochdb_proto_init() {
 	if File_epochdb_proto != nil {
 		return
 	}
+	file_epochdb_proto_msgTypes[7].OneofWrappers = []any{}
+	file_epochdb_proto_msgTypes[12].OneofWrappers = []any{}
+	file_epochdb_proto_msgTypes[16].OneofWrappers = []any{
+		(*TraceRequest_TxHash)(nil),
+		(*TraceRequest_BlockNumber)(nil),
+		(*TraceRequest_BlockHash)(nil),
+		(*TraceRequest_Call)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_epochdb_proto_rawDesc), len(file_epochdb_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   19,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

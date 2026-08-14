@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -34,10 +35,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 
@@ -397,6 +401,483 @@ func TestAdapterEquivalence(t *testing.T) {
 		head.Number, height, nTxs, txHash, len(libLogs), from, height)
 }
 
+// TestAdapterEquivalenceFullSurface is the same promise as the test above, for
+// the REST of the gRPC surface: every capability gRPC gained beyond the first
+// eight methods is asked here through gRPC and through JSON-RPC, and the two
+// answers must agree. gRPC is the PRIMARY remote API (DESIGN), so a capability
+// JSON-RPC has and gRPC answers differently is a divergence, and one gRPC
+// cannot answer at all is a gap this test would not catch: the classification
+// of what is covered, added and refused lives in the commit message.
+func TestAdapterEquivalenceFullSurface(t *testing.T) {
+	n := corpusNode(t)
+	gc := grpcClient(t, n)
+	jrpc := httptest.NewServer(n.Core())
+	defer jrpc.Close()
+	ctx := context.Background()
+
+	head, err := n.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	height, txHash := blockWithTxs(t, n, head.Number)
+	tag := fmt.Sprintf("0x%x", height)
+
+	// --- node metadata: chainId, client version, syncing, config, ots level ---
+	info, err := gc.GetNodeInfo(ctx, &grpcapi.NodeInfoRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := "0x"+new(big.Int).SetBytes(info.ChainId).Text(16), jsonString(t, jrpc, "eth_chainId"); got != want {
+		t.Fatalf("chainId: gRPC %s, JSON-RPC %s", got, want)
+	}
+	if got, want := info.ClientVersion, jsonString(t, jrpc, "web3_clientVersion"); got != want {
+		t.Fatalf("client version: gRPC %s, JSON-RPC %s", got, want)
+	}
+	var jsyncing any
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_syncing"), &jsyncing)
+	if syncing := jsyncing != false; syncing != info.Syncing {
+		t.Fatalf("syncing: gRPC %v, JSON-RPC %v", info.Syncing, jsyncing)
+	}
+	if !sameJSON(t, info.ChainConfigJson, jsonRPC(t, jrpc, "eth_getChainConfig")) {
+		t.Fatalf("chain config differs between gRPC and JSON-RPC")
+	}
+	var jlevel uint32
+	json.Unmarshal(jsonRPC(t, jrpc, "ots_getApiLevel"), &jlevel)
+	if info.OtsApiLevel != jlevel {
+		t.Fatalf("ots api level: gRPC %d, JSON-RPC %d", info.OtsApiLevel, jlevel)
+	}
+	if len(info.Refusals) == 0 {
+		t.Fatal("GetNodeInfo publishes no refusals: a client cannot learn what this node will never answer")
+	}
+
+	// --- the block, in every form JSON-RPC serves it -------------------------
+	gb, err := gc.GetBlock(ctx, &grpcapi.BlockRequest{
+		Number: height, TxHashes: true, Receipts: true, Raw: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hexutil.Encode(gb.BlockRlp), jsonString(t, jrpc, "debug_getRawBlock", tag); got != want {
+		t.Fatalf("raw block %d: gRPC %s, JSON-RPC %s", height, got, want)
+	}
+	if got, want := hexutil.Encode(gb.HeaderRlp), jsonString(t, jrpc, "debug_getRawHeader", tag); got != want {
+		t.Fatalf("raw header %d: gRPC %s, JSON-RPC %s", height, got, want)
+	}
+	var jblock map[string]any
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_getBlockByNumber", tag, false), &jblock)
+	jhashes := jblock["transactions"].([]any)
+	if len(gb.TxHash) != len(jhashes) {
+		t.Fatalf("tx hashes of %d: gRPC %d, JSON-RPC %d", height, len(gb.TxHash), len(jhashes))
+	}
+	for i, h := range gb.TxHash {
+		if got := common.BytesToHash(h).Hex(); got != jhashes[i].(string) {
+			t.Fatalf("tx hash %d of block %d: gRPC %s, JSON-RPC %s", i, height, got, jhashes[i])
+		}
+	}
+	var jreceipts []map[string]any
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_getBlockReceipts", tag), &jreceipts)
+	if len(gb.Receipts) != len(jreceipts) {
+		t.Fatalf("receipts of %d: gRPC %d, JSON-RPC %d", height, len(gb.Receipts), len(jreceipts))
+	}
+	for i, r := range gb.Receipts {
+		if got, want := fmt.Sprintf("0x%x", r.GasUsed), jreceipts[i]["gasUsed"].(string); got != want {
+			t.Fatalf("receipt %d gasUsed: gRPC %s, JSON-RPC %s", i, got, want)
+		}
+		if got, want := len(r.Logs), len(jreceipts[i]["logs"].([]any)); got != want {
+			t.Fatalf("receipt %d logs: gRPC %d, JSON-RPC %d", i, got, want)
+		}
+	}
+	var jrawReceipts []string
+	json.Unmarshal(jsonRPC(t, jrpc, "debug_getRawReceipts", tag), &jrawReceipts)
+	if len(gb.ReceiptRlp) != len(jrawReceipts) {
+		t.Fatalf("raw receipts of %d: gRPC %d, JSON-RPC %d", height, len(gb.ReceiptRlp), len(jrawReceipts))
+	}
+	for i, raw := range gb.ReceiptRlp {
+		if got := hexutil.Encode(raw); got != jrawReceipts[i] {
+			t.Fatalf("raw receipt %d: gRPC %s, JSON-RPC %s", i, got, jrawReceipts[i])
+		}
+	}
+	var jdetails map[string]any
+	json.Unmarshal(jsonRPC(t, jrpc, "ots_getBlockDetails", tag), &jdetails)
+	if got, want := hexBig(gb.TotalFees), jdetails["totalFees"].(string); got != want {
+		t.Fatalf("total fees of %d: gRPC %s, JSON-RPC %s", height, got, want)
+	}
+	var juncles string
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_getUncleCountByBlockNumber", tag), &juncles)
+	if got := fmt.Sprintf("0x%x", gb.UncleCount); got != juncles {
+		t.Fatalf("uncle count: gRPC %s, JSON-RPC %s", got, juncles)
+	}
+
+	// --- the transaction, named three ways -----------------------------------
+	gt, err := gc.GetTransaction(ctx, &grpcapi.TransactionRequest{Hash: txHash.Bytes()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tx types.Transaction
+	if err := tx.UnmarshalBinary(gt.TxRlp); err != nil {
+		t.Fatal(err)
+	}
+	idx := uint32(gt.Index)
+	byIndex, err := gc.GetTransaction(ctx, &grpcapi.TransactionRequest{BlockNumber: height, Index: &idx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jbyIndex map[string]any
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_getTransactionByBlockNumberAndIndex", tag, fmt.Sprintf("0x%x", idx)), &jbyIndex)
+	if got, want := common.BytesToHash(byIndex.Hash).Hex(), jbyIndex["hash"].(string); got != want {
+		t.Fatalf("tx by block+index: gRPC %s, JSON-RPC %s", got, want)
+	}
+	sender, err := types.Sender(types.LatestSignerForChainID(n.ChainID()), &tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := tx.Nonce()
+	byNonce, err := gc.GetTransaction(ctx, &grpcapi.TransactionRequest{Sender: sender.Bytes(), Nonce: &nonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jByNonce := jsonString(t, jrpc, "ots_getTransactionBySenderAndNonce", sender, nonce)
+	if got := common.BytesToHash(byNonce.Hash).Hex(); got != jByNonce {
+		t.Fatalf("tx by sender+nonce: gRPC %s, JSON-RPC %s", got, jByNonce)
+	}
+	// The stored frames are Otterscan's internal operations, filtered the same
+	// way at read time: CREATE/CREATE2, and a CALL that moved value.
+	var jops []map[string]any
+	json.Unmarshal(jsonRPC(t, jrpc, "ots_getInternalOperations", txHash), &jops)
+	ops := 0
+	for _, f := range gt.Frames {
+		switch {
+		case f.Kind == 0xf0 || f.Kind == 0xf5: // CREATE, CREATE2
+			ops++
+		case f.Kind == 0xf1 && len(f.Value) > 0: // CALL with value
+			ops++
+		}
+	}
+	if ops != len(jops) {
+		t.Fatalf("internal operations of %s: gRPC frames yield %d, JSON-RPC %d", txHash, ops, len(jops))
+	}
+
+	// --- execution: call detail, access list, gas estimate --------------------
+	to, data := benchTarget(t, n, head.Number)
+	args := map[string]any{"to": to, "data": hexutil.Encode(data), "gas": "0x100000"}
+	req := &grpcapi.CallRequest{To: to.Bytes(), Data: data, Gas: 0x100000, Height: head.Number}
+
+	detailed, err := gc.Call(ctx, &grpcapi.CallRequest{
+		To: req.To, Data: req.Data, Gas: req.Gas, Height: req.Height, Detailed: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jdetailed map[string]any
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_callDetailed", args, tag), &jdetailed)
+	if got, want := detailed.GasUsed, uint64(jdetailed["gas"].(float64)); got != want {
+		t.Fatalf("callDetailed gas: gRPC %d, JSON-RPC %d", got, want)
+	}
+	if got, want := hexutil.Encode(detailed.Output), jdetailed["returnData"].(string); got != want {
+		t.Fatalf("callDetailed returnData: gRPC %s, JSON-RPC %s", got, want)
+	}
+
+	al, err := gc.Call(ctx, &grpcapi.CallRequest{
+		To: req.To, Data: req.Data, Gas: req.Gas, Height: req.Height, AccessList: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jal map[string]any
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_createAccessList", args, tag), &jal)
+	if got, want := fmt.Sprintf("0x%x", al.GasUsed), jal["gasUsed"].(string); got != want {
+		t.Fatalf("createAccessList gas: gRPC %s, JSON-RPC %s", got, want)
+	}
+	if got, want := len(al.AccessList), len(jal["accessList"].([]any)); got != want {
+		t.Fatalf("createAccessList tuples: gRPC %d, JSON-RPC %d", got, want)
+	}
+
+	gest, gerr := gc.EstimateGas(ctx, req)
+	jest, jerr := jsonRPCTry(t, jrpc, "eth_estimateGas", args, tag)
+	switch {
+	case gerr != nil || jerr != "":
+		if gerr == nil || jerr == "" {
+			t.Fatalf("estimateGas: gRPC %v, JSON-RPC %q (one refused, the other answered)", gerr, jerr)
+		}
+	default:
+		var jgas string
+		json.Unmarshal(jest, &jgas)
+		if got := fmt.Sprintf("0x%x", gest.Gas); got != jgas {
+			t.Fatalf("estimateGas: gRPC %s, JSON-RPC %s", got, jgas)
+		}
+	}
+
+	// --- tracing: a transaction, a block, a call -----------------------------
+	tracerArg := map[string]any{"tracer": "callTracer"}
+	gtrace, err := gc.Trace(ctx, &grpcapi.TraceRequest{
+		Target: &grpcapi.TraceRequest_TxHash{TxHash: txHash.Bytes()}, Tracer: "callTracer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameJSON(t, gtrace.ResultJson[0], jsonRPC(t, jrpc, "debug_traceTransaction", txHash, tracerArg)) {
+		t.Fatalf("traceTransaction %s differs between gRPC and JSON-RPC", txHash)
+	}
+	gblockTrace, err := gc.Trace(ctx, &grpcapi.TraceRequest{
+		Target: &grpcapi.TraceRequest_BlockNumber{BlockNumber: height}, Tracer: "callTracer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jblockTrace []struct {
+		TxHash string          `json:"txHash"`
+		Result json.RawMessage `json:"result"`
+	}
+	json.Unmarshal(jsonRPC(t, jrpc, "debug_traceBlockByNumber", tag, tracerArg), &jblockTrace)
+	if len(gblockTrace.ResultJson) != len(jblockTrace) {
+		t.Fatalf("traceBlock %d: gRPC %d results, JSON-RPC %d", height, len(gblockTrace.ResultJson), len(jblockTrace))
+	}
+	for i, r := range gblockTrace.ResultJson {
+		if !sameJSON(t, r, jblockTrace[i].Result) {
+			t.Fatalf("traceBlock %d result %d differs between gRPC and JSON-RPC", height, i)
+		}
+		if got := common.BytesToHash(gblockTrace.TxHash[i]).Hex(); got != jblockTrace[i].TxHash {
+			t.Fatalf("traceBlock %d tx %d: gRPC %s, JSON-RPC %s", height, i, got, jblockTrace[i].TxHash)
+		}
+	}
+	gcallTrace, err := gc.Trace(ctx, &grpcapi.TraceRequest{
+		Target: &grpcapi.TraceRequest_Call{Call: req}, Tracer: "callTracer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameJSON(t, gcallTrace.ResultJson[0], jsonRPC(t, jrpc, "debug_traceCall", args, tag, tracerArg)) {
+		t.Fatal("traceCall differs between gRPC and JSON-RPC")
+	}
+
+	// --- fees ----------------------------------------------------------------
+	percentiles := []float64{20, 80}
+	gfh, err := gc.GetFeeHistory(ctx, &grpcapi.FeeHistoryRequest{
+		BlockCount: 5, NewestBlock: height, RewardPercentiles: percentiles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jfh struct {
+		OldestBlock   string     `json:"oldestBlock"`
+		BaseFeePerGas []string   `json:"baseFeePerGas"`
+		GasUsedRatio  []float64  `json:"gasUsedRatio"`
+		Reward        [][]string `json:"reward"`
+	}
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_feeHistory", "0x5", tag, percentiles), &jfh)
+	if got := fmt.Sprintf("0x%x", gfh.OldestBlock); got != jfh.OldestBlock {
+		t.Fatalf("feeHistory oldestBlock: gRPC %s, JSON-RPC %s", got, jfh.OldestBlock)
+	}
+	if len(gfh.BaseFeePerGas) != len(jfh.BaseFeePerGas) || len(gfh.Reward) != len(jfh.Reward) {
+		t.Fatalf("feeHistory shape: gRPC %d fees / %d rewards, JSON-RPC %d / %d",
+			len(gfh.BaseFeePerGas), len(gfh.Reward), len(jfh.BaseFeePerGas), len(jfh.Reward))
+	}
+	for i, f := range gfh.BaseFeePerGas {
+		if got := hexBig(f); got != jfh.BaseFeePerGas[i] {
+			t.Fatalf("feeHistory baseFee %d: gRPC %s, JSON-RPC %s", i, got, jfh.BaseFeePerGas[i])
+		}
+	}
+	for i, row := range gfh.Reward {
+		for j, v := range row.Values {
+			if got := hexBig(v); got != jfh.Reward[i][j] {
+				t.Fatalf("feeHistory reward %d/%d: gRPC %s, JSON-RPC %s", i, j, got, jfh.Reward[i][j])
+			}
+		}
+	}
+
+	gp, err := gc.GetGasPrice(ctx, &grpcapi.GasPriceRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hexBig(gp.GasPrice), jsonString(t, jrpc, "eth_gasPrice"); got != want {
+		t.Fatalf("gasPrice: gRPC %s, JSON-RPC %s", got, want)
+	}
+	if got, want := hexBig(gp.MaxPriorityFeePerGas), jsonString(t, jrpc, "eth_maxPriorityFeePerGas"); got != want {
+		t.Fatalf("maxPriorityFeePerGas: gRPC %s, JSON-RPC %s", got, want)
+	}
+	if got, want := hexBig(gp.BaseFee), jsonString(t, jrpc, "eth_baseFee"); got != want {
+		t.Fatalf("baseFee: gRPC %s, JSON-RPC %s", got, want)
+	}
+	var jopts map[string]map[string]string
+	json.Unmarshal(jsonRPC(t, jrpc, "eth_suggestPriceOptions"), &jopts)
+	for name, got := range map[string]*grpcapi.PriceOption{
+		"slow": gp.Slow, "normal": gp.Normal, "fast": gp.Fast} {
+		want, ok := jopts[name]
+		if !ok != (got == nil) {
+			t.Fatalf("price option %s: gRPC %v, JSON-RPC %v", name, got, want)
+		}
+		if got == nil {
+			continue
+		}
+		if hexBig(got.MaxPriorityFeePerGas) != want["maxPriorityFeePerGas"] ||
+			hexBig(got.MaxFeePerGas) != want["maxFeePerGas"] {
+			t.Fatalf("price option %s: gRPC tip %s fee %s, JSON-RPC %v",
+				name, hexBig(got.MaxPriorityFeePerGas), hexBig(got.MaxFeePerGas), want)
+		}
+	}
+
+	// --- the contract creator ------------------------------------------------
+	gcreator, err := gc.GetContractCreator(ctx, &grpcapi.ContractCreatorRequest{Address: to.Bytes()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jcreator map[string]string
+	json.Unmarshal(jsonRPC(t, jrpc, "ots_getContractCreator", to), &jcreator)
+	if gcreator.Found != (jcreator != nil) {
+		t.Fatalf("contract creator of %s: gRPC found=%v, JSON-RPC %v", to, gcreator.Found, jcreator)
+	}
+	if gcreator.Found {
+		if got := common.BytesToHash(gcreator.TxHash).Hex(); got != jcreator["hash"] {
+			t.Fatalf("contract creator tx: gRPC %s, JSON-RPC %s", got, jcreator["hash"])
+		}
+		// The JSON encoding of an address is lower-case hex, the Go one is
+		// checksummed, so the comparison is on the address itself.
+		if got := common.BytesToAddress(gcreator.Creator); got != common.HexToAddress(jcreator["creator"]) {
+			t.Fatalf("contract creator: gRPC %s, JSON-RPC %s", got, jcreator["creator"])
+		}
+	}
+
+	// --- the streams, over a bounded historical range ------------------------
+	// A BOUNDED STREAM MUST END BY ITSELF: that is what replaces uninstalling a
+	// filter, so a consumer that reads to EOF has the whole range and knows it.
+	from := height
+	if from > 200 {
+		from = height - 200
+	}
+	want, err := n.Core().GetLogs(from, height, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := gc.StreamLogs(ctx, &grpcapi.LogsRequest{FromBlock: from, ToBlock: height})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var streamed []*grpcapi.Log
+	for {
+		batch, err := stream.Recv()
+		if err == io.EOF {
+			break // the clean end
+		}
+		if err != nil {
+			t.Fatalf("logs stream: %v", err)
+		}
+		streamed = append(streamed, batch.Logs...)
+	}
+	if len(streamed) != len(want) {
+		t.Fatalf("logs stream %d..%d: %d logs, GetLogs %d", from, height, len(streamed), len(want))
+	}
+	for i, l := range streamed {
+		if !bytes.Equal(l.TxHash, want[i].TxHash.Bytes()) || l.Index != uint32(want[i].Index) {
+			t.Fatalf("logs stream row %d: %x/%d, want %s/%d", i, l.TxHash, l.Index, want[i].TxHash, want[i].Index)
+		}
+	}
+
+	txStream, err := gc.StreamTransactions(ctx, &grpcapi.StreamTransactionsRequest{
+		FromBlock: height, ToBlock: height, Full: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for {
+		batch, err := txStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("transaction stream: %v", err)
+		}
+		if batch.BlockNumber != height {
+			t.Fatalf("transaction stream delivered block %d, want %d", batch.BlockNumber, height)
+		}
+		seen += len(batch.TxHash)
+		if len(batch.TxRlp) != len(batch.TxHash) {
+			t.Fatalf("transaction stream: %d hashes but %d bodies", len(batch.TxHash), len(batch.TxRlp))
+		}
+	}
+	if seen != len(jhashes) {
+		t.Fatalf("transaction stream on block %d: %d transactions, block holds %d", height, seen, len(jhashes))
+	}
+
+	t.Logf("gRPC and JSON-RPC agree on the whole surface at head %d: block %d, tx %s, contract %s, %d streamed logs",
+		head.Number, height, txHash, to, len(streamed))
+}
+
+// TestGRPCRefusesWhatTheNodeRefuses: the permanent refusal set is refused on
+// gRPC too, and it is refused BY NAME. A method that does not exist answers
+// Unimplemented (never an empty message a client would read as "none on this
+// chain"), and GetNodeInfo carries the reason so a client can find out WHY
+// without reading DESIGN.
+func TestGRPCRefusesWhatTheNodeRefuses(t *testing.T) {
+	n := synthNode(t)
+	writeBlock(t, n, 0)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := grpc.NewServer()
+	grpcapi.RegisterEpochDBServer(g, grpcapi.New(n))
+	go g.Serve(ln)
+	defer g.Stop()
+	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx := context.Background()
+
+	// Nothing in the refusal set has a method, and asking for one is a status
+	// code that names it rather than a plausible answer.
+	for _, method := range []string{
+		"GetProof", "DumpBlock", "AccountRange", "StorageRangeAt", "IntermediateRoots",
+		"GetPreimage", "GetBadBlocks", "TraceBadBlock", "TraceChain", "GetModifiedAccounts",
+		"SendRawTransaction", "SendTransaction", "SignTransaction", "GetTxPool",
+		"StreamPendingTransactions",
+	} {
+		err := conn.Invoke(ctx, "/epochdb.v0.EpochDB/"+method, &grpcapi.HeadRequest{}, &grpcapi.HeadResponse{})
+		if status.Code(err) != codes.Unimplemented {
+			t.Fatalf("%s: %v (want Unimplemented; a refusal must never look like an answer)", method, err)
+		}
+	}
+
+	// And the reasons are published, so a client learns them from the API.
+	info, err := grpcapi.NewEpochDBClient(conn).GetNodeInfo(ctx, &grpcapi.NodeInfoRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"eth_getProof", "debug_preimage", "eth_sendRawTransaction", "txpool_"} {
+		found := false
+		for _, r := range info.Refusals {
+			if strings.Contains(r.Capability, want) {
+				if r.Reason == "" {
+					t.Fatalf("refusal %q carries no reason", r.Capability)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("GetNodeInfo does not name %s among its refusals", want)
+		}
+	}
+}
+
+// jsonString calls a JSON-RPC method whose result is a string.
+func jsonString(t *testing.T, srv *httptest.Server, method string, params ...any) string {
+	t.Helper()
+	var out string
+	json.Unmarshal(jsonRPC(t, srv, method, params...), &out)
+	return out
+}
+
+// hexBig prints a big-endian gRPC integer the way JSON-RPC prints it.
+func hexBig(b []byte) string { return hexutil.EncodeBig(new(big.Int).SetBytes(b)) }
+
+// sameJSON compares two JSON documents structurally: key order and whitespace
+// are not part of the answer, everything else is.
+func sameJSON(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var x, y any
+	if err := json.Unmarshal(a, &x); err != nil {
+		t.Fatalf("decode %s: %v", a, err)
+	}
+	if err := json.Unmarshal(b, &y); err != nil {
+		t.Fatalf("decode %s: %v", b, err)
+	}
+	return reflect.DeepEqual(x, y)
+}
+
 // blockWithTxs walks down from the head for a block that has transactions, and
 // returns it with its first transaction's hash. A corpus with none in the last
 // 5,000 blocks fails the test rather than passing vacuously.
@@ -629,7 +1110,7 @@ func BenchmarkInProcessCall(b *testing.B) {
 // EPOCHDB_BENCH_TO names a contract instead, which is how the CODE-HEAVY shape
 // is measured: a proxy's call loads its own code and its implementation's, so
 // it is two code reads per call rather than one.
-func benchTarget(b *testing.B, n *epochdb.Node, head uint64) (common.Address, []byte) {
+func benchTarget(b testing.TB, n *epochdb.Node, head uint64) (common.Address, []byte) {
 	b.Helper()
 	if to := os.Getenv("EPOCHDB_BENCH_TO"); to != "" {
 		return common.HexToAddress(to), common.FromHex("0x18160ddd") // totalSupply()

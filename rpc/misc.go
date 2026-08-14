@@ -189,30 +189,42 @@ func (s *Server) estimateGas(reqParams []json.RawMessage) (any, *rpcError) {
 	} else if header, rerr := s.headerAt(n); rerr == nil && header.GasLimit > 0 {
 		hi = min(hi, header.GasLimit)
 	}
-
-	// The ceiling must execute at all, or the call fails regardless of gas.
-	res, rerr := s.runCall(&args, n, hi, nil, ov)
+	gas, rerr := s.estimateGasAt(args.msg(hi), n, ov)
 	if rerr != nil {
 		return nil, rerr
 	}
+	return hexutil.EncodeUint64(gas), nil
+}
+
+// estimateGasAt is the core-layer half of the estimator: msg.GasLimit is the
+// CEILING to search under, and the search runs the same s.call every other
+// surface runs.
+func (s *Server) estimateGasAt(msg *callMsg, n uint64, ov *overrides) (uint64, *rpcError) {
+	hi := msg.GasLimit
+	run := func(gas uint64) (*callResult, *rpcError) {
+		m := *msg
+		m.GasLimit = gas
+		return s.call(&m, n, nil, ov)
+	}
+	// The ceiling must execute at all, or the call fails regardless of gas.
+	res, rerr := run(hi)
+	if rerr != nil {
+		return 0, rerr
+	}
 	if res.Err != nil {
-		return nil, revertError(res)
+		return 0, revertError(res)
 	}
 
 	// A TRANSPORT OR STATE failure is not "not executable". Reading it as one
 	// pushed lo up exactly as an out-of-gas would and returned the cap as a
 	// confident estimate, which a wallet then builds a transaction around.
-	gas, rerr := searchGas(ethparams.TxGas-1, hi, func(gas uint64) (bool, *rpcError) {
-		res, rerr := s.runCall(&args, n, gas, nil, ov)
+	return searchGas(ethparams.TxGas-1, hi, func(gas uint64) (bool, *rpcError) {
+		res, rerr := run(gas)
 		if rerr != nil {
 			return false, rerr
 		}
 		return res.Err == nil, nil
 	})
-	if rerr != nil {
-		return nil, rerr
-	}
-	return hexutil.EncodeUint64(gas), nil
 }
 
 // searchGas returns the smallest gas in (lo, hi] for which executable
@@ -318,7 +330,7 @@ func (s *Server) nextBaseFee(n uint64) (*big.Int, *rpcError) {
 // trailingBaseFee is eth_feeHistory's blockCount+1'th entry: the base fee of
 // the block after n. Below the head that block is READ, not estimated; at the
 // head it is projected.
-func (s *Server) trailingBaseFee(n uint64) (*hexutil.Big, *rpcError) {
+func (s *Server) trailingBaseFee(n uint64) (*big.Int, *rpcError) {
 	var next *big.Int
 	if n < s.head() {
 		var rerr *rpcError
@@ -334,7 +346,7 @@ func (s *Server) trailingBaseFee(n uint64) (*hexutil.Big, *rpcError) {
 	if next == nil {
 		next = new(big.Int) // pre-AP3 / pre-SubnetEVM: there is no base fee
 	}
-	return (*hexutil.Big)(next), nil
+	return next, nil
 }
 
 // feeHistory serves the geth-shaped response from headers (and, when
@@ -363,6 +375,36 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 			return nil, errInvalid("bad rewardPercentiles: %v", err)
 		}
 	}
+	fh, rerr := s.feeHistoryAt(count, newest, percentiles)
+	if rerr != nil {
+		return nil, rerr
+	}
+	baseFees := make([]any, len(fh.BaseFee))
+	for i, f := range fh.BaseFee {
+		baseFees[i] = (*hexutil.Big)(f)
+	}
+	out := map[string]any{
+		"oldestBlock":   hexutil.EncodeUint64(fh.OldestBlock),
+		"baseFeePerGas": baseFees,
+		"gasUsedRatio":  fh.GasUsedRatio,
+	}
+	if len(percentiles) > 0 {
+		rewards := make([]any, len(fh.Reward))
+		for i, row := range fh.Reward {
+			cells := make([]any, len(row))
+			for j, v := range row {
+				cells[j] = (*hexutil.Big)(v)
+			}
+			rewards[i] = cells
+		}
+		out["reward"] = rewards
+	}
+	return out, nil
+}
+
+// feeHistoryAt is the core-layer half: numbers in, numbers out, shared by
+// every adapter (the JSON one above just hex-encodes them).
+func (s *Server) feeHistoryAt(count, newest uint64, percentiles []float64) (*FeeHistory, *rpcError) {
 	if count > 1024 {
 		count = 1024
 	}
@@ -374,11 +416,10 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 		oldest = newest + 1 - count
 	}
 
-	zero := (*hexutil.Big)(new(big.Int))
 	var (
-		baseFees []any
+		baseFees []*big.Int
 		ratios   []float64
-		rewards  []any
+		rewards  [][]*big.Int
 	)
 	// One walk for the whole range: above the Helicon boundary each entry is
 	// derived from the gas clock, and deriving them one at a time would repeat
@@ -392,9 +433,9 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 		if rerr != nil {
 			return nil, rerr
 		}
-		bf := zero
+		bf := new(big.Int)
 		if f := fees[n-oldest]; f != nil {
-			bf = (*hexutil.Big)(f)
+			bf = f
 		}
 		baseFees = append(baseFees, bf)
 		ratio := 0.0
@@ -403,7 +444,7 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 		}
 		ratios = append(ratios, ratio)
 		if len(percentiles) > 0 {
-			row, rerr := s.rewardRow(n, header, (*big.Int)(bf), percentiles)
+			row, rerr := s.rewardRow(n, header, bf, percentiles)
 			if rerr != nil {
 				return nil, rerr
 			}
@@ -426,23 +467,17 @@ func (s *Server) feeHistory(params []json.RawMessage) (any, *rpcError) {
 		return nil, rerr
 	}
 	baseFees = append(baseFees, next)
-	out := map[string]any{
-		"oldestBlock":   hexutil.EncodeUint64(oldest),
-		"baseFeePerGas": baseFees,
-		"gasUsedRatio":  ratios,
-	}
-	if len(percentiles) > 0 {
-		out["reward"] = rewards
-	}
-	return out, nil
+	return &FeeHistory{
+		OldestBlock: oldest, BaseFee: baseFees, GasUsedRatio: ratios, Reward: rewards,
+	}, nil
 }
 
 // rewardRow computes the effective-tip percentiles of one block, weighted
 // by per-tx gas used (geth's algorithm; gas weights come from one
 // re-execution).
-func (s *Server) rewardRow(n uint64, header *types.Header, baseFee *big.Int, percentiles []float64) ([]any, *rpcError) {
-	row := make([]any, len(percentiles))
-	zero := (*hexutil.Big)(new(big.Int))
+func (s *Server) rewardRow(n uint64, header *types.Header, baseFee *big.Int, percentiles []float64) ([]*big.Int, *rpcError) {
+	row := make([]*big.Int, len(percentiles))
+	zero := new(big.Int)
 	blk, rerr := s.blockAt(n)
 	if rerr != nil {
 		return nil, rerr
@@ -488,7 +523,7 @@ func (s *Server) rewardRow(n uint64, header *types.Header, baseFee *big.Int, per
 			cum += items[idx].gas
 			idx++
 		}
-		row[i] = (*hexutil.Big)(items[idx].tip)
+		row[i] = items[idx].tip
 	}
 	return row, nil
 }

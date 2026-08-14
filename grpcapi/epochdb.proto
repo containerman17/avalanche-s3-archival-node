@@ -4,11 +4,23 @@ syntax = "proto3";
 // to access it"). It is a PEER adapter over the core query layer (rpc.Server's
 // direct methods), never a proxy to JSON-RPC.
 //
+// IT COVERS THE WHOLE CAPABILITY SET. Everything the node can actually do is
+// reachable here; the JSON-RPC surface's 90-odd method spellings collapse onto
+// these methods because most of that count is spelling variety over one
+// primitive (by-number and by-hash, filter-install plus poll, four names for
+// the same fee answer). What is NOT here is the permanent refusal set, and it
+// is not here BY ABSENCE PLUS A NAMED REASON: GetNodeInfo lists every refused
+// capability with the reason, and calling one of them is Unimplemented rather
+// than a plausible empty answer (DESIGN: "null means not on this chain, never
+// I could not read it").
+//
 // BYTES ARE VERBATIM CONSENSUS RLP wherever the corpus stores RLP: a header, a
-// transaction. Nothing is re-serialized into a field-by-field shape that could
-// disagree with the stored bytes, and a caller that wants fields decodes with
-// the EVM library it already links. Numbers that are not RLP (heights, TxNums,
-// gas) are plain integers, and big integers travel as big-endian bytes.
+// transaction, a container. Nothing is re-serialized into a field-by-field
+// shape that could disagree with the stored bytes, and a caller that wants
+// fields decodes with the EVM library it already links. Numbers that are not
+// RLP (heights, TxNums, gas) are plain integers, and big integers travel as
+// big-endian bytes. A TRACER'S CONFIG AND RESULT ARE JSON, verbatim, because
+// that is what a geth tracer takes and emits.
 package epochdb.v0;
 
 option go_package = "github.com/containerman17/epochdb/grpcapi";
@@ -19,12 +31,34 @@ service EpochDB {
   // StreamHeads pushes one HeadResponse per new block until the caller goes
   // away.
   rpc StreamHeads(HeadRequest) returns (stream HeadResponse);
+  // GetNodeInfo is the chain, the build, the sync state and the refusal list.
+  rpc GetNodeInfo(NodeInfoRequest) returns (NodeInfoResponse);
+
   rpc GetBlock(BlockRequest) returns (BlockResponse);
   rpc GetTransaction(TransactionRequest) returns (TransactionResponse);
-  rpc Call(CallRequest) returns (CallResponse);
   rpc GetState(StateRequest) returns (StateResponse);
-  rpc SearchTransactionsByAddress(SearchRequest) returns (SearchResponse);
+
+  rpc Call(CallRequest) returns (CallResponse);
+  rpc EstimateGas(CallRequest) returns (EstimateGasResponse);
+  // Trace re-executes a transaction, a block or a call under a named tracer.
+  rpc Trace(TraceRequest) returns (TraceResponse);
+
   rpc GetLogs(LogsRequest) returns (LogsResponse);
+  // StreamLogs REPLACES the whole poll-and-filter-id model: there is nothing
+  // to install and nothing to uninstall, the stream IS the filter, and
+  // cancelling it is uninstalling it.
+  rpc StreamLogs(LogsRequest) returns (stream LogsResponse);
+  // StreamTransactions pushes each new block's transactions. There is no
+  // mempool on this node, so these are ACCEPTED transactions, never pending
+  // ones.
+  rpc StreamTransactions(StreamTransactionsRequest) returns (stream TransactionBatch);
+
+  rpc SearchTransactionsByAddress(SearchRequest) returns (SearchResponse);
+  rpc GetContractCreator(ContractCreatorRequest) returns (ContractCreatorResponse);
+
+  rpc GetFeeHistory(FeeHistoryRequest) returns (FeeHistoryResponse);
+  // GetGasPrice is the whole fee-suggestion surface out of one sample.
+  rpc GetGasPrice(GasPriceRequest) returns (GasPriceResponse);
 }
 
 message HeadRequest {}
@@ -37,12 +71,36 @@ message HeadResponse {
   uint64 settled = 5;   // SAE-settled: `safe`/`finalized`
 }
 
-// BlockRequest names a block by hash if hash is set, by number otherwise.
-// full=false answers with the header and the transaction COUNT only.
+message NodeInfoRequest {}
+
+message NodeInfoResponse {
+  bytes chain_id = 1;             // big-endian
+  string client_version = 2;
+  bool syncing = 3;
+  uint64 current_block = 4;       // the executed head
+  uint64 highest_block = 5;       // the height this node is syncing toward
+  bytes chain_config_json = 6;    // the VM's own marshalling of its config
+  uint32 ots_api_level = 7;
+  repeated Refusal refusals = 8;  // what this node will NEVER answer, and why
+}
+
+// Refusal is a capability refused BY DESIGN, with the reason. None of these is
+// a phase gap, and none of them has a method above.
+message Refusal {
+  string capability = 1;
+  string reason = 2;
+}
+
+// BlockRequest names a block by hash if hash is set, by number otherwise
+// (number 0 with no hash means the serving head). The flags say how much of
+// the block to assemble: nothing extra by default.
 message BlockRequest {
   uint64 number = 1;
   bytes hash = 2;
-  bool full = 3;
+  bool full = 3;       // the transactions, as stored RLP
+  bool tx_hashes = 4;  // the transaction hashes, in block order
+  bool receipts = 5;   // the receipts, decoded and as consensus RLP
+  bool raw = 6;        // the VERBATIM container bytes (header + extras + txs)
 }
 
 message BlockResponse {
@@ -50,11 +108,25 @@ message BlockResponse {
   bytes hash = 2;
   bytes header_rlp = 3;       // the stored consensus bytes, verbatim
   uint32 tx_count = 4;
-  repeated bytes tx_rlp = 5;  // full=true only, in block order
+  repeated bytes tx_rlp = 5;  // full only, in block order
+  repeated bytes tx_hash = 6; // tx_hashes only, in block order
+  repeated Receipt receipts = 7;    // receipts only
+  repeated bytes receipt_rlp = 8;   // receipts only: the consensus encoding
+  bytes block_rlp = 9;              // raw only: the verbatim container
+  bytes total_fees = 10;      // receipts only: what this block's txs paid, big-endian
+  uint32 uncle_count = 11;    // always 0: Avalanche has no uncles
 }
 
+// TransactionRequest names a transaction three ways, in this order: by hash;
+// by sender and nonce; by position in a block (index set, with block_number or
+// block_hash). nonce and index are `optional` because 0 is a real value.
 message TransactionRequest {
   bytes hash = 1;
+  bytes sender = 2;
+  optional uint64 nonce = 3;
+  uint64 block_number = 4;
+  bytes block_hash = 5;
+  optional uint32 index = 6;
 }
 
 // found=false is a clean "unknown transaction", never an error.
@@ -66,6 +138,7 @@ message TransactionResponse {
   uint32 index = 5;
   Receipt receipt = 6;
   repeated Frame frames = 7;  // the STORED call frames, never a re-execution
+  bytes hash = 8;
 }
 
 message Receipt {
@@ -74,6 +147,9 @@ message Receipt {
   uint64 cumulative_gas_used = 3;
   bytes contract_address = 4;  // empty unless the tx created one
   repeated Log logs = 5;
+  bytes effective_gas_price = 6;  // big-endian
+  uint32 type = 7;
+  bytes tx_hash = 8;
 }
 
 message Log {
@@ -87,7 +163,9 @@ message Log {
 }
 
 // Frame is one stored call frame in enter order. kind is the vm.OpCode of the
-// call that opened it.
+// call that opened it, which is also Otterscan's internal-operation kind:
+// CREATE/CREATE2 frames are deployments, and a CALL frame with a non-zero
+// value is a transfer.
 message Frame {
   uint32 kind = 1;
   uint32 depth = 2;
@@ -106,14 +184,57 @@ message CallRequest {
   bytes from = 1;
   bytes to = 2;       // empty is a contract creation
   bytes value = 3;    // big-endian
-  uint64 gas = 4;     // 0 takes the server's cap
+  uint64 gas = 4;     // 0 takes the server's cap; for EstimateGas it is the ceiling
   bytes gas_price = 5;
   bytes data = 6;
   uint64 height = 7;
+  // detailed makes a REVERT a result rather than an error: gas_used, output
+  // and revert come back filled in and error carries the EVM's own message.
+  bool detailed = 8;
+  // access_list additionally runs geth's access-list fixed point.
+  bool access_list = 9;
+  optional uint64 nonce = 10;  // access_list on a creation: the deployment nonce
 }
 
 message CallResponse {
   bytes output = 1;
+  uint64 gas_used = 2;         // detailed or access_list only
+  string error = 3;            // detailed or access_list only: the EVM's own failure
+  bytes revert = 4;            // detailed only: the revert data
+  repeated AccessTuple access_list = 5;
+}
+
+message AccessTuple {
+  bytes address = 1;
+  repeated bytes storage_keys = 2;
+}
+
+message EstimateGasResponse {
+  uint64 gas = 1;
+}
+
+// TraceRequest re-executes under a tracer. tracer is a name from geth's
+// directory ("callTracer", "prestateTracer", "flatCallTracer", ...); empty is
+// the struct logger. tracer_config is that tracer's OWN JSON, verbatim.
+//
+// TRACING IS RE-EXECUTION. The stored call frames, which are never a
+// re-execution, come back with GetTransaction.
+message TraceRequest {
+  oneof target {
+    bytes tx_hash = 1;
+    uint64 block_number = 2;
+    bytes block_hash = 3;
+    CallRequest call = 4;
+  }
+  string tracer = 5;
+  bytes tracer_config = 6;
+}
+
+message TraceResponse {
+  // One JSON document per traced transaction, in block order (one entry for a
+  // transaction or a call target).
+  repeated bytes result_json = 1;
+  repeated bytes tx_hash = 2;  // block targets: the transaction each result is for
 }
 
 // StateRequest reads one account at a height, and one storage slot of it when
@@ -155,6 +276,17 @@ message AddrHit {
   uint32 roles = 4;  // store.Role* bits: sender, recipient, created, emitter, frame
 }
 
+message ContractCreatorRequest {
+  bytes address = 1;
+}
+
+// found=false is a clean "no contract at this address", never an error.
+message ContractCreatorResponse {
+  bool found = 1;
+  bytes tx_hash = 2;
+  bytes creator = 3;
+}
+
 message LogsRequest {
   uint64 from_block = 1;
   uint64 to_block = 2;
@@ -168,4 +300,54 @@ message TopicSet {
 
 message LogsResponse {
   repeated Log logs = 1;
+  uint64 to_block = 2;  // streams: the highest block this batch covers
+}
+
+message StreamTransactionsRequest {
+  uint64 from_block = 1;  // 0 starts at the block after the current head
+  uint64 to_block = 2;    // 0 follows the head forever
+  bool full = 3;          // the transaction RLP, not just the hashes
+}
+
+message TransactionBatch {
+  uint64 block_number = 1;
+  repeated bytes tx_hash = 2;
+  repeated bytes tx_rlp = 3;  // full only
+}
+
+message FeeHistoryRequest {
+  uint64 block_count = 1;
+  uint64 newest_block = 2;  // 0 means the serving head
+  repeated double reward_percentiles = 3;
+}
+
+message FeeHistoryResponse {
+  uint64 oldest_block = 1;
+  // One entry per block PLUS a trailing entry for the block after the range,
+  // read below the head and projected at it. Big-endian.
+  repeated bytes base_fee_per_gas = 2;
+  repeated double gas_used_ratio = 3;
+  repeated RewardRow reward = 4;  // one row per block, when percentiles were asked for
+}
+
+message RewardRow {
+  repeated bytes values = 1;  // big-endian, one per requested percentile
+}
+
+message GasPriceRequest {}
+
+message GasPriceResponse {
+  bytes gas_price = 1;                 // the sampled price
+  bytes max_priority_fee_per_gas = 2;  // the tip above the base fee
+  bytes base_fee = 3;                  // the head's; empty where the chain has none
+  bytes next_base_fee = 4;             // projected for the block above the head
+  // The three speeds, empty on a chain with no base fee at the head.
+  PriceOption slow = 5;
+  PriceOption normal = 6;
+  PriceOption fast = 7;
+}
+
+message PriceOption {
+  bytes max_priority_fee_per_gas = 1;
+  bytes max_fee_per_gas = 2;
 }

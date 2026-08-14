@@ -213,6 +213,15 @@ func (s *Server) debugGetRawBlock(params []json.RawMessage) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
+	raw, rerr := s.rawBlock(n)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return hexutil.Bytes(raw), nil
+}
+
+// rawBlock is the core-layer half: the container bytes at height n.
+func (s *Server) rawBlock(n uint64) ([]byte, *rpcError) {
 	headerRLP, ok, err := s.db.HeaderRLP(n)
 	if err != nil || !ok {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("header %d: ok=%v err=%v", n, ok, err)}
@@ -235,7 +244,7 @@ func (s *Server) debugGetRawBlock(params []json.RawMessage) (any, *rpcError) {
 	if err != nil {
 		return nil, &rpcError{Code: -32000, Message: err.Error()}
 	}
-	return hexutil.Bytes(raw), nil
+	return raw, nil
 }
 
 // debugGetRawHeader is the stored header row, verbatim.
@@ -393,32 +402,57 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 	if n == 0 {
 		return nil, errInvalid("eth_createAccessList needs an executed block (>=1)")
 	}
-	header, rerr := s.execHeader(n)
+	gas := uint64(GasCap)
+	if args.Gas != nil && uint64(*args.Gas) < gas {
+		gas = uint64(*args.Gas)
+	}
+	var prev types.AccessList
+	if args.AccessList != nil {
+		prev = *args.AccessList
+	}
+	var nonce *uint64
+	if args.Nonce != nil {
+		v := uint64(*args.Nonce)
+		nonce = &v
+	}
+	al, gasUsed, execErr, rerr := s.accessListAt(args.msg(gas), n, prev, nonce)
 	if rerr != nil {
 		return nil, rerr
 	}
-
-	from := common.Address{}
-	if args.From != nil {
-		from = *args.From
+	out := map[string]any{"accessList": al, "gasUsed": hexutil.Uint64(gasUsed)}
+	if execErr != "" {
+		out["error"] = execErr
 	}
+	return out, nil
+}
+
+// accessListAt is the core-layer half: geth's fixed-point loop over the
+// access-list tracer. nonce, when set, is the creation nonce the deployed
+// address is derived from (msg.To == nil). It returns the list, the gas the
+// converged run used, and the EVM's own error where the call itself failed.
+func (s *Server) accessListAt(msg *callMsg, n uint64, prev types.AccessList, nonce *uint64) (types.AccessList, uint64, string, *rpcError) {
+	header, rerr := s.execHeader(n)
+	if rerr != nil {
+		return nil, 0, "", rerr
+	}
+	from := msg.From
 	// Destination: explicit, or the address the creation would deploy to.
 	var to common.Address
-	if args.To != nil {
-		to = *args.To
+	if msg.To != nil {
+		to = *msg.To
 	} else {
 		st, rerr := s.stateAt(n)
 		if rerr != nil {
-			return nil, rerr
+			return nil, 0, "", rerr
 		}
-		nonce := st.GetNonce(from)
+		next := st.GetNonce(from)
 		if err := st.Error(); err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
+			return nil, 0, "", &rpcError{Code: -32000, Message: err.Error()}
 		}
-		if args.Nonce != nil {
-			nonce = uint64(*args.Nonce)
+		if nonce != nil {
+			next = *nonce
 		}
-		to = crypto.CreateAddress(from, nonce)
+		to = crypto.CreateAddress(from, next)
 	}
 	// The active precompile set is what the tracer must NOT list as accessed.
 	// Rules is libevm's, and its VM-specific half comes out of the config's
@@ -426,74 +460,45 @@ func (s *Server) createAccessList(params []json.RawMessage) (any, *rpcError) {
 	rules := s.chainCfg.Rules(header.Number, isMergeTODO, header.Time)
 	precompiles := vm.ActivePrecompiles(rules)
 
-	gas := uint64(GasCap)
-	if args.Gas != nil && uint64(*args.Gas) < gas {
-		gas = uint64(*args.Gas)
-	}
-	var data []byte
-	if args.Input != nil {
-		data = *args.Input
-	} else if args.Data != nil {
-		data = *args.Data
-	}
-
 	// Geth's fixed-point loop: run with the previous round's list until
 	// the traced list stops changing (AccessListTracer.Equal).
 	backend := registeredVM()
 	cctx := captureHeaders(s.chainCtx)
-	prevTracer := logger.NewAccessListTracer(nil, from, to, precompiles)
-	if args.AccessList != nil {
-		prevTracer = logger.NewAccessListTracer(*args.AccessList, from, to, precompiles)
-	}
+	prevTracer := logger.NewAccessListTracer(prev, from, to, precompiles)
 	for i := 0; ; i++ {
 		al := prevTracer.AccessList()
 		st, rerr := s.stateAt(n)
 		if rerr != nil {
-			return nil, rerr
+			return nil, 0, "", rerr
 		}
 		tracer := logger.NewAccessListTracer(al, from, to, precompiles)
-		msg := &callMsg{
-			From:       from,
-			To:         args.To,
-			Value:      new(big.Int),
-			GasLimit:   gas,
-			GasPrice:   new(big.Int),
-			GasFeeCap:  new(big.Int),
-			GasTipCap:  new(big.Int),
-			Data:       data,
-			AccessList: al,
-		}
-		if args.Value != nil {
-			msg.Value = (*big.Int)(args.Value)
-		}
+		run := *msg
+		run.AccessList = al
 		res, err := backend.applyMsg(s.chainCfg, backend.blockContext(header, cctx), st,
-			msg, vm.Config{Tracer: tracer, NoBaseFee: true})
+			&run, vm.Config{Tracer: tracer, NoBaseFee: true})
 		if err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
+			return nil, 0, "", &rpcError{Code: -32000, Message: err.Error()}
 		}
 		// An unreadable BLOCKHASH header is 0x0 in the trace and absent from
 		// st.Error(), so the list would be a fiction of a different kind.
 		if cctx.err != nil {
-			return nil, &rpcError{Code: -32000, Message: cctx.err.Error()}
+			return nil, 0, "", &rpcError{Code: -32000, Message: cctx.err.Error()}
 		}
 		// A state read that failed (a coverage hole) makes the whole traced
 		// list and gasUsed fiction, exactly as in ethCall.
 		if err := st.Error(); err != nil {
-			return nil, &rpcError{Code: -32000, Message: err.Error()}
+			return nil, 0, "", &rpcError{Code: -32000, Message: err.Error()}
 		}
 		if tracer.Equal(prevTracer) {
-			out := map[string]any{
-				"accessList": al,
-				"gasUsed":    hexutil.Uint64(res.UsedGas),
-			}
+			execErr := ""
 			if res.Err != nil {
-				out["error"] = res.Err.Error()
+				execErr = res.Err.Error()
 			}
-			return out, nil
+			return al, res.UsedGas, execErr, nil
 		}
 		prevTracer = tracer
 		if i >= 8 {
-			return nil, &rpcError{Code: -32000, Message: "access list did not converge"}
+			return nil, 0, "", &rpcError{Code: -32000, Message: "access list did not converge"}
 		}
 	}
 }
