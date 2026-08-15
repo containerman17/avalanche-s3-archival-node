@@ -884,6 +884,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				e.spl.read.Seconds(), e.spl.evm.Seconds(), e.spl.hash.Seconds(),
 				e.spl.fw.Seconds(), e.spl.fsync.Seconds(),
 				time.Duration(e.flushBusyNs.Swap(0)).Seconds(), dt)
+			log.Printf("exec: jemalloc %s", jemallocLine())
 			e.spl = struct{ read, evm, hash, fw, fsync time.Duration }{}
 			if e.sae != nil && e.sae.settledSeen {
 				log.Printf("sae: settled=%d (lag %d..%d over %d settlements)",
