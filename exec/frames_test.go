@@ -78,27 +78,29 @@ func TestFrameCaptureRefusesAHoleAndAccountsForAWholeTx(t *testing.T) {
 		t.Error("PARTIAL FRAMES ACCEPTED: the call stack never closed and take() reported a good trace")
 	}
 
-	// 5. THE COLLAPSE MUST NOT EAT A REAL CALL. reannounced() folds two enters
-	// into one only when they name the SAME call, and the forwarded gas is what
-	// separates them: a frame's first nested call is always given strictly less
-	// gas than the frame itself. Same participants, same input, one gas apart
-	// is two frames, and the sole real difference from case 4 is the exit.
+	// 5. NOTHING IS FOLDED. This capture used to collapse two enters that named
+	// the same call, because libevm announced a precompile's call-out twice; at
+	// db6d70f2748e the pair is balanced at the source, so the capture stores one
+	// frame per CaptureEnter and nothing else. The shape below is the exact one
+	// the old fold ate (same kind, participants, input, value AND gas, nothing
+	// in between) and it must now come back as two frames: a capture that
+	// second-guesses the EVM is a capture that can lose a real call.
 	l.CaptureTxStart(21000)
 	l.CaptureStart(nil, common.Address{1}, common.Address{2}, false, nil, 0, nil)
 	l.CaptureEnter(vm.CALL, common.Address{2}, common.Address{3}, []byte("in"), 500, nil)
-	l.CaptureEnter(vm.CALL, common.Address{2}, common.Address{3}, []byte("in"), 499, nil)
+	l.CaptureEnter(vm.CALL, common.Address{2}, common.Address{3}, []byte("in"), 500, nil)
 	l.CaptureExit([]byte("inner"), 100, nil)
 	l.CaptureExit([]byte("outer"), 200, nil)
 	rec, _, why = c.take()
 	if why != "" {
-		t.Fatalf("two real calls one gas apart were refused: %s", why)
+		t.Fatalf("two closed frames were refused: %s", why)
 	}
 	frames, err = store.DecodeFrames(rec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(frames) != 2 || frames[0].Gas != 500 || frames[1].Gas != 499 || frames[1].Depth != 1 {
-		t.Errorf("a real nested call was collapsed into its parent: %+v", frames)
+	if len(frames) != 2 || frames[0].Depth != 0 || frames[1].Depth != 1 {
+		t.Errorf("a frame was collapsed into its parent: %+v", frames)
 	}
 }
 

@@ -22,12 +22,15 @@ package exec
 // execution exactly, so a config that would change them diverges the state root
 // first, which the executor hard-stops on.
 //
-// ONE CALL IS ANNOUNCED TWICE when a stateful precompile calls back into the
-// EVM: see reannounced below. That is a libevm shape, not a capture defect, and
-// collapsing it is what keeps a NativeAssetCall transaction honest.
+// ONE CALL WAS ONCE ANNOUNCED TWICE when a stateful precompile called back into
+// the EVM: libevm's precompile environment fired CaptureEnter itself, handed the
+// same call to evm.Call which fired it again, and closed its own announcement
+// with CaptureEnd instead of CaptureExit. That halted mainnet C at 5,456,905 on
+// a NativeAssetCall. libevm db6d70f2748e removed the manual tracer block, so the
+// pair is balanced at the source and this capture folds nothing: every
+// CaptureEnter is a call that happened. See exec/frames_coreth_test.go.
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -92,10 +95,9 @@ func (c *frameCapture) resetTx() {
 //   - the tracer ran but the enter/exit stack did not close, so the open frames
 //     carry gasUsed 0, no output and no error flag. That is INDISTINGUISHABLE
 //     from a real zero-gas success once stored, which makes it exactly the
-//     silent hole the fail-stop exists to refuse. The one shape at this pin
-//     that reaches it legitimately is the precompile re-announcement, and
-//     reannounced below folds that away rather than storing it, so anything
-//     still open here is an enter/exit contract this capture does not model.
+//     silent hole the fail-stop exists to refuse. No shape at this pin reaches
+//     it legitimately, so anything still open here is an enter/exit contract
+//     this capture does not model.
 func (c *frameCapture) take() (rec []byte, addrs [][]byte, why string) {
 	if !c.armed {
 		return nil, nil, "the frame tracer never ran for this transaction"
@@ -182,39 +184,6 @@ func (l frameLogger) CaptureStart(_ *vm.EVM, from, to common.Address, _ bool, _ 
 
 func (l frameLogger) CaptureEnd([]byte, uint64, error) {}
 
-// reannounced reports whether this CaptureEnter is libevm announcing a call it
-// has ALREADY announced, in which case the frame is already open and pushing a
-// second one would both duplicate a call that happened once and leave the stack
-// one deep at the end of the transaction.
-//
-// THE SHAPE, exactly as pinned (this is what halted mainnet C at 5,456,905, a
-// NativeAssetCall transaction): a stateful precompile that calls back into the
-// EVM goes through libevm's precompile environment, which fires CaptureEnter
-// itself (core/vm/environment.libevm.go:131) and then hands the very same call
-// to evm.call, which fires CaptureEnter again (core/vm/evm.go:230). The
-// environment then closes ITS announcement with CaptureEnd rather than
-// CaptureExit (environment.libevm.go:135), so one of the two enters can never
-// be paired. Only coreth reaches this: nativeasset.NativeAssetCall is the only
-// caller of PrecompileEnvironment.Call in the pinned dependency set.
-//
-// THE TEST IS THE FORWARDED GAS and it cannot false-positive on a real call. A
-// genuine nested call is always given strictly less gas than the frame that
-// makes it, because that frame pays at least the CALL/CREATE opcode's own cost
-// before forwarding and EIP-150 then withholds a 64th. Equal gas, equal
-// participants, equal input and equal value, with no event in between, is only
-// ever the same call named twice.
-func (c *frameCapture) reannounced(typ vm.OpCode, from, to common.Address, input []byte, gas uint64, value []byte) bool {
-	// The open frame must also be the most recent one: anything nested in
-	// between means execution moved on and this is a new call.
-	if len(c.stack) == 0 || c.stack[len(c.stack)-1] != len(c.cur)-1 {
-		return false
-	}
-	f := &c.cur[len(c.cur)-1]
-	return f.kind == byte(typ) && f.gas == gas && f.from == from && f.to == to &&
-		bytes.Equal(c.arena[f.inOff:f.inOff+f.inLen], input) &&
-		bytes.Equal(c.arena[f.valOff:f.valOff+f.valLen], value)
-}
-
 func (l frameLogger) CaptureEnter(typ vm.OpCode, from, to common.Address, input []byte, gas uint64, value *big.Int) {
 	c := l.c
 	c.participant(from)
@@ -222,9 +191,6 @@ func (l frameLogger) CaptureEnter(typ vm.OpCode, from, to common.Address, input 
 	var valBytes []byte
 	if value != nil && value.Sign() != 0 {
 		valBytes = value.Bytes()
-	}
-	if c.reannounced(typ, from, to, input, gas, valBytes) {
-		return
 	}
 	f := openFrame{kind: byte(typ), depth: byte(len(c.stack)), from: from, to: to, gas: gas}
 	if len(valBytes) != 0 {

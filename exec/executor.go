@@ -1148,9 +1148,9 @@ func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) err
 	frameRec, frameAddrs, why := frames.take()
 	if why != "" {
 		e.dieOnUncapturedTrace(tx.Hash().String(), why,
-			"The contract this capture models is in exec/frames.go: every CaptureEnter is paired with a CaptureExit, except the "+
-				"precompile re-announcement that reannounced() folds away. A new unpaired shape is an execution path the capture "+
-				"does not model yet: find the frame named above in the pinned libevm before changing anything.")
+			"The contract this capture models is in exec/frames.go: every CaptureEnter is paired with a CaptureExit, with no "+
+				"exception since libevm db6d70f2748e balanced the precompile call-out. An unpaired shape is an execution path "+
+				"the capture does not model yet: find the frame named above in the pinned libevm before changing anything.")
 	}
 	tw := store.TxWrite{
 		Hash:       tx.Hash().Bytes(),

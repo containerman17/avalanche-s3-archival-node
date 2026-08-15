@@ -3,12 +3,12 @@ module github.com/containerman17/epochdb
 go 1.26
 
 require (
-	github.com/ava-labs/avalanchego v1.15.0-fuji
-	github.com/ava-labs/avalanchego/graft/coreth v1.15.0-fuji
-	github.com/ava-labs/avalanchego/graft/evm v1.15.0-fuji
-	github.com/ava-labs/avalanchego/graft/subnet-evm v1.15.0-fuji
+	github.com/ava-labs/avalanchego v1.14.3-0.20260804141953-6dc4c3b395b6
+	github.com/ava-labs/avalanchego/graft/coreth v1.14.3-0.20260804141953-6dc4c3b395b6
+	github.com/ava-labs/avalanchego/graft/evm v1.14.3-0.20260804141953-6dc4c3b395b6
+	github.com/ava-labs/avalanchego/graft/subnet-evm v1.14.3-0.20260804141953-6dc4c3b395b6
 	github.com/ava-labs/firewood-go-ethhash/ffi v0.8.0
-	github.com/ava-labs/libevm v1.13.15-0.20260721184559-5557c68d296b
+	github.com/ava-labs/libevm v1.13.15-0.20260803133207-db6d70f2748e
 	github.com/cockroachdb/pebble/v2 v2.1.6
 	github.com/containerman17/casfs v0.0.0-20260806014414-57040ab836bb
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
@@ -17,7 +17,7 @@ require (
 	github.com/klauspost/compress v1.18.0
 	github.com/prometheus/client_golang v1.23.0
 	golang.org/x/sync v0.20.0
-	google.golang.org/grpc v1.80.0
+	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -124,7 +124,7 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
 )

@@ -238,7 +238,7 @@ func (e *Executor) executeSAEBlock(blk *types.Block, pvm []byte) error {
 	cap := &capture{code: map[string][]byte{}}
 	e.wrapDB.setCapture(cap)
 	res, err := saexec.Execute(
-		b, e, math.MaxInt, nil, e.sae.hooks,
+		b, e, math.MaxInt, e.sae.hooks,
 		e.chainCfg, saeChainContext{e}, &saexec.NullReceiptStore{}, logging.NoLog{},
 	)
 	if err != nil {

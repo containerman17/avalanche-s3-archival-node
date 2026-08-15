@@ -8,13 +8,21 @@ package exec
 // 0x0100000000000000000000000000000000000002.
 //
 // The transaction is REBUILT here rather than replayed, because the shape is
-// the whole content: a stateful precompile that calls back into the EVM makes
-// libevm announce the SAME call twice (PrecompileEnvironment.Call fires
-// CaptureEnter, then hands the call to evm.call which fires CaptureEnter
-// again) and close its own announcement with CaptureEnd instead of
-// CaptureExit. Both entry depths are covered: straight to the precompile as
-// the mainnet transaction does, and through a contract, which is the case
-// where the duplicate would otherwise be stored as a call that never happened.
+// the whole content: a stateful precompile that calls back into the EVM used to
+// make libevm announce the SAME call twice (PrecompileEnvironment.Call fired
+// CaptureEnter, then handed the call to evm.call which fired CaptureEnter
+// again) and close its own announcement with CaptureEnd instead of CaptureExit.
+// Both entry depths are covered: straight to the precompile as the mainnet
+// transaction does, and through a contract, which is the case where the
+// duplicate would otherwise be stored as a call that never happened.
+//
+// THIS ASSERTS THE UPSTREAM FIX, NOT A WORKAROUND. libevm db6d70f2748e removed
+// the manual tracer block from PrecompileEnvironment.Call, so evm.Call emits
+// the balanced pair on its own and exec/frames.go folds nothing. The capture
+// used to reach the same frame counts by collapsing the duplicate; it now
+// reaches them because the duplicate is not emitted. That is strictly stronger:
+// the old test passed on both a fixed and an unfixed libevm, this one fails on
+// an unfixed one, so it is the guard that keeps the dependency from regressing.
 
 import (
 	"math/big"
@@ -37,7 +45,7 @@ import (
 	"github.com/containerman17/epochdb/store"
 )
 
-func TestFrameCaptureCollapsesAPrecompileReannouncement(t *testing.T) {
+func TestFrameCaptureOfAPrecompileCallOut(t *testing.T) {
 	fetch.RegisterExtras(chain.Coreth)
 
 	sdb, err := state.New(types.EmptyRootHash, state.NewDatabase(rawdb.NewMemoryDatabase()), nil)
@@ -119,8 +127,9 @@ func TestFrameCaptureCollapsesAPrecompileReannouncement(t *testing.T) {
 		if _, _, err := evm.Call(vm.AccountRef(sender), to, input, gasLimit, new(uint256.Int)); err != nil {
 			t.Fatalf("call to %s reverted: %v", to, err)
 		}
-		// THE HALT: before the fix take() refused this transaction and the
-		// executor turned that refusal into log.Fatalf.
+		// THE HALT: on a libevm before db6d70f2748e take() refused this
+		// transaction (one enter never got an exit) and the executor turned
+		// that refusal into log.Fatalf. It must now close on its own.
 		rec, _, why := c.take()
 		if why != "" {
 			t.Fatalf("a NativeAssetCall transaction was refused as an uncaptured trace: %s", why)
@@ -133,8 +142,9 @@ func TestFrameCaptureCollapsesAPrecompileReannouncement(t *testing.T) {
 	}
 
 	// 1. The mainnet shape: the transaction IS the call to the precompile, so
-	// the only frame is the one call the precompile makes. Storing two here
-	// would be storing a call that happened once as if it happened twice.
+	// the only frame is the one call the precompile makes. The capture pushes
+	// one frame per CaptureEnter and drops none, so ONE frame here is the
+	// direct assertion that libevm announces this call exactly once.
 	frames := run(nativeasset.NativeAssetCallAddr)
 	if len(frames) != 1 {
 		t.Fatalf("got %d frames for a direct NativeAssetCall, want 1: %+v", len(frames), frames)
@@ -151,7 +161,8 @@ func TestFrameCaptureCollapsesAPrecompileReannouncement(t *testing.T) {
 	}
 
 	// 2. One level down: the call INTO the precompile is its own frame, and
-	// the call the precompile makes hangs under it. Two frames, not three.
+	// the call the precompile makes hangs under it. Two frames, not three, and
+	// again with no fold in the way to reach that count.
 	frames = run(proxy)
 	if len(frames) != 2 {
 		t.Fatalf("got %d frames for a contract-driven NativeAssetCall, want 2: %+v", len(frames), frames)
@@ -162,8 +173,13 @@ func TestFrameCaptureCollapsesAPrecompileReannouncement(t *testing.T) {
 	if frames[1].From != proxy || frames[1].To != callee || frames[1].Depth != 1 {
 		t.Errorf("the precompile's own call is not nested under it: %+v", frames[1])
 	}
+	// A genuine nested call is always forwarded strictly less gas than the
+	// frame that makes it: that frame pays the CALL opcode's own cost first and
+	// EIP-150 then withholds a 64th. Equal gas across a parent and its child is
+	// the fingerprint of the duplicate announcement, so this is what fails
+	// loudly if a libevm bump ever brings the double enter back.
 	if frames[1].Gas >= frames[0].Gas {
-		t.Errorf("nested frame gas %d is not below its parent's %d, which is the invariant reannounced() rests on",
+		t.Errorf("nested frame gas %d is not below its parent's %d, so these are one call announced twice, not two calls",
 			frames[1].Gas, frames[0].Gas)
 	}
 }
