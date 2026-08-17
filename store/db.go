@@ -243,6 +243,12 @@ func open(dir string, cas *dist.Store, chainRoot [32]byte, readOnly bool) (*DB, 
 		mem.close()
 		return nil, err
 	}
+	jdBudget, jdWhy, err := jumpDestCacheBytes(codeBudget)
+	if err != nil {
+		mem.close()
+		return nil, err
+	}
+	registerJumpDests(jdBudget, jdWhy)
 	d := &DB{dir: dir, cas: cas, chainRoot: chainRoot, mem: mem, man: man, flat: newFlatCache(budget)}
 	d.flushTxs, d.flushBlocks, d.terminalTxs = FlushTxs, FlushBlocks, TerminalTxs
 	d.flatWhy, d.codeBudget, d.codeWhy = why, codeBudget, codeWhy
