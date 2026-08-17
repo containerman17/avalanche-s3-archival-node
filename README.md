@@ -117,6 +117,11 @@ EPOCHDB_CODE_CACHE        bytes of the contract-code cache: an LRU of code blobs
                           front of the code descent (default a tenth of EPOCHDB_FLAT_CACHE's
                           budget). Bytecode is immutable by hash, so this cache has nothing
                           to invalidate. 0 turns it off.
+EPOCHDB_JUMPDEST_CACHE    bytes of the JUMPDEST bitmap cache: libevm's jump analysis by code hash,
+                          shared across every transaction instead of one call (default an eighth
+                          of EPOCHDB_CODE_CACHE's budget, which is what a bitmap costs against
+                          the code it analyses). A bitmap is a pure function of immutable
+                          bytecode, so this cache has nothing to invalidate. 0 turns it off.
 EPOCHDB_NEW_CHAIN         set to 1 only to start a NEW chain in a prefix that already holds
                           other chains' objects. See "Joining a published chain".
 GOMEMLIMIT                honoured if you set it; otherwise derived as 7/10 of the container ceiling
