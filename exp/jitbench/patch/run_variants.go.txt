@@ -1,0 +1,152 @@
+// EXPERIMENT, NOT PRODUCTION. See blockgas.go.
+package vmx
+
+import "github.com/ava-labs/libevm/common/math"
+
+// Mode selects which run loop Run dispatches to. It is a package variable
+// because this fork exists only to be benchmarked; a real integration would
+// hang it off the interpreter.
+type RunMode int
+
+const (
+	// ModeStock is libevm's loop, byte for byte.
+	ModeStock RunMode = iota
+	// ModeBlockGas charges a basic block's constant gas once at block entry.
+	// Consensus-exact, tracer-visible. See blockgas.go.
+	ModeBlockGas
+	// ModeNoMeter removes gas accounting and stack bounds checking ENTIRELY.
+	// It is WRONG on purpose: it exists to measure the ceiling, the most any
+	// scheme that only removes per-opcode bookkeeping could ever win.
+	ModeNoMeter
+)
+
+var Mode = ModeStock
+
+// runBlockGas is Run's loop with per-opcode constant-gas charging and stack
+// validation lifted to the basic block.
+//
+// The loop is NESTED on purpose. An outer step enters a block and charges it;
+// the inner step runs exactly the block's instruction count. That keeps the
+// "am I at a block boundary?" question out of the per-opcode path entirely,
+// which is the whole point of the technique: a flat loop that consults a
+// per-pc table trades a cheap register subtract for a bounds-checked slice
+// load and loses.
+func (in *EVMInterpreter) runBlockGas(contract *Contract, callContext *ScopeContext, stack *Stack, mem *Memory) (ret []byte, err error) {
+	a := analysisFor(contract, in.table)
+	var (
+		pc  uint64
+		res []byte
+	)
+	for {
+		n := 1 // an undefined opcode belongs to no block; run it alone and let it fault
+		if pc < uint64(len(a.blockIdx)) {
+			if i := a.blockIdx[pc]; i >= 0 {
+				b := &a.blocks[i]
+				if !contract.UseGas(b.gas) {
+					return nil, ErrOutOfGas
+				}
+				if sLen := stack.len(); sLen < b.stackReq {
+					return nil, &ErrStackUnderflow{stackLen: sLen, required: b.stackReq}
+				} else if sLen+b.maxGrowth > 1024 {
+					return nil, &ErrStackOverflow{stackLen: sLen, limit: 1024 - b.maxGrowth}
+				}
+				n = b.n
+			}
+		}
+		for k := 0; k < n; k++ {
+			op := contract.GetOp(pc)
+			operation := in.table[op]
+
+			// The opcodes that read the remaining gas get the block's
+			// not-yet-run constant gas handed back, so they see exactly what
+			// the stock loop would have left them.
+			var corr uint64
+			if operation.dynamicGas != nil {
+				corr = a.corr[pc]
+				contract.Gas += corr
+				var memorySize uint64
+				if operation.memorySize != nil {
+					memSize, overflow := operation.memorySize(stack)
+					if overflow {
+						return nil, ErrGasUintOverflow
+					}
+					if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
+						return nil, ErrGasUintOverflow
+					}
+				}
+				dynamicCost, gerr := operation.dynamicGas(in.evm, contract, stack, mem, memorySize)
+				if gerr != nil || !contract.UseGas(dynamicCost) {
+					return nil, ErrOutOfGas
+				}
+				if memorySize > 0 {
+					mem.Resize(memorySize)
+				}
+			} else if op == GAS {
+				corr = a.corr[pc]
+				contract.Gas += corr
+			}
+			res, err = operation.execute(&pc, in, callContext)
+			if corr != 0 {
+				// The instruction ate into gas that belonged to the rest of
+				// the block, so the block cannot finish: that is the
+				// out-of-gas the stock loop would have hit a few opcodes
+				// later, and it burns the whole frame either way.
+				if contract.Gas < corr {
+					return nil, ErrOutOfGas
+				}
+				contract.Gas -= corr
+			}
+			if err != nil {
+				goto done
+			}
+			pc++
+		}
+	}
+done:
+	if err == errStopToken {
+		err = nil
+	}
+	return res, err
+}
+
+// runNoMeter is DELIBERATELY INCORRECT: no gas, no stack bounds. Ceiling probe
+// only. It still pays dynamic gas because those functions have side effects the
+// opcodes depend on (memory sizing, callGasTemp, access lists).
+func (in *EVMInterpreter) runNoMeter(contract *Contract, callContext *ScopeContext, stack *Stack, mem *Memory) (ret []byte, err error) {
+	var (
+		pc  uint64
+		res []byte
+	)
+	for {
+		op := contract.GetOp(pc)
+		operation := in.table[op]
+		if operation.dynamicGas != nil {
+			var memorySize uint64
+			if operation.memorySize != nil {
+				memSize, overflow := operation.memorySize(stack)
+				if overflow {
+					return nil, ErrGasUintOverflow
+				}
+				if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
+					return nil, ErrGasUintOverflow
+				}
+			}
+			dynamicCost, err := operation.dynamicGas(in.evm, contract, stack, mem, memorySize)
+			if err != nil || !contract.UseGas(dynamicCost) {
+				return nil, ErrOutOfGas
+			}
+			if memorySize > 0 {
+				mem.Resize(memorySize)
+			}
+		}
+		res, err = operation.execute(&pc, in, callContext)
+		if err != nil {
+			break
+		}
+		pc++
+	}
+	if err == errStopToken {
+		err = nil
+	}
+	return res, err
+}

@@ -1,0 +1,163 @@
+// EXPERIMENT, NOT PRODUCTION. This file is part of a throwaway fork of
+// libevm's core/vm used to measure how much of the Go interpreter's time goes
+// to per-opcode bookkeeping. See exp/jitbench/README.md.
+//
+// blockgas implements evmone's "advanced" basic-block gas accounting on top of
+// the stock go-ethereum jump table: the straight-line block's constant gas is
+// charged ONCE at block entry, and the block's stack requirement and maximum
+// growth are checked once at block entry, instead of once per opcode.
+//
+// Exactness. Charging at block entry moves the gas counter ahead of where a
+// per-opcode interpreter would have it, which two things can observe:
+//
+//  1. An opcode that READS the remaining gas: GAS, the CALL family (63/64), the
+//     CREATE family, and SSTORE's EIP-2200 reentrancy sentry. Each such opcode
+//     carries a CORRECTION, the constant gas of the block's instructions that
+//     follow it, which is added back before the opcode runs and taken away
+//     after. That reproduces the per-opcode value exactly. (Same trick as
+//     evmone; evmjit split a block at every such opcode instead.)
+//
+//  2. WHERE the run out of gas lands. Block entry can fail before opcodes that
+//     a per-opcode interpreter would have executed. That is not a consensus
+//     difference: an out-of-gas is a hard exception, it burns the frame's whole
+//     remaining gas and reverts every effect of the frame, so the caller sees
+//     the same gas used and the same state either way. It IS a difference a
+//     TRACER sees, so a traced call must take the stock loop.
+package vmx
+
+import (
+	"sync"
+
+	"github.com/ava-labs/libevm/common"
+)
+
+// blockInfo is one straight-line block: no jump in, no jump out, no terminator
+// except at its end.
+type blockInfo struct {
+	gas       uint64 // sum of every instruction's constant gas
+	n         int    // instructions in the block
+	stackReq  int    // stack items the block needs on entry
+	maxGrowth int    // most the block ever adds to the stack height
+}
+
+// codeAnalysis is the whole per-contract analysis, cached by code hash.
+type codeAnalysis struct {
+	// blockIdx[pc] is the index into blocks of the block STARTING at pc, or -1.
+	blockIdx []int32
+	blocks   []blockInfo
+	// corr[pc] is the constant gas of the instructions after pc in pc's block,
+	// for the opcodes that read the remaining gas. Zero everywhere else.
+	corr []uint64
+}
+
+var analysisCache sync.Map // common.Hash -> *codeAnalysis
+
+// analyze splits code into basic blocks. table supplies each opcode's constant
+// gas and stack shape, so the analysis is only valid for the fork it came from;
+// the cache key mixes the table in for that reason.
+func analyze(code []byte, table *JumpTable) *codeAnalysis {
+	a := &codeAnalysis{
+		blockIdx: make([]int32, len(code)+1),
+		corr:     make([]uint64, len(code)+1),
+	}
+	for i := range a.blockIdx {
+		a.blockIdx[i] = -1
+	}
+
+	// One pass. `start` is the block being accumulated; `height` is the stack
+	// height relative to block entry; `req` and `growth` are the running
+	// requirement and high-water mark. `first` is the pc of the block's first
+	// instruction so the correction pass can walk back over it.
+	newBlock := true
+	var (
+		start               uint64
+		blk                 blockInfo
+		height, req, growth int
+		pcsInBlock          []uint64
+		gasBefore           []uint64 // constant gas accumulated before each pc
+	)
+	flush := func() {
+		if newBlock {
+			return
+		}
+		blk.stackReq, blk.maxGrowth, blk.n = req, growth, len(pcsInBlock)
+		a.blockIdx[start] = int32(len(a.blocks))
+		a.blocks = append(a.blocks, blk)
+		// corr[pc] = block gas after pc = total - (gas before pc + gas of pc).
+		for i, pc := range pcsInBlock {
+			var own uint64
+			if i+1 < len(gasBefore) {
+				own = gasBefore[i+1] - gasBefore[i]
+			} else {
+				own = blk.gas - gasBefore[i]
+			}
+			a.corr[pc] = blk.gas - gasBefore[i] - own
+		}
+		newBlock = true
+	}
+
+	for pc := uint64(0); pc < uint64(len(code)); pc++ {
+		op := OpCode(code[pc])
+		if newBlock {
+			start, blk = pc, blockInfo{}
+			height, req, growth = 0, 0, 0
+			pcsInBlock, gasBefore = pcsInBlock[:0], gasBefore[:0]
+			newBlock = false
+		}
+		// An undefined opcode aborts, so nothing after it in this block runs:
+		// end the block BEFORE it and leave it to the run loop's own
+		// undefined-opcode path.
+		if opCodeToString[op] == "" {
+			flush()
+			continue
+		}
+		operation := table[op]
+		pcsInBlock = append(pcsInBlock, pc)
+		gasBefore = append(gasBefore, blk.gas)
+		blk.gas += operation.constantGas
+		// geth stores maxStack as StackLimit + pops - pushes, so the net height
+		// change of an instruction is StackLimit - maxStack.
+		delta := 1024 - operation.maxStack
+		if n := operation.minStack - height; n > req {
+			req = n
+		}
+		// The high-water mark is reached AFTER the pushes, which is height plus
+		// the pops it consumed plus everything it pushes: height+delta covers it
+		// for every geth opcode, since none pushes more than it ends up with.
+		height += delta
+		if height > growth {
+			growth = height
+		}
+
+		if op >= PUSH1 && op <= PUSH32 {
+			pc += uint64(op - PUSH1 + 1)
+		}
+		switch op {
+		case JUMP, JUMPI, STOP, RETURN, REVERT, SELFDESTRUCT, INVALID:
+			flush()
+		}
+		// A JUMPDEST is a jump target, so it must START a block. Handled by
+		// looking ahead: if the NEXT byte is a JUMPDEST, cut here.
+		if !newBlock && pc+1 < uint64(len(code)) && OpCode(code[pc+1]) == JUMPDEST {
+			flush()
+		}
+	}
+	flush()
+	return a
+}
+
+func analysisFor(contract *Contract, table *JumpTable) *codeAnalysis {
+	key := contract.CodeHash
+	if key == (common.Hash{}) {
+		return analyze(contract.Code, table)
+	}
+	if v, ok := analysisCache.Load(key); ok {
+		return v.(*codeAnalysis)
+	}
+	a := analyze(contract.Code, table)
+	analysisCache.Store(key, a)
+	return a
+}
+
+// AnalyzeForBench exposes the analysis pass so its cost can be measured.
+func AnalyzeForBench(code []byte) { analyze(code, &cancunInstructionSet) }
