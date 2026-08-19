@@ -189,6 +189,19 @@ type DB struct {
 	// knob, and the constants themselves stay pinned.
 	flushTxs, flushBlocks, terminalTxs uint64
 
+	// THE TERMINAL MERGE RUNS ON ITS OWN GOROUTINE (merge.go). mergeDone is the
+	// in-flight merge's completion channel and nil when none runs, so it is both
+	// the "one at a time" flag and what WaitMerge blocks on; mergeErr is what the
+	// last merge did, and it is STICKY because the goroutine has nobody to return
+	// an error to, so MaybeMerge hands it to the executor at the next flush. Both
+	// are under mu.
+	mergeDone chan struct{}
+	mergeErr  error
+	// pubMu serialises Publish. The merge goroutine publishes the terminal it
+	// just made while the executor's flushes call Publish too, and two of them
+	// racing would move the chain pointer twice for one head.
+	pubMu sync.Mutex
+
 	mu   sync.RWMutex
 	man  *Manifest
 	runs []*Run // ascending TxNum range, same order as man.Runs
@@ -282,6 +295,11 @@ func (d *DB) FlatCacheBudget() (uint64, string) { return d.flat.budget, d.flatWh
 func (d *DB) CodeCacheBudget() (uint64, string) { return d.codeBudget, d.codeWhy }
 
 func (d *DB) Close() error {
+	// A MERGE GOROUTINE MUST NOT OUTLIVE THE DB IT WRITES INTO: it swaps the
+	// manifest and closes runs. Waiting here is the whole shutdown rule, and it
+	// costs at most one merge. A kill instead of a shutdown is equally safe, by
+	// the write order (merge.go's crash points).
+	d.WaitMerge()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, r := range d.runs {
@@ -403,17 +421,6 @@ func (d *DB) Flush() error {
 	if !started || nextHeight == baseHeight {
 		return nil
 	}
-	// A MERGE THAT DID NOT FINISH RUNS BEFORE THE NEXT RUN IS CUT. The span is
-	// every L0 since the last terminal, so a crash between the boundary and the
-	// manifest swap would otherwise hand the retry a SEVENTEENTH run: the
-	// terminal would cover more than the boundary says, and every terminal after
-	// it would sit at a different TxNum than another builder's. Byte identity is
-	// the core promise, so the retry happens here, before a new run can widen the
-	// span. It is a manifest scan and a no-op on every ordinary flush.
-	if err := d.MaybeMerge(); err != nil {
-		return err
-	}
-
 	prev := d.chainRoot
 	d.mu.RLock()
 	if n := len(d.man.Runs); n > 0 {
@@ -466,7 +473,12 @@ func (d *DB) Flush() error {
 	if err := d.mem.reset(nextTx, nextHeight); err != nil {
 		return err
 	}
-	// THE MERGE BOUNDARY IS A FLUSH BOUNDARY, known in advance.
+	// THE MERGE BOUNDARY IS A FLUSH BOUNDARY, known in advance. This STARTS the
+	// merge and returns; the terminal lands on its own goroutine minutes later
+	// and publishes itself. It is also the retry after a kill, and it needs no
+	// special position for that any more: the span is fixed by content, so a
+	// process that finds seventeen L0 runs still merges the sixteen the boundary
+	// names (merge.go's mergeSpanLocked).
 	if err := d.MaybeMerge(); err != nil {
 		return err
 	}

@@ -87,6 +87,9 @@ func TestGateNeverUploadsAnL0(t *testing.T) {
 	if err := db.Flush(); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.WaitMerge(); err != nil {
+		t.Fatal(err)
+	}
 	man = db.Manifest()
 	if len(man.Runs) != 1 || !man.Runs[0].Terminal() {
 		t.Fatalf("the boundary did not cut a terminal run: %+v", man.Runs)
@@ -228,6 +231,9 @@ func TestConsumerJoinsWhileTheProducerIsAhead(t *testing.T) {
 			if err := db.Flush(); err != nil {
 				t.Fatal(err)
 			}
+		}
+		if err := db.WaitMerge(); err != nil {
+			t.Fatal(err)
 		}
 	}
 	write(MergeFanIn) // earns the terminal, which publishes the pointer

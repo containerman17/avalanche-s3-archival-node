@@ -558,6 +558,7 @@ func (s *Store) Open(hash string) (*Blob, error) {
 type Blob struct {
 	size uint64
 	mm   []byte      // no credentials: whole-file mapping of the spool file
+	path string      // the mapped file, for Cold
 	f    *casfs.File // credentials: the chunk cache
 }
 
@@ -586,10 +587,43 @@ func mmapArtifact(path string) (*Blob, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Blob{size: uint64(size), mm: mm}, nil
+	return &Blob{size: uint64(size), mm: mm, path: path}, nil
 }
 
 func (b *Blob) Size() uint64 { return b.size }
+
+// Cold evicts this artifact from the page cache: MADV_DONTNEED tears down this
+// process's mapping of it, then POSIX_FADV_DONTNEED drops the pages themselves.
+// BOTH STEPS ARE REQUIRED and in that order, because fadvise refuses a page any
+// process still has mapped.
+//
+// IT IS AN ADVISORY DROP, NEVER A CORRECTNESS STEP: the mapping is read-only
+// and file-backed, so a reader that touches an evicted page simply faults it
+// back in. It exists for the STREAMING READER (store's terminal merge), which
+// walks gigabytes exactly once and would otherwise evict the state pages the
+// executor's 90% hit rate depends on.
+//
+// With credentials the bytes come from casfs's chunk cache, which owns its own
+// byte budget and evicts by unlinking; there is nothing here to drop.
+func (b *Blob) Cold() error {
+	if b.mm == nil {
+		return nil
+	}
+	if err := syscall.Madvise(b.mm, syscall.MADV_DONTNEED); err != nil {
+		return err
+	}
+	return coldFile(b.path)
+}
+
+// ColdFile drops one path's page-cache pages. It is Cold for a file this
+// process is WRITING rather than mapping (the merge's output run): the pages
+// have to be written back before the kernel will drop them, so a caller that
+// wants them gone as it goes calls this repeatedly.
+func ColdFile(path string) error { return coldFile(path) }
+
+// ResidentPages reports how many of a file's pages the page cache holds, and
+// how many it has. It is the EVIDENCE for the rule above, used by tests.
+func ResidentPages(path string) (resident, total int, err error) { return residentPages(path) }
 
 func (b *Blob) bounds(off, n uint64) error {
 	if off > b.size || n > b.size-off {

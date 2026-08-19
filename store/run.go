@@ -318,6 +318,17 @@ func (r *Run) ResidentBytes() uint64 {
 	return n
 }
 
+// Cold hands this run's pages back to the machine (dist.Blob.Cold). It is what
+// the merge calls on the runs it is streaming through, so a one-pass reader
+// cannot evict the state pages serving depends on. Advisory: an evicted page
+// faults straight back in.
+func (r *Run) Cold() error {
+	if r.blob == nil {
+		return nil
+	}
+	return r.blob.Cold()
+}
+
 func (r *Run) Close() error {
 	for i, rd := range r.rd {
 		if rd != nil {

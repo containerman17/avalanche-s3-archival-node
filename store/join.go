@@ -72,6 +72,10 @@ func ReadFooter(cas *dist.Store, name RunName) (*Footer, error) {
 // prefix. That is not a degraded state, it is the answer for every chain under
 // eight million transactions, which joins over p2p in minutes.
 func (d *DB) Publish() error {
+	// One publisher at a time: the merge goroutine publishes the terminal it just
+	// made, and the executor's flushes call this too.
+	d.pubMu.Lock()
+	defer d.pubMu.Unlock()
 	m := d.Manifest()
 	m.Runs = publishable(m.Runs)
 	if len(m.Runs) == 0 {
