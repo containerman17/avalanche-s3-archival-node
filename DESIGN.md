@@ -160,6 +160,8 @@ One publisher, many read-only consumers; object storage R2/B2-class with zero eg
 
 ## Sizing inputs
 
+THE HARDWARE REQUIREMENT IS ONE LINE (user ruling 2026-08-19): **local SSD = the merkleized state size plus 50%**, and nothing else may be load-bearing. At mainnet that is 130-157GB of Firewood, so 195-235GB of disk, which is the 200GB target the product claims. Everything besides current state is therefore held to roughly half the state size in total: unpublished runs (bounded by the publish cadence), the window log, and the chunk cache, which is watermark-bounded and shrinks under pressure by design. Staging costs nothing since forward fetch keeps unexecuted blocks in a bounded RAM queue. A DEFECT THAT BREAKS THIS RULE IS A RELEASE BLOCKER, not a tuning item: a retired run that is unlinked while still mapped holds its blocks until process exit (measured ~8.5GB per merge, ~100GB/day at mainnet cadence, invisible to `du`), which alone makes the target unreachable.
+
 - IN-PROCESS CALLS, MEASURED 2026-08-12 on the dev box (i7-10700K, 8 cores / 16 threads) against numine at tip, an ERC20 `totalSupply()` through `Node.CallAt`, all four runs back to back on an otherwise idle box:
 
   | | single-core | all-core (16 threads) | scaling |
