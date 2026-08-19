@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -226,18 +227,48 @@ func (w *RunWriter) Abort() {
 
 // Run is an open run: three sstable.Readers over one artifact, plus the two
 // resident blooms. Goroutine-safe (everything is immutable after open).
+//
+// A RUN IS CLOSED BY ITS LAST REFERENCE, NEVER BY THE CODE THAT RETIRES IT
+// (db.go's version). refs counts the VERSIONS of the run list that hold it, and
+// a version outlives every reader inside it, so the munmap and the close happen
+// at the one instant nobody can be reading: not before, which was a
+// use-after-munmap, and not at process exit, which was 8.5GB of allocated
+// blocks per merge that `du` could not even see.
 type Run struct {
 	Name   RunName
 	Footer *Footer
 
+	refs   atomic.Int64
 	blob   *dist.Blob
 	rd     [numSections]*sstable.Reader
 	sec    [numSections]*sectionReadable
 	filter [numSections][]byte
 }
 
+// hold and drop are the run's lifetime, and only a version calls them.
+func (r *Run) hold() { r.refs.Add(1) }
+
+func (r *Run) drop() {
+	if r.refs.Add(-1) == 0 {
+		r.Close()
+	}
+}
+
 // OpenRun opens the named run out of the artifact store.
-func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
+func OpenRun(cas *dist.Store, name RunName) (*Run, error) { return openRun(cas, name, nil) }
+
+// ReopenRun opens the run again over whatever the artifact store hands out NOW,
+// carrying the old handle's resident bytes across so the reopen reads nothing:
+// its footer, its blooms and its SST index blocks are the same bytes for the
+// same name, forever, because a run is immutable and content-addressed.
+//
+// It exists for ONE event: `dist.Sync` uploaded a terminal run and unlinked the
+// local copy the old handle still had open. That handle keeps the file's blocks
+// allocated until it closes, so the run has to move onto the chunk cache, which
+// is exactly where every other node reads it from.
+func ReopenRun(cas *dist.Store, old *Run) (*Run, error) { return openRun(cas, old.Name, old) }
+
+func openRun(cas *dist.Store, name RunName, seed *Run) (*Run, error) {
 	blob, err := cas.Open(name)
 	if err != nil {
 		return nil, err
@@ -247,17 +278,28 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 		blob.Close()
 		return nil, fmt.Errorf("store: run %s is %d bytes, too small for a footer", name, blob.Size())
 	}
-	fb, err := blob.Read(blob.Size()-uint64(footerSize), uint64(footerSize))
-	if err != nil {
-		blob.Close()
-		return nil, err
-	}
-	if r.Footer, err = decodeFooter(fb); err != nil {
-		blob.Close()
-		return nil, fmt.Errorf("store: run %s: %w", name, err)
+	if seed != nil {
+		r.Footer, r.filter = seed.Footer, seed.filter
+	} else {
+		fb, err := blob.Read(blob.Size()-uint64(footerSize), uint64(footerSize))
+		if err != nil {
+			blob.Close()
+			return nil, err
+		}
+		if r.Footer, err = decodeFooter(fb); err != nil {
+			blob.Close()
+			return nil, fmt.Errorf("store: run %s: %w", name, err)
+		}
 	}
 	for s := Section(0); s < numSections; s++ {
 		sec := &sectionReadable{b: blob, off: r.Footer.Off[s], n: r.Footer.Len[s]}
+		if seed != nil {
+			// The resident ranges are a copy, never the seed's own slice: the
+			// seed is still serving reads out of it until its last reference
+			// goes, and reside appends.
+			sec.res = append([]residentRange(nil), seed.sec[s].res...)
+			sec.resident = seed.sec[s].resident
+		}
 		r.sec[s] = sec
 		readable, err := sstable.NewSimpleReadable(sec)
 		if err != nil {
@@ -293,7 +335,7 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
 		}
 		// pebble's sstable.Reader has no point-get, so the bloom gate is ours
 		// to apply: keep the filter bytes in hand for MayHave.
-		if len(lay.Filter) > 0 && lay.Filter[0].Length > 0 {
+		if seed == nil && len(lay.Filter) > 0 && lay.Filter[0].Length > 0 {
 			f, err := blob.Read(r.Footer.Off[s]+lay.Filter[0].Offset, lay.Filter[0].Length)
 			if err != nil {
 				r.Close()

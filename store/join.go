@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"slices"
 
 	"github.com/containerman17/epochdb/dist"
 )
@@ -109,6 +110,73 @@ func (d *DB) Publish() error {
 		if err := os.Remove(d.cas.SpoolPath(old)); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+	}
+	return nil
+}
+
+// SyncArtifacts uploads the spool and REOPENS every run the upload released.
+// It is the whole publish half of the retirement rule, and it is one method
+// because the two halves are one step: `dist.Sync` unlinks a terminal run's
+// local copy once the bucket confirms it, and the handle this process still had
+// open on that file would otherwise keep its blocks allocated until the process
+// exited (~8.5GB per terminal, ~100GB a day at the mainnet cadence, invisible
+// to `du` and fatal to DESIGN's state-plus-50% disk rule).
+//
+// The reopened run reads through the chunk cache, which is where a joiner reads
+// it from and what the read-through budget is sized for. It costs no re-reading
+// of blooms or index blocks: those are the same bytes for the same name forever
+// and ReopenRun carries them across.
+//
+// THE ORDER IS UNCHANGED AND STAYS: the bucket confirms, THEN the local copy
+// goes. Nothing here deletes anything, and nothing in the bucket is ever
+// touched.
+func (d *DB) SyncArtifacts() error {
+	released, err := d.cas.Sync()
+	if len(released) == 0 {
+		return err
+	}
+	return errors.Join(err, d.reopenReleased(released))
+}
+
+func (d *DB) reopenReleased(names []RunName) error {
+	gone := make(map[RunName]bool, len(names))
+	for _, n := range names {
+		gone[n] = true
+	}
+	runs, done := d.snapshot()
+	defer done()
+	var fresh []*Run
+	for _, r := range runs {
+		if !gone[r.Name] {
+			continue
+		}
+		nr, err := ReopenRun(d.cas, r)
+		if err != nil {
+			for _, o := range fresh {
+				o.Close()
+			}
+			return fmt.Errorf("store: run %s was uploaded and unlinked but does not reopen: %w", r.Name, err)
+		}
+		fresh = append(fresh, nr)
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	swapped := append([]*Run(nil), d.ver.runs...)
+	n := 0
+	for _, nr := range fresh {
+		i := slices.IndexFunc(swapped, func(r *Run) bool { return r.Name == nr.Name })
+		if i < 0 { // it left the live set while we were reopening it
+			nr.Close()
+			continue
+		}
+		swapped[i] = nr
+		n++
+	}
+	if n > 0 {
+		d.swapLocked(swapped)
 	}
 	return nil
 }

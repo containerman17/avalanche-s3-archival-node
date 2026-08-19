@@ -49,7 +49,7 @@ func TestMinioRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Sync(); err != nil {
+	if _, err := st.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(st.SpoolPath(hash)); err == nil {

@@ -34,7 +34,8 @@ type FrontierRow struct {
 // MergeFrontier calls fn once per state key, in key order, with that key's
 // value at TxNum atTx.
 func (d *DB) MergeFrontier(atTx uint64, fn func(FrontierRow) error) error {
-	runs := d.snapshot()
+	runs, done := d.snapshot()
+	defer done()
 	var h cursorHeap
 	defer func() {
 		for _, c := range h {

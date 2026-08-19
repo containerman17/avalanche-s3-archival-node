@@ -492,17 +492,27 @@ func writeDurable(path string, parts ...[]byte) error {
 // Sync uploads everything in the spool the bucket does not have yet and then
 // unlinks the local copy of whatever it now confirms. No-op without
 // credentials, where the spool is the only durable copy there is.
-func (s *Store) Sync() error {
+//
+// IT RETURNS WHAT IT RELEASED, and a caller that still has one of those
+// artifacts OPEN must act on it: an unlinked file whose descriptor or mapping
+// this process still holds keeps every one of its blocks allocated until that
+// handle closes, invisible to `du` and counted by `df`. That is 8.5GB per
+// terminal run on mainnet C. store.DB reopens them onto the chunk cache
+// (DB.SyncArtifacts), which is where every other node reads them from anyway.
+func (s *Store) Sync() ([]string, error) {
 	if s.cas == nil {
-		return nil
+		return nil, nil
 	}
 	done, err := s.cas.Sync()
+	released := make([]string, 0, len(done))
 	for _, h := range done {
 		if rerr := s.cas.Release(h); rerr != nil {
 			err = errors.Join(err, rerr)
+			continue
 		}
+		released = append(released, h)
 	}
-	return err
+	return released, err
 }
 
 // ---------- reading ----------

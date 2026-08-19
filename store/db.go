@@ -202,9 +202,13 @@ type DB struct {
 	// racing would move the chain pointer twice for one head.
 	pubMu sync.Mutex
 
-	mu   sync.RWMutex
-	man  *Manifest
-	runs []*Run // ascending TxNum range, same order as man.Runs
+	mu  sync.RWMutex
+	man *Manifest
+	// ver is the current run list, ascending TxNum range, same order as
+	// man.Runs. It is REPLACED, never edited: a reader holds the version it
+	// started on and the runs in it stay open until it lets go (the version
+	// type below).
+	ver *version
 	// lastManifest is the published manifest artifact, so the superseded one's
 	// local copy can go once the pointer no longer names it.
 	lastManifest string
@@ -262,14 +266,17 @@ func open(dir string, cas *dist.Store, chainRoot [32]byte, readOnly bool) (*DB, 
 	if codeBudget > 0 {
 		d.code = lru.NewSizeConstrainedCache[common.Hash, []byte](codeBudget)
 	}
+	var runs []*Run
 	for _, ref := range man.Runs {
 		r, err := OpenRun(cas, ref.Name)
 		if err != nil {
+			d.ver = newVersion(runs)
 			d.Close()
 			return nil, err
 		}
-		d.runs = append(d.runs, r)
+		runs = append(runs, r)
 	}
+	d.ver = newVersion(runs)
 	// The window is replayed back into RAM from its own log and cut at the last
 	// COMPLETE block; the executor's reconcile walk-back re-executes from there
 	// out of staging.
@@ -302,10 +309,12 @@ func (d *DB) Close() error {
 	d.WaitMerge()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, r := range d.runs {
-		r.Close()
-	}
-	d.runs = nil
+	// THE LAST REFERENCE CLOSES EACH RUN, and here that is almost always this
+	// one. A reader still inside a run keeps exactly that run open until it
+	// returns, which is the point: Close does not wait for it and cannot hang
+	// on it, and the file it holds is one this process was serving anyway.
+	d.ver.release()
+	d.ver = newVersion(nil)
 	if d.mem != nil {
 		d.mem.close()
 		d.mem = nil
@@ -466,7 +475,7 @@ func (d *DB) Flush() error {
 		run.Close()
 		return err
 	}
-	d.runs = append(d.runs, run)
+	d.swapLocked(append(append([]*Run(nil), d.ver.runs...), run))
 	d.mu.Unlock()
 
 	// Only now may the window's staging go.
@@ -566,10 +575,73 @@ func (d *DB) writeSections(w *RunWriter) error {
 // hit wins. ONE DESCENT FOR EVERYTHING.
 // ---------------------------------------------------------------------------
 
-func (d *DB) snapshot() []*Run {
+// A VERSION IS THE RUN LIST AS ONE IMMUTABLE OBJECT, and it is what returns a
+// retired run's disk to the filesystem at the right instant.
+//
+// A reader takes ONE reference for its whole descent, whatever the run count: a
+// mainnet manifest holds ~200 runs and the descent walks many of them per miss,
+// so a reference per run would have put two hundred contended atomics in the
+// hot path. A run's own refs counts the VERSIONS holding it instead, so it
+// moves once per flush and once per merge rather than once per read.
+//
+// RETIREMENT IS THEREFORE NOT AN EVENT: a run is retired by being left out of
+// the next version, which is the same statement as "no new reader can reach
+// it". The version that held it dies when its last reader leaves, that drops
+// the run's last reference, and THAT closes it: munmap, close, blocks back.
+//
+// NOTHING WAITS FOR ANYTHING HERE, which is the property that makes it safe to
+// use from the merge goroutine and from Close: there is no lock a reader can
+// hold against a writer, so there is no deadlock to design around, and a
+// reference that somehow leaked would cost that run's blocks until exit, which
+// is what EVERY published run used to cost.
+type version struct {
+	runs []*Run
+	refs atomic.Int64 // live readers, plus one while this is the current version
+}
+
+func newVersion(runs []*Run) *version {
+	for _, r := range runs {
+		r.hold()
+	}
+	v := &version{runs: runs}
+	v.refs.Store(1)
+	return v
+}
+
+func (v *version) release() {
+	if v.refs.Add(-1) != 0 {
+		return
+	}
+	for _, r := range v.runs {
+		r.drop()
+	}
+}
+
+// snapshot takes a reference to the current run list and hands back its
+// release. EVERY CALLER RELEASES IT, and the shape is always
+// `runs, done := d.snapshot(); defer done()`: those runs are open for exactly
+// as long as that reference lives, and for no longer.
+func (d *DB) snapshot() ([]*Run, func()) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.runs
+	return d.snapshotLocked()
+}
+
+// snapshotLocked is snapshot for a caller that already holds d.mu, which is how
+// the merge takes its reference in the same breath as the manifest it merges.
+func (d *DB) snapshotLocked() ([]*Run, func()) {
+	v := d.ver
+	v.refs.Add(1)
+	return v.runs, v.release
+}
+
+// swapLocked installs runs as the current version. Whatever the old version
+// held and this one does not is retired by that fact alone. The caller holds
+// d.mu and owns runs.
+func (d *DB) swapLocked(runs []*Run) {
+	old := d.ver
+	d.ver = newVersion(runs)
+	old.release()
 }
 
 // chainRow resolves a chain-section row: the window's spill first, then the run
@@ -579,7 +651,8 @@ func (d *DB) chainRow(fam int, n uint64, byHeight bool) ([]byte, bool, error) {
 	if v, ok, err := d.mem.chainGet(fam, n); err != nil || ok {
 		return v, ok, err
 	}
-	runs := d.snapshot()
+	runs, done := d.snapshot()
+	defer done()
 	for i := len(runs) - 1; i >= 0; i-- {
 		f := runs[i].Footer
 		in := n >= f.FromTx && n < f.ToTx
@@ -631,7 +704,9 @@ func (d *DB) ChainRows(fam int, from, to uint64) iter.Seq2[ChainRow, error] {
 		byHeight := famByHeight(fam)
 		prefix := famPrefix[fam]
 		next := from
-		for _, r := range d.snapshot() { // ascending; chain ranges never overlap
+		runs, done := d.snapshot()
+		defer done()
+		for _, r := range runs { // ascending; chain ranges never overlap
 			f := r.Footer
 			lo, hi := f.FromTx, f.ToTx-1
 			if byHeight {
@@ -719,7 +794,8 @@ func (d *DB) lookupNum(key []byte) (uint64, bool, error) {
 	if n, ok := d.mem.lookupNum(key); ok {
 		return n, true, nil
 	}
-	runs := d.snapshot()
+	runs, done := d.snapshot()
+	defer done()
 	for i := len(runs) - 1; i >= 0; i-- {
 		v, ok, err := runs[i].Get(SecLookup, key)
 		if err != nil {
@@ -748,7 +824,8 @@ func (d *DB) latest(sec Section, prefix []byte, at uint64) ([]byte, bool, error)
 	if v, _, ok := d.mem.latestState(prefix, at); ok {
 		return v, true, nil
 	}
-	runs := d.snapshot()
+	runs, done := d.snapshot()
+	defer done()
 	for i := len(runs) - 1; i >= 0; i-- {
 		if runs[i].Footer.FromTx > at {
 			continue
@@ -797,7 +874,8 @@ func (d *DB) Code(hash []byte) ([]byte, bool, error) {
 		return b, true, nil
 	}
 	key := CodeKey(hash)
-	runs := d.snapshot()
+	runs, done := d.snapshot()
+	defer done()
 	for i := len(runs) - 1; i >= 0; i-- {
 		v, ok, err := runs[i].Get(SecState, key)
 		if err != nil {
@@ -820,7 +898,9 @@ func (d *DB) Code(hash []byte) ([]byte, bool, error) {
 // rather than by TxNum, so the numbers arrive in no useful order and the caller
 // collects them. Code rows carry no TxNum and are skipped.
 func (d *DB) StateTxNums(lo, hi uint64, fn func(txnum uint64)) error {
-	for _, r := range d.snapshot() {
+	runs, done := d.snapshot()
+	defer done()
+	for _, r := range runs {
 		if r.Footer.ToTx <= lo || r.Footer.FromTx > hi {
 			continue
 		}
@@ -849,7 +929,8 @@ func (d *DB) StateTxNums(lo, hi uint64, fn func(txnum uint64)) error {
 
 // Postings scans one lookup family's posting rows in [loTx, hiTx] ascending.
 func (d *DB) Postings(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, val byte) bool) error {
-	runs := d.snapshot()
+	runs, done := d.snapshot()
+	defer done()
 	stop := false
 	for _, r := range runs {
 		if stop || r.Footer.ToTx <= loTx || r.Footer.FromTx > hiTx {
@@ -914,7 +995,8 @@ func (d *DB) PostingsDesc(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64
 			return nil
 		}
 	}
-	runs := d.snapshot()
+	runs, done := d.snapshot()
+	defer done()
 	for i := len(runs) - 1; i >= 0; i-- {
 		r := runs[i]
 		if r.Footer.ToTx <= loTx || r.Footer.FromTx > hiTx {
@@ -985,7 +1067,9 @@ func (d *DB) heightBounds(txnum uint64) (lo, hi uint64, ok bool) {
 // SectionSizes reports the on-disk bytes per section across the live runs.
 func (d *DB) SectionSizes() [numSections]uint64 {
 	var out [numSections]uint64
-	for _, r := range d.snapshot() {
+	runs, done := d.snapshot()
+	defer done()
+	for _, r := range runs {
 		for s := Section(0); s < numSections; s++ {
 			out[s] += r.SectionSize(s)
 		}

@@ -86,7 +86,7 @@ func publish(t *testing.T, dataDir string) {
 			t.Fatal(err)
 		}
 	}
-	if err := cas.Sync(); err != nil {
+	if _, err := cas.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	// Nothing local is left: without this, the read below would pass over

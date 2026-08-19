@@ -145,7 +145,11 @@ func publishRuns(t *testing.T, endpoint, prefix string, runs int) (dir string, r
 		t.Fatal(err)
 	}
 	const blocks, txs = 40, 8
-	db.scaleTriggers(FlushTxs, FlushBlocks, uint64(blocks*txs*runs))
+	// EVERY BLOCK OWNS A BOUNDARY SLOT, so a run is blocks*(txs+1) slots wide
+	// and the boundary has to be the whole span: the merge span ends at the
+	// FIRST run that carries it past the boundary, so a lower number here cuts
+	// the terminal one run early and leaves an L0 behind.
+	db.scaleTriggers(FlushTxs, FlushBlocks, uint64(blocks*(txs+1)*runs))
 	h := uint64(0)
 	for r := 0; r < runs; r++ {
 		for i := 0; i < blocks; i++ {
@@ -158,11 +162,16 @@ func publishRuns(t *testing.T, endpoint, prefix string, runs int) (dir string, r
 			t.Fatal(err)
 		}
 	}
+	// The merge runs beside execution, so a test that wants to look at the
+	// terminal waits for it.
+	if err := db.WaitMerge(); err != nil {
+		t.Fatal(err)
+	}
 	if got := db.Manifest().Runs; len(got) != 1 || !got[0].Terminal() {
 		t.Fatalf("the corpus did not merge into one terminal run: %+v", got)
 	}
 	db.Close()
-	if err := cas.Sync(); err != nil {
+	if _, err := cas.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	ents, err := os.ReadDir(filepath.Join(dir, "cas"))
@@ -215,7 +224,9 @@ func TestReadThroughFromS3(t *testing.T) {
 	openGets, openChunks := since()
 
 	var resident uint64
-	for _, r := range db.snapshot() {
+	runs, done := db.snapshot()
+	defer done()
+	for _, r := range runs {
 		resident += r.ResidentBytes()
 	}
 	if resident == 0 {
@@ -224,11 +235,11 @@ func TestReadThroughFromS3(t *testing.T) {
 	sizes := db.SectionSizes()
 	total := sizes[SecChain] + sizes[SecState] + sizes[SecLookup]
 	t.Logf("cold open of %d runs (%.1f MB of runs): %d GETs / %d chunks, resident %d bytes (%.2f%% of the corpus)",
-		len(db.snapshot()), float64(total)/(1<<20), openGets, openChunks, resident, 100*float64(resident)/float64(total))
+		len(runs), float64(total)/(1<<20), openGets, openChunks, resident, 100*float64(resident)/float64(total))
 
 	// Residency is only a claim worth making if every run spans several
 	// chunks: a corpus that fits in one chunk per run is read whole either way.
-	for _, r := range db.snapshot() {
+	for _, r := range runs {
 		if got := r.Footer.Off[numSections-1] + r.Footer.Len[numSections-1]; got < 2*dist.ChunkSize {
 			t.Fatalf("run %s is %d bytes, under two chunks: too small to prove read-through", r.Name, got)
 		}

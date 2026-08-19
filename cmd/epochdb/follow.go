@@ -23,6 +23,7 @@ import (
 	"github.com/containerman17/epochdb/dist"
 	"github.com/containerman17/epochdb/grpcapi"
 	"github.com/containerman17/epochdb/plainhttp"
+	"github.com/containerman17/epochdb/store"
 )
 
 // serveMain is `epochdb serve`, THE ONLY OPERATOR COMMAND (RULING 2026-08-03),
@@ -199,7 +200,7 @@ func serveMain(args []string) {
 			defer gsrv.Stop()
 			log.Printf("epochdb: serve: gRPC on :%d", *grpcPort)
 		}
-		go syncLoop(ctx, n.CAS(), *syncEvery)
+		go syncLoop(ctx, n.CAS(), n.Store(), *syncEvery)
 
 		select {
 		case <-ctx.Done():
@@ -323,12 +324,14 @@ func serveOn(port int, run func(net.Listener)) error {
 	return nil
 }
 
-// syncLoop pushes whatever the producers left in the spool to the bucket and
-// unlinks the local copy once the bucket confirms it. Fail-loud but never
-// fatal: an upload that cannot happen leaves the artifact durable in the spool
-// and the next tick retries. Without S3 credentials it never does anything.
-func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
-	if !st.Remote() {
+// syncLoop pushes whatever the producers left in the spool to the bucket,
+// unlinks the local copy once the bucket confirms it, and moves the run this
+// node still has open onto the chunk cache so those blocks really go back
+// (store.DB.SyncArtifacts). Fail-loud but never fatal: an upload that cannot
+// happen leaves the artifact durable in the spool and the next tick retries.
+// Without S3 credentials it never does anything.
+func syncLoop(ctx context.Context, cas *dist.Store, db *store.DB, every time.Duration) {
+	if !cas.Remote() {
 		return
 	}
 	t := time.NewTicker(every)
@@ -339,7 +342,7 @@ func syncLoop(ctx context.Context, st *dist.Store, every time.Duration) {
 			return
 		case <-t.C:
 		}
-		if err := st.Sync(); err != nil {
+		if err := db.SyncArtifacts(); err != nil {
 			log.Printf("epochdb: SYNC FAILED (artifacts stay in the spool, chain unaffected): %v", err)
 		}
 	}

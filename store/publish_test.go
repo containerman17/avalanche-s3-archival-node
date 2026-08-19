@@ -237,13 +237,13 @@ func TestConsumerJoinsWhileTheProducerIsAhead(t *testing.T) {
 		}
 	}
 	write(MergeFanIn) // earns the terminal, which publishes the pointer
-	if err := cas.Sync(); err != nil {
+	if _, err := cas.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	// THE PRODUCER RUNS AHEAD. Five more flushes, no new terminal, and a Sync
 	// on top of them: the bucket must not change.
 	write(5)
-	if err := cas.Sync(); err != nil {
+	if _, err := cas.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	live := db.Manifest()

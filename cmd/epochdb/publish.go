@@ -67,7 +67,7 @@ func publishMain(args []string) {
 		log.Fatalf("epochdb: publish: %v", err)
 	}
 	t0 := time.Now()
-	if err := cas.Sync(); err != nil {
+	if err := db.SyncArtifacts(); err != nil {
 		log.Fatalf("epochdb: publish: sync: %v", err)
 	}
 	log.Printf("epochdb: published %d terminal runs (blocks %d..%d, %d txs) in %s",

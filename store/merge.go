@@ -184,8 +184,13 @@ func (d *DB) mergeSpanLocked() (start, end int, ok bool) {
 // merge folds the runs in [start,end) into one terminal run.
 func (d *DB) merge(start, end int) error {
 	d.mu.RLock()
+	// THE MERGE IS A READER TOO, and a long one: it takes its reference in the
+	// same breath as the manifest, and holds it for the whole pass, so its
+	// inputs cannot close under it even after the swap below retires them.
+	live, done := d.snapshotLocked()
+	defer done()
 	refs := append([]RunRef(nil), d.man.Runs[start:end]...)
-	inputs := append([]*Run(nil), d.runs[start:end]...)
+	inputs := append([]*Run(nil), live[start:end]...)
 	prev := d.chainRoot
 	if start > 0 {
 		var err error
@@ -282,20 +287,28 @@ func (d *DB) merge(start, end int) error {
 		merged.Close()
 		return err
 	}
-	runs := make([]*Run, 0, len(d.runs)-len(inputs)+1)
-	runs = append(runs, d.runs[:start]...)
+	cur := d.ver.runs
+	runs := make([]*Run, 0, len(cur)-len(inputs)+1)
+	runs = append(runs, cur[:start]...)
 	runs = append(runs, merged)
-	d.runs = append(runs, d.runs[end:]...)
+	runs = append(runs, cur[end:]...)
+	// THE SWAP IS THE RETIREMENT: the inputs are simply not in the new version,
+	// so no reader can reach them from here on, and each one closes the moment
+	// the last version holding it lets go (db.go's version).
+	d.swapLocked(runs)
 	d.mu.Unlock()
 	mergeCrash("swapped")
 
 	// ONLY NOW may the inputs go. They only ever existed locally, so this is an
 	// unlink of files nobody else has a copy of, and there is nothing in any
 	// bucket to reconcile: what is published is final, forever. The cold worker
-	// stops first: it reads the inputs' mappings, and they are about to close.
+	// stops first: it reads the inputs' mappings.
+	//
+	// UNLINK IS NOT THE FREE, THE LAST REFERENCE IS. A reader inside one of
+	// these runs still holds its mapping, so the blocks go back when it leaves,
+	// which is microseconds later and needs no waiting here.
 	stopCold()
-	for i, r := range inputs {
-		r.Close()
+	for i := range inputs {
 		if err := d.cas.DropLocal(refs[i].Name); err != nil {
 			return fmt.Errorf("store: retire run %s: %w", refs[i].Name, err)
 		}

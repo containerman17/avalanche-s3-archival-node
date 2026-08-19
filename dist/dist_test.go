@@ -114,7 +114,7 @@ func TestStoreLocalRoundtrip(t *testing.T) {
 	}
 	v.Close()
 	// Sync is a no-op without credentials: the spool IS the durable copy.
-	if err := s.Sync(); err != nil {
+	if _, err := s.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(s.SpoolPath(hash)); err != nil {

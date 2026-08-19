@@ -49,7 +49,9 @@ func TestNumineReadThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldest := src.snapshot()[0]
+	srcRuns, srcDone := src.snapshot()
+	defer srcDone()
+	oldest := srcRuns[0]
 	var slotKey, txhKey []byte
 	if err := oldest.ScanRange(SecState, []byte(PrefixState), []byte("state0"), func(k, v []byte) bool {
 		if len(k) > 27 && k[27] == 's' && len(v) > 0 {
@@ -125,7 +127,7 @@ func TestNumineReadThrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	t0 := time.Now()
-	if err := pubStore.Sync(); err != nil {
+	if _, err := pubStore.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	pubStore.Close()
@@ -153,13 +155,15 @@ func TestNumineReadThrough(t *testing.T) {
 	openDur := time.Since(t0)
 
 	var resident uint64
-	for _, r := range db.snapshot() {
+	runs, done := db.snapshot()
+	defer done()
+	for _, r := range runs {
 		resident += r.ResidentBytes()
 	}
 	sizes := db.SectionSizes()
 	total := sizes[SecChain] + sizes[SecState] + sizes[SecLookup]
 	t.Logf("corpus %.1f MB (chain %.1f, state %.1f, lookup %.1f) over %d runs",
-		mb(total), mb(sizes[SecChain]), mb(sizes[SecState]), mb(sizes[SecLookup]), len(db.snapshot()))
+		mb(total), mb(sizes[SecChain]), mb(sizes[SecState]), mb(sizes[SecLookup]), len(runs))
 	t.Logf("COLD OPEN: %s, %d ranged GETs / %d chunks; RESIDENT %.2f MB = %.3f%% of the corpus",
 		openDur.Round(time.Millisecond), openGets, openChunks, mb(resident), 100*float64(resident)/float64(total))
 
