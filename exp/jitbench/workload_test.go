@@ -1,3 +1,5 @@
+//go:build jitbench
+
 // Package jitbench is an EXPERIMENT, not production code. It measures how much
 // of libevm's EVM interpreter time is per-opcode bookkeeping (gas charging and
 // stack bounds checking) rather than real work, which is the ceiling on what an

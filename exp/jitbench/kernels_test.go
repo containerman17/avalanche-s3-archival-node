@@ -1,3 +1,5 @@
+//go:build jitbench
+
 package jitbench
 
 import "bytes"

@@ -1,4 +1,4 @@
-# jitbench
+# jitbench (build-tagged: go test -tags jitbench ./exp/jitbench/, needs regen.sh first)
 
 EXPERIMENT, not production. Nothing in `exp/` is imported by the node.
 
