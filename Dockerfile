@@ -1,7 +1,11 @@
 FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+# BuildKit cache mounts keep the module and compile caches on the BUILDER
+# across image builds (local iteration drops to the changed packages'
+# compile time). CI runners start cold and just repopulate them; the mounts
+# never reach the image layers either way.
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 # GOFLAGS is a build knob for memory-tight machines (e.g. -p=4); empty in CI.
 ARG GOFLAGS=
@@ -9,7 +13,8 @@ ARG GOFLAGS=
 # glibc, so the runtime image must be glibc-based too, not distroless/static.
 # distroless/cc-debian13 matches the builder's Debian 13 and carries the
 # libgcc_s.so.1 the binary needs; distroless/base does not ship it.
-RUN CGO_ENABLED=1 go build -o /epochdb ./cmd/epochdb
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 go build -o /epochdb ./cmd/epochdb
 
 # THE PINNED zstd CLI LAYER IS GONE, as DESIGN said it would be: it existed for
 # the sealer's per-epoch dictionary training, and storage v0 deleted both the
