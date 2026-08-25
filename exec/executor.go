@@ -142,6 +142,10 @@ type Executor struct {
 	cfg Config
 	// vm is the execution backend seam (vm.go): coreth or subnet-evm.
 	vm        vmBackend
+	innerDB   ethstate.Database // unwrapped state db, for the warm pre-execution
+	// committedRoot is the last root Firewood committed (a readable revision),
+	// published for the warm stage, which runs off the executor goroutine.
+	committedRoot goatomic.Value
 	chainCfg  *params.ChainConfig
 	wrapDB    *wrappedDatabase
 	triedb    *triedb.Database
@@ -489,6 +493,7 @@ func New(cfg Config) (*Executor, error) {
 	e := &Executor{
 		cfg:         cfg,
 		vm:          backend,
+		innerDB:     inner,
 		chainCfg:    g.Config,
 		ring:        ring,
 		wrapDB:      wrapDB,
@@ -628,6 +633,7 @@ func (e *Executor) reconcile() error {
 		e.headRoot = rootFW
 		e.headTime = h.Time
 	}
+	e.committedRoot.Store(e.headRoot)
 
 	if fwN == top {
 		log.Printf("exec: resume head=%d root=%x", top, e.headRoot)
@@ -773,8 +779,24 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 	pfCtx, pfCancel := context.WithCancel(ctx)
 	defer pfCancel()
 	pf := make(chan pfItem, 512)
+	// Warm stage: fetched blocks pass through warmBlock on their own
+	// goroutine before the executor sees them (see warm.go).
+	fetched := make(chan pfItem, 512)
 	go func() {
 		defer close(pf)
+		for it := range fetched {
+			if it.err == nil {
+				e.warmBlock(it.blk)
+			}
+			select {
+			case pf <- it:
+			case <-pfCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		defer close(fetched)
 		for h := next; ; h++ {
 			if e.cfg.StopAt > 0 && h > e.cfg.StopAt {
 				return
@@ -782,7 +804,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			raw, ok, err := e.cfg.Blocks.GetByHeight(h)
 			if err != nil {
 				select {
-				case pf <- pfItem{n: h, err: err}:
+				case fetched <- pfItem{n: h, err: err}:
 				case <-pfCtx.Done():
 				}
 				return
@@ -799,7 +821,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			pvm, blk, perr := store.SplitContainer(raw)
 			if perr != nil {
 				select {
-				case pf <- pfItem{n: h, err: fmt.Errorf("block %d parse: %w", h, perr)}:
+				case fetched <- pfItem{n: h, err: fmt.Errorf("block %d parse: %w", h, perr)}:
 				case <-pfCtx.Done():
 				}
 				return
@@ -812,7 +834,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				types.Sender(signer, tx)
 			}
 			select {
-			case pf <- pfItem{n: h, pvm: pvm, blk: blk}:
+			case fetched <- pfItem{n: h, pvm: pvm, blk: blk}:
 			case <-pfCtx.Done():
 				return
 			}
@@ -970,6 +992,7 @@ func (e *Executor) executeDecoded(blockNum uint64, pvm []byte, blk *types.Block)
 		}
 		e.headRoot = newRoot
 		e.headNum = blockNum
+		e.committedRoot.Store(newRoot)
 	}
 	e.headTime = blk.Time()
 	e.totalGas += blk.GasUsed()
@@ -1376,6 +1399,7 @@ func (e *Executor) flushBatch() error {
 		}
 		e.spl.fw += time.Since(tFw)
 		e.fwHeight++
+		e.committedRoot.Store(computed)
 	} else {
 		// Whole batch empty: no proposal, just register the boundary hash.
 		e.fwBackend.SetHashAndHeight(boundaryHash, boundaryNum)
@@ -1434,6 +1458,7 @@ func (e *Executor) bisect(computed common.Hash, boundaryNum uint64, boundaryRoot
 		}
 		e.headRoot = newRoot
 		e.headNum = i
+		e.committedRoot.Store(newRoot)
 		e.headTime = blk.Time()
 	}
 	return fmt.Errorf("batch [%d..%d] root mismatch (computed %x want %x) but per-block re-execution verified clean: batching bug", from, to, computed, boundaryRoot)

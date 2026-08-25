@@ -245,3 +245,6 @@ func (sevmVM) runEVM(cc chainContext, chainCfg *params.ChainConfig, _ *snow.Cont
 func (sevmVM) transitionTimestamp(*params.ChainConfig) (uint64, bool) { return 0, false }
 
 func (sevmVM) hasSettledMarkers(*types.Header) bool { return false }
+
+// warmEVM: subnet-evm chains are small; the warm stage is a coreth (mainnet C) lever.
+func (sevmVM) warmEVM(chainContext, *params.ChainConfig, *types.Block, *ethstate.StateDB) {}

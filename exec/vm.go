@@ -88,6 +88,11 @@ type vmBackend interface {
 	runEVM(cc chainContext, cfg *params.ChainConfig, snowCtx *snow.Context,
 		blk *types.Block, parentTime uint64, statedb *ethstate.StateDB, onTx TxHook) (types.Receipts, error)
 
+	// warmEVM runs blk's transactions on a throwaway statedb for their reads
+	// only: account checks skipped, failures ignored, nothing kept. See
+	// warm.go.
+	warmEVM(cc chainContext, cfg *params.ChainConfig, blk *types.Block, statedb *ethstate.StateDB)
+
 	// transitionTimestamp is the transitionvm switch time and whether the SAE
 	// transition is scheduled at all.
 	transitionTimestamp(cfg *params.ChainConfig) (uint64, bool)

@@ -204,3 +204,22 @@ func (corethVM) hasSettledMarkers(h *types.Header) bool {
 	return he.SettledHeight != nil && he.SettledGasUnix != nil &&
 		he.SettledGasNumerator != nil && he.SettledExcess != nil
 }
+
+// warmEVM is the read-only half of runEVM: no upgrades, no atomic txs, no
+// tracer, no capture. Every tx runs regardless of nonce or balance (the
+// state is a stale revision) and errors are dropped; the reads are the point.
+func (corethVM) warmEVM(cc chainContext, chainCfg *params.ChainConfig, blk *types.Block, statedb *ethstate.StateDB) {
+	header := blk.Header()
+	signer := types.MakeSigner(chainCfg, header.Number, header.Time)
+	evm := vm.NewEVM(corethcore.NewEVMBlockContext(header, cc, nil), vm.TxContext{}, statedb, chainCfg, vm.Config{})
+	for i, tx := range blk.Transactions() {
+		msg, err := corethcore.TransactionToMessage(tx, signer, header.BaseFee)
+		if err != nil {
+			continue
+		}
+		msg.SkipAccountChecks = true
+		statedb.SetTxContext(tx.Hash(), i)
+		evm.Reset(corethcore.NewEVMTxContext(msg), statedb)
+		corethcore.ApplyMessage(evm, msg, new(corethcore.GasPool).AddGas(tx.Gas()))
+	}
+}
