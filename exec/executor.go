@@ -141,17 +141,17 @@ type Config struct {
 type Executor struct {
 	cfg Config
 	// vm is the execution backend seam (vm.go): coreth or subnet-evm.
-	vm        vmBackend
-	innerDB   ethstate.Database // unwrapped state db, for the warm pre-execution
+	vm      vmBackend
+	innerDB ethstate.Database // unwrapped state db, for the warm pre-execution
 	// committedRoot is the last root Firewood committed (a readable revision),
 	// published for the warm stage, which runs off the executor goroutine.
 	committedRoot goatomic.Value
-	chainCfg  *params.ChainConfig
-	wrapDB    *wrappedDatabase
-	triedb    *triedb.Database
-	fwBackend *firewood.TrieDB
-	snowCtx   *snow.Context
-	chainCtx  chainContext
+	chainCfg      *params.ChainConfig
+	wrapDB        *wrappedDatabase
+	triedb        *triedb.Database
+	fwBackend     *firewood.TrieDB
+	snowCtx       *snow.Context
+	chainCtx      chainContext
 
 	genesisRoot common.Hash
 	genesisHash common.Hash
