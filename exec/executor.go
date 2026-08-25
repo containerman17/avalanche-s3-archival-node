@@ -766,7 +766,8 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 	// mutex-guarded, so bisect's direct GetByHeight calls stay safe.
 	type pfItem struct {
 		n   uint64
-		raw []byte
+		pvm []byte
+		blk *types.Block
 		err error
 	}
 	pfCtx, pfCancel := context.WithCancel(ctx)
@@ -795,8 +796,23 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				h--
 				continue
 			}
+			pvm, blk, perr := store.SplitContainer(raw)
+			if perr != nil {
+				select {
+				case pf <- pfItem{n: h, err: fmt.Errorf("block %d parse: %w", h, perr)}:
+				case <-pfCtx.Done():
+				}
+				return
+			}
+			// Sender recovery is ~6% of executor CPU, so do the ECDSA here:
+			// libevm caches the result inside each tx and the channel send
+			// publishes it, making the executor's Sender calls field reads.
+			signer := types.MakeSigner(e.chainCfg, blk.Number(), blk.Time())
+			for _, tx := range blk.Transactions() {
+				types.Sender(signer, tx)
+			}
 			select {
-			case pf <- pfItem{n: h, raw: raw}:
+			case pf <- pfItem{n: h, pvm: pvm, blk: blk}:
 			case <-pfCtx.Done():
 				return
 			}
@@ -816,7 +832,8 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			return nil
 		}
 		tRead := time.Now()
-		var raw []byte
+		var pvm []byte
+		var blk *types.Block
 		ok := false
 		select {
 		case it, alive := <-pf:
@@ -829,7 +846,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			} else if it.n != next {
 				return fmt.Errorf("prefetch out of order: got %d want %d", it.n, next)
 			} else {
-				raw, ok = it.raw, true
+				pvm, blk, ok = it.pvm, it.blk, true
 			}
 		case <-time.After(200 * time.Millisecond):
 			// Staging dry or prefetcher behind: same stall path as before.
@@ -854,7 +871,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			}
 			continue
 		}
-		if err := e.executeRaw(next, raw); err != nil {
+		if err := e.executeDecoded(next, pvm, blk); err != nil {
 			return err
 		}
 		blocksDone++
@@ -914,11 +931,15 @@ func (e *Executor) ownRootAt(hdr *types.Header, n uint64) (common.Hash, bool) {
 func (e *Executor) executeRaw(blockNum uint64, raw []byte) error {
 	// NO CONTAINER DUPLICATION: the proposervm wrapper is stored beside the
 	// header and the container is reassembled on demand, so this split is the
-	// only place the two halves are told apart.
+	// only place (with the prefetcher) the two halves are told apart.
 	pvm, blk, err := store.SplitContainer(raw)
 	if err != nil {
 		return fmt.Errorf("block %d parse: %w", blockNum, err)
 	}
+	return e.executeDecoded(blockNum, pvm, blk)
+}
+
+func (e *Executor) executeDecoded(blockNum uint64, pvm []byte, blk *types.Block) error {
 	if got := blk.NumberU64(); got != blockNum {
 		return fmt.Errorf("block %d has internal number %d", blockNum, got)
 	}
