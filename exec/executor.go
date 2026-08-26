@@ -373,15 +373,17 @@ func New(cfg Config) (*Executor, error) {
 	// window (observed live at N=1000: root 64k blocks back, reconcile
 	// failed). Scale it so the persisted root lags at most ~64 blocks'
 	// worth of commits.
-	// PERSIST EVERY FOURTH BATCH, NOT EVERY BATCH. The root is verified at
+	// PERSIST EVERY 16TH BATCH, NOT EVERY BATCH. The root is verified at
 	// propose time; the commit that follows is persistence only, and at
 	// interval 1 it was 18% of the executor's wall (40 stack samples,
 	// mainnet C 2026-08-26: fwd_commit_proposal, write + fsync inline).
-	// Four batches of ~8k ops retain ~30MB each in Rust memory and the
-	// persisted root lags at most 4*CommitEvery blocks, inside the
+	// Sixteen batches of ~8k ops retain ~70MB each in Rust memory, the
+	// shared upper nodes are written once instead of sixteen times (a
+	// persist dirtied ~300k 4KB pages for ~30k keys at interval 4), and the
+	// persisted root lags at most 16*CommitEvery blocks, inside the
 	// walk-back budget.
 	if cfg.CommitEvery > 1 {
-		fwCfg.DeferredCommitInterval = max(1, 256/uint64(cfg.CommitEvery))
+		fwCfg.DeferredCommitInterval = max(1, 1024/uint64(cfg.CommitEvery))
 	}
 	// A FRONTIER BUILD KEEPS NO HISTORY AT ALL, and that is the difference
 	// between a merge that fits in a container and one the kernel kills.
