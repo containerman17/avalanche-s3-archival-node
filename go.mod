@@ -14,9 +14,9 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/gorilla/websocket v1.5.0
 	github.com/holiman/uint256 v1.2.4
-	github.com/klauspost/compress v1.18.0
 	github.com/prometheus/client_golang v1.23.0
-	golang.org/x/sync v0.20.0
+	golang.org/x/crypto v0.52.0
+	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6
 	golang.org/x/sys v0.45.0
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
@@ -82,6 +82,7 @@ require (
 	github.com/holiman/bloomfilter/v2 v2.0.3 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
+	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
@@ -117,9 +118,8 @@ require (
 	go.uber.org/mock v0.5.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	golang.org/x/crypto v0.52.0 // indirect
-	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/term v0.43.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
@@ -128,3 +128,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
 )
+
+replace github.com/ava-labs/libevm => github.com/containerman17/libevm v1.13.15-0.20260817022927-4c8a6553b55f
