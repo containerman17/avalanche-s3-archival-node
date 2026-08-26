@@ -317,8 +317,10 @@ var Compression = zstdProfile(ZstdLevel)
 // machine, so the bytes anyone else sees never depend on it. It is picked for
 // the executor's clock instead: the run cut runs on the executor goroutine
 // and zstd-9 was 9.2s of a 17s cut (mainnet C, 2026-08-26, 500k-tx window).
-// Uncompressed, an L0 run is a few hundred MB and at most sixteen exist.
-var L0Compression = sstable.NoCompression
+// zstd-1, not none: an uncompressed block is served straight out of the mmap
+// and TestMergeKeepsItsIOOutOfThePageCache saw 10% of a scanned run stay
+// resident after Cold on CI with NoCompression (1% here, 5% is the bar).
+var L0Compression = zstdProfile(1)
 
 // Section identifies one of a run's three SST sections.
 type Section int
