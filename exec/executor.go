@@ -795,17 +795,56 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 	pfCtx, pfCancel := context.WithCancel(ctx)
 	defer pfCancel()
 	pf := make(chan pfItem, 512)
-	// Warm stage: fetched blocks pass through warmBlock on their own
-	// goroutine before the executor sees them (see warm.go).
+	// Warm stage: fetched blocks pass through warmBlock on a pool of
+	// warmWorkers goroutines before the executor sees them (see warm.go).
+	// One worker was the stage the executor waited on (mainnet C
+	// 2026-08-26: 20-29% of executor wall in the pf receive, the warm
+	// goroutine in EVM in every stack sample), so the pool runs blocks
+	// concurrently and a forwarder hands them on in fetch order.
 	fetched := make(chan pfItem, 512)
+	type warmed struct {
+		it   pfItem
+		done chan struct{}
+	}
+	warmOrder := make(chan warmed, 512)
+	warmWork := make(chan warmed, 512)
+	for range warmWorkers {
+		go func() {
+			for w := range warmWork {
+				if w.it.err == nil {
+					e.warmBlock(w.it.blk)
+				}
+				close(w.done)
+			}
+		}()
+	}
 	go func() {
-		defer close(pf)
+		defer close(warmOrder)
+		defer close(warmWork)
 		for it := range fetched {
-			if it.err == nil {
-				e.warmBlock(it.blk)
+			w := warmed{it: it, done: make(chan struct{})}
+			select {
+			case warmOrder <- w:
+			case <-pfCtx.Done():
+				return
 			}
 			select {
-			case pf <- it:
+			case warmWork <- w:
+			case <-pfCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		defer close(pf)
+		for w := range warmOrder {
+			select {
+			case <-w.done:
+			case <-pfCtx.Done():
+				return
+			}
+			select {
+			case pf <- w.it:
 			case <-pfCtx.Done():
 				return
 			}
