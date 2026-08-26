@@ -69,7 +69,7 @@ func blockSizesFor(s Section) []int {
 // separators turns into a two-level index and that is a property of the block
 // size, not a free choice.
 func benchOptions(s Section, prof *sstable.CompressionProfile, blockSize int) sstable.WriterOptions {
-	o := writerOptions(s)
+	o := writerOptions(s, TerminalLevel)
 	o.Compression = prof
 	o.BlockSize = blockSize
 	o.IndexBlockSize = max(64<<10, 2*blockSize)

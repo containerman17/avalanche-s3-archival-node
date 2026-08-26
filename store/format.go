@@ -121,14 +121,14 @@ func numKey(prefix string, n uint64) []byte {
 }
 
 // BlkKey ... TxKey are the chain-section keys.
-func BlkKey(height uint64) []byte  { return numKey(PrefixBlk, height) }
-func HdrKey(height uint64) []byte  { return numKey(PrefixHdr, height) }
-func ItxKey(txnum uint64) []byte   { return numKey(PrefixItx, txnum) }
-func PvmKey(height uint64) []byte  { return numKey(PrefixPvm, height) }
-func RcptKey(txnum uint64) []byte  { return numKey(PrefixRcpt, txnum) }
-func TxKey(txnum uint64) []byte    { return numKey(PrefixTx, txnum) }
-func TxHashKey(h []byte) []byte    { return append([]byte(PrefixTxHash), h...) }
-func CodeKey(hash []byte) []byte   { return append([]byte(PrefixCode), hash...) }
+func BlkKey(height uint64) []byte { return numKey(PrefixBlk, height) }
+func HdrKey(height uint64) []byte { return numKey(PrefixHdr, height) }
+func ItxKey(txnum uint64) []byte  { return numKey(PrefixItx, txnum) }
+func PvmKey(height uint64) []byte { return numKey(PrefixPvm, height) }
+func RcptKey(txnum uint64) []byte { return numKey(PrefixRcpt, txnum) }
+func TxKey(txnum uint64) []byte   { return numKey(PrefixTx, txnum) }
+func TxHashKey(h []byte) []byte   { return append([]byte(PrefixTxHash), h...) }
+func CodeKey(hash []byte) []byte  { return append([]byte(PrefixCode), hash...) }
 
 // BlkHashKey is the BLOCK-HASH INDEX row, blkh/<blockhash> -> height. It is the
 // txh/ family's twin in every respect: a lookup-section row with no TxNum
@@ -311,6 +311,15 @@ func zstdProfile(level uint8) *sstable.CompressionProfile {
 // binary that wrote it.
 var Compression = zstdProfile(ZstdLevel)
 
+// L0Compression is the codec of an L0 run, and it is NOT a format constant:
+// an L0 run is local (never uploaded, run.go's upload gate) and every row in
+// it is re-encoded by the merge under Compression before anything leaves the
+// machine, so the bytes anyone else sees never depend on it. It is picked for
+// the executor's clock instead: the run cut runs on the executor goroutine
+// and zstd-9 was 9.2s of a 17s cut (mainnet C, 2026-08-26, 500k-tx window).
+// Uncompressed, an L0 run is a few hundred MB and at most sixteen exist.
+var L0Compression = sstable.NoCompression
+
 // Section identifies one of a run's three SST sections.
 type Section int
 
@@ -362,7 +371,7 @@ func indexBlockSize(s Section) int { return max(64<<10, 2*BlockSize(s)) }
 
 // writerOptions is the pinned per-section profile. Chain carries NO bloom:
 // existence there is answered by the run's tx range before any file opens.
-func writerOptions(s Section) sstable.WriterOptions {
+func writerOptions(s Section, level int) sstable.WriterOptions {
 	o := sstable.WriterOptions{
 		Comparer:             Comparer,
 		TableFormat:          TableFormat,
@@ -376,6 +385,9 @@ func writerOptions(s Section) sstable.WriterOptions {
 	if s != SecChain {
 		o.FilterPolicy = bloom.FilterPolicy(20)
 		o.FilterType = sstable.TableFilter
+	}
+	if level < TerminalLevel {
+		o.Compression = L0Compression
 	}
 	return o
 }

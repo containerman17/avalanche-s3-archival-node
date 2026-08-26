@@ -256,7 +256,7 @@ func TestFormatConstantsArePinned(t *testing.T) {
 	// materially smaller than snappy would write them.
 	size := func(prof *sstable.CompressionProfile) int {
 		var buf sizeWritable
-		o := writerOptions(SecChain)
+		o := writerOptions(SecChain, TerminalLevel)
 		o.Compression = prof
 		w := sstable.NewWriter(&buf, o)
 		for i := 0; i < 20000; i++ {

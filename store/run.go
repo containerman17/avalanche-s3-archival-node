@@ -34,8 +34,8 @@ const (
 
 // Footer is a run's trailer.
 type Footer struct {
-	Off  [numSections]uint64
-	Len  [numSections]uint64
+	Off                  [numSections]uint64
+	Len                  [numSections]uint64
 	FromTx, ToTx         uint64 // [FromTx, ToTx): the run's TxNum range and its name
 	FromHeight, ToHeight uint64 // [FromHeight, ToHeight]: blocks, inclusive
 	Prev                 [32]byte
@@ -150,7 +150,7 @@ func (w *RunWriter) Begin(s Section) error {
 	}
 	w.cur = s
 	w.sec = &sectionWritable{w: w}
-	w.sst = sstable.NewWriter(w.sec, writerOptions(s))
+	w.sst = sstable.NewWriter(w.sec, writerOptions(s, w.level))
 	w.footer.Off[s] = w.off
 	return nil
 }
