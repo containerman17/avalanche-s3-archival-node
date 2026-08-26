@@ -373,8 +373,15 @@ func New(cfg Config) (*Executor, error) {
 	// window (observed live at N=1000: root 64k blocks back, reconcile
 	// failed). Scale it so the persisted root lags at most ~64 blocks'
 	// worth of commits.
+	// PERSIST EVERY FOURTH BATCH, NOT EVERY BATCH. The root is verified at
+	// propose time; the commit that follows is persistence only, and at
+	// interval 1 it was 18% of the executor's wall (40 stack samples,
+	// mainnet C 2026-08-26: fwd_commit_proposal, write + fsync inline).
+	// Four batches of ~8k ops retain ~30MB each in Rust memory and the
+	// persisted root lags at most 4*CommitEvery blocks, inside the
+	// walk-back budget.
 	if cfg.CommitEvery > 1 {
-		fwCfg.DeferredCommitInterval = max(1, 64/uint64(cfg.CommitEvery))
+		fwCfg.DeferredCommitInterval = max(1, 256/uint64(cfg.CommitEvery))
 	}
 	// A FRONTIER BUILD KEEPS NO HISTORY AT ALL, and that is the difference
 	// between a merge that fits in a container and one the kernel kills.
@@ -416,8 +423,10 @@ func New(cfg Config) (*Executor, error) {
 	// silently clamp it to 1, i.e. an fsync per block. serve runs 64 and the
 	// standalone exec defaults to 1000, so both take this path and lose
 	// nothing.
-	if cfg.FrontierBuild || cfg.CommitEvery > 1 {
+	if cfg.FrontierBuild {
 		fwCfg.RevisionsInMemory = 2
+	} else if cfg.CommitEvery > 1 {
+		fwCfg.RevisionsInMemory = uint(fwCfg.DeferredCommitInterval) + 1
 	}
 	// The default 1MB node cache collapses once state outgrows it: at
 	// height ~3.7M a 60s CPU profile showed ~50% of samples inside the
