@@ -777,6 +777,9 @@ func TestResumeOnAFlushBoundaryNeverReappendsSealedRows(t *testing.T) {
 	// window EMPTY, which is the whole precondition.
 	db := open()
 	write(db, 0, 7)
+	if err := db.waitCut(); err != nil {
+		t.Fatal(err)
+	}
 	if got := db.FlushedFloor(); got != 7 {
 		t.Fatalf("the run was not cut at the boundary: flushed floor %d, want 7", got)
 	}
@@ -1119,4 +1122,164 @@ func TestATxLessBlockKeepsItsOwnStateRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("run")
+}
+
+// TestACutServesItsFrozenWindowWhileItSeals: the run cut runs on its own
+// goroutine, and while it does, the rows it is sealing are still readable
+// (frozen window), the executor keeps writing into a fresh window, and the
+// head is the newest block of either. When the cut lands the frozen log is
+// gone and the same rows answer out of the run.
+func TestACutServesItsFrozenWindowWhileItSeals(t *testing.T) {
+	dir := t.TempDir()
+	cas, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cas.Close() })
+	db, err := Open(dir, cas, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.scaleTriggers(1<<40, 8, 1<<40)
+	for h := uint64(0); h <= 7; h++ {
+		if err := db.WriteBlock(block(h, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The 8-block trigger fired inside the last WriteBlock: a cut is in flight.
+	if db.cut == nil {
+		t.Fatal("no cut in flight after the trigger")
+	}
+	a, f := db.mems()
+	if f == nil {
+		t.Fatal("no frozen window while the cut is in flight")
+	}
+	if _, _, _, _, started := a.window(); started {
+		t.Fatal("the fresh window is not empty")
+	}
+	if !fileExists(filepath.Join(dir, "window", frozenLog)) {
+		t.Fatal("the frozen log is not on disk")
+	}
+	if got := db.NextHeight(); got != 8 {
+		t.Fatalf("NextHeight %d during the cut, want 8", got)
+	}
+	for h := uint64(8); h <= 10; h++ {
+		if err := db.WriteBlock(block(h, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := chainDensity(db, 0, 10); err != nil {
+		t.Fatalf("during the cut: %v", err)
+	}
+	frames := func(h uint64, when string) {
+		t.Helper()
+		n, ok, err := db.TxNumByHash(hash32(byte(h * 10)))
+		if err != nil || !ok {
+			t.Fatalf("txnum of block %d's tx %s: %v %v", h, when, ok, err)
+		}
+		want := fmt.Sprintf("itx-%d-0", h)
+		if v, ok, err := db.Frames(n); err != nil || !ok || string(v) != want {
+			t.Fatalf("frames of block %d's tx %s: %q %v %v", h, when, v, ok, err)
+		}
+	}
+	frames(3, "during the cut")
+	frames(9, "during the cut")
+	if err := db.waitCut(); err != nil {
+		t.Fatal(err)
+	}
+	if _, f := db.mems(); f != nil {
+		t.Fatal("frozen window still set after the cut landed")
+	}
+	if fileExists(filepath.Join(dir, "window", frozenLog)) {
+		t.Fatal("the frozen log outlived its run")
+	}
+	if got := db.FlushedFloor(); got != 7 {
+		t.Fatalf("flushed floor %d after the cut, want 7", got)
+	}
+	if err := chainDensity(db, 0, 10); err != nil {
+		t.Fatalf("after the cut: %v", err)
+	}
+	frames(3, "after the cut")
+	frames(9, "after the cut")
+}
+
+// TestOpenSealsAFrozenLogACrashLeftBehind: a kill inside a cut leaves a frozen
+// log (its run not yet published) and an active log that continues from it.
+// open replays the frozen one first, seals it, then replays the active one, so
+// the corpus after open is exactly what a finished cut would have made.
+func TestOpenSealsAFrozenLogACrashLeftBehind(t *testing.T) {
+	dir := t.TempDir()
+	cas, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cas.Close() })
+	db, err := Open(dir, cas, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.scaleTriggers(1<<40, 1<<40, 1<<40)
+	for h := uint64(0); h <= 7; h++ {
+		if err := db.WriteBlock(block(h, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The crash: freeze by hand (sync, rename, fresh window), write on, and
+	// drop the DB without sealing.
+	m := db.mem
+	if err := m.sync(); err != nil {
+		t.Fatal(err)
+	}
+	wdir := filepath.Join(dir, "window")
+	if err := os.Rename(m.path, filepath.Join(wdir, frozenLog)); err != nil {
+		t.Fatal(err)
+	}
+	m.close()
+	fresh, err := newMemtable(wdir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.reset(db.NextTx(), 8); err != nil {
+		t.Fatal(err)
+	}
+	db.mem = fresh
+	for h := uint64(8); h <= 10; h++ {
+		if err := db.WriteBlock(block(h, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.mem.sync(); err != nil {
+		t.Fatal(err)
+	}
+	db.mem.close()
+
+	db, err = Open(dir, cas, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if fileExists(filepath.Join(wdir, frozenLog)) {
+		t.Fatal("open left the frozen log behind")
+	}
+	runs := db.Manifest().Runs
+	if len(runs) != 1 || runs[0].FromHeight != 0 || runs[0].ToHeight != 7 {
+		t.Fatalf("runs after open: %+v, want one run of blocks 0..7", runs)
+	}
+	if got := db.NextHeight(); got != 11 {
+		t.Fatalf("NextHeight %d after open, want 11", got)
+	}
+	if err := chainDensity(db, 0, 10); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []uint64{3, 9} {
+		n, ok, err := db.TxNumByHash(hash32(byte(h * 10)))
+		if err != nil || !ok {
+			t.Fatalf("txnum of block %d's tx after open: %v %v", h, ok, err)
+		}
+		want := fmt.Sprintf("itx-%d-0", h)
+		if v, ok, err := db.Frames(n); err != nil || !ok || string(v) != want {
+			t.Fatalf("frames of block %d's tx after open: %q %v %v", h, v, ok, err)
+		}
+	}
 }

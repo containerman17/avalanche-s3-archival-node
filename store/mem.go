@@ -167,11 +167,21 @@ var famRec = [6]byte{recBlk, recHdr, recItx, recPvm, recRcpt, recTx}
 
 const recHeader = 1 + 8 + 4 // kind, num, payload length
 
+// frozenLog is the name the active log takes at a cut (DB.Flush): the window
+// it holds is sealed into a run on a goroutine while the executor writes into
+// a fresh window.log beside it. It exists only while a cut is in flight, or
+// after a crash inside one, when open seals it before anything else.
+const frozenLog = "window.frozen.log"
+
 func newMemtable(dir string, readOnly bool) (*memtable, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	m := &memtable{path: filepath.Join(dir, "window.log"), readOnly: readOnly}
+	return newMemtableAt(filepath.Join(dir, "window.log"), readOnly)
+}
+
+func newMemtableAt(path string, readOnly bool) (*memtable, error) {
+	m := &memtable{path: path, readOnly: readOnly}
 	m.clear()
 	f, err := os.OpenFile(m.path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
@@ -412,6 +422,18 @@ func (m *memtable) close() error {
 		err = cerr
 	}
 	m.f = nil
+	return err
+}
+
+// remove closes the log and deletes it: the last step of a cut, after the run
+// it was sealed into is published (publish-before-delete).
+func (m *memtable) remove() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err := m.close()
+	if rerr := os.Remove(m.path); err == nil && rerr != nil && !os.IsNotExist(rerr) {
+		err = rerr
+	}
 	return err
 }
 
@@ -706,6 +728,12 @@ func (m *memtable) postRow(key []byte, val byte) error {
 // is a data race on the executor's own output.
 func (m *memtable) chainGet(fam int, num uint64) ([]byte, bool, error) {
 	m.mu.RLock()
+	if m.f == nil {
+		// A frozen window a reader picked up just before its cut removed
+		// it: the run holds every row it had, so the descent goes on.
+		m.mu.RUnlock()
+		return nil, false, nil
+	}
 	off, n, ok := m.chain[fam].find(num)
 	if !ok || n == 0 || off+uint64(n) <= m.flushed {
 		v, found, err := m.readRow(off, n, ok)
@@ -716,6 +744,9 @@ func (m *memtable) chainGet(fam int, num uint64) ([]byte, bool, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.f == nil {
+		return nil, false, nil
+	}
 	off, n, ok = m.chain[fam].find(num)
 	if ok && n > 0 {
 		if err := m.flushLocked(); err != nil {

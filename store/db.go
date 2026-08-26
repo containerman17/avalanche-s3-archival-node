@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -189,6 +190,17 @@ type DB struct {
 	// knob, and the constants themselves stay pinned.
 	flushTxs, flushBlocks, terminalTxs uint64
 
+	// THE RUN CUT RUNS ON ITS OWN GOROUTINE. Flush renames the full window
+	// log to frozenLog, opens a fresh mem, and a goroutine seals the frozen
+	// one into an L0 run (mainnet C 2026-08-26: the cut was a 5-17s stall on
+	// the executor every ~160s, 8% of its wall). frozen is that memtable
+	// while the cut is in flight, nil otherwise, under mu beside mem; every
+	// read descends mem, then frozen, then the runs. cut is the in-flight
+	// cut's result, one at a time: the next Flush waits for it first. It is
+	// touched by the writer only (Flush, MaybeFlush, Close).
+	frozen *memtable
+	cut    chan error
+
 	// THE TERMINAL MERGE RUNS ON ITS OWN GOROUTINE (merge.go). mergeDone is the
 	// in-flight merge's completion channel and nil when none runs, so it is both
 	// the "one at a time" flag and what WaitMerge blocks on; mergeErr is what the
@@ -285,8 +297,42 @@ func open(dir string, cas *dist.Store, chainRoot [32]byte, readOnly bool) (*DB, 
 	d.ver = newVersion(runs)
 	// The window is replayed back into RAM from its own log and cut at the last
 	// COMPLETE block; the executor's reconcile walk-back re-executes from there
-	// out of staging.
-	if err := mem.recover(d.flushedTx(), d.flushedHeight()); err != nil {
+	// out of staging. A frozen log is a cut that did not finish: it is replayed
+	// first (its blocks come before the active log's) and, for the writer,
+	// sealed here before anything else runs, so nothing after open ever sees
+	// a frozen window it did not make itself. Its blocks already in a run
+	// (a crash between publish and delete) fall under recover's floor and
+	// leave it empty, so it is simply removed.
+	baseTx, baseHeight := d.flushedTx(), d.flushedHeight()
+	if fpath := filepath.Join(dir, "window", frozenLog); fileExists(fpath) {
+		fm, err := newMemtableAt(fpath, readOnly)
+		if err != nil {
+			d.Close()
+			return nil, err
+		}
+		if err := fm.recover(baseTx, baseHeight); err != nil {
+			fm.close()
+			d.Close()
+			return nil, err
+		}
+		fBaseTx, fNextTx, fBaseHeight, fNextHeight, started := fm.window()
+		if started {
+			baseTx, baseHeight = fNextTx, fNextHeight
+			d.frozen = fm
+			if !readOnly {
+				if err := d.seal(fm, fBaseTx, fNextTx, fBaseHeight, fNextHeight); err != nil {
+					d.Close()
+					return nil, err
+				}
+			}
+		} else if readOnly {
+			fm.close()
+		} else if err := fm.remove(); err != nil {
+			d.Close()
+			return nil, err
+		}
+	}
+	if err := mem.recover(baseTx, baseHeight); err != nil {
 		d.Close()
 		return nil, err
 	}
@@ -312,6 +358,9 @@ func (d *DB) Close() error {
 	// manifest and closes runs. Waiting here is the whole shutdown rule, and it
 	// costs at most one merge. A kill instead of a shutdown is equally safe, by
 	// the write order (merge.go's crash points).
+	// A CUT MUST NOT OUTLIVE THE DB EITHER, for the same reason and the same
+	// cost (at most one cut).
+	d.waitCut()
 	d.WaitMerge()
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -325,7 +374,30 @@ func (d *DB) Close() error {
 		d.mem.close()
 		d.mem = nil
 	}
+	if d.frozen != nil {
+		d.frozen.close()
+		d.frozen = nil
+	}
 	return nil
+}
+
+// mems is the read side of the cut: the active window and the frozen one (nil
+// when no cut is in flight), taken together under mu so a reader never sees a
+// swap half-done.
+func (d *DB) mems() (active, frozen *memtable) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.mem, d.frozen
+}
+
+// waitCut collects the in-flight cut, if any. Writer only.
+func (d *DB) waitCut() error {
+	if d.cut == nil {
+		return nil
+	}
+	err := <-d.cut
+	d.cut = nil
+	return err
 }
 
 // Manifest returns a copy of the live run list.
@@ -340,9 +412,14 @@ func (d *DB) Manifest() Manifest {
 // NextTx is the TxNum the next transaction takes: the flushed end plus the
 // window.
 func (d *DB) NextTx() uint64 {
-	_, next, _, _, started := d.mem.window()
-	if started {
+	a, f := d.mems()
+	if _, next, _, _, started := a.window(); started {
 		return next
+	}
+	if f != nil {
+		if _, next, _, _, started := f.window(); started {
+			return next
+		}
 	}
 	return d.flushedTx()
 }
@@ -358,9 +435,14 @@ func (d *DB) flushedTx() uint64 {
 
 // NextHeight is the height the next block takes.
 func (d *DB) NextHeight() uint64 {
-	_, _, _, next, started := d.mem.window()
-	if started {
+	a, f := d.mems()
+	if _, _, _, next, started := a.window(); started {
 		return next
+	}
+	if f != nil {
+		if _, _, _, next, started := f.window(); started {
+			return next
+		}
 	}
 	return d.flushedHeight()
 }
@@ -425,17 +507,66 @@ func (d *DB) MaybeFlush() error {
 	if nextTx-baseTx < d.flushTxs && nextHeight-baseHeight < d.flushBlocks {
 		return nil
 	}
-	return d.Flush()
+	return d.cutWindow()
 }
 
-// Flush cuts the window into a run and retires it, in the publish-before-delete
-// order the whole design runs on: cut, fsync, publish by atomic snapshot swap,
-// only then unlink staging.
+// Flush cuts the window into a run and waits for the run to be published: the
+// synchronous form, for a stop and for tests. The executor's own path is
+// MaybeFlush, which cuts and returns.
 func (d *DB) Flush() error {
-	baseTx, nextTx, baseHeight, nextHeight, started := d.mem.window()
+	if err := d.cutWindow(); err != nil {
+		return err
+	}
+	return d.waitCut()
+}
+
+// cutWindow freezes the window and seals it on a goroutine. The active log is
+// fsynced, renamed to frozenLog and replaced by a fresh one under mu; from
+// then on the executor writes into the new window while seal() turns the
+// frozen one into a run. One cut at a time: an unfinished one is collected
+// first, which is also where its error (and a merge's sticky error) reaches
+// the executor.
+func (d *DB) cutWindow() error {
+	if err := d.waitCut(); err != nil {
+		return err
+	}
+	m := d.mem
+	baseTx, nextTx, baseHeight, nextHeight, started := m.window()
 	if !started || nextHeight == baseHeight {
 		return nil
 	}
+	if err := m.sync(); err != nil {
+		return err
+	}
+	dir := filepath.Dir(m.path)
+	frozenPath := filepath.Join(dir, frozenLog)
+	if err := os.Rename(m.path, frozenPath); err != nil {
+		return err
+	}
+	m.path = frozenPath
+	if err := syncDir(dir); err != nil {
+		return err
+	}
+	fresh, err := newMemtable(dir, false)
+	if err != nil {
+		return err
+	}
+	if err := fresh.reset(nextTx, nextHeight); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.frozen, d.mem = m, fresh
+	d.mu.Unlock()
+	d.cut = make(chan error, 1)
+	log.Printf("store: cut window [tx %d..%d, blocks %d..%d], sealing on a goroutine", baseTx, nextTx, baseHeight, nextHeight-1)
+	go func() { d.cut <- d.seal(m, baseTx, nextTx, baseHeight, nextHeight) }()
+	return nil
+}
+
+// seal writes the frozen window m into an L0 run and retires it, in the
+// publish-before-delete order the whole design runs on: write, fsync, publish
+// by atomic snapshot swap, only then unlink the frozen log.
+func (d *DB) seal(m *memtable, baseTx, nextTx, baseHeight, nextHeight uint64) error {
 	prev := d.chainRoot
 	d.mu.RLock()
 	if n := len(d.man.Runs); n > 0 {
@@ -455,7 +586,7 @@ func (d *DB) Flush() error {
 	if err != nil {
 		return err
 	}
-	if err := d.writeSections(w); err != nil {
+	if err := d.writeSections(w, m); err != nil {
 		w.Abort()
 		return err
 	}
@@ -482,12 +613,14 @@ func (d *DB) Flush() error {
 		return err
 	}
 	d.swapLocked(append(append([]*Run(nil), d.ver.runs...), run))
+	d.frozen = nil
 	d.mu.Unlock()
 
 	// Only now may the window's staging go.
-	if err := d.mem.reset(nextTx, nextHeight); err != nil {
+	if err := m.remove(); err != nil {
 		return err
 	}
+	log.Printf("store: sealed run %s [blocks %d..%d]", name, baseHeight, nextHeight-1)
 	// THE MERGE BOUNDARY IS A FLUSH BOUNDARY, known in advance. This STARTS the
 	// merge and returns; the terminal lands on its own goroutine minutes later
 	// and publishes itself. It is also the retry after a kill, and it needs no
@@ -506,8 +639,7 @@ func (d *DB) Flush() error {
 // writeSections streams the window into the three sections in order. Chain
 // arrives sorted (it is read back out of the spills in key order); state and
 // lookup are sorted here.
-func (d *DB) writeSections(w *RunWriter) error {
-	m := d.mem
+func (d *DB) writeSections(w *RunWriter, m *memtable) error {
 
 	if err := w.Begin(SecChain); err != nil {
 		return err
@@ -654,8 +786,14 @@ func (d *DB) swapLocked(runs []*Run) {
 // whose range covers the number. Chain rows have no bloom because the run's
 // range answers existence before any file opens.
 func (d *DB) chainRow(fam int, n uint64, byHeight bool) ([]byte, bool, error) {
-	if v, ok, err := d.mem.chainGet(fam, n); err != nil || ok {
+	a, f := d.mems()
+	if v, ok, err := a.chainGet(fam, n); err != nil || ok {
 		return v, ok, err
+	}
+	if f != nil {
+		if v, ok, err := f.chainGet(fam, n); err != nil || ok {
+			return v, ok, err
+		}
 	}
 	runs, done := d.snapshot()
 	defer done()
@@ -745,8 +883,12 @@ func (d *DB) ChainRows(fam int, from, to uint64) iter.Seq2[ChainRow, error] {
 		// The window's rows are uncompressed offsets into the append-only log,
 		// so there is no block to decode once and nothing to iterate: reading
 		// them one by one IS the sequential read.
+		a, f := d.mems()
 		for n := next; n <= to; n++ {
-			v, ok, err := d.mem.chainGet(fam, n)
+			v, ok, err := a.chainGet(fam, n)
+			if err == nil && !ok && f != nil {
+				v, ok, err = f.chainGet(fam, n)
+			}
 			if err != nil {
 				yield(ChainRow{}, err)
 				return
@@ -797,8 +939,14 @@ func (d *DB) Receipt(txnum uint64) ([]byte, bool, error) { return d.chainRow(fam
 // newest-to-oldest, whole-key-bloom gated. A hash lives in exactly one run, so
 // nearly every probe is a bloom miss: the filter's best case.
 func (d *DB) lookupNum(key []byte) (uint64, bool, error) {
-	if n, ok := d.mem.lookupNum(key); ok {
+	a, f := d.mems()
+	if n, ok := a.lookupNum(key); ok {
 		return n, true, nil
+	}
+	if f != nil {
+		if n, ok := f.lookupNum(key); ok {
+			return n, true, nil
+		}
 	}
 	runs, done := d.snapshot()
 	defer done()
@@ -827,8 +975,14 @@ func (d *DB) HeightByHash(hash []byte) (uint64, bool, error) { return d.lookupNu
 
 // latest walks the descent for the newest value under prefix at or below txnum.
 func (d *DB) latest(sec Section, prefix []byte, at uint64) ([]byte, bool, error) {
-	if v, _, ok := d.mem.latestState(prefix, at); ok {
+	a, f := d.mems()
+	if v, _, ok := a.latestState(prefix, at); ok {
 		return v, true, nil
+	}
+	if f != nil {
+		if v, _, ok := f.latestState(prefix, at); ok {
+			return v, true, nil
+		}
 	}
 	runs, done := d.snapshot()
 	defer done()
@@ -876,8 +1030,14 @@ func (d *DB) Code(hash []byte) ([]byte, bool, error) {
 			return b, true, nil
 		}
 	}
-	if b, ok := d.mem.codeBlob(hash); ok {
+	a, f := d.mems()
+	if b, ok := a.codeBlob(hash); ok {
 		return b, true, nil
+	}
+	if f != nil {
+		if b, ok := f.codeBlob(hash); ok {
+			return b, true, nil
+		}
 	}
 	key := CodeKey(hash)
 	runs, done := d.snapshot()
@@ -921,14 +1081,20 @@ func (d *DB) StateTxNums(lo, hi uint64, fn func(txnum uint64)) error {
 			return err
 		}
 	}
-	d.mem.mu.RLock()
-	defer d.mem.mu.RUnlock()
-	for _, h := range d.mem.state {
-		for _, e := range h {
-			if e.txnum >= lo && e.txnum <= hi {
-				fn(e.txnum)
+	a, f := d.mems()
+	for _, m := range []*memtable{f, a} {
+		if m == nil {
+			continue
+		}
+		m.mu.RLock()
+		for _, h := range m.state {
+			for _, e := range h {
+				if e.txnum >= lo && e.txnum <= hi {
+					fn(e.txnum)
+				}
 			}
 		}
+		m.mu.RUnlock()
 	}
 	return nil
 }
@@ -960,9 +1126,7 @@ func (d *DB) Postings(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, va
 		return nil
 	}
 	// The window's postings are unsorted in memory; scan them in TxNum order.
-	d.mem.mu.RLock()
-	rows := append([]posting(nil), d.mem.post...)
-	d.mem.mu.RUnlock()
+	rows := d.windowPostings()
 	sort.Slice(rows, func(i, j int) bool { return TxNumOf(rows[i].key) < TxNumOf(rows[j].key) })
 	for _, p := range rows {
 		if len(p.key) != len(prefix)+8 || string(p.key[:len(prefix)]) != string(prefix) {
@@ -985,9 +1149,7 @@ func (d *DB) Postings(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, va
 // page is the first pageSize rows this walk yields, and the cursor for the next
 // page is the last TxNum it returned. fn returning false stops the walk.
 func (d *DB) PostingsDesc(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, val byte) bool) error {
-	d.mem.mu.RLock()
-	rows := append([]posting(nil), d.mem.post...)
-	d.mem.mu.RUnlock()
+	rows := d.windowPostings()
 	sort.Slice(rows, func(i, j int) bool { return TxNumOf(rows[i].key) > TxNumOf(rows[j].key) })
 	for _, p := range rows {
 		if len(p.key) != len(prefix)+8 || string(p.key[:len(prefix)]) != string(prefix) {
@@ -1055,10 +1217,31 @@ func (d *DB) HeightOfTx(txnum uint64) (uint64, bool, error) {
 	return lo, true, nil
 }
 
+// windowPostings copies the posting rows of both windows (frozen and active).
+func (d *DB) windowPostings() []posting {
+	a, f := d.mems()
+	var rows []posting
+	for _, m := range []*memtable{f, a} {
+		if m == nil {
+			continue
+		}
+		m.mu.RLock()
+		rows = append(rows, m.post...)
+		m.mu.RUnlock()
+	}
+	return rows
+}
+
 func (d *DB) heightBounds(txnum uint64) (lo, hi uint64, ok bool) {
-	baseTx, nextTx, baseHeight, nextHeight, started := d.mem.window()
-	if started && txnum >= baseTx && txnum < nextTx {
-		return baseHeight, nextHeight - 1, true
+	a, f := d.mems()
+	for _, m := range []*memtable{a, f} {
+		if m == nil {
+			continue
+		}
+		baseTx, nextTx, baseHeight, nextHeight, started := m.window()
+		if started && txnum >= baseTx && txnum < nextTx {
+			return baseHeight, nextHeight - 1, true
+		}
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -1092,3 +1275,18 @@ func beDecode(b []byte) uint64 {
 }
 
 func beDecode32(b []byte) uint32 { return uint32(beDecode(b)) }
+
+// syncDir fsyncs a directory, which is what makes a rename inside it durable.
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
