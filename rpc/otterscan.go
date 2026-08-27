@@ -209,7 +209,7 @@ func (s *Server) otsSearchBefore(params []json.RawMessage) (any, *rpcError) {
 		hiTx = first - 1
 	}
 
-	nums, more, rerr := s.otsWalk(addr, 0, hiTx, pageSize, true)
+	nums, _, more, rerr := s.otsWalk(addr, 0, hiTx, pageSize, true)
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -250,7 +250,7 @@ func (s *Server) otsSearchAfter(params []json.RawMessage) (any, *rpcError) {
 			return nil, rerr
 		}
 	}
-	nums, more, rerr := s.otsWalk(addr, loTx, head, pageSize, false)
+	nums, _, more, rerr := s.otsWalk(addr, loTx, head, pageSize, false)
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -272,17 +272,19 @@ func (s *Server) otsSearchAfter(params []json.RawMessage) (any, *rpcError) {
 // because the address has nothing further (more=false). It reads ONE row past
 // the page to tell those apart, which is what makes lastPage exact instead of
 // a guess.
-func (s *Server) otsWalk(addr common.Address, lo, hi uint64, pageSize int, desc bool) (nums []uint64, more bool, _ *rpcError) {
+func (s *Server) otsWalk(addr common.Address, lo, hi uint64, pageSize int, desc bool) (nums []uint64, roles map[uint64]byte, more bool, _ *rpcError) {
 	if hi < lo {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	prefix := store.AddrPrefix(addr[:])
-	collect := func(n uint64, _ byte) bool {
+	roles = map[uint64]byte{}
+	collect := func(n uint64, role byte) bool {
 		if len(nums) == pageSize {
 			more = true
 			return false
 		}
 		nums = append(nums, n)
+		roles[n] = role
 		return true
 	}
 	var err error
@@ -292,9 +294,9 @@ func (s *Server) otsWalk(addr common.Address, lo, hi uint64, pageSize int, desc 
 		err = s.db.Postings(prefix, lo, hi, collect)
 	}
 	if err != nil {
-		return nil, false, &rpcError{Code: -32000, Message: err.Error()}
+		return nil, nil, false, &rpcError{Code: -32000, Message: err.Error()}
 	}
-	return nums, more, nil
+	return nums, roles, more, nil
 }
 
 // otsPage turns a list of TxNums into Otterscan's txs+receipts pair, in the

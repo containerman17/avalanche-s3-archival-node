@@ -452,10 +452,11 @@ func (e *Executor) appendSAETxs(bw *store.BlockWrite, blk *types.Block, receipts
 			tw.Created = r.ContractAddress.Bytes()
 		}
 		for _, l := range r.Logs {
-			tw.LogAddrs = append(tw.LogAddrs, l.Address.Bytes())
+			lw := store.LogWrite{Emitter: l.Address.Bytes()}
 			for _, tp := range l.Topics {
-				tw.Topics = append(tw.Topics, tp.Bytes())
+				lw.Topics = append(lw.Topics, tp.Bytes())
 			}
+			tw.Logs = append(tw.Logs, lw)
 		}
 		bw.Txs = append(bw.Txs, tw)
 	}

@@ -60,8 +60,7 @@ func block(height uint64, n int) *BlockWrite {
 			FrameAddrs: [][]byte{addr(4)},
 			Sender:     addr(1),
 			To:         addr(2),
-			LogAddrs:   [][]byte{addr(3)},
-			Topics:     [][]byte{hash32(9)},
+			Logs:       []LogWrite{{Emitter: addr(3), Topics: [][]byte{hash32(9)}}},
 			State: []StateRow{
 				{Kind: 's', Addr: addr(2), Slot: hash32(7), Val: []byte{byte(height), byte(i)}},
 				{Kind: 'a', Addr: addr(2), Val: []byte(fmt.Sprintf("acct-%d-%d", height, i))},
@@ -143,7 +142,7 @@ func TestRoundTrip(t *testing.T) {
 
 	// Postings survive too.
 	var got []uint64
-	if err := db.Postings(LogAddrPrefix(addr(3)), 0, 1<<62, func(n uint64, _ byte) bool {
+	if err := db.Postings(ELogPrefix(addr(3)), 0, 1<<62, func(n uint64, _ byte) bool {
 		got = append(got, n)
 		return true
 	}); err != nil {
@@ -388,8 +387,9 @@ func TestSplitPins(t *testing.T) {
 		{Suffixed(AccountPrefix(addr(1)), 9), 29},
 		{Suffixed(CodeRefPrefix(addr(1)), 9), 29},
 		{Suffixed(AddrPrefix(addr(1)), 9), 26},
-		{Suffixed(LogAddrPrefix(addr(1)), 9), 29},
-		{Suffixed(TopicPrefix(hash32(1)), 9), 39},
+		{Suffixed(ELogGroup(addr(1), hash32(2)), 9), 26},
+		{Suffixed(TValGroup(hash32(1), hash32(2)), 9), 38},
+		{Suffixed(SigGroup(hash32(1)), 9), 37},
 		{TxHashKey(hash32(1)), 36},
 		{BlkHashKey(hash32(1)), 37}, // whole key: a block hash carries no suffix
 		{CodeKey(hash32(1)), 37},

@@ -160,24 +160,9 @@ func (s *Server) SearchByAddress(addr common.Address, cursor uint64, limit int, 
 	} else {
 		lo = cursor
 	}
-	nums, more, rerr := s.otsWalk(addr, lo, hi, limit, desc)
+	nums, roles, more, rerr := s.otsWalk(addr, lo, hi, limit, desc)
 	if rerr != nil {
 		return nil, false, rerr.error()
-	}
-	// The role bits are the posting VALUE, so they come from a second pass over
-	// the same rows rather than from otsWalk, whose shape the ots_ methods own.
-	roles := make(map[uint64]byte, len(nums))
-	if len(nums) > 0 {
-		first, last := nums[0], nums[len(nums)-1]
-		if first > last {
-			first, last = last, first
-		}
-		if err := s.db.Postings(store.AddrPrefix(addr[:]), first, last, func(n uint64, v byte) bool {
-			roles[n] = v
-			return true
-		}); err != nil {
-			return nil, false, err
-		}
 	}
 	for _, num := range nums {
 		height, ok, err := s.db.HeightOfTx(num)

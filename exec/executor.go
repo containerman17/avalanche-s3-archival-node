@@ -1269,19 +1269,12 @@ func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) err
 	} else if r.ContractAddress != (common.Address{}) {
 		tw.Created = r.ContractAddress.Bytes()
 	}
-	seenAddr := make(map[common.Address]struct{}, len(r.Logs))
-	seenTopic := make(map[common.Hash]struct{}, len(r.Logs))
 	for _, l := range r.Logs {
-		if _, ok := seenAddr[l.Address]; !ok {
-			seenAddr[l.Address] = struct{}{}
-			tw.LogAddrs = append(tw.LogAddrs, l.Address.Bytes())
-		}
+		lw := store.LogWrite{Emitter: l.Address.Bytes()}
 		for _, tp := range l.Topics {
-			if _, ok := seenTopic[tp]; !ok {
-				seenTopic[tp] = struct{}{}
-				tw.Topics = append(tw.Topics, tp.Bytes())
-			}
+			lw.Topics = append(lw.Topics, tp.Bytes())
 		}
+		tw.Logs = append(tw.Logs, lw)
 	}
 	e.curBW.Txs = append(e.curBW.Txs, tw)
 	return nil

@@ -77,11 +77,12 @@ type memVal struct {
 	val   []byte
 }
 
+// posting is one entry of a posting family, held ungrouped until the flush
+// sorts and chunks it: group key (no suffix), TxNum, payload bits.
 type posting struct {
-	key   []byte // full key including the TxNum suffix
-	val   byte
-	num   uint64 // txh/ and blkh/ rows only
-	isNum bool   // the value is num as 8 big-endian bytes, not the role byte
+	group   []byte
+	txnum   uint64
+	payload byte
 }
 
 type chainIndex struct {
@@ -304,8 +305,8 @@ replay:
 			if len(payload) < 1 {
 				break replay
 			}
-			key, v := append([]byte(nil), payload[1:]...), payload[0]
-			pend = append(pend, func() error { m.post = append(m.post, posting{key: key, val: v}); return nil })
+			group, v := append([]byte(nil), payload[1:]...), payload[0]
+			pend = append(pend, func() error { m.post = append(m.post, posting{group: group, txnum: num, payload: v}); return nil })
 		case recNum:
 			k := string(payload)
 			pend = append(pend, func() error { m.nums[k] = num; return nil })
@@ -488,8 +489,14 @@ type TxWrite struct {
 	Sender     []byte
 	To         []byte // nil for a creation
 	Created    []byte // contract address for a creation
-	LogAddrs   [][]byte
-	Topics     [][]byte
+	Logs       []LogWrite
+}
+
+// LogWrite is one emitted log's index inputs: the emitter and the topics in
+// position order (topic 0 is the event signature).
+type LogWrite struct {
+	Emitter []byte
+	Topics  [][]byte
 }
 
 // BlockWrite is everything one block contributes, handed over in one call so
@@ -611,37 +618,39 @@ func (m *memtable) add(b *BlockWrite) error {
 			return err
 		}
 
-		roles := map[string]byte{}
-		if len(t.Sender) > 0 {
-			roles[string(t.Sender)] |= RoleSender
+		// One posting per (group, tx), payloads OR-ed: the store dedups here
+		// so no producer has to (SAE hands logs over undeduped).
+		post := map[string]byte{}
+		role := func(a []byte, r byte) {
+			if len(a) > 0 {
+				post[string(AddrPrefix(a))] |= r
+			}
 		}
-		if len(t.To) > 0 {
-			roles[string(t.To)] |= RoleRecipient
-		}
-		if len(t.Created) > 0 {
-			roles[string(t.Created)] |= RoleCreated
-		}
+		role(t.Sender, RoleSender)
+		role(t.To, RoleRecipient)
+		role(t.Created, RoleCreated)
 		for _, a := range t.FrameAddrs {
-			roles[string(a)] |= RoleFrame
+			role(a, RoleFrame)
 		}
-		for _, a := range t.LogAddrs {
-			roles[string(a)] |= RoleEmitter
-			if err := m.postRow(Suffixed(LogAddrPrefix(a), n), 0); err != nil {
-				return err
+		for _, l := range t.Logs {
+			role(l.Emitter, RoleEmitter)
+			topic0 := zeroHash[:]
+			if len(l.Topics) > 0 {
+				topic0 = l.Topics[0]
+				post[string(SigGroup(topic0))] |= 0
+			}
+			post[string(ELogGroup(l.Emitter, topic0))] |= 0
+			for i := 1; i < len(l.Topics) && i <= 3; i++ {
+				post[string(TValGroup(l.Topics[i], topic0))] |= 1 << (i - 1)
 			}
 		}
-		for _, tp := range t.Topics {
-			if err := m.postRow(Suffixed(TopicPrefix(tp), n), 0); err != nil {
-				return err
-			}
+		groups := make([]string, 0, len(post))
+		for g := range post {
+			groups = append(groups, g)
 		}
-		addrs := make([]string, 0, len(roles))
-		for a := range roles {
-			addrs = append(addrs, a)
-		}
-		sort.Strings(addrs)
-		for _, a := range addrs {
-			if err := m.postRow(Suffixed(AddrPrefix([]byte(a)), n), roles[a]); err != nil {
+		sort.Strings(groups)
+		for _, g := range groups {
+			if err := m.postRow([]byte(g), n, post[g]); err != nil {
 				return err
 			}
 		}
@@ -707,13 +716,15 @@ func (m *memtable) numRow(key []byte, num uint64) error {
 	return nil
 }
 
-func (m *memtable) postRow(key []byte, val byte) error {
-	if _, _, err := m.write(recPost, TxNumOf(key), []byte{val}, key); err != nil {
+func (m *memtable) postRow(group []byte, txnum uint64, payload byte) error {
+	if _, _, err := m.write(recPost, txnum, []byte{payload}, group); err != nil {
 		return err
 	}
-	m.post = append(m.post, posting{key: key, val: val})
+	m.post = append(m.post, posting{group: group, txnum: txnum, payload: payload})
 	return nil
 }
+
+var zeroHash [32]byte
 
 // ---------------------------------------------------------------------------
 // reads

@@ -29,7 +29,7 @@ import (
 // (DESIGN's clean-slate ruling); the bump exists so the handful of already
 // published v0 prefixes are REFUSED BY NAME at join and at open instead of
 // being read with v1 semantics and silently answering the wrong state.
-const StorageVersion = 1
+const StorageVersion = 2
 
 // ---------------------------------------------------------------------------
 // THE ONE DIMENSION IS TxNum, AND EVERY BLOCK OWNS A SLOT OF ITS OWN.
@@ -70,12 +70,28 @@ const StorageVersion = 1
 //
 //	txh/<txhash>            -> txnum (8B)
 //	blkh/<blockhash>        -> height (8B)
-//	addr/<address>/<txnum>  -> role bits (1B)
-//	logaddr/<address>/<txnum> -> log index within the tx (1B)
-//	topic/<value>/<txnum>   -> topic position (1B)
+//
+// and four POSTING FAMILIES (storage v2). A posting family's row is one CHUNK:
+// up to ef.MaxEntries sorted TxNums of one group, Elias-Fano coded (store/ef),
+// each with a small payload; the key's <txnum> suffix is the chunk's FIRST
+// TxNum, so the suffix rules below still hold and a scan seeks by it.
+//
+//	addr/<address>/<txnum>                -> chunk, payload = 5 role bits
+//	elog/<emitter>/<topic0>/<txnum>       -> chunk, no payload (log emitted;
+//	                                         topic0 is the zero hash for a
+//	                                         topic-less log)
+//	tval/<value>/<topic0>/<txnum>         -> chunk, payload = 3 position bits
+//	                                         (the value stood at topic 1, 2, 3)
+//	sig/<topic0>/<txnum>                  -> chunk, no payload
+//
+// One TxNum appears at most once per group: roles and positions are OR-ed.
+// Runs are TxNum-disjoint, so a merge concatenates chunks and never re-cuts.
 //
 // The <txnum> suffix is EIGHT BIG-ENDIAN BYTES everywhere, and Split() keeps it
-// out of the prefix blooms (the CockroachDB MVCC pattern).
+// out of the prefix blooms (the CockroachDB MVCC pattern). For the posting
+// families Split() cuts at the FIRST component (address, emitter, value,
+// signature): the bloom answers "does this run hold anything for X", which is
+// the question a wallet-level descent asks.
 // ---------------------------------------------------------------------------
 
 const (
@@ -92,9 +108,28 @@ const (
 	PrefixTxHash  = "txh/"
 	PrefixBlkHash = "blkh/"
 	PrefixAddr    = "addr/"
-	PrefixLogAddr = "logaddr/"
-	PrefixTopic   = "topic/"
+	PrefixELog    = "elog/"
+	PrefixTVal    = "tval/"
+	PrefixSig     = "sig/"
 )
+
+// Position bits for a tval/ entry: the value stood at topic index 1, 2 or 3.
+const (
+	Pos1 byte = 1 << 0
+	Pos2 byte = 1 << 1
+	Pos3 byte = 1 << 2
+)
+
+// PayloadBits is the payload width of a posting family, by group key.
+func PayloadBits(group []byte) int {
+	switch {
+	case bytes.HasPrefix(group, []byte(PrefixAddr)):
+		return 5
+	case bytes.HasPrefix(group, []byte(PrefixTVal)):
+		return 3
+	}
+	return 0
+}
 
 // Role bits for an addr/ row.
 const (
@@ -175,10 +210,25 @@ func SlotPrefix(addr, slot []byte) []byte {
 	return append(k, '/')
 }
 
-// AddrPrefix, LogAddrPrefix, TopicPrefix are the lookup posting-row prefixes.
-func AddrPrefix(addr []byte) []byte    { return append(append([]byte(PrefixAddr), addr...), '/') }
-func LogAddrPrefix(addr []byte) []byte { return append(append([]byte(PrefixLogAddr), addr...), '/') }
-func TopicPrefix(topic []byte) []byte  { return append(append([]byte(PrefixTopic), topic...), '/') }
+// The posting GROUP keys. A group is the key without the chunk suffix; the
+// one-component forms (ELogPrefix, TValPrefix) cover every group under that
+// component and are what a "by emitter" or "by value" read scans.
+func AddrPrefix(addr []byte) []byte { return join(PrefixAddr, addr) }
+func ELogPrefix(emitter []byte) []byte {
+	return join(PrefixELog, emitter)
+}
+func ELogGroup(emitter, topic0 []byte) []byte { return join(PrefixELog, emitter, topic0) }
+func TValPrefix(value []byte) []byte          { return join(PrefixTVal, value) }
+func TValGroup(value, topic0 []byte) []byte   { return join(PrefixTVal, value, topic0) }
+func SigGroup(topic0 []byte) []byte           { return join(PrefixSig, topic0) }
+
+func join(prefix string, parts ...[]byte) []byte {
+	k := []byte(prefix)
+	for _, p := range parts {
+		k = append(append(k, p...), '/')
+	}
+	return k
+}
 
 // Suffixed appends the 8-byte big-endian TxNum suffix to a prefix.
 func Suffixed(prefix []byte, txnum uint64) []byte {
@@ -218,15 +268,19 @@ func split(key []byte) int {
 		return len(key)
 	case bytes.HasPrefix(key, []byte(PrefixAddr)):
 		if len(key) >= 26+8 {
-			return 26
+			return 26 // addr/<20>/
 		}
-	case bytes.HasPrefix(key, []byte(PrefixLogAddr)):
-		if len(key) >= 29+8 {
-			return 29
+	case bytes.HasPrefix(key, []byte(PrefixELog)):
+		if len(key) >= 26+8 {
+			return 26 // elog/<20>/
 		}
-	case bytes.HasPrefix(key, []byte(PrefixTopic)):
-		if len(key) >= 39+8 {
-			return 39
+	case bytes.HasPrefix(key, []byte(PrefixTVal)):
+		if len(key) >= 38+8 {
+			return 38 // tval/<32>/
+		}
+	case bytes.HasPrefix(key, []byte(PrefixSig)):
+		if len(key) >= 37+8 {
+			return 37 // sig/<32>/
 		}
 	}
 	return len(key)

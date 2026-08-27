@@ -688,20 +688,13 @@ func (d *DB) writeSections(w *RunWriter, m *memtable) error {
 	if err := w.Begin(SecLookup); err != nil {
 		return err
 	}
-	rows := make([]posting, 0, len(m.post)+len(m.nums))
-	rows = append(rows, m.post...)
+	rows := chunkPostings(m.post)
 	for k, n := range m.nums {
-		rows = append(rows, posting{key: []byte(k), num: n, isNum: true})
+		rows = append(rows, kv{[]byte(k), beU64(n)})
 	}
 	sort.Slice(rows, func(i, j int) bool { return string(rows[i].key) < string(rows[j].key) })
 	for _, r := range rows {
-		var val []byte
-		if r.isNum {
-			val = beU64(r.num)
-		} else {
-			val = []byte{r.val}
-		}
-		if err := w.Set(r.key, val); err != nil {
+		if err := w.Set(r.key, r.val); err != nil {
 			return err
 		}
 	}
@@ -1099,93 +1092,100 @@ func (d *DB) StateTxNums(lo, hi uint64, fn func(txnum uint64)) error {
 	return nil
 }
 
-// Postings scans one lookup family's posting rows in [loTx, hiTx] ascending.
-func (d *DB) Postings(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, val byte) bool) error {
-	runs, done := d.snapshot()
-	defer done()
-	stop := false
-	for _, r := range runs {
-		if stop || r.Footer.ToTx <= loTx || r.Footer.FromTx > hiTx {
-			continue
+// Postings walks the entries of every posting group under prefix with a TxNum
+// in [loTx, hiTx], ascending, runs oldest-to-newest then the window. prefix is
+// a group key or a one-component prefix (ELogPrefix, TValPrefix): the entries
+// of one run are sorted before they are handed out, so a page cut anywhere is
+// TxNum-ordered whatever prefix drove it. fn returning false stops the walk.
+func (d *DB) Postings(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, payload byte) bool) error {
+	return d.postings(prefix, loTx, hiTx, false, fn)
+}
+
+// PostingsDesc is Postings in reverse: window first (it holds the newest
+// entries), then the runs newest-to-oldest, each run's entries descending. It
+// is what newest-first keyset pagination reads: a page is the first pageSize
+// entries this walk yields, and the cursor for the next page is the last
+// TxNum it returned.
+func (d *DB) PostingsDesc(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, payload byte) bool) error {
+	return d.postings(prefix, loTx, hiTx, true, fn)
+}
+
+func (d *DB) postings(prefix []byte, loTx, hiTx uint64, desc bool, fn func(uint64, byte) bool) error {
+	emit := func(ents []posting) bool {
+		if desc {
+			sort.SliceStable(ents, func(i, j int) bool { return ents[i].txnum > ents[j].txnum })
+		} else {
+			sort.SliceStable(ents, func(i, j int) bool { return ents[i].txnum < ents[j].txnum })
 		}
-		if err := r.Scan(SecLookup, prefix, loTx, hiTx, func(n uint64, v []byte) bool {
-			var b byte
-			if len(v) > 0 {
-				b = v[0]
-			}
-			if !fn(n, b) {
-				stop = true
+		for _, e := range ents {
+			if !fn(e.txnum, e.payload) {
 				return false
 			}
-			return true
-		}); err != nil {
-			return err
 		}
+		return true
 	}
-	if stop {
+	window := func() bool {
+		var ents []posting
+		for _, p := range d.windowPostings() {
+			if p.txnum >= loTx && p.txnum <= hiTx && bytes.HasPrefix(p.group, prefix) {
+				ents = append(ents, p)
+			}
+		}
+		return emit(ents)
+	}
+	if desc && !window() {
 		return nil
 	}
-	// The window's postings are unsorted in memory; scan them in TxNum order.
-	rows := d.windowPostings()
-	sort.Slice(rows, func(i, j int) bool { return TxNumOf(rows[i].key) < TxNumOf(rows[j].key) })
-	for _, p := range rows {
-		if len(p.key) != len(prefix)+8 || string(p.key[:len(prefix)]) != string(prefix) {
+	runs, done := d.snapshot()
+	defer done()
+	for i := range runs {
+		r := runs[i]
+		if desc {
+			r = runs[len(runs)-1-i]
+		}
+		if r.Footer.ToTx <= loTx || r.Footer.FromTx > hiTx {
 			continue
 		}
-		n := TxNumOf(p.key)
-		if n < loTx || n > hiTx {
-			continue
+		ents, err := r.ScanChunks(prefix, loTx, hiTx)
+		if err != nil {
+			return err
 		}
-		if !fn(n, p.val) {
+		if !emit(ents) {
 			return nil
 		}
+	}
+	if !desc {
+		window()
 	}
 	return nil
 }
 
-// PostingsDesc is Postings in reverse: one lookup family's posting rows in
-// [loTx, hiTx] DESCENDING, window first (it holds the newest rows), then the
-// runs newest-to-oldest. It is what newest-first keyset pagination reads: a
-// page is the first pageSize rows this walk yields, and the cursor for the next
-// page is the last TxNum it returned. fn returning false stops the walk.
-func (d *DB) PostingsDesc(prefix []byte, loTx, hiTx uint64, fn func(txnum uint64, val byte) bool) error {
-	rows := d.windowPostings()
-	sort.Slice(rows, func(i, j int) bool { return TxNumOf(rows[i].key) > TxNumOf(rows[j].key) })
-	for _, p := range rows {
-		if len(p.key) != len(prefix)+8 || string(p.key[:len(prefix)]) != string(prefix) {
-			continue
-		}
-		n := TxNumOf(p.key)
-		if n < loTx || n > hiTx {
-			continue
-		}
-		if !fn(n, p.val) {
-			return nil
-		}
-	}
+// Groups calls fn once per distinct posting group under prefix, across every
+// run and the window, in key order per source (a group living in several
+// sources is reported once per source; callers dedup). It is the "which
+// (topic0) groups does this value have" read behind the token-list methods.
+func (d *DB) Groups(prefix []byte, fn func(group []byte) bool) error {
 	runs, done := d.snapshot()
 	defer done()
-	for i := len(runs) - 1; i >= 0; i-- {
-		r := runs[i]
-		if r.Footer.ToTx <= loTx || r.Footer.FromTx > hiTx {
-			continue
-		}
+	for _, r := range runs {
 		stop := false
-		if err := r.ScanDesc(SecLookup, prefix, loTx, hiTx, func(n uint64, v []byte) bool {
-			var b byte
-			if len(v) > 0 {
-				b = v[0]
-			}
-			if !fn(n, b) {
-				stop = true
-				return false
-			}
-			return true
+		if err := r.ScanGroups(prefix, func(g []byte) bool {
+			stop = !fn(g)
+			return !stop
 		}); err != nil {
 			return err
 		}
 		if stop {
 			return nil
+		}
+	}
+	seen := map[string]bool{}
+	for _, p := range d.windowPostings() {
+		if bytes.HasPrefix(p.group, prefix) && !seen[string(p.group)] {
+			seen[string(p.group)] = true
+			if !fn(p.group) {
+				return nil
+			}
 		}
 	}
 	return nil

@@ -85,8 +85,7 @@ func testServer(t *testing.T) (*Server, *types.Transaction, common.Address, comm
 			Hash:     tx.Hash().Bytes(),
 			RLP:      txRLP,
 			Receipt:  store.EncodeTxReceipt(receipt, 21000),
-			LogAddrs: [][]byte{logAddr.Bytes()},
-			Topics:   [][]byte{topic.Bytes()},
+			Logs:     []store.LogWrite{{Emitter: logAddr.Bytes(), Topics: [][]byte{topic.Bytes()}}},
 		}},
 	}); err != nil {
 		t.Fatal(err)

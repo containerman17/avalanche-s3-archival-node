@@ -217,25 +217,53 @@ func (s *Server) logCandidates(from, to uint64, addrs []common.Address, topics [
 		return nil, rerr
 	}
 
+	// One posting set per filter dimension, all in TxNum space. A single
+	// topic0 narrows every other dimension to its (x, topic0) group.
+	var topic0 []byte
+	if len(topics) > 0 && len(topics[0]) == 1 {
+		topic0 = topics[0][0][:]
+	}
 	var sets []map[uint64]bool
 	if len(addrs) > 0 {
 		set := map[uint64]bool{}
 		for _, a := range addrs {
-			if rerr := s.collectPostings(store.LogAddrPrefix(a[:]), loTx, hiTx, set); rerr != nil {
+			prefix := store.ELogPrefix(a[:])
+			if topic0 != nil {
+				prefix = store.ELogGroup(a[:], topic0)
+			}
+			if rerr := s.collectPostings(prefix, loTx, hiTx, 0, set); rerr != nil {
 				return nil, rerr
 			}
 		}
 		sets = append(sets, set)
 	}
-	for _, want := range topics {
+	for i, want := range topics {
 		if want == nil {
 			continue
 		}
 		set := map[uint64]bool{}
 		for _, t := range want {
-			if rerr := s.collectPostings(store.TopicPrefix(t[:]), loTx, hiTx, set); rerr != nil {
+			var prefix []byte
+			var mask byte
+			switch {
+			case i == 0:
+				prefix = store.SigGroup(t[:])
+			case i <= 3:
+				prefix, mask = store.TValPrefix(t[:]), 1<<(i-1)
+				if topic0 != nil {
+					prefix = store.TValGroup(t[:], topic0)
+				}
+			default:
+				// Topic 4+ is not indexed (the EVM allows at most 4 topics);
+				// the exact filter still applies on the re-read.
+				continue
+			}
+			if rerr := s.collectPostings(prefix, loTx, hiTx, mask, set); rerr != nil {
 				return nil, rerr
 			}
+		}
+		if i > 3 {
+			continue
 		}
 		sets = append(sets, set)
 	}
@@ -280,10 +308,13 @@ func (s *Server) logCandidates(from, to uint64, addrs []common.Address, topics [
 	return out, nil
 }
 
-// collectPostings adds every TxNum under prefix in [loTx, hiTx] to set.
-func (s *Server) collectPostings(prefix []byte, loTx, hiTx uint64, set map[uint64]bool) *rpcError {
-	if err := s.db.Postings(prefix, loTx, hiTx, func(txnum uint64, _ byte) bool {
-		set[txnum] = true
+// collectPostings adds every TxNum under prefix in [loTx, hiTx] whose payload
+// has a bit of mask set (mask 0: every entry) to set.
+func (s *Server) collectPostings(prefix []byte, loTx, hiTx uint64, mask byte, set map[uint64]bool) *rpcError {
+	if err := s.db.Postings(prefix, loTx, hiTx, func(txnum uint64, payload byte) bool {
+		if mask == 0 || payload&mask != 0 {
+			set[txnum] = true
+		}
 		return true
 	}); err != nil {
 		return &rpcError{Code: -32000, Message: err.Error()}
