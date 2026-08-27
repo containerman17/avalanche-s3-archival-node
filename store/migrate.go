@@ -81,9 +81,19 @@ func Migrate(dir string, cas *dist.Store, logf func(string, ...any)) error {
 			}
 		}
 		t0 := time.Now()
-		newName, err := migrateRun(cas, ref, prev)
-		if err != nil {
-			return fmt.Errorf("store: migrate run %s: %w", ref.Name, err)
+		var newName RunName
+		// A bucket read fails transiently now and then (a 503 in the middle
+		// of a 13GB run); the run is retried whole, the writer is aborted.
+		for attempt := 1; ; attempt++ {
+			newName, err = migrateRun(cas, ref, prev)
+			if err == nil {
+				break
+			}
+			if attempt == 5 {
+				return fmt.Errorf("store: migrate run %s: %w", ref.Name, err)
+			}
+			logf("run %d/%d: attempt %d failed, retrying in 30s: %v", i+1, len(man.Runs), attempt, err)
+			time.Sleep(30 * time.Second)
 		}
 		done[ref.Name] = newName
 		if err := saveJSON(donePath, done); err != nil {
