@@ -447,6 +447,33 @@ func (d *differ) run(scale int) {
 	}
 
 	// --- logs -----------------------------------------------------------------
+	// The receipts above also give real topics and block hashes, so the filter
+	// shapes the posting families answer differently (address, topic0 alone,
+	// a value at position 1..3, several addresses, blockHash) are each diffed.
+	type logSample struct {
+		blockHash string
+		address   string
+		topics    []string
+	}
+	var samples []logSample
+	for i, h := range txHashes {
+		if i >= n(30) {
+			break
+		}
+		raw := d.compare("eth_getTransactionReceipt", "eth_getTransactionReceipt", h)
+		var r struct {
+			BlockHash string `json:"blockHash"`
+			Logs      []struct {
+				Address string   `json:"address"`
+				Topics  []string `json:"topics"`
+			} `json:"logs"`
+		}
+		if len(raw) > 0 && json.Unmarshal(raw, &r) == nil {
+			for _, l := range r.Logs {
+				samples = append(samples, logSample{r.BlockHash, l.Address, l.Topics})
+			}
+		}
+	}
 	for i, h := range d.heights(n(20)) {
 		to := h + 9
 		if to > d.head {
@@ -455,6 +482,37 @@ func (d *differ) run(scale int) {
 		filter := map[string]any{"fromBlock": hexNum(h), "toBlock": hexNum(to)}
 		if i%2 == 1 && len(contracts) > 0 {
 			filter["address"] = contracts[d.rnd.Intn(len(contracts))]
+		}
+		d.compare("eth_getLogs", "eth_getLogs", filter)
+	}
+	for i, smp := range samples {
+		if i >= n(40) {
+			break
+		}
+		filter := map[string]any{"blockHash": smp.blockHash}
+		switch i % 5 {
+		case 0: // the whole block by hash
+		case 1: // emitter + topic0
+			filter["address"] = smp.address
+			if len(smp.topics) > 0 {
+				filter["topics"] = []any{smp.topics[0]}
+			}
+		case 2: // topic0 alone
+			if len(smp.topics) > 0 {
+				filter["topics"] = []any{smp.topics[0]}
+			}
+		case 3: // a value at position 1..3, any signature
+			if len(smp.topics) > 1 {
+				pos := 1 + d.rnd.Intn(len(smp.topics)-1)
+				topics := make([]any, pos+1)
+				topics[pos] = smp.topics[pos]
+				filter["topics"] = topics
+			}
+		case 4: // several emitters over a range
+			delete(filter, "blockHash")
+			hh := d.heights(1)[0]
+			filter["fromBlock"], filter["toBlock"] = hexNum(hh), hexNum(min(hh+9, d.head))
+			filter["address"] = []string{smp.address, samples[d.rnd.Intn(len(samples))].address}
 		}
 		d.compare("eth_getLogs", "eth_getLogs", filter)
 	}

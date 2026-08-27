@@ -1980,6 +1980,634 @@ func (x *ContractCreatorResponse) GetCreator() []byte {
 	return nil
 }
 
+type Page struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Cursor        uint64                 `protobuf:"varint,1,opt,name=cursor,proto3" json:"cursor,omitempty"` // TxNum to continue from (inclusive); 0 = the end the walk starts at
+	Limit         uint32                 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`   // transactions per page, capped at 1000
+	Ascending     bool                   `protobuf:"varint,3,opt,name=ascending,proto3" json:"ascending,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Page) Reset() {
+	*x = Page{}
+	mi := &file_epochdb_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Page) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Page) ProtoMessage() {}
+
+func (x *Page) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Page.ProtoReflect.Descriptor instead.
+func (*Page) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *Page) GetCursor() uint64 {
+	if x != nil {
+		return x.Cursor
+	}
+	return 0
+}
+
+func (x *Page) GetLimit() uint32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *Page) GetAscending() bool {
+	if x != nil {
+		return x.Ascending
+	}
+	return false
+}
+
+type LogsByEmitterRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Emitter       []byte                 `protobuf:"bytes,1,opt,name=emitter,proto3" json:"emitter,omitempty"`
+	Topic0        []byte                 `protobuf:"bytes,2,opt,name=topic0,proto3" json:"topic0,omitempty"` // empty: any signature
+	Page          *Page                  `protobuf:"bytes,3,opt,name=page,proto3" json:"page,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LogsByEmitterRequest) Reset() {
+	*x = LogsByEmitterRequest{}
+	mi := &file_epochdb_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LogsByEmitterRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LogsByEmitterRequest) ProtoMessage() {}
+
+func (x *LogsByEmitterRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LogsByEmitterRequest.ProtoReflect.Descriptor instead.
+func (*LogsByEmitterRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *LogsByEmitterRequest) GetEmitter() []byte {
+	if x != nil {
+		return x.Emitter
+	}
+	return nil
+}
+
+func (x *LogsByEmitterRequest) GetTopic0() []byte {
+	if x != nil {
+		return x.Topic0
+	}
+	return nil
+}
+
+func (x *LogsByEmitterRequest) GetPage() *Page {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
+type LogsByTopicValueRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Value         []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
+	Topic0        []byte                 `protobuf:"bytes,2,opt,name=topic0,proto3" json:"topic0,omitempty"`        // empty: any signature
+	Positions     uint32                 `protobuf:"varint,3,opt,name=positions,proto3" json:"positions,omitempty"` // bitmask of topic positions 1..3 (1, 2, 4); 0: any
+	Page          *Page                  `protobuf:"bytes,4,opt,name=page,proto3" json:"page,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LogsByTopicValueRequest) Reset() {
+	*x = LogsByTopicValueRequest{}
+	mi := &file_epochdb_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LogsByTopicValueRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LogsByTopicValueRequest) ProtoMessage() {}
+
+func (x *LogsByTopicValueRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LogsByTopicValueRequest.ProtoReflect.Descriptor instead.
+func (*LogsByTopicValueRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *LogsByTopicValueRequest) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *LogsByTopicValueRequest) GetTopic0() []byte {
+	if x != nil {
+		return x.Topic0
+	}
+	return nil
+}
+
+func (x *LogsByTopicValueRequest) GetPositions() uint32 {
+	if x != nil {
+		return x.Positions
+	}
+	return 0
+}
+
+func (x *LogsByTopicValueRequest) GetPage() *Page {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
+type PagedLogsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Logs          []*Log                 `protobuf:"bytes,1,rep,name=logs,proto3" json:"logs,omitempty"`
+	More          bool                   `protobuf:"varint,2,opt,name=more,proto3" json:"more,omitempty"`
+	NextCursor    uint64                 `protobuf:"varint,3,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PagedLogsResponse) Reset() {
+	*x = PagedLogsResponse{}
+	mi := &file_epochdb_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PagedLogsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PagedLogsResponse) ProtoMessage() {}
+
+func (x *PagedLogsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PagedLogsResponse.ProtoReflect.Descriptor instead.
+func (*PagedLogsResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *PagedLogsResponse) GetLogs() []*Log {
+	if x != nil {
+		return x.Logs
+	}
+	return nil
+}
+
+func (x *PagedLogsResponse) GetMore() bool {
+	if x != nil {
+		return x.More
+	}
+	return false
+}
+
+func (x *PagedLogsResponse) GetNextCursor() uint64 {
+	if x != nil {
+		return x.NextCursor
+	}
+	return 0
+}
+
+type TopicGroupsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Value         []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
+	Topic0        []byte                 `protobuf:"bytes,2,opt,name=topic0,proto3" json:"topic0,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TopicGroupsRequest) Reset() {
+	*x = TopicGroupsRequest{}
+	mi := &file_epochdb_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TopicGroupsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TopicGroupsRequest) ProtoMessage() {}
+
+func (x *TopicGroupsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TopicGroupsRequest.ProtoReflect.Descriptor instead.
+func (*TopicGroupsRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *TopicGroupsRequest) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *TopicGroupsRequest) GetTopic0() []byte {
+	if x != nil {
+		return x.Topic0
+	}
+	return nil
+}
+
+type TopicGroup struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Topic0        []byte                 `protobuf:"bytes,1,opt,name=topic0,proto3" json:"topic0,omitempty"`
+	Emitter       []byte                 `protobuf:"bytes,2,opt,name=emitter,proto3" json:"emitter,omitempty"`
+	FirstTxNum    uint64                 `protobuf:"varint,3,opt,name=first_tx_num,json=firstTxNum,proto3" json:"first_tx_num,omitempty"`
+	LastTxNum     uint64                 `protobuf:"varint,4,opt,name=last_tx_num,json=lastTxNum,proto3" json:"last_tx_num,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TopicGroup) Reset() {
+	*x = TopicGroup{}
+	mi := &file_epochdb_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TopicGroup) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TopicGroup) ProtoMessage() {}
+
+func (x *TopicGroup) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TopicGroup.ProtoReflect.Descriptor instead.
+func (*TopicGroup) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *TopicGroup) GetTopic0() []byte {
+	if x != nil {
+		return x.Topic0
+	}
+	return nil
+}
+
+func (x *TopicGroup) GetEmitter() []byte {
+	if x != nil {
+		return x.Emitter
+	}
+	return nil
+}
+
+func (x *TopicGroup) GetFirstTxNum() uint64 {
+	if x != nil {
+		return x.FirstTxNum
+	}
+	return 0
+}
+
+func (x *TopicGroup) GetLastTxNum() uint64 {
+	if x != nil {
+		return x.LastTxNum
+	}
+	return 0
+}
+
+type TopicGroupsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Groups        []*TopicGroup          `protobuf:"bytes,1,rep,name=groups,proto3" json:"groups,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TopicGroupsResponse) Reset() {
+	*x = TopicGroupsResponse{}
+	mi := &file_epochdb_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TopicGroupsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TopicGroupsResponse) ProtoMessage() {}
+
+func (x *TopicGroupsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TopicGroupsResponse.ProtoReflect.Descriptor instead.
+func (*TopicGroupsResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *TopicGroupsResponse) GetGroups() []*TopicGroup {
+	if x != nil {
+		return x.Groups
+	}
+	return nil
+}
+
+type TokenTransfersRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       []byte                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`   // the holder, or the token contract
+	Standard      string                 `protobuf:"bytes,2,opt,name=standard,proto3" json:"standard,omitempty"` // erc20 | erc721 | erc1155
+	Page          *Page                  `protobuf:"bytes,3,opt,name=page,proto3" json:"page,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TokenTransfersRequest) Reset() {
+	*x = TokenTransfersRequest{}
+	mi := &file_epochdb_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenTransfersRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenTransfersRequest) ProtoMessage() {}
+
+func (x *TokenTransfersRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenTransfersRequest.ProtoReflect.Descriptor instead.
+func (*TokenTransfersRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *TokenTransfersRequest) GetAddress() []byte {
+	if x != nil {
+		return x.Address
+	}
+	return nil
+}
+
+func (x *TokenTransfersRequest) GetStandard() string {
+	if x != nil {
+		return x.Standard
+	}
+	return ""
+}
+
+func (x *TokenTransfersRequest) GetPage() *Page {
+	if x != nil {
+		return x.Page
+	}
+	return nil
+}
+
+type TokenContractsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       []byte                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TokenContractsRequest) Reset() {
+	*x = TokenContractsRequest{}
+	mi := &file_epochdb_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenContractsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenContractsRequest) ProtoMessage() {}
+
+func (x *TokenContractsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenContractsRequest.ProtoReflect.Descriptor instead.
+func (*TokenContractsRequest) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *TokenContractsRequest) GetAddress() []byte {
+	if x != nil {
+		return x.Address
+	}
+	return nil
+}
+
+type TokenContract struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Standard      string                 `protobuf:"bytes,1,opt,name=standard,proto3" json:"standard,omitempty"`
+	Token         []byte                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`
+	FirstTxNum    uint64                 `protobuf:"varint,3,opt,name=first_tx_num,json=firstTxNum,proto3" json:"first_tx_num,omitempty"`
+	LastTxNum     uint64                 `protobuf:"varint,4,opt,name=last_tx_num,json=lastTxNum,proto3" json:"last_tx_num,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TokenContract) Reset() {
+	*x = TokenContract{}
+	mi := &file_epochdb_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenContract) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenContract) ProtoMessage() {}
+
+func (x *TokenContract) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenContract.ProtoReflect.Descriptor instead.
+func (*TokenContract) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *TokenContract) GetStandard() string {
+	if x != nil {
+		return x.Standard
+	}
+	return ""
+}
+
+func (x *TokenContract) GetToken() []byte {
+	if x != nil {
+		return x.Token
+	}
+	return nil
+}
+
+func (x *TokenContract) GetFirstTxNum() uint64 {
+	if x != nil {
+		return x.FirstTxNum
+	}
+	return 0
+}
+
+func (x *TokenContract) GetLastTxNum() uint64 {
+	if x != nil {
+		return x.LastTxNum
+	}
+	return 0
+}
+
+type TokenContractsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Contracts     []*TokenContract       `protobuf:"bytes,1,rep,name=contracts,proto3" json:"contracts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TokenContractsResponse) Reset() {
+	*x = TokenContractsResponse{}
+	mi := &file_epochdb_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenContractsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenContractsResponse) ProtoMessage() {}
+
+func (x *TokenContractsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_epochdb_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenContractsResponse.ProtoReflect.Descriptor instead.
+func (*TokenContractsResponse) Descriptor() ([]byte, []int) {
+	return file_epochdb_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *TokenContractsResponse) GetContracts() []*TokenContract {
+	if x != nil {
+		return x.Contracts
+	}
+	return nil
+}
+
 type LogsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	FromBlock     uint64                 `protobuf:"varint,1,opt,name=from_block,json=fromBlock,proto3" json:"from_block,omitempty"`
@@ -1992,7 +2620,7 @@ type LogsRequest struct {
 
 func (x *LogsRequest) Reset() {
 	*x = LogsRequest{}
-	mi := &file_epochdb_proto_msgTypes[25]
+	mi := &file_epochdb_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2004,7 +2632,7 @@ func (x *LogsRequest) String() string {
 func (*LogsRequest) ProtoMessage() {}
 
 func (x *LogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[25]
+	mi := &file_epochdb_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2017,7 +2645,7 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{25}
+	return file_epochdb_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *LogsRequest) GetFromBlock() uint64 {
@@ -2057,7 +2685,7 @@ type TopicSet struct {
 
 func (x *TopicSet) Reset() {
 	*x = TopicSet{}
-	mi := &file_epochdb_proto_msgTypes[26]
+	mi := &file_epochdb_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2069,7 +2697,7 @@ func (x *TopicSet) String() string {
 func (*TopicSet) ProtoMessage() {}
 
 func (x *TopicSet) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[26]
+	mi := &file_epochdb_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2082,7 +2710,7 @@ func (x *TopicSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TopicSet.ProtoReflect.Descriptor instead.
 func (*TopicSet) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{26}
+	return file_epochdb_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *TopicSet) GetValues() [][]byte {
@@ -2102,7 +2730,7 @@ type LogsResponse struct {
 
 func (x *LogsResponse) Reset() {
 	*x = LogsResponse{}
-	mi := &file_epochdb_proto_msgTypes[27]
+	mi := &file_epochdb_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2114,7 +2742,7 @@ func (x *LogsResponse) String() string {
 func (*LogsResponse) ProtoMessage() {}
 
 func (x *LogsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[27]
+	mi := &file_epochdb_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2127,7 +2755,7 @@ func (x *LogsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsResponse.ProtoReflect.Descriptor instead.
 func (*LogsResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{27}
+	return file_epochdb_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *LogsResponse) GetLogs() []*Log {
@@ -2155,7 +2783,7 @@ type StreamTransactionsRequest struct {
 
 func (x *StreamTransactionsRequest) Reset() {
 	*x = StreamTransactionsRequest{}
-	mi := &file_epochdb_proto_msgTypes[28]
+	mi := &file_epochdb_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2167,7 +2795,7 @@ func (x *StreamTransactionsRequest) String() string {
 func (*StreamTransactionsRequest) ProtoMessage() {}
 
 func (x *StreamTransactionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[28]
+	mi := &file_epochdb_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2180,7 +2808,7 @@ func (x *StreamTransactionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamTransactionsRequest.ProtoReflect.Descriptor instead.
 func (*StreamTransactionsRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{28}
+	return file_epochdb_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *StreamTransactionsRequest) GetFromBlock() uint64 {
@@ -2215,7 +2843,7 @@ type TransactionBatch struct {
 
 func (x *TransactionBatch) Reset() {
 	*x = TransactionBatch{}
-	mi := &file_epochdb_proto_msgTypes[29]
+	mi := &file_epochdb_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2227,7 +2855,7 @@ func (x *TransactionBatch) String() string {
 func (*TransactionBatch) ProtoMessage() {}
 
 func (x *TransactionBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[29]
+	mi := &file_epochdb_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2240,7 +2868,7 @@ func (x *TransactionBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionBatch.ProtoReflect.Descriptor instead.
 func (*TransactionBatch) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{29}
+	return file_epochdb_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *TransactionBatch) GetBlockNumber() uint64 {
@@ -2275,7 +2903,7 @@ type FeeHistoryRequest struct {
 
 func (x *FeeHistoryRequest) Reset() {
 	*x = FeeHistoryRequest{}
-	mi := &file_epochdb_proto_msgTypes[30]
+	mi := &file_epochdb_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2287,7 +2915,7 @@ func (x *FeeHistoryRequest) String() string {
 func (*FeeHistoryRequest) ProtoMessage() {}
 
 func (x *FeeHistoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[30]
+	mi := &file_epochdb_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2300,7 +2928,7 @@ func (x *FeeHistoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FeeHistoryRequest.ProtoReflect.Descriptor instead.
 func (*FeeHistoryRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{30}
+	return file_epochdb_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *FeeHistoryRequest) GetBlockCount() uint64 {
@@ -2338,7 +2966,7 @@ type FeeHistoryResponse struct {
 
 func (x *FeeHistoryResponse) Reset() {
 	*x = FeeHistoryResponse{}
-	mi := &file_epochdb_proto_msgTypes[31]
+	mi := &file_epochdb_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2350,7 +2978,7 @@ func (x *FeeHistoryResponse) String() string {
 func (*FeeHistoryResponse) ProtoMessage() {}
 
 func (x *FeeHistoryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[31]
+	mi := &file_epochdb_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2363,7 +2991,7 @@ func (x *FeeHistoryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FeeHistoryResponse.ProtoReflect.Descriptor instead.
 func (*FeeHistoryResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{31}
+	return file_epochdb_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *FeeHistoryResponse) GetOldestBlock() uint64 {
@@ -2403,7 +3031,7 @@ type RewardRow struct {
 
 func (x *RewardRow) Reset() {
 	*x = RewardRow{}
-	mi := &file_epochdb_proto_msgTypes[32]
+	mi := &file_epochdb_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2415,7 +3043,7 @@ func (x *RewardRow) String() string {
 func (*RewardRow) ProtoMessage() {}
 
 func (x *RewardRow) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[32]
+	mi := &file_epochdb_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2428,7 +3056,7 @@ func (x *RewardRow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RewardRow.ProtoReflect.Descriptor instead.
 func (*RewardRow) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{32}
+	return file_epochdb_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *RewardRow) GetValues() [][]byte {
@@ -2446,7 +3074,7 @@ type GasPriceRequest struct {
 
 func (x *GasPriceRequest) Reset() {
 	*x = GasPriceRequest{}
-	mi := &file_epochdb_proto_msgTypes[33]
+	mi := &file_epochdb_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2458,7 +3086,7 @@ func (x *GasPriceRequest) String() string {
 func (*GasPriceRequest) ProtoMessage() {}
 
 func (x *GasPriceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[33]
+	mi := &file_epochdb_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2471,7 +3099,7 @@ func (x *GasPriceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GasPriceRequest.ProtoReflect.Descriptor instead.
 func (*GasPriceRequest) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{33}
+	return file_epochdb_proto_rawDescGZIP(), []int{44}
 }
 
 type GasPriceResponse struct {
@@ -2490,7 +3118,7 @@ type GasPriceResponse struct {
 
 func (x *GasPriceResponse) Reset() {
 	*x = GasPriceResponse{}
-	mi := &file_epochdb_proto_msgTypes[34]
+	mi := &file_epochdb_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2502,7 +3130,7 @@ func (x *GasPriceResponse) String() string {
 func (*GasPriceResponse) ProtoMessage() {}
 
 func (x *GasPriceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[34]
+	mi := &file_epochdb_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2515,7 +3143,7 @@ func (x *GasPriceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GasPriceResponse.ProtoReflect.Descriptor instead.
 func (*GasPriceResponse) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{34}
+	return file_epochdb_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *GasPriceResponse) GetGasPrice() []byte {
@@ -2577,7 +3205,7 @@ type PriceOption struct {
 
 func (x *PriceOption) Reset() {
 	*x = PriceOption{}
-	mi := &file_epochdb_proto_msgTypes[35]
+	mi := &file_epochdb_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2589,7 +3217,7 @@ func (x *PriceOption) String() string {
 func (*PriceOption) ProtoMessage() {}
 
 func (x *PriceOption) ProtoReflect() protoreflect.Message {
-	mi := &file_epochdb_proto_msgTypes[35]
+	mi := &file_epochdb_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2602,7 +3230,7 @@ func (x *PriceOption) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PriceOption.ProtoReflect.Descriptor instead.
 func (*PriceOption) Descriptor() ([]byte, []int) {
-	return file_epochdb_proto_rawDescGZIP(), []int{35}
+	return file_epochdb_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *PriceOption) GetMaxPriorityFeePerGas() []byte {
@@ -2789,7 +3417,51 @@ const file_epochdb_proto_rawDesc = "" +
 	"\x17ContractCreatorResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x17\n" +
 	"\atx_hash\x18\x02 \x01(\fR\x06txHash\x12\x18\n" +
-	"\acreator\x18\x03 \x01(\fR\acreator\"\x93\x01\n" +
+	"\acreator\x18\x03 \x01(\fR\acreator\"R\n" +
+	"\x04Page\x12\x16\n" +
+	"\x06cursor\x18\x01 \x01(\x04R\x06cursor\x12\x14\n" +
+	"\x05limit\x18\x02 \x01(\rR\x05limit\x12\x1c\n" +
+	"\tascending\x18\x03 \x01(\bR\tascending\"n\n" +
+	"\x14LogsByEmitterRequest\x12\x18\n" +
+	"\aemitter\x18\x01 \x01(\fR\aemitter\x12\x16\n" +
+	"\x06topic0\x18\x02 \x01(\fR\x06topic0\x12$\n" +
+	"\x04page\x18\x03 \x01(\v2\x10.epochdb.v0.PageR\x04page\"\x8b\x01\n" +
+	"\x17LogsByTopicValueRequest\x12\x14\n" +
+	"\x05value\x18\x01 \x01(\fR\x05value\x12\x16\n" +
+	"\x06topic0\x18\x02 \x01(\fR\x06topic0\x12\x1c\n" +
+	"\tpositions\x18\x03 \x01(\rR\tpositions\x12$\n" +
+	"\x04page\x18\x04 \x01(\v2\x10.epochdb.v0.PageR\x04page\"m\n" +
+	"\x11PagedLogsResponse\x12#\n" +
+	"\x04logs\x18\x01 \x03(\v2\x0f.epochdb.v0.LogR\x04logs\x12\x12\n" +
+	"\x04more\x18\x02 \x01(\bR\x04more\x12\x1f\n" +
+	"\vnext_cursor\x18\x03 \x01(\x04R\n" +
+	"nextCursor\"B\n" +
+	"\x12TopicGroupsRequest\x12\x14\n" +
+	"\x05value\x18\x01 \x01(\fR\x05value\x12\x16\n" +
+	"\x06topic0\x18\x02 \x01(\fR\x06topic0\"\x80\x01\n" +
+	"\n" +
+	"TopicGroup\x12\x16\n" +
+	"\x06topic0\x18\x01 \x01(\fR\x06topic0\x12\x18\n" +
+	"\aemitter\x18\x02 \x01(\fR\aemitter\x12 \n" +
+	"\ffirst_tx_num\x18\x03 \x01(\x04R\n" +
+	"firstTxNum\x12\x1e\n" +
+	"\vlast_tx_num\x18\x04 \x01(\x04R\tlastTxNum\"E\n" +
+	"\x13TopicGroupsResponse\x12.\n" +
+	"\x06groups\x18\x01 \x03(\v2\x16.epochdb.v0.TopicGroupR\x06groups\"s\n" +
+	"\x15TokenTransfersRequest\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\fR\aaddress\x12\x1a\n" +
+	"\bstandard\x18\x02 \x01(\tR\bstandard\x12$\n" +
+	"\x04page\x18\x03 \x01(\v2\x10.epochdb.v0.PageR\x04page\"1\n" +
+	"\x15TokenContractsRequest\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\fR\aaddress\"\x83\x01\n" +
+	"\rTokenContract\x12\x1a\n" +
+	"\bstandard\x18\x01 \x01(\tR\bstandard\x12\x14\n" +
+	"\x05token\x18\x02 \x01(\fR\x05token\x12 \n" +
+	"\ffirst_tx_num\x18\x03 \x01(\x04R\n" +
+	"firstTxNum\x12\x1e\n" +
+	"\vlast_tx_num\x18\x04 \x01(\x04R\tlastTxNum\"Q\n" +
+	"\x16TokenContractsResponse\x127\n" +
+	"\tcontracts\x18\x01 \x03(\v2\x19.epochdb.v0.TokenContractR\tcontracts\"\x93\x01\n" +
 	"\vLogsRequest\x12\x1d\n" +
 	"\n" +
 	"from_block\x18\x01 \x01(\x04R\tfromBlock\x12\x19\n" +
@@ -2833,7 +3505,7 @@ const file_epochdb_proto_rawDesc = "" +
 	"\x04fast\x18\a \x01(\v2\x17.epochdb.v0.PriceOptionR\x04fast\"l\n" +
 	"\vPriceOption\x126\n" +
 	"\x18max_priority_fee_per_gas\x18\x01 \x01(\fR\x14maxPriorityFeePerGas\x12%\n" +
-	"\x0fmax_fee_per_gas\x18\x02 \x01(\fR\fmaxFeePerGas2\x99\t\n" +
+	"\x0fmax_fee_per_gas\x18\x02 \x01(\fR\fmaxFeePerGas2\xb8\r\n" +
 	"\aEpochDB\x12<\n" +
 	"\aGetHead\x12\x17.epochdb.v0.HeadRequest\x1a\x18.epochdb.v0.HeadResponse\x12B\n" +
 	"\vStreamHeads\x12\x17.epochdb.v0.HeadRequest\x1a\x18.epochdb.v0.HeadResponse0\x01\x12H\n" +
@@ -2849,7 +3521,13 @@ const file_epochdb_proto_rawDesc = "" +
 	"StreamLogs\x12\x17.epochdb.v0.LogsRequest\x1a\x18.epochdb.v0.LogsResponse0\x01\x12[\n" +
 	"\x12StreamTransactions\x12%.epochdb.v0.StreamTransactionsRequest\x1a\x1c.epochdb.v0.TransactionBatch0\x01\x12T\n" +
 	"\x1bSearchTransactionsByAddress\x12\x19.epochdb.v0.SearchRequest\x1a\x1a.epochdb.v0.SearchResponse\x12]\n" +
-	"\x12GetContractCreator\x12\".epochdb.v0.ContractCreatorRequest\x1a#.epochdb.v0.ContractCreatorResponse\x12N\n" +
+	"\x12GetContractCreator\x12\".epochdb.v0.ContractCreatorRequest\x1a#.epochdb.v0.ContractCreatorResponse\x12S\n" +
+	"\x10GetLogsByEmitter\x12 .epochdb.v0.LogsByEmitterRequest\x1a\x1d.epochdb.v0.PagedLogsResponse\x12Y\n" +
+	"\x13GetLogsByTopicValue\x12#.epochdb.v0.LogsByTopicValueRequest\x1a\x1d.epochdb.v0.PagedLogsResponse\x12Q\n" +
+	"\x0eGetTopicGroups\x12\x1e.epochdb.v0.TopicGroupsRequest\x1a\x1f.epochdb.v0.TopicGroupsResponse\x12]\n" +
+	"\x19GetTokenTransfersByHolder\x12!.epochdb.v0.TokenTransfersRequest\x1a\x1d.epochdb.v0.PagedLogsResponse\x12_\n" +
+	"\x1bGetTokenTransfersByContract\x12!.epochdb.v0.TokenTransfersRequest\x1a\x1d.epochdb.v0.PagedLogsResponse\x12Z\n" +
+	"\x11GetTokenContracts\x12!.epochdb.v0.TokenContractsRequest\x1a\".epochdb.v0.TokenContractsResponse\x12N\n" +
 	"\rGetFeeHistory\x12\x1d.epochdb.v0.FeeHistoryRequest\x1a\x1e.epochdb.v0.FeeHistoryResponse\x12H\n" +
 	"\vGetGasPrice\x12\x1b.epochdb.v0.GasPriceRequest\x1a\x1c.epochdb.v0.GasPriceResponseB+Z)github.com/containerman17/epochdb/grpcapib\x06proto3"
 
@@ -2865,7 +3543,7 @@ func file_epochdb_proto_rawDescGZIP() []byte {
 	return file_epochdb_proto_rawDescData
 }
 
-var file_epochdb_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
+var file_epochdb_proto_msgTypes = make([]protoimpl.MessageInfo, 47)
 var file_epochdb_proto_goTypes = []any{
 	(*HeadRequest)(nil),               // 0: epochdb.v0.HeadRequest
 	(*HeadResponse)(nil),              // 1: epochdb.v0.HeadResponse
@@ -2892,17 +3570,28 @@ var file_epochdb_proto_goTypes = []any{
 	(*AddrHit)(nil),                   // 22: epochdb.v0.AddrHit
 	(*ContractCreatorRequest)(nil),    // 23: epochdb.v0.ContractCreatorRequest
 	(*ContractCreatorResponse)(nil),   // 24: epochdb.v0.ContractCreatorResponse
-	(*LogsRequest)(nil),               // 25: epochdb.v0.LogsRequest
-	(*TopicSet)(nil),                  // 26: epochdb.v0.TopicSet
-	(*LogsResponse)(nil),              // 27: epochdb.v0.LogsResponse
-	(*StreamTransactionsRequest)(nil), // 28: epochdb.v0.StreamTransactionsRequest
-	(*TransactionBatch)(nil),          // 29: epochdb.v0.TransactionBatch
-	(*FeeHistoryRequest)(nil),         // 30: epochdb.v0.FeeHistoryRequest
-	(*FeeHistoryResponse)(nil),        // 31: epochdb.v0.FeeHistoryResponse
-	(*RewardRow)(nil),                 // 32: epochdb.v0.RewardRow
-	(*GasPriceRequest)(nil),           // 33: epochdb.v0.GasPriceRequest
-	(*GasPriceResponse)(nil),          // 34: epochdb.v0.GasPriceResponse
-	(*PriceOption)(nil),               // 35: epochdb.v0.PriceOption
+	(*Page)(nil),                      // 25: epochdb.v0.Page
+	(*LogsByEmitterRequest)(nil),      // 26: epochdb.v0.LogsByEmitterRequest
+	(*LogsByTopicValueRequest)(nil),   // 27: epochdb.v0.LogsByTopicValueRequest
+	(*PagedLogsResponse)(nil),         // 28: epochdb.v0.PagedLogsResponse
+	(*TopicGroupsRequest)(nil),        // 29: epochdb.v0.TopicGroupsRequest
+	(*TopicGroup)(nil),                // 30: epochdb.v0.TopicGroup
+	(*TopicGroupsResponse)(nil),       // 31: epochdb.v0.TopicGroupsResponse
+	(*TokenTransfersRequest)(nil),     // 32: epochdb.v0.TokenTransfersRequest
+	(*TokenContractsRequest)(nil),     // 33: epochdb.v0.TokenContractsRequest
+	(*TokenContract)(nil),             // 34: epochdb.v0.TokenContract
+	(*TokenContractsResponse)(nil),    // 35: epochdb.v0.TokenContractsResponse
+	(*LogsRequest)(nil),               // 36: epochdb.v0.LogsRequest
+	(*TopicSet)(nil),                  // 37: epochdb.v0.TopicSet
+	(*LogsResponse)(nil),              // 38: epochdb.v0.LogsResponse
+	(*StreamTransactionsRequest)(nil), // 39: epochdb.v0.StreamTransactionsRequest
+	(*TransactionBatch)(nil),          // 40: epochdb.v0.TransactionBatch
+	(*FeeHistoryRequest)(nil),         // 41: epochdb.v0.FeeHistoryRequest
+	(*FeeHistoryResponse)(nil),        // 42: epochdb.v0.FeeHistoryResponse
+	(*RewardRow)(nil),                 // 43: epochdb.v0.RewardRow
+	(*GasPriceRequest)(nil),           // 44: epochdb.v0.GasPriceRequest
+	(*GasPriceResponse)(nil),          // 45: epochdb.v0.GasPriceResponse
+	(*PriceOption)(nil),               // 46: epochdb.v0.PriceOption
 }
 var file_epochdb_proto_depIdxs = []int32{
 	4,  // 0: epochdb.v0.NodeInfoResponse.refusals:type_name -> epochdb.v0.Refusal
@@ -2913,49 +3602,67 @@ var file_epochdb_proto_depIdxs = []int32{
 	14, // 5: epochdb.v0.CallResponse.access_list:type_name -> epochdb.v0.AccessTuple
 	12, // 6: epochdb.v0.TraceRequest.call:type_name -> epochdb.v0.CallRequest
 	22, // 7: epochdb.v0.SearchResponse.hits:type_name -> epochdb.v0.AddrHit
-	26, // 8: epochdb.v0.LogsRequest.topics:type_name -> epochdb.v0.TopicSet
-	10, // 9: epochdb.v0.LogsResponse.logs:type_name -> epochdb.v0.Log
-	32, // 10: epochdb.v0.FeeHistoryResponse.reward:type_name -> epochdb.v0.RewardRow
-	35, // 11: epochdb.v0.GasPriceResponse.slow:type_name -> epochdb.v0.PriceOption
-	35, // 12: epochdb.v0.GasPriceResponse.normal:type_name -> epochdb.v0.PriceOption
-	35, // 13: epochdb.v0.GasPriceResponse.fast:type_name -> epochdb.v0.PriceOption
-	0,  // 14: epochdb.v0.EpochDB.GetHead:input_type -> epochdb.v0.HeadRequest
-	0,  // 15: epochdb.v0.EpochDB.StreamHeads:input_type -> epochdb.v0.HeadRequest
-	2,  // 16: epochdb.v0.EpochDB.GetNodeInfo:input_type -> epochdb.v0.NodeInfoRequest
-	5,  // 17: epochdb.v0.EpochDB.GetBlock:input_type -> epochdb.v0.BlockRequest
-	7,  // 18: epochdb.v0.EpochDB.GetTransaction:input_type -> epochdb.v0.TransactionRequest
-	18, // 19: epochdb.v0.EpochDB.GetState:input_type -> epochdb.v0.StateRequest
-	12, // 20: epochdb.v0.EpochDB.Call:input_type -> epochdb.v0.CallRequest
-	12, // 21: epochdb.v0.EpochDB.EstimateGas:input_type -> epochdb.v0.CallRequest
-	16, // 22: epochdb.v0.EpochDB.Trace:input_type -> epochdb.v0.TraceRequest
-	25, // 23: epochdb.v0.EpochDB.GetLogs:input_type -> epochdb.v0.LogsRequest
-	25, // 24: epochdb.v0.EpochDB.StreamLogs:input_type -> epochdb.v0.LogsRequest
-	28, // 25: epochdb.v0.EpochDB.StreamTransactions:input_type -> epochdb.v0.StreamTransactionsRequest
-	20, // 26: epochdb.v0.EpochDB.SearchTransactionsByAddress:input_type -> epochdb.v0.SearchRequest
-	23, // 27: epochdb.v0.EpochDB.GetContractCreator:input_type -> epochdb.v0.ContractCreatorRequest
-	30, // 28: epochdb.v0.EpochDB.GetFeeHistory:input_type -> epochdb.v0.FeeHistoryRequest
-	33, // 29: epochdb.v0.EpochDB.GetGasPrice:input_type -> epochdb.v0.GasPriceRequest
-	1,  // 30: epochdb.v0.EpochDB.GetHead:output_type -> epochdb.v0.HeadResponse
-	1,  // 31: epochdb.v0.EpochDB.StreamHeads:output_type -> epochdb.v0.HeadResponse
-	3,  // 32: epochdb.v0.EpochDB.GetNodeInfo:output_type -> epochdb.v0.NodeInfoResponse
-	6,  // 33: epochdb.v0.EpochDB.GetBlock:output_type -> epochdb.v0.BlockResponse
-	8,  // 34: epochdb.v0.EpochDB.GetTransaction:output_type -> epochdb.v0.TransactionResponse
-	19, // 35: epochdb.v0.EpochDB.GetState:output_type -> epochdb.v0.StateResponse
-	13, // 36: epochdb.v0.EpochDB.Call:output_type -> epochdb.v0.CallResponse
-	15, // 37: epochdb.v0.EpochDB.EstimateGas:output_type -> epochdb.v0.EstimateGasResponse
-	17, // 38: epochdb.v0.EpochDB.Trace:output_type -> epochdb.v0.TraceResponse
-	27, // 39: epochdb.v0.EpochDB.GetLogs:output_type -> epochdb.v0.LogsResponse
-	27, // 40: epochdb.v0.EpochDB.StreamLogs:output_type -> epochdb.v0.LogsResponse
-	29, // 41: epochdb.v0.EpochDB.StreamTransactions:output_type -> epochdb.v0.TransactionBatch
-	21, // 42: epochdb.v0.EpochDB.SearchTransactionsByAddress:output_type -> epochdb.v0.SearchResponse
-	24, // 43: epochdb.v0.EpochDB.GetContractCreator:output_type -> epochdb.v0.ContractCreatorResponse
-	31, // 44: epochdb.v0.EpochDB.GetFeeHistory:output_type -> epochdb.v0.FeeHistoryResponse
-	34, // 45: epochdb.v0.EpochDB.GetGasPrice:output_type -> epochdb.v0.GasPriceResponse
-	30, // [30:46] is the sub-list for method output_type
-	14, // [14:30] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	25, // 8: epochdb.v0.LogsByEmitterRequest.page:type_name -> epochdb.v0.Page
+	25, // 9: epochdb.v0.LogsByTopicValueRequest.page:type_name -> epochdb.v0.Page
+	10, // 10: epochdb.v0.PagedLogsResponse.logs:type_name -> epochdb.v0.Log
+	30, // 11: epochdb.v0.TopicGroupsResponse.groups:type_name -> epochdb.v0.TopicGroup
+	25, // 12: epochdb.v0.TokenTransfersRequest.page:type_name -> epochdb.v0.Page
+	34, // 13: epochdb.v0.TokenContractsResponse.contracts:type_name -> epochdb.v0.TokenContract
+	37, // 14: epochdb.v0.LogsRequest.topics:type_name -> epochdb.v0.TopicSet
+	10, // 15: epochdb.v0.LogsResponse.logs:type_name -> epochdb.v0.Log
+	43, // 16: epochdb.v0.FeeHistoryResponse.reward:type_name -> epochdb.v0.RewardRow
+	46, // 17: epochdb.v0.GasPriceResponse.slow:type_name -> epochdb.v0.PriceOption
+	46, // 18: epochdb.v0.GasPriceResponse.normal:type_name -> epochdb.v0.PriceOption
+	46, // 19: epochdb.v0.GasPriceResponse.fast:type_name -> epochdb.v0.PriceOption
+	0,  // 20: epochdb.v0.EpochDB.GetHead:input_type -> epochdb.v0.HeadRequest
+	0,  // 21: epochdb.v0.EpochDB.StreamHeads:input_type -> epochdb.v0.HeadRequest
+	2,  // 22: epochdb.v0.EpochDB.GetNodeInfo:input_type -> epochdb.v0.NodeInfoRequest
+	5,  // 23: epochdb.v0.EpochDB.GetBlock:input_type -> epochdb.v0.BlockRequest
+	7,  // 24: epochdb.v0.EpochDB.GetTransaction:input_type -> epochdb.v0.TransactionRequest
+	18, // 25: epochdb.v0.EpochDB.GetState:input_type -> epochdb.v0.StateRequest
+	12, // 26: epochdb.v0.EpochDB.Call:input_type -> epochdb.v0.CallRequest
+	12, // 27: epochdb.v0.EpochDB.EstimateGas:input_type -> epochdb.v0.CallRequest
+	16, // 28: epochdb.v0.EpochDB.Trace:input_type -> epochdb.v0.TraceRequest
+	36, // 29: epochdb.v0.EpochDB.GetLogs:input_type -> epochdb.v0.LogsRequest
+	36, // 30: epochdb.v0.EpochDB.StreamLogs:input_type -> epochdb.v0.LogsRequest
+	39, // 31: epochdb.v0.EpochDB.StreamTransactions:input_type -> epochdb.v0.StreamTransactionsRequest
+	20, // 32: epochdb.v0.EpochDB.SearchTransactionsByAddress:input_type -> epochdb.v0.SearchRequest
+	23, // 33: epochdb.v0.EpochDB.GetContractCreator:input_type -> epochdb.v0.ContractCreatorRequest
+	26, // 34: epochdb.v0.EpochDB.GetLogsByEmitter:input_type -> epochdb.v0.LogsByEmitterRequest
+	27, // 35: epochdb.v0.EpochDB.GetLogsByTopicValue:input_type -> epochdb.v0.LogsByTopicValueRequest
+	29, // 36: epochdb.v0.EpochDB.GetTopicGroups:input_type -> epochdb.v0.TopicGroupsRequest
+	32, // 37: epochdb.v0.EpochDB.GetTokenTransfersByHolder:input_type -> epochdb.v0.TokenTransfersRequest
+	32, // 38: epochdb.v0.EpochDB.GetTokenTransfersByContract:input_type -> epochdb.v0.TokenTransfersRequest
+	33, // 39: epochdb.v0.EpochDB.GetTokenContracts:input_type -> epochdb.v0.TokenContractsRequest
+	41, // 40: epochdb.v0.EpochDB.GetFeeHistory:input_type -> epochdb.v0.FeeHistoryRequest
+	44, // 41: epochdb.v0.EpochDB.GetGasPrice:input_type -> epochdb.v0.GasPriceRequest
+	1,  // 42: epochdb.v0.EpochDB.GetHead:output_type -> epochdb.v0.HeadResponse
+	1,  // 43: epochdb.v0.EpochDB.StreamHeads:output_type -> epochdb.v0.HeadResponse
+	3,  // 44: epochdb.v0.EpochDB.GetNodeInfo:output_type -> epochdb.v0.NodeInfoResponse
+	6,  // 45: epochdb.v0.EpochDB.GetBlock:output_type -> epochdb.v0.BlockResponse
+	8,  // 46: epochdb.v0.EpochDB.GetTransaction:output_type -> epochdb.v0.TransactionResponse
+	19, // 47: epochdb.v0.EpochDB.GetState:output_type -> epochdb.v0.StateResponse
+	13, // 48: epochdb.v0.EpochDB.Call:output_type -> epochdb.v0.CallResponse
+	15, // 49: epochdb.v0.EpochDB.EstimateGas:output_type -> epochdb.v0.EstimateGasResponse
+	17, // 50: epochdb.v0.EpochDB.Trace:output_type -> epochdb.v0.TraceResponse
+	38, // 51: epochdb.v0.EpochDB.GetLogs:output_type -> epochdb.v0.LogsResponse
+	38, // 52: epochdb.v0.EpochDB.StreamLogs:output_type -> epochdb.v0.LogsResponse
+	40, // 53: epochdb.v0.EpochDB.StreamTransactions:output_type -> epochdb.v0.TransactionBatch
+	21, // 54: epochdb.v0.EpochDB.SearchTransactionsByAddress:output_type -> epochdb.v0.SearchResponse
+	24, // 55: epochdb.v0.EpochDB.GetContractCreator:output_type -> epochdb.v0.ContractCreatorResponse
+	28, // 56: epochdb.v0.EpochDB.GetLogsByEmitter:output_type -> epochdb.v0.PagedLogsResponse
+	28, // 57: epochdb.v0.EpochDB.GetLogsByTopicValue:output_type -> epochdb.v0.PagedLogsResponse
+	31, // 58: epochdb.v0.EpochDB.GetTopicGroups:output_type -> epochdb.v0.TopicGroupsResponse
+	28, // 59: epochdb.v0.EpochDB.GetTokenTransfersByHolder:output_type -> epochdb.v0.PagedLogsResponse
+	28, // 60: epochdb.v0.EpochDB.GetTokenTransfersByContract:output_type -> epochdb.v0.PagedLogsResponse
+	35, // 61: epochdb.v0.EpochDB.GetTokenContracts:output_type -> epochdb.v0.TokenContractsResponse
+	42, // 62: epochdb.v0.EpochDB.GetFeeHistory:output_type -> epochdb.v0.FeeHistoryResponse
+	45, // 63: epochdb.v0.EpochDB.GetGasPrice:output_type -> epochdb.v0.GasPriceResponse
+	42, // [42:64] is the sub-list for method output_type
+	20, // [20:42] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_epochdb_proto_init() }
@@ -2977,7 +3684,7 @@ func file_epochdb_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_epochdb_proto_rawDesc), len(file_epochdb_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   36,
+			NumMessages:   47,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

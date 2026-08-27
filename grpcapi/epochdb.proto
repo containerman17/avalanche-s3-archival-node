@@ -56,6 +56,18 @@ service EpochDB {
   rpc SearchTransactionsByAddress(SearchRequest) returns (SearchResponse);
   rpc GetContractCreator(ContractCreatorRequest) returns (ContractCreatorResponse);
 
+  // The posting-list log reads (rpc/tokens.go): what eth_getLogs cannot
+  // answer in one bounded call. Keyset-paged over TxNum like the search;
+  // the page is cut on transactions, never inside one.
+  rpc GetLogsByEmitter(LogsByEmitterRequest) returns (PagedLogsResponse);
+  rpc GetLogsByTopicValue(LogsByTopicValueRequest) returns (PagedLogsResponse);
+  rpc GetTopicGroups(TopicGroupsRequest) returns (TopicGroupsResponse);
+  // The ERC-20/721/1155 shortcuts: fixed signatures and positions over the two
+  // reads above. standard is erc20 | erc721 | erc1155.
+  rpc GetTokenTransfersByHolder(TokenTransfersRequest) returns (PagedLogsResponse);
+  rpc GetTokenTransfersByContract(TokenTransfersRequest) returns (PagedLogsResponse);
+  rpc GetTokenContracts(TokenContractsRequest) returns (TokenContractsResponse);
+
   rpc GetFeeHistory(FeeHistoryRequest) returns (FeeHistoryResponse);
   // GetGasPrice is the whole fee-suggestion surface out of one sample.
   rpc GetGasPrice(GasPriceRequest) returns (GasPriceResponse);
@@ -285,6 +297,68 @@ message ContractCreatorResponse {
   bool found = 1;
   bytes tx_hash = 2;
   bytes creator = 3;
+}
+
+message Page {
+  uint64 cursor = 1;  // TxNum to continue from (inclusive); 0 = the end the walk starts at
+  uint32 limit = 2;   // transactions per page, capped at 1000
+  bool ascending = 3;
+}
+
+message LogsByEmitterRequest {
+  bytes emitter = 1;
+  bytes topic0 = 2;  // empty: any signature
+  Page page = 3;
+}
+
+message LogsByTopicValueRequest {
+  bytes value = 1;
+  bytes topic0 = 2;     // empty: any signature
+  uint32 positions = 3; // bitmask of topic positions 1..3 (1, 2, 4); 0: any
+  Page page = 4;
+}
+
+message PagedLogsResponse {
+  repeated Log logs = 1;
+  bool more = 2;
+  uint64 next_cursor = 3;
+}
+
+message TopicGroupsRequest {
+  bytes value = 1;
+  bytes topic0 = 2;
+}
+
+message TopicGroup {
+  bytes topic0 = 1;
+  bytes emitter = 2;
+  uint64 first_tx_num = 3;
+  uint64 last_tx_num = 4;
+}
+
+message TopicGroupsResponse {
+  repeated TopicGroup groups = 1;
+}
+
+message TokenTransfersRequest {
+  bytes address = 1;   // the holder, or the token contract
+  string standard = 2; // erc20 | erc721 | erc1155
+  Page page = 3;
+}
+
+message TokenContractsRequest {
+  bytes address = 1;
+}
+
+message TokenContract {
+  string standard = 1;
+  bytes token = 2;
+  uint64 first_tx_num = 3;
+  uint64 last_tx_num = 4;
+}
+
+message TokenContractsResponse {
+  repeated TokenContract contracts = 1;
 }
 
 message LogsRequest {

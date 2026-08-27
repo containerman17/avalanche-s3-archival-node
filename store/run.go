@@ -57,7 +57,9 @@ func (f *Footer) encode() []byte {
 	return append(b, runMagic...)
 }
 
-func decodeFooter(b []byte) (*Footer, error) {
+func decodeFooter(b []byte) (*Footer, error) { return decodeFooterVersion(b, StorageVersion) }
+
+func decodeFooterVersion(b []byte, version uint32) (*Footer, error) {
 	if len(b) != footerSize {
 		return nil, fmt.Errorf("store: footer is %d bytes, want %d", len(b), footerSize)
 	}
@@ -74,8 +76,8 @@ func decodeFooter(b []byte) (*Footer, error) {
 	copy(f.Prev[:], p)
 	p = p[32:]
 	f.Version = binary.BigEndian.Uint32(p)
-	if f.Version != StorageVersion {
-		return nil, fmt.Errorf("store: run is storage version %d, this binary is %d", f.Version, StorageVersion)
+	if f.Version != version {
+		return nil, fmt.Errorf("store: run is storage version %d, want %d", f.Version, version)
 	}
 	return &f, nil
 }
@@ -173,6 +175,35 @@ func (w *RunWriter) End() error {
 	return nil
 }
 
+// CopySection writes section s as the verbatim bytes [off, off+n) of blob: an
+// SST section that is byte-identical between two storage versions goes through
+// the hasher and onto disk without being decoded (the migrator's chain and
+// state sections).
+func (w *RunWriter) CopySection(s Section, blob *dist.Blob, off, n uint64) error {
+	if s != w.cur+1 {
+		return fmt.Errorf("store: section %v out of order", s)
+	}
+	w.cur = s
+	w.footer.Off[s], w.footer.Len[s] = w.off, n
+	const piece = 4 << 20
+	for done := uint64(0); done < n; {
+		k := min(uint64(piece), n-done)
+		b, err := blob.Read(off+done, k)
+		if err != nil {
+			return err
+		}
+		if _, err := w.h.Write(b); err != nil {
+			return err
+		}
+		if _, err := w.bw.Write(b); err != nil {
+			return err
+		}
+		done += k
+	}
+	w.off += n
+	return nil
+}
+
 // Finish writes the footer, fsyncs, and hands the file to the artifact store
 // under the name its hash list commits to.
 //
@@ -255,7 +286,17 @@ func (r *Run) drop() {
 }
 
 // OpenRun opens the named run out of the artifact store.
-func OpenRun(cas *dist.Store, name RunName) (*Run, error) { return openRun(cas, name, nil) }
+func OpenRun(cas *dist.Store, name RunName) (*Run, error) {
+	return openRunVersion(cas, name, nil, StorageVersion)
+}
+
+// OpenRunVersion opens a run written by an OLDER storage version, for the
+// migrator only: the SST sections read the same, and the caller knows which
+// keys and values it is looking at. Blooms of an old lookup section were built
+// under the old split and must not be probed.
+func OpenRunVersion(cas *dist.Store, name RunName, version uint32) (*Run, error) {
+	return openRunVersion(cas, name, nil, version)
+}
 
 // ReopenRun opens the run again over whatever the artifact store hands out NOW,
 // carrying the old handle's resident bytes across so the reopen reads nothing:
@@ -266,9 +307,11 @@ func OpenRun(cas *dist.Store, name RunName) (*Run, error) { return openRun(cas, 
 // local copy the old handle still had open. That handle keeps the file's blocks
 // allocated until it closes, so the run has to move onto the chunk cache, which
 // is exactly where every other node reads it from.
-func ReopenRun(cas *dist.Store, old *Run) (*Run, error) { return openRun(cas, old.Name, old) }
+func ReopenRun(cas *dist.Store, old *Run) (*Run, error) {
+	return openRunVersion(cas, old.Name, old, StorageVersion)
+}
 
-func openRun(cas *dist.Store, name RunName, seed *Run) (*Run, error) {
+func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*Run, error) {
 	blob, err := cas.Open(name)
 	if err != nil {
 		return nil, err
@@ -286,7 +329,7 @@ func openRun(cas *dist.Store, name RunName, seed *Run) (*Run, error) {
 			blob.Close()
 			return nil, err
 		}
-		if r.Footer, err = decodeFooter(fb); err != nil {
+		if r.Footer, err = decodeFooterVersion(fb, version); err != nil {
 			blob.Close()
 			return nil, fmt.Errorf("store: run %s: %w", name, err)
 		}

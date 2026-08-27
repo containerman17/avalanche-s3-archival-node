@@ -791,6 +791,113 @@ func TestAdapterEquivalenceFullSurface(t *testing.T) {
 		t.Fatalf("transaction stream on block %d: %d transactions, block holds %d", height, seen, len(jhashes))
 	}
 
+	// --- the posting-list log reads, across all four peers -------------------
+	// Driven by a real log of the range: its emitter, its signature and (when
+	// it has one) the value at topic 1, so every read has something to find.
+	plain := httptest.NewServer(plainhttp.Handler(n))
+	defer plain.Close()
+	if len(want) > 0 {
+		l := want[0]
+		emitter, sig := l.Address, l.Topics[0]
+		lib, err := n.Core().LogsByEmitter(emitter, &sig, 0, 5, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		g, err := gc.GetLogsByEmitter(ctx, &grpcapi.LogsByEmitterRequest{Emitter: emitter.Bytes(), Topic0: sig.Bytes(), Page: &grpcapi.Page{Limit: 5}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pl := httpGet(t, plain, "getLogsByEmitter", url.Values{"emitter": {emitter.Hex()}, "topic0": {sig.Hex()}, "limit": {"5"}})
+		var jl map[string]any
+		json.Unmarshal(jsonRPC(t, jrpc, "edb_getLogsByEmitter", map[string]any{"emitter": emitter, "topic0": sig, "limit": 5}), &jl)
+		if len(g.Logs) != len(lib.Logs) || len(pl["logs"].([]any)) != len(lib.Logs) || len(jl["logs"].([]any)) != len(lib.Logs) || g.More != lib.More || jl["more"] != lib.More {
+			t.Fatalf("logs by emitter %s: library %d/%v, gRPC %d/%v, plain %d, JSON-RPC %d/%v",
+				emitter, len(lib.Logs), lib.More, len(g.Logs), g.More, len(pl["logs"].([]any)), len(jl["logs"].([]any)), jl["more"])
+		}
+		for i, x := range lib.Logs {
+			if !bytes.Equal(g.Logs[i].TxHash, x.TxHash.Bytes()) || g.Logs[i].Index != uint32(x.Index) {
+				t.Fatalf("logs by emitter row %d: gRPC %x/%d, library %s/%d", i, g.Logs[i].TxHash, g.Logs[i].Index, x.TxHash, x.Index)
+			}
+		}
+		if len(l.Topics) > 1 {
+			value := l.Topics[1]
+			libV, err := n.Core().LogsByTopicValue(value, nil, 0, 0, 5, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gv, err := gc.GetLogsByTopicValue(ctx, &grpcapi.LogsByTopicValueRequest{Value: value.Bytes(), Page: &grpcapi.Page{Limit: 5}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pv := httpGet(t, plain, "getLogsByTopicValue", url.Values{"value": {value.Hex()}, "limit": {"5"}})
+			var jv map[string]any
+			json.Unmarshal(jsonRPC(t, jrpc, "edb_getLogsByTopicValue", map[string]any{"value": value, "limit": 5}), &jv)
+			if len(gv.Logs) != len(libV.Logs) || len(pv["logs"].([]any)) != len(libV.Logs) || len(jv["logs"].([]any)) != len(libV.Logs) {
+				t.Fatalf("logs by topic value %s: library %d, gRPC %d, plain %d, JSON-RPC %d",
+					value, len(libV.Logs), len(gv.Logs), len(pv["logs"].([]any)), len(jv["logs"].([]any)))
+			}
+			libG, err := n.Core().TopicGroups(value, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gg, err := gc.GetTopicGroups(ctx, &grpcapi.TopicGroupsRequest{Value: value.Bytes()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pg := httpGet(t, plain, "getTopicGroups", url.Values{"value": {value.Hex()}})
+			var jg []any
+			json.Unmarshal(jsonRPC(t, jrpc, "edb_getTopicGroups", map[string]any{"value": value}), &jg)
+			if len(gg.Groups) != len(libG) || len(pg["groups"].([]any)) != len(libG) || len(jg) != len(libG) {
+				t.Fatalf("topic groups of %s: library %d, gRPC %d, plain %d, JSON-RPC %d", value, len(libG), len(gg.Groups), len(pg["groups"].([]any)), len(jg))
+			}
+			// The token shortcuts, on the holder the value spells (a Transfer
+			// makes it one; anything else answers empty on every peer alike).
+			holder := common.BytesToAddress(value.Bytes())
+			for _, std := range []string{"erc20", "erc721", "erc1155"} {
+				libT, err := n.Core().TokenTransfersByHolder(holder, std, 0, 5, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gt, err := gc.GetTokenTransfersByHolder(ctx, &grpcapi.TokenTransfersRequest{Address: holder.Bytes(), Standard: std, Page: &grpcapi.Page{Limit: 5}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pt := httpGet(t, plain, "getTokenTransfersByHolder", url.Values{"address": {holder.Hex()}, "standard": {std}, "limit": {"5"}})
+				var jt map[string]any
+				json.Unmarshal(jsonRPC(t, jrpc, "edb_getTokenTransfersByHolder", map[string]any{"address": holder, "standard": std, "limit": 5}), &jt)
+				if len(gt.Logs) != len(libT.Logs) || len(pt["logs"].([]any)) != len(libT.Logs) || len(jt["logs"].([]any)) != len(libT.Logs) {
+					t.Fatalf("%s transfers of %s: library %d, gRPC %d, plain %d, JSON-RPC %d", std, holder, len(libT.Logs), len(gt.Logs), len(pt["logs"].([]any)), len(jt["logs"].([]any)))
+				}
+				libC, err := n.Core().TokenTransfersByContract(emitter, std, 0, 5, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gcs, err := gc.GetTokenTransfersByContract(ctx, &grpcapi.TokenTransfersRequest{Address: emitter.Bytes(), Standard: std, Page: &grpcapi.Page{Limit: 5}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pc := httpGet(t, plain, "getTokenTransfersByContract", url.Values{"token": {emitter.Hex()}, "standard": {std}, "limit": {"5"}})
+				if len(gcs.Logs) != len(libC.Logs) || len(pc["logs"].([]any)) != len(libC.Logs) {
+					t.Fatalf("%s transfers by %s: library %d, gRPC %d, plain %d", std, emitter, len(libC.Logs), len(gcs.Logs), len(pc["logs"].([]any)))
+				}
+			}
+			libK, err := n.Core().TokenContracts(holder)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gk, err := gc.GetTokenContracts(ctx, &grpcapi.TokenContractsRequest{Address: holder.Bytes()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pk := httpGet(t, plain, "getTokenContracts", url.Values{"address": {holder.Hex()}})
+			var jk []any
+			json.Unmarshal(jsonRPC(t, jrpc, "edb_getTokenContracts", map[string]any{"address": holder}), &jk)
+			if len(gk.Contracts) != len(libK) || len(pk["contracts"].([]any)) != len(libK) || len(jk) != len(libK) {
+				t.Fatalf("token contracts of %s: library %d, gRPC %d, plain %d, JSON-RPC %d", holder, len(libK), len(gk.Contracts), len(pk["contracts"].([]any)), len(jk))
+			}
+		}
+	}
+
 	t.Logf("gRPC and JSON-RPC agree on the whole surface at head %d: block %d, tx %s, contract %s, %d streamed logs",
 		head.Number, height, txHash, to, len(streamed))
 }
@@ -1029,7 +1136,8 @@ func TestPlainHTTPAcceptsEveryParameterEncoding(t *testing.T) {
 	// The index is the discovery surface, and it names every method.
 	idx := decode(http.Get(srv.URL + "/"))
 	for _, m := range []string{"head", "getBlock", "getTransaction", "call", "getState",
-		"searchTransactionsByAddress", "getLogs"} {
+		"searchTransactionsByAddress", "getLogs", "getLogsByEmitter", "getLogsByTopicValue", "getTopicGroups",
+		"getTokenTransfersByHolder", "getTokenTransfersByContract", "getTokenContracts"} {
 		if _, ok := idx[m]; !ok {
 			t.Fatalf("GET / does not list %s: %v", m, idx)
 		}

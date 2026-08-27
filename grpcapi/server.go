@@ -582,6 +582,78 @@ func (s *Server) SearchTransactionsByAddress(_ context.Context, req *SearchReque
 	return out, nil
 }
 
+// --- the posting-list log reads ---------------------------------------------
+
+func pageOf(p *Page) (cursor uint64, limit int, desc bool) {
+	if p == nil {
+		return 0, 0, true
+	}
+	return p.Cursor, int(p.Limit), !p.Ascending
+}
+
+func optHash(b []byte) *common.Hash {
+	if len(b) == 0 {
+		return nil
+	}
+	h := common.BytesToHash(b)
+	return &h
+}
+
+func pagedPB(p *rpc.PagedLogs, err error) (*PagedLogsResponse, error) {
+	if err != nil {
+		return nil, readErr(err)
+	}
+	out := &PagedLogsResponse{More: p.More, NextCursor: p.NextCursor}
+	for _, l := range p.Logs {
+		out.Logs = append(out.Logs, logPB(l))
+	}
+	return out, nil
+}
+
+func (s *Server) GetLogsByEmitter(_ context.Context, req *LogsByEmitterRequest) (*PagedLogsResponse, error) {
+	cursor, limit, desc := pageOf(req.Page)
+	return pagedPB(s.n.Core().LogsByEmitter(common.BytesToAddress(req.Emitter), optHash(req.Topic0), cursor, limit, desc))
+}
+
+func (s *Server) GetLogsByTopicValue(_ context.Context, req *LogsByTopicValueRequest) (*PagedLogsResponse, error) {
+	cursor, limit, desc := pageOf(req.Page)
+	return pagedPB(s.n.Core().LogsByTopicValue(common.BytesToHash(req.Value), optHash(req.Topic0), byte(req.Positions), cursor, limit, desc))
+}
+
+func (s *Server) GetTopicGroups(_ context.Context, req *TopicGroupsRequest) (*TopicGroupsResponse, error) {
+	groups, err := s.n.Core().TopicGroups(common.BytesToHash(req.Value), optHash(req.Topic0))
+	if err != nil {
+		return nil, readErr(err)
+	}
+	out := &TopicGroupsResponse{}
+	for _, g := range groups {
+		out.Groups = append(out.Groups, &TopicGroup{Topic0: g.Topic0.Bytes(), Emitter: g.Emitter.Bytes(), FirstTxNum: g.First, LastTxNum: g.Last})
+	}
+	return out, nil
+}
+
+func (s *Server) GetTokenTransfersByHolder(_ context.Context, req *TokenTransfersRequest) (*PagedLogsResponse, error) {
+	cursor, limit, desc := pageOf(req.Page)
+	return pagedPB(s.n.Core().TokenTransfersByHolder(common.BytesToAddress(req.Address), req.Standard, cursor, limit, desc))
+}
+
+func (s *Server) GetTokenTransfersByContract(_ context.Context, req *TokenTransfersRequest) (*PagedLogsResponse, error) {
+	cursor, limit, desc := pageOf(req.Page)
+	return pagedPB(s.n.Core().TokenTransfersByContract(common.BytesToAddress(req.Address), req.Standard, cursor, limit, desc))
+}
+
+func (s *Server) GetTokenContracts(_ context.Context, req *TokenContractsRequest) (*TokenContractsResponse, error) {
+	cs, err := s.n.Core().TokenContracts(common.BytesToAddress(req.Address))
+	if err != nil {
+		return nil, readErr(err)
+	}
+	out := &TokenContractsResponse{}
+	for _, c := range cs {
+		out.Contracts = append(out.Contracts, &TokenContract{Standard: c.Standard, Token: c.Token.Bytes(), FirstTxNum: c.First, LastTxNum: c.Last})
+	}
+	return out, nil
+}
+
 // logMatchers is the request's filter in core terms, shared by the one-shot
 // query and the stream so the two cannot match differently.
 func logMatchers(req *LogsRequest) ([]common.Address, [][]common.Hash) {

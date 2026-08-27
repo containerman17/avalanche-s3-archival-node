@@ -688,11 +688,15 @@ func (d *DB) writeSections(w *RunWriter, m *memtable) error {
 	if err := w.Begin(SecLookup); err != nil {
 		return err
 	}
-	rows := chunkPostings(m.post)
+	var set postSet
+	for _, p := range m.post {
+		set.add(p.group, p.txnum, p.payload)
+	}
+	rows := set.chunks()
 	for k, n := range m.nums {
 		rows = append(rows, kv{[]byte(k), beU64(n)})
 	}
-	sort.Slice(rows, func(i, j int) bool { return string(rows[i].key) < string(rows[j].key) })
+	sortKV(rows)
 	for _, r := range rows {
 		if err := w.Set(r.key, r.val); err != nil {
 			return err

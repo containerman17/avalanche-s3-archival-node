@@ -634,22 +634,9 @@ func (m *memtable) add(b *BlockWrite) error {
 		}
 		for _, l := range t.Logs {
 			role(l.Emitter, RoleEmitter)
-			topic0 := zeroHash[:]
-			if len(l.Topics) > 0 {
-				topic0 = l.Topics[0]
-				post[string(SigGroup(topic0))] |= 0
-			}
-			post[string(ELogGroup(l.Emitter, topic0))] |= 0
-			for i := 1; i < len(l.Topics) && i <= 3; i++ {
-				post[string(TValGroup(l.Topics[i], topic0))] |= 1 << (i - 1)
-			}
+			logPostings(post, l.Emitter, l.Topics)
 		}
-		groups := make([]string, 0, len(post))
-		for g := range post {
-			groups = append(groups, g)
-		}
-		sort.Strings(groups)
-		for _, g := range groups {
+		for _, g := range sortedKeys(post) {
 			if err := m.postRow([]byte(g), n, post[g]); err != nil {
 				return err
 			}
@@ -725,6 +712,29 @@ func (m *memtable) postRow(group []byte, txnum uint64, payload byte) error {
 }
 
 var zeroHash [32]byte
+
+// logPostings adds one log's elog/, sig/ and tval/ groups to post, OR-ing the
+// position bits. A topic-less log files under the zero hash in elog/ only.
+func logPostings(post map[string]byte, emitter []byte, topics [][]byte) {
+	topic0 := zeroHash[:]
+	if len(topics) > 0 {
+		topic0 = topics[0]
+		post[string(SigGroup(topic0))] |= 0
+	}
+	post[string(ELogGroup(emitter, topic0))] |= 0
+	for i := 1; i < len(topics) && i <= 3; i++ {
+		post[string(TValGroup(topics[i], topic0))] |= 1 << (i - 1)
+	}
+}
+
+func sortedKeys(m map[string]byte) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // ---------------------------------------------------------------------------
 // reads

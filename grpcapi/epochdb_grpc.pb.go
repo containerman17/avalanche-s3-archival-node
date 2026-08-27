@@ -55,6 +55,12 @@ const (
 	EpochDB_StreamTransactions_FullMethodName          = "/epochdb.v0.EpochDB/StreamTransactions"
 	EpochDB_SearchTransactionsByAddress_FullMethodName = "/epochdb.v0.EpochDB/SearchTransactionsByAddress"
 	EpochDB_GetContractCreator_FullMethodName          = "/epochdb.v0.EpochDB/GetContractCreator"
+	EpochDB_GetLogsByEmitter_FullMethodName            = "/epochdb.v0.EpochDB/GetLogsByEmitter"
+	EpochDB_GetLogsByTopicValue_FullMethodName         = "/epochdb.v0.EpochDB/GetLogsByTopicValue"
+	EpochDB_GetTopicGroups_FullMethodName              = "/epochdb.v0.EpochDB/GetTopicGroups"
+	EpochDB_GetTokenTransfersByHolder_FullMethodName   = "/epochdb.v0.EpochDB/GetTokenTransfersByHolder"
+	EpochDB_GetTokenTransfersByContract_FullMethodName = "/epochdb.v0.EpochDB/GetTokenTransfersByContract"
+	EpochDB_GetTokenContracts_FullMethodName           = "/epochdb.v0.EpochDB/GetTokenContracts"
 	EpochDB_GetFeeHistory_FullMethodName               = "/epochdb.v0.EpochDB/GetFeeHistory"
 	EpochDB_GetGasPrice_FullMethodName                 = "/epochdb.v0.EpochDB/GetGasPrice"
 )
@@ -88,6 +94,17 @@ type EpochDBClient interface {
 	StreamTransactions(ctx context.Context, in *StreamTransactionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TransactionBatch], error)
 	SearchTransactionsByAddress(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
 	GetContractCreator(ctx context.Context, in *ContractCreatorRequest, opts ...grpc.CallOption) (*ContractCreatorResponse, error)
+	// The posting-list log reads (rpc/tokens.go): what eth_getLogs cannot
+	// answer in one bounded call. Keyset-paged over TxNum like the search;
+	// the page is cut on transactions, never inside one.
+	GetLogsByEmitter(ctx context.Context, in *LogsByEmitterRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error)
+	GetLogsByTopicValue(ctx context.Context, in *LogsByTopicValueRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error)
+	GetTopicGroups(ctx context.Context, in *TopicGroupsRequest, opts ...grpc.CallOption) (*TopicGroupsResponse, error)
+	// The ERC-20/721/1155 shortcuts: fixed signatures and positions over the two
+	// reads above. standard is erc20 | erc721 | erc1155.
+	GetTokenTransfersByHolder(ctx context.Context, in *TokenTransfersRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error)
+	GetTokenTransfersByContract(ctx context.Context, in *TokenTransfersRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error)
+	GetTokenContracts(ctx context.Context, in *TokenContractsRequest, opts ...grpc.CallOption) (*TokenContractsResponse, error)
 	GetFeeHistory(ctx context.Context, in *FeeHistoryRequest, opts ...grpc.CallOption) (*FeeHistoryResponse, error)
 	// GetGasPrice is the whole fee-suggestion surface out of one sample.
 	GetGasPrice(ctx context.Context, in *GasPriceRequest, opts ...grpc.CallOption) (*GasPriceResponse, error)
@@ -268,6 +285,66 @@ func (c *epochDBClient) GetContractCreator(ctx context.Context, in *ContractCrea
 	return out, nil
 }
 
+func (c *epochDBClient) GetLogsByEmitter(ctx context.Context, in *LogsByEmitterRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PagedLogsResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetLogsByEmitter_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetLogsByTopicValue(ctx context.Context, in *LogsByTopicValueRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PagedLogsResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetLogsByTopicValue_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetTopicGroups(ctx context.Context, in *TopicGroupsRequest, opts ...grpc.CallOption) (*TopicGroupsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TopicGroupsResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetTopicGroups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetTokenTransfersByHolder(ctx context.Context, in *TokenTransfersRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PagedLogsResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetTokenTransfersByHolder_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetTokenTransfersByContract(ctx context.Context, in *TokenTransfersRequest, opts ...grpc.CallOption) (*PagedLogsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PagedLogsResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetTokenTransfersByContract_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *epochDBClient) GetTokenContracts(ctx context.Context, in *TokenContractsRequest, opts ...grpc.CallOption) (*TokenContractsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TokenContractsResponse)
+	err := c.cc.Invoke(ctx, EpochDB_GetTokenContracts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *epochDBClient) GetFeeHistory(ctx context.Context, in *FeeHistoryRequest, opts ...grpc.CallOption) (*FeeHistoryResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FeeHistoryResponse)
@@ -317,6 +394,17 @@ type EpochDBServer interface {
 	StreamTransactions(*StreamTransactionsRequest, grpc.ServerStreamingServer[TransactionBatch]) error
 	SearchTransactionsByAddress(context.Context, *SearchRequest) (*SearchResponse, error)
 	GetContractCreator(context.Context, *ContractCreatorRequest) (*ContractCreatorResponse, error)
+	// The posting-list log reads (rpc/tokens.go): what eth_getLogs cannot
+	// answer in one bounded call. Keyset-paged over TxNum like the search;
+	// the page is cut on transactions, never inside one.
+	GetLogsByEmitter(context.Context, *LogsByEmitterRequest) (*PagedLogsResponse, error)
+	GetLogsByTopicValue(context.Context, *LogsByTopicValueRequest) (*PagedLogsResponse, error)
+	GetTopicGroups(context.Context, *TopicGroupsRequest) (*TopicGroupsResponse, error)
+	// The ERC-20/721/1155 shortcuts: fixed signatures and positions over the two
+	// reads above. standard is erc20 | erc721 | erc1155.
+	GetTokenTransfersByHolder(context.Context, *TokenTransfersRequest) (*PagedLogsResponse, error)
+	GetTokenTransfersByContract(context.Context, *TokenTransfersRequest) (*PagedLogsResponse, error)
+	GetTokenContracts(context.Context, *TokenContractsRequest) (*TokenContractsResponse, error)
 	GetFeeHistory(context.Context, *FeeHistoryRequest) (*FeeHistoryResponse, error)
 	// GetGasPrice is the whole fee-suggestion surface out of one sample.
 	GetGasPrice(context.Context, *GasPriceRequest) (*GasPriceResponse, error)
@@ -371,6 +459,24 @@ func (UnimplementedEpochDBServer) SearchTransactionsByAddress(context.Context, *
 }
 func (UnimplementedEpochDBServer) GetContractCreator(context.Context, *ContractCreatorRequest) (*ContractCreatorResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetContractCreator not implemented")
+}
+func (UnimplementedEpochDBServer) GetLogsByEmitter(context.Context, *LogsByEmitterRequest) (*PagedLogsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLogsByEmitter not implemented")
+}
+func (UnimplementedEpochDBServer) GetLogsByTopicValue(context.Context, *LogsByTopicValueRequest) (*PagedLogsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLogsByTopicValue not implemented")
+}
+func (UnimplementedEpochDBServer) GetTopicGroups(context.Context, *TopicGroupsRequest) (*TopicGroupsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTopicGroups not implemented")
+}
+func (UnimplementedEpochDBServer) GetTokenTransfersByHolder(context.Context, *TokenTransfersRequest) (*PagedLogsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTokenTransfersByHolder not implemented")
+}
+func (UnimplementedEpochDBServer) GetTokenTransfersByContract(context.Context, *TokenTransfersRequest) (*PagedLogsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTokenTransfersByContract not implemented")
+}
+func (UnimplementedEpochDBServer) GetTokenContracts(context.Context, *TokenContractsRequest) (*TokenContractsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTokenContracts not implemented")
 }
 func (UnimplementedEpochDBServer) GetFeeHistory(context.Context, *FeeHistoryRequest) (*FeeHistoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetFeeHistory not implemented")
@@ -630,6 +736,114 @@ func _EpochDB_GetContractCreator_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EpochDB_GetLogsByEmitter_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LogsByEmitterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetLogsByEmitter(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetLogsByEmitter_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetLogsByEmitter(ctx, req.(*LogsByEmitterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetLogsByTopicValue_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LogsByTopicValueRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetLogsByTopicValue(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetLogsByTopicValue_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetLogsByTopicValue(ctx, req.(*LogsByTopicValueRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetTopicGroups_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TopicGroupsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetTopicGroups(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetTopicGroups_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetTopicGroups(ctx, req.(*TopicGroupsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetTokenTransfersByHolder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TokenTransfersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetTokenTransfersByHolder(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetTokenTransfersByHolder_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetTokenTransfersByHolder(ctx, req.(*TokenTransfersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetTokenTransfersByContract_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TokenTransfersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetTokenTransfersByContract(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetTokenTransfersByContract_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetTokenTransfersByContract(ctx, req.(*TokenTransfersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EpochDB_GetTokenContracts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TokenContractsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EpochDBServer).GetTokenContracts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EpochDB_GetTokenContracts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EpochDBServer).GetTokenContracts(ctx, req.(*TokenContractsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _EpochDB_GetFeeHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(FeeHistoryRequest)
 	if err := dec(in); err != nil {
@@ -716,6 +930,30 @@ var EpochDB_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetContractCreator",
 			Handler:    _EpochDB_GetContractCreator_Handler,
+		},
+		{
+			MethodName: "GetLogsByEmitter",
+			Handler:    _EpochDB_GetLogsByEmitter_Handler,
+		},
+		{
+			MethodName: "GetLogsByTopicValue",
+			Handler:    _EpochDB_GetLogsByTopicValue_Handler,
+		},
+		{
+			MethodName: "GetTopicGroups",
+			Handler:    _EpochDB_GetTopicGroups_Handler,
+		},
+		{
+			MethodName: "GetTokenTransfersByHolder",
+			Handler:    _EpochDB_GetTokenTransfersByHolder_Handler,
+		},
+		{
+			MethodName: "GetTokenTransfersByContract",
+			Handler:    _EpochDB_GetTokenTransfersByContract_Handler,
+		},
+		{
+			MethodName: "GetTokenContracts",
+			Handler:    _EpochDB_GetTokenContracts_Handler,
 		},
 		{
 			MethodName: "GetFeeHistory",

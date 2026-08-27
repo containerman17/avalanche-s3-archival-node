@@ -511,6 +511,9 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		if res, rerr, ok := s.otsDispatch(req.Method, req.Params); ok {
 			return res, rerr
 		}
+		if res, rerr, ok := s.edbDispatch(req.Method, req.Params); ok {
+			return res, rerr
+		}
 		if ns, _, ok := strings.Cut(req.Method, "_"); ok {
 			switch ns {
 			case "personal", "miner", "admin", "les", "clique", "ethash":

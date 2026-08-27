@@ -150,6 +150,7 @@ var devCommands = map[string]func([]string){
 	"rpcdiff": rpcdiffMain,
 	"probe":   probeMain,
 	"publish": publishMain,
+	"migrate": migrateMain,
 }
 
 func main() {

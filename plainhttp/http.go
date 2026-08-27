@@ -44,6 +44,14 @@ var methods = map[string]method{
 	"getState":                    {"address, slot, height, withCode", getState},
 	"searchTransactionsByAddress": {"address, cursor, limit, ascending", search},
 	"getLogs":                     {"fromBlock, toBlock, address, topic0..topic3", getLogs},
+	// The posting-list log reads (rpc/tokens.go): keyset-paged over TxNum
+	// like searchTransactionsByAddress, the page cut on transactions.
+	"getLogsByEmitter":            {"emitter, topic0, cursor, limit, ascending", logsByEmitter},
+	"getLogsByTopicValue":         {"value, topic0, positions, cursor, limit, ascending", logsByTopicValue},
+	"getTopicGroups":              {"value, topic0", topicGroups},
+	"getTokenTransfersByHolder":   {"address, standard, cursor, limit, ascending", tokenTransfersByHolder},
+	"getTokenTransfersByContract": {"token, standard, cursor, limit, ascending", tokenTransfersByContract},
+	"getTokenContracts":           {"address", tokenContracts},
 }
 
 // Handler serves the method set under its own prefix. The caller strips the
@@ -518,6 +526,134 @@ func roleNames(bits byte) []string {
 		}
 	}
 	return out
+}
+
+// page reads the keyset paging triple every posting-list read takes.
+func page(p params) (cursor uint64, limit int, desc bool, err error) {
+	if cursor, err = p.num("cursor"); err != nil {
+		return 0, 0, false, fmt.Errorf("cursor: %v", err)
+	}
+	l, err := p.num("limit")
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("limit: %v", err)
+	}
+	return cursor, int(l), !p.flag("ascending"), nil
+}
+
+func optTopic0(p params) (*common.Hash, error) {
+	if !p.has("topic0") {
+		return nil, nil
+	}
+	h, err := p.hash("topic0")
+	if err != nil {
+		return nil, fmt.Errorf("topic0: %v", err)
+	}
+	return &h, nil
+}
+
+func pagedOut(pg *rpc.PagedLogs, err error) (any, error) {
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{"logs": pg.Logs, "more": pg.More}
+	if pg.More {
+		out["nextCursor"] = pg.NextCursor
+	}
+	return out, nil
+}
+
+func logsByEmitter(n *epochdb.Node, p params) (any, error) {
+	emitter, err := p.addr("emitter")
+	if err != nil {
+		return nil, err
+	}
+	topic0, err := optTopic0(p)
+	if err != nil {
+		return nil, err
+	}
+	cursor, limit, desc, err := page(p)
+	if err != nil {
+		return nil, err
+	}
+	return pagedOut(n.Core().LogsByEmitter(emitter, topic0, cursor, limit, desc))
+}
+
+func logsByTopicValue(n *epochdb.Node, p params) (any, error) {
+	value, err := p.hash("value")
+	if err != nil {
+		return nil, err
+	}
+	topic0, err := optTopic0(p)
+	if err != nil {
+		return nil, err
+	}
+	positions, err := p.num("positions")
+	if err != nil {
+		return nil, fmt.Errorf("positions: %v", err)
+	}
+	cursor, limit, desc, err := page(p)
+	if err != nil {
+		return nil, err
+	}
+	return pagedOut(n.Core().LogsByTopicValue(value, topic0, byte(positions), cursor, limit, desc))
+}
+
+func topicGroups(n *epochdb.Node, p params) (any, error) {
+	value, err := p.hash("value")
+	if err != nil {
+		return nil, err
+	}
+	topic0, err := optTopic0(p)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := n.Core().TopicGroups(value, topic0)
+	if err != nil {
+		return nil, err
+	}
+	if groups == nil {
+		groups = []rpc.TopicGroup{}
+	}
+	return map[string]any{"groups": groups}, nil
+}
+
+func tokenTransfersByHolder(n *epochdb.Node, p params) (any, error) {
+	addr, err := p.addr("address")
+	if err != nil {
+		return nil, err
+	}
+	cursor, limit, desc, err := page(p)
+	if err != nil {
+		return nil, err
+	}
+	return pagedOut(n.Core().TokenTransfersByHolder(addr, p.str("standard"), cursor, limit, desc))
+}
+
+func tokenTransfersByContract(n *epochdb.Node, p params) (any, error) {
+	token, err := p.addr("token")
+	if err != nil {
+		return nil, err
+	}
+	cursor, limit, desc, err := page(p)
+	if err != nil {
+		return nil, err
+	}
+	return pagedOut(n.Core().TokenTransfersByContract(token, p.str("standard"), cursor, limit, desc))
+}
+
+func tokenContracts(n *epochdb.Node, p params) (any, error) {
+	addr, err := p.addr("address")
+	if err != nil {
+		return nil, err
+	}
+	cs, err := n.Core().TokenContracts(addr)
+	if err != nil {
+		return nil, err
+	}
+	if cs == nil {
+		cs = []rpc.TokenContract{}
+	}
+	return map[string]any{"contracts": cs}, nil
 }
 
 func getLogs(n *epochdb.Node, p params) (any, error) {
