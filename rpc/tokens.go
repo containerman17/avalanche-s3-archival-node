@@ -85,11 +85,11 @@ func (s *Server) TopicGroups(value common.Hash, topic0 *common.Hash) ([]TopicGro
 		em common.Address
 	}
 	groups := map[key]*TopicGroup{}
-	w := &txLogs{s: s}
+	var fail error
 	err := s.db.Postings(prefix, 0, ^uint64(0), func(txnum uint64, _ byte) bool {
-		logs, rerr := w.at(txnum)
-		if rerr != nil {
-			w.fail = rerr
+		logs, err := s.txLogsBare(txnum)
+		if err != nil {
+			fail = err
 			return false
 		}
 		for _, l := range logs {
@@ -106,8 +106,8 @@ func (s *Server) TopicGroups(value common.Hash, topic0 *common.Hash) ([]TopicGro
 		}
 		return true
 	})
-	if err == nil && w.fail != nil {
-		err = w.fail.error()
+	if err == nil {
+		err = fail
 	}
 	if err != nil {
 		return nil, err
@@ -210,14 +210,14 @@ func (s *Server) TokenContracts(holder common.Address) ([]TokenContract, error) 
 		for _, sig := range st.sigs {
 			sig := sig
 			prefix := store.TValGroup(value[:], sig[:])
-			w := &txLogs{s: s}
+			var fail error
 			err := s.db.Postings(prefix, 0, ^uint64(0), func(txnum uint64, pos byte) bool {
 				if pos&st.positions == 0 {
 					return true
 				}
-				logs, rerr := w.at(txnum)
-				if rerr != nil {
-					w.fail = rerr
+				logs, err := s.txLogsBare(txnum)
+				if err != nil {
+					fail = err
 					return false
 				}
 				for _, l := range logs {
@@ -235,8 +235,8 @@ func (s *Server) TokenContracts(holder common.Address) ([]TokenContract, error) 
 				}
 				return true
 			})
-			if err == nil && w.fail != nil {
-				err = w.fail.error()
+			if err == nil {
+				err = fail
 			}
 			if err != nil {
 				return nil, err
@@ -244,6 +244,30 @@ func (s *Server) TokenContracts(holder common.Address) ([]TokenContract, error) 
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].First < out[j].First })
+	return out, nil
+}
+
+// txLogsBare is one transaction's logs as (emitter, topics, data) only: ONE
+// point read of its rcpt/ row, no block resolution and no addressing. It is
+// what the full-history reads (TopicGroups, TokenContracts) walk with; a
+// wallet with a million postings costs a million sequential row reads, not
+// a million block reconstructions.
+func (s *Server) txLogsBare(txnum uint64) ([]*types.Log, error) {
+	rec, ok, err := s.db.Receipt(txnum)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("no receipt at TxNum %d", txnum)
+	}
+	_, _, _, stored, err := store.DecodeTxReceipt(rec)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*types.Log, len(stored))
+	for i, l := range stored {
+		out[i] = &types.Log{Address: l.Address, Topics: l.Topics, Data: l.Data}
+	}
 	return out, nil
 }
 
