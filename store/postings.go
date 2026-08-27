@@ -91,13 +91,21 @@ func (p *postSet) chunks() []kv {
 	return rows
 }
 
+// bloomGated reports whether prefix reaches the family's first component,
+// which is what the bloom is keyed on. A shorter prefix (a whole family) has
+// no bloom question to ask and scans ungated; probing it would be a whole-key
+// lookup of a key that does not exist, a guaranteed false negative.
+func bloomGated(prefix []byte) bool {
+	return split(Suffixed(prefix, 0)) < len(prefix)+8
+}
+
 // ScanChunks returns every posting entry under prefix with a TxNum in
 // [lo, hi], in key order (grouped, ascending inside a group). prefix is a
 // group key or a one-component prefix. A chunk is decoded only if it can hold
 // an entry of the range: its first TxNum is <= hi and the group's next chunk
 // (if any) starts past lo.
 func (r *Run) ScanChunks(prefix []byte, lo, hi uint64) ([]posting, error) {
-	if !r.MayHave(SecLookup, Suffixed(prefix, 0)) {
+	if bloomGated(prefix) && !r.MayHave(SecLookup, Suffixed(prefix, 0)) {
 		return nil, nil
 	}
 	it, err := r.newIter(SecLookup)
@@ -158,7 +166,7 @@ func (r *Run) ScanChunks(prefix []byte, lo, hi uint64) ([]posting, error) {
 
 // ScanGroups calls fn once per distinct group key under prefix, in key order.
 func (r *Run) ScanGroups(prefix []byte, fn func(group []byte) bool) error {
-	if !r.MayHave(SecLookup, Suffixed(prefix, 0)) {
+	if bloomGated(prefix) && !r.MayHave(SecLookup, Suffixed(prefix, 0)) {
 		return nil
 	}
 	it, err := r.newIter(SecLookup)

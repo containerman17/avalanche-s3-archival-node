@@ -15,9 +15,17 @@ import (
 // chain and state sections are the same bytes, and the run chain walks back to
 // the root. A second Migrate is a no-op.
 func TestMigrateV1(t *testing.T) {
+	t.Run("with window", func(t *testing.T) { testMigrateV1(t, true) })
+	t.Run("no window", func(t *testing.T) { testMigrateV1(t, false) })
+}
+
+func testMigrateV1(t *testing.T, window bool) {
 	dir := t.TempDir()
 	if out, err := exec.Command("cp", "-r", filepath.Join("testdata", "v1")+"/.", dir).CombinedOutput(); err != nil {
 		t.Fatalf("cp: %v %s", err, out)
+	}
+	if !window {
+		os.Remove(filepath.Join(dir, "window", "window.log"))
 	}
 	cas, err := dist.Local(dir)
 	if err != nil {
@@ -42,6 +50,12 @@ func TestMigrateV1(t *testing.T) {
 	defer got.Close()
 	want := writeFixture(t, t.TempDir())
 	defer want.Close()
+	// Without the window the migrated dir holds the sealed runs only, so the
+	// comparison stops at their end.
+	hiTx, blocks := uint64(1<<62), uint64(56)
+	if !window {
+		hiTx, blocks = 161, 54
+	}
 
 	gm, wm := got.Manifest(), want.Manifest()
 	if gm.StorageVersion != StorageVersion || len(gm.Runs) != len(wm.Runs) {
@@ -88,7 +102,7 @@ func TestMigrateV1(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, g := range groups {
-				if err := db.Postings([]byte(g), 0, 1<<62, func(n uint64, p byte) bool {
+				if err := db.Postings([]byte(g), 0, hiTx, func(n uint64, p byte) bool {
 					out = append(out, entry{g, n, p})
 					return true
 				}); err != nil {
@@ -107,7 +121,7 @@ func TestMigrateV1(t *testing.T) {
 			t.Fatalf("entry %d: %q/%d/%d want %q/%d/%d", i, ge[i].g[:5], ge[i].n, ge[i].p, we[i].g[:5], we[i].n, we[i].p)
 		}
 	}
-	for h := uint64(0); h < 56; h++ {
+	for h := uint64(0); h < blocks; h++ {
 		first, n, ok, err := got.BlockTxRange(h)
 		if err != nil || !ok {
 			t.Fatalf("block %d: %v %v", h, ok, err)

@@ -2,3 +2,4 @@
 *.log
 /data-epoch/
 /data-*/
+!store/testdata/v1/window/window.log
