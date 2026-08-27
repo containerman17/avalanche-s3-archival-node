@@ -1,0 +1,30 @@
+{
+  "storage_version": 1,
+  "chain_root": "0100000000000000000000000000000000000000000000000000000000000000",
+  "runs": [
+    {
+      "from_tx": 0,
+      "to_tx": 144,
+      "from_height": 0,
+      "to_height": 47,
+      "name": "b9287504fd678672abb90b3bcb1b7755a07b429bf0e6ca2256d8778d9aa353fd",
+      "level": 1
+    },
+    {
+      "from_tx": 144,
+      "to_tx": 153,
+      "from_height": 48,
+      "to_height": 50,
+      "name": "18be1de67a2dd9bdfc46b9ea71c934a80e3feb9c8815c4f309e73e0f4ad07239",
+      "level": 0
+    },
+    {
+      "from_tx": 153,
+      "to_tx": 162,
+      "from_height": 51,
+      "to_height": 53,
+      "name": "57e9ede8be886e9b1e2549887c7a2000146ba8ef527c7aa826ceb818fff11842",
+      "level": 0
+    }
+  ]
+}
