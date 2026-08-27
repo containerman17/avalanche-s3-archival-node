@@ -82,10 +82,10 @@ func testServer(t *testing.T) (*Server, *types.Transaction, common.Address, comm
 	if err := db.WriteBlock(&store.BlockWrite{
 		Height: 1, HeaderRLP: header(1),
 		Txs: []store.TxWrite{{
-			Hash:     tx.Hash().Bytes(),
-			RLP:      txRLP,
-			Receipt:  store.EncodeTxReceipt(receipt, 21000),
-			Logs:     []store.LogWrite{{Emitter: logAddr.Bytes(), Topics: [][]byte{topic.Bytes()}}},
+			Hash:    tx.Hash().Bytes(),
+			RLP:     txRLP,
+			Receipt: store.EncodeTxReceipt(receipt, 21000),
+			Logs:    []store.LogWrite{{Emitter: logAddr.Bytes(), Topics: [][]byte{topic.Bytes()}}},
 		}},
 	}); err != nil {
 		t.Fatal(err)
