@@ -9,7 +9,7 @@ import (
 	"os"
 	"slices"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // JOINING A CHAIN (DESIGN, "The read path" and the join/start decision tree).

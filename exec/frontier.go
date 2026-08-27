@@ -41,7 +41,7 @@ import (
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // frontierBatch is how many trie ops go into one Firewood Update. Rows are

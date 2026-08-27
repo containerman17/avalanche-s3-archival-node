@@ -17,8 +17,8 @@ import (
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch"
 )
 
 // addHeaderExtraFields adds the block fields that live in the header's

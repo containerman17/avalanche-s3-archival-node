@@ -7,7 +7,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/vm"
 
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // THE FAIL-STOP IS THE DESIGN (DESIGN, principles: "traces are stored, and

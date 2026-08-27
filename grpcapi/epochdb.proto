@@ -23,7 +23,7 @@ syntax = "proto3";
 // that is what a geth tracer takes and emits.
 package epochdb.v0;
 
-option go_package = "github.com/containerman17/epochdb/grpcapi";
+option go_package = "github.com/containerman17/avalanche-s3-archival-node/grpcapi";
 
 service EpochDB {
   // GetHead is the serving frontier: latest, pending and safe at once.

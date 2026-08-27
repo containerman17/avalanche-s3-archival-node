@@ -7,8 +7,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/containerman17/epochdb/exp/jitbench/vmx"
-	"github.com/containerman17/epochdb/exp/jitbench/vmx/runtime"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx/runtime"
 )
 
 var modes = []struct {

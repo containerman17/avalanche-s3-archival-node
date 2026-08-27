@@ -21,7 +21,7 @@ import (
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/ava-labs/libevm/rlp"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 
 	saetypes "github.com/ava-labs/avalanchego/vms/saevm/types"
 )

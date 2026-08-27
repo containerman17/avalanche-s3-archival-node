@@ -7,8 +7,8 @@ import (
 
 	"github.com/holiman/uint256"
 
-	"github.com/containerman17/epochdb/exp/jitbench/vmx"
-	"github.com/containerman17/epochdb/exp/jitbench/vmx/runtime"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx/runtime"
 )
 
 // arithCompiled is the "arith" kernel as a PERFECT ahead-of-time compilation

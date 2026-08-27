@@ -32,7 +32,7 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // VMKind selects the libevm extras registration set, and with it the header

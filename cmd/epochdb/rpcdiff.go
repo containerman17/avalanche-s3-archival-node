@@ -29,8 +29,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerman17/epochdb/exec"
-	"github.com/containerman17/epochdb/rpc"
+	"github.com/containerman17/avalanche-s3-archival-node/exec"
+	"github.com/containerman17/avalanche-s3-archival-node/rpc"
 )
 
 func rpcdiffMain(args []string) {

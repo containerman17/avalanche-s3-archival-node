@@ -36,7 +36,7 @@ import (
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/triedb"
 
-	"github.com/containerman17/epochdb/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
 )
 
 // sevmVM is any Avalanche L1 running subnet-evm.

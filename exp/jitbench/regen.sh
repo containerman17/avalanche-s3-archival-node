@@ -23,7 +23,7 @@ chmod -R u+w vmx
 
 # package vm -> package vmx, and repoint the runtime harness at the fork.
 sed -i 's/^package vm$/package vmx/' vmx/*.go
-sed -i 's#"github.com/ava-labs/libevm/core/vm"#"github.com/containerman17/epochdb/exp/jitbench/vmx"#; s#\bvm\.#vmx.#g' vmx/runtime/*.go
+sed -i 's#"github.com/ava-labs/libevm/core/vm"#"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx"#; s#\bvm\.#vmx.#g' vmx/runtime/*.go
 
 # core.CanTransfer/Transfer are typed against libevm's own vm.StateDB, so the
 # harness needs its own copies against the fork's.

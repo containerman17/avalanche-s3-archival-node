@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // THE BUCKET IS WRITE-ONCE AND FOREVER (DESIGN, storage v0). These are the

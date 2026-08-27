@@ -2,7 +2,7 @@
 
 THE single design file, a SNAPSHOT OF THE PRESENT (user ruling 2026-08-04). It describes the system AS IT IS and changes IN PLACE: no build diary, no commit hashes, no "superseded" blocks. Statuses are **TODO**, **IN PROGRESS**, **DONE**. History of this file is `git log -p -- DESIGN.md`. Chronological rulings and dead ends live in `~/dotfiles/devlogs/epochdb/`; durable gotchas in `~/dotfiles/wiki/epochdb/`. Where a rule exists because the user said so, the user's words and attribution stay attached. Only measurements that are DESIGN INPUTS live here.
 
-Repo: `~/epochdb`, PUBLIC: https://github.com/containerman17/epochdb. Sibling library, also public: https://github.com/containerman17/casfs.
+Repo: `~/epochdb`, PUBLIC: https://github.com/containerman17/avalanche-s3-archival-node. Sibling library, also public: https://github.com/containerman17/casfs.
 
 ## Where the project stands (2026-08-12)
 
@@ -203,7 +203,7 @@ Unchanged: the box slice (`MemoryHigh` ~70%, `MemoryMax` ~85%, sshd always runs)
 - A NODE THAT CANNOT MAKE PROGRESS MUST NOT LOOK IDLE (2026-08-14, after step, dexalot and gunz). When every peer answers a height poll with the PRUNED FALLBACK (its own last accepted block, because it no longer holds the height), `seedSpan` cannot terminate, and it used to spin in silence: gunz polled 4,070 times and fetched zero containers for 20 minutes with nothing in the log. It now names the height, the pruned-answer count and the connected archival peers after 10s and every minute after that, and `serve`'s status line and `/status` carry `pruned_seeds`/`bad_links` (omitted while zero, so a healthy node's output is unchanged). IT KEEPS TRYING RATHER THAN DYING: the height is unavailable from THESE peers, a restart comes back to the same peers, and the fail-stop we do want is the operator reading the line.
 - CONFIG IS ENVIRONMENT ONLY: `EPOCHDB_S3_*`, `EPOCHDB_CACHE_*`, `EPOCHDB_FETCH_CONCURRENCY`, `EPOCHDB_FIREWOOD_CACHE`, `EPOCHDB_FLAT_CACHE`, `EPOCHDB_CODE_CACHE`, `EPOCHDB_HEAVY_SLOTS`, `EPOCHDB_NEW_CHAIN`, `GOMEMLIMIT`, `GOGC`. Credentials: static keys win, else the AWS SDK default chain; HTTP client and SigV4 signer stay hand-rolled.
 - MEMORY DEFAULTS: GOGC=50, GODEBUG=madvdontneed=1 baked into the image (docker replaces GODEBUG wholesale; the binary warns when missing).
-- PACKAGING: per-commit images ARE the release channel; vet+test then `ghcr.io/containerman17/epochdb` as `latest` and `sha-<short>`; cgo mandatory (firewood, and the zstd byte-identity pin); runtime `distroless/cc-debian13`. There is no zstd CLI layer: block compression is the library's.
+- PACKAGING: per-commit images ARE the release channel; vet+test then `ghcr.io/containerman17/avalanche-s3-archival-node` as `latest` and `sha-<short>`; cgo mandatory (firewood, and the zstd byte-identity pin); runtime `distroless/cc-debian13`. There is no zstd CLI layer: block compression is the library's.
 - SOLE WRITER: flock on `<data>/.epochdb.lock`; read-only openers cohabit freely.
 - NEVER MINT CLOUD CREDENTIALS FOR A TEST; reuse what exists; MinIO for S3 tests.
 - THE TOKYO BOX (i7i.2xlarge, 61.78GiB, 1.8TB): fleet STOPPED 2026-08-09, data intact, crons paused; wiki has access and deployment shape.

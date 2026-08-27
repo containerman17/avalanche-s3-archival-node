@@ -21,7 +21,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // THE COMPRESSION AND SECTION-TUNING MATRIX (DESIGN, "Storage v0": compression

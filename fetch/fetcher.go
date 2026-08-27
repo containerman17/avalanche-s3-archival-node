@@ -26,8 +26,8 @@ import (
 	"github.com/ava-labs/avalanchego/vms/platformvm"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 const (

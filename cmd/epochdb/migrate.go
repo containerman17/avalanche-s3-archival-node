@@ -5,8 +5,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // migrateMain is `epochdb dev migrate --data <dir>`: rewrite a storage v1 data

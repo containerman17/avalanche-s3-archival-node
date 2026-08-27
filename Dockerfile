@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 # library's, pinned by module version.
 
 FROM gcr.io/distroless/cc-debian13
-LABEL org.opencontainers.image.source=https://github.com/containerman17/epochdb
+LABEL org.opencontainers.image.source=https://github.com/containerman17/avalanche-s3-archival-node
 COPY --from=build /epochdb /usr/local/bin/epochdb
 # GO RETURNS FREED HEAP PAGES LAZILY BY DEFAULT (MADV_FREE): they stay RESIDENT
 # until the kernel reclaims them, so the arena ratchets to its high-water mark

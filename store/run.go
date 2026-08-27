@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/sstable"
 	sstblock "github.com/cockroachdb/pebble/v2/sstable/block"
 	"github.com/cockroachdb/pebble/v2/vfs"
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // A RUN is one immutable file:

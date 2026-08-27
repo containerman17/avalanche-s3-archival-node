@@ -9,8 +9,8 @@ import (
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch"
 )
 
 // TestRegisterSubnetEVM registers the subnet-evm extras in THIS process. It can

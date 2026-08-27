@@ -25,9 +25,9 @@ import (
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
 
-	"github.com/containerman17/epochdb"
-	"github.com/containerman17/epochdb/rpc"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node"
+	"github.com/containerman17/avalanche-s3-archival-node/rpc"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // method is one entry point: what it takes, and what it does.

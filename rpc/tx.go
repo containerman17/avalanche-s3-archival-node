@@ -13,7 +13,7 @@ import (
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/params"
 
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // findTx resolves a tx hash to its block and its index in that block. It is

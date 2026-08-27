@@ -23,11 +23,11 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/exec"
-	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/exec"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // parseContainerID accepts a cb58 container ID or a 0x-hex 32-byte eth

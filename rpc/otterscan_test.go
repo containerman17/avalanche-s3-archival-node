@@ -12,9 +12,9 @@ import (
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/exec"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/exec"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // THE ots_ PAGINATION TEST RUNS ACROSS A FLUSH BOUNDARY, which is the only

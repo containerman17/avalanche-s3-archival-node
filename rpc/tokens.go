@@ -8,7 +8,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // THE POSTING-LIST LOG READS: the questions eth_getLogs cannot answer in one

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"sort"
 
-	"github.com/containerman17/epochdb/store/ef"
+	"github.com/containerman17/avalanche-s3-archival-node/store/ef"
 )
 
 type kv struct{ key, val []byte }

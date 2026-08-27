@@ -10,7 +10,7 @@ import (
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/triedb"
 
-	"github.com/containerman17/epochdb/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
 )
 
 // snowContextFor builds the snow.Context the EVM sees. EVERY field is an

@@ -15,7 +15,7 @@ import (
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/lru"
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // FLUSH TRIGGERS (DESIGN rule 3): every 500,000 txs or 50,000 blocks, whichever

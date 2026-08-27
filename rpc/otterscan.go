@@ -25,7 +25,7 @@ import (
 	"github.com/ava-labs/libevm/core/vm"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // OtsAPILevel is the Otterscan API version this server implements.

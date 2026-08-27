@@ -54,12 +54,12 @@ Two of these will surprise you. Both are hard.
 
 ## Quick start: Docker
 
-Every push to `main` publishes `ghcr.io/containerman17/epochdb` as `latest` and `sha-<shortsha>`.
+Every push to `main` publishes `ghcr.io/containerman17/avalanche-s3-archival-node` as `latest` and `sha-<shortsha>`.
 There are no tagged releases; the per-commit image is the release channel. The image carries the
 pinned zstd.
 
 ```sh
-docker run -v epochdb-data:/data -p 9650:9650 ghcr.io/containerman17/epochdb \
+docker run -v epochdb-data:/data -p 9650:9650 ghcr.io/containerman17/avalanche-s3-archival-node \
   serve --data /data --network fuji
 ```
 
@@ -133,7 +133,7 @@ run as the same uid**, or one leaves files its siblings cannot evict:
 ```yaml
 services:
   mainnet-c:
-    image: ghcr.io/containerman17/epochdb
+    image: ghcr.io/containerman17/avalanche-s3-archival-node
     command: serve --data /data --network mainnet --port 9650
     environment: [EPOCHDB_CACHE_DIR=/cache]
     volumes: ["c-data:/data", "cache:/cache"]
@@ -142,7 +142,7 @@ services:
     mem_limit: 24g
     restart: unless-stopped
   some-l1:
-    image: ghcr.io/containerman17/epochdb
+    image: ghcr.io/containerman17/avalanche-s3-archival-node
     command: serve --data /data --network mainnet --chain <blockchainID> --port 9650
     environment: [EPOCHDB_CACHE_DIR=/cache]
     volumes: ["l1-data:/data", "cache:/cache"]
@@ -159,7 +159,7 @@ are running one chain on a dedicated box.
 ## Quick start: from source
 
 ```sh
-git clone https://github.com/containerman17/epochdb && cd epochdb
+git clone https://github.com/containerman17/avalanche-s3-archival-node && cd avalanche-s3-archival-node
 zstd --version          # must print v1.5.7
 CGO_ENABLED=1 go run ./cmd/epochdb serve --data ./data --network fuji
 ```

@@ -13,7 +13,7 @@ import (
 	"github.com/ava-labs/libevm/core/vm"
 	"github.com/ava-labs/libevm/core/vm/runtime"
 	"github.com/ava-labs/libevm/crypto"
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // A WRONG BITMAP MAKES AN INVALID JUMP LOOK VALID, which changes execution and

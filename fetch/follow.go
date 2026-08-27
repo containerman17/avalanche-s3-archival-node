@@ -17,8 +17,8 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/platformvm"
 
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/fetch/consensus"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch/consensus"
 )
 
 // vdrRefreshInterval is how often the validator set is re-fetched and

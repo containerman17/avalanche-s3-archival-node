@@ -26,12 +26,12 @@ import (
 	"github.com/ava-labs/libevm/common"
 	ethstate "github.com/ava-labs/libevm/core/state"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/exec"
-	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/rpc"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/exec"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch"
+	"github.com/containerman17/avalanche-s3-archival-node/rpc"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // commitEvery is how many blocks go into one Firewood proposal. It is also

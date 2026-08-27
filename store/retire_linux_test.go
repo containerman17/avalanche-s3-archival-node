@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // A RETIRED RUN'S BLOCKS MUST GO BACK TO THE FILESYSTEM WHILE THE PROCESS RUNS

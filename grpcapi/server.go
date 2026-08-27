@@ -22,8 +22,8 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 
-	"github.com/containerman17/epochdb"
-	"github.com/containerman17/epochdb/rpc"
+	"github.com/containerman17/avalanche-s3-archival-node"
+	"github.com/containerman17/avalanche-s3-archival-node/rpc"
 )
 
 // THE TWO FAILURE CODES, and they are not interchangeable (DESIGN: "null means

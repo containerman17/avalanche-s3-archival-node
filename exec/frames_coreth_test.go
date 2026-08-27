@@ -40,9 +40,9 @@ import (
 	ethparams "github.com/ava-labs/libevm/params"
 	"github.com/holiman/uint256"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/fetch"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 func TestFrameCaptureOfAPrecompileCallOut(t *testing.T) {

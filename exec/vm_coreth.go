@@ -28,7 +28,7 @@ import (
 
 	ethstate "github.com/ava-labs/libevm/core/state"
 
-	"github.com/containerman17/epochdb/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
 )
 
 // corethVM is the primary network's C-chain.

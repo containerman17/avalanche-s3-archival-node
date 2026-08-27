@@ -38,7 +38,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/containerman17/epochdb:latest
-            ghcr.io/containerman17/epochdb:sha-${{ steps.sha.outputs.short }}
+            ghcr.io/containerman17/avalanche-s3-archival-node:latest
+            ghcr.io/containerman17/avalanche-s3-archival-node:sha-${{ steps.sha.outputs.short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

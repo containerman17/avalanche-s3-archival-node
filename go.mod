@@ -1,4 +1,4 @@
-module github.com/containerman17/epochdb
+module github.com/containerman17/avalanche-s3-archival-node
 
 go 1.26
 

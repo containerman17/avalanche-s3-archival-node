@@ -8,8 +8,8 @@ import (
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/libevm/core/types"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch"
 )
 
 // The Warp precompile returns snow.Context.ChainID straight into EVM output

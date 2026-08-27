@@ -11,7 +11,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/eth/tracers"
 
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // THE CORE QUERY LAYER in Go (DESIGN "Entry points and adapters"): the reads

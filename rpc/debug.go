@@ -17,7 +17,7 @@ import (
 	// Register the native tracers (callTracer, prestateTracer, ...).
 	_ "github.com/ava-labs/libevm/eth/tracers/native"
 
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // traceConfig mirrors geth's TraceConfig: struct-logger options inline,

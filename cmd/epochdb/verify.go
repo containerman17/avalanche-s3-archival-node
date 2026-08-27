@@ -13,8 +13,8 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/trie"
 
-	"github.com/containerman17/epochdb/exec"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/exec"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // VERIFICATION LAYER 1: CRYPTOGRAPHIC SELF-VERIFICATION, the strongest oracle

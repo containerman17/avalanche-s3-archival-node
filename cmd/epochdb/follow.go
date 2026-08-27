@@ -18,12 +18,12 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 
-	"github.com/containerman17/epochdb"
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/grpcapi"
-	"github.com/containerman17/epochdb/plainhttp"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/grpcapi"
+	"github.com/containerman17/avalanche-s3-archival-node/plainhttp"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // serveMain is `epochdb serve`, THE ONLY OPERATOR COMMAND (RULING 2026-08-03),

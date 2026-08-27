@@ -3529,7 +3529,7 @@ const file_epochdb_proto_rawDesc = "" +
 	"\x1bGetTokenTransfersByContract\x12!.epochdb.v0.TokenTransfersRequest\x1a\x1d.epochdb.v0.PagedLogsResponse\x12Z\n" +
 	"\x11GetTokenContracts\x12!.epochdb.v0.TokenContractsRequest\x1a\".epochdb.v0.TokenContractsResponse\x12N\n" +
 	"\rGetFeeHistory\x12\x1d.epochdb.v0.FeeHistoryRequest\x1a\x1e.epochdb.v0.FeeHistoryResponse\x12H\n" +
-	"\vGetGasPrice\x12\x1b.epochdb.v0.GasPriceRequest\x1a\x1c.epochdb.v0.GasPriceResponseB+Z)github.com/containerman17/epochdb/grpcapib\x06proto3"
+	"\vGetGasPrice\x12\x1b.epochdb.v0.GasPriceRequest\x1a\x1c.epochdb.v0.GasPriceResponseB>Z<github.com/containerman17/avalanche-s3-archival-node/grpcapib\x06proto3"
 
 var (
 	file_epochdb_proto_rawDescOnce sync.Once

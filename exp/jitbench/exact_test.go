@@ -6,8 +6,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/containerman17/epochdb/exp/jitbench/vmx"
-	"github.com/containerman17/epochdb/exp/jitbench/vmx/runtime"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx/runtime"
 )
 
 // run executes one call under mode and reports what a caller can observe:

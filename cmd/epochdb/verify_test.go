@@ -10,8 +10,8 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/trie"
 
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // VERIFICATION LAYER 1 HAD NO TEST OF ITS OWN, which is a strange gap in the

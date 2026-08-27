@@ -17,7 +17,7 @@ import (
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/cockroachdb/pebble/v2/sstable"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 func testDB(t *testing.T) (*DB, string) {

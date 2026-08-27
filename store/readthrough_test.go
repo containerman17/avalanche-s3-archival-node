@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // READ-THROUGH FROM S3 (DESIGN, "The read path"). A node holds its blooms, its

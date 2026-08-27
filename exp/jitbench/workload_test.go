@@ -25,8 +25,8 @@ import (
 	"github.com/ava-labs/libevm/params"
 	"github.com/holiman/uint256"
 
-	"github.com/containerman17/epochdb/exp/jitbench/vmx"
-	"github.com/containerman17/epochdb/exp/jitbench/vmx/runtime"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx"
+	"github.com/containerman17/avalanche-s3-archival-node/exp/jitbench/vmx/runtime"
 )
 
 // contract is one real hot mainnet C-chain contract plus the call that makes it

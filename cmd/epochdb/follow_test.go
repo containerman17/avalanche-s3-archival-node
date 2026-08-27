@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/containerman17/epochdb"
+	"github.com/containerman17/avalanche-s3-archival-node"
 	"net"
 	"strings"
 	"testing"

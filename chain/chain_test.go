@@ -10,7 +10,7 @@ import (
 
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // TestCChainDescriptor pins the C-chain path: the descriptor built from the

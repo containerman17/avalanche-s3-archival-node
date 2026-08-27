@@ -17,9 +17,9 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/fetch"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch"
 )
 
 // probeMain sizes an L1 WITHOUT a chain-specific RPC.

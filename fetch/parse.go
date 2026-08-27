@@ -13,8 +13,8 @@ import (
 	ethtypes "github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 
-	"github.com/containerman17/epochdb/chain"
-	"github.com/containerman17/epochdb/fetch/sevm"
+	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/fetch/sevm"
 )
 
 // C-Chain blocks and state use four libevm extras:

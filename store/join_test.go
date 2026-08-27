@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // joinable builds a corpus of `terminals` TERMINAL runs in dir and returns its

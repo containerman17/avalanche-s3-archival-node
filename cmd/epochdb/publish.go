@@ -5,8 +5,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/containerman17/epochdb/dist"
-	"github.com/containerman17/epochdb/store"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
 // publishMain is `epochdb dev publish`: one shot of what a serving node's

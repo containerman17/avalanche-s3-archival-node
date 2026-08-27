@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerman17/epochdb/dist"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
 // testTerminalTxs is the TEST-ONLY terminal boundary (export_test.go): exactly
