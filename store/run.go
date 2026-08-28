@@ -562,6 +562,43 @@ func (s *sectionReadable) reside(bh sstblock.Handle) error {
 	return nil
 }
 
+// resideAll pulls the WHOLE section into RAM with CopySection's access pattern
+// (sequential 4MB pieces, chunk-aligned) and serves every later read from it.
+//
+// It is for a caller that ITERATES a section row by row while the chunk cache
+// is evicting under it. A walk of the lookup section reads 8KB blocks, one
+// dist.ChunkSize (4MB) fetch each on a miss, so on a box whose cache sits at
+// its min-free floor a 920MB section costs hundreds of GB of S3 traffic: 250x
+// to 500x amplification, measured on a v2 -> v3 migration.
+//
+// The single range covers the section, so it REPLACES the index and filter
+// ranges instead of joining them: ReadAt takes the last range starting at or
+// before the read, and a short range sitting inside this one would shadow it.
+func (s *sectionReadable) resideAll() error {
+	if s.n == 0 {
+		return nil
+	}
+	buf := make([]byte, s.n)
+	const piece = 4 << 20
+	for done := uint64(0); done < s.n; {
+		k := min(uint64(piece), s.n-done)
+		b, err := s.b.Read(s.off+done, k)
+		if err != nil {
+			return err
+		}
+		copy(buf[done:], b)
+		done += k
+	}
+	s.res = []residentRange{{off: 0, data: buf}}
+	s.resident = s.n
+	return nil
+}
+
+// release drops the resident overlay. Reads fall back to the artifact, which is
+// correct and only slower: it is for a caller that walked the section once and
+// is done with it.
+func (s *sectionReadable) release() { s.res, s.resident = nil, 0 }
+
 func (s *sectionReadable) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 || uint64(off) > s.n {
 		return 0, io.EOF

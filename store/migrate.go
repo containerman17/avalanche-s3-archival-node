@@ -216,6 +216,17 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 	// streamed straight into the merge at the end (buffering it was millions
 	// of two-allocation rows of live heap, and a sort of rows that the old
 	// section already holds in order).
+	//
+	// EITHER WAY THE SECTION IS WALKED ROW BY ROW, so it is pulled in one
+	// sequential pass first (sectionReadable.resideAll). Iterating it straight
+	// off the artifact reads 8KB blocks, and every miss fetches a whole 4MB
+	// chunk: on a node whose chunk cache is at its min-free floor that turned a
+	// 920MB section into 232GB of S3 traffic for one run. The pull is the same
+	// access pattern CopySection uses for chain and state, which moved 12.7GB
+	// in 17.8s on that box, and its time lands in the lookup phase.
+	if err := r.sec[SecLookup].resideAll(); err != nil {
+		return "", ph, err
+	}
 	var post postSet
 	var rows []kv
 	if from == 1 {
@@ -238,6 +249,9 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 			}
 		}
 		it.Close()
+		// v1 read the section here and never looks at it again; v2 merges it
+		// below and needs it until the write is done.
+		r.sec[SecLookup].release()
 	}
 	lap(&ph.lookup)
 
