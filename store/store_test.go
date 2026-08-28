@@ -1283,3 +1283,29 @@ func TestOpenSealsAFrozenLogACrashLeftBehind(t *testing.T) {
 		}
 	}
 }
+
+// TestResideCoalescesTheTailBlocks pins the open path's read count. pebble
+// writes a section's filter, index, top-level index, properties and metaindex
+// back to back at the tail, so residing them is ONE read, not one per block:
+// each block read on its own missed the chunk cache and pulled a whole 4MB
+// chunk, which is what made a 197-run corpus take half an hour to open.
+func TestResideCoalescesTheTailBlocks(t *testing.T) {
+	var want []blockRange
+	off := uint64(1) << 30
+	for i := 0; i < 64; i++ {
+		want = append(want, blockRange{off, 8 << 10})
+		off += 8<<10 + blockTrailer
+	}
+	if got := resideSpans(want); len(got) != 1 {
+		t.Fatalf("64 back-to-back blocks want 1 read, got %d", len(got))
+	}
+	// and a block past the gap cap is its own read, never a span across the
+	// whole section: a chain section is ~12GB.
+	want = append(want, blockRange{off + 12<<30, 8 << 10})
+	if got := resideSpans(want); len(got) != 2 || got[0] != 64 {
+		t.Fatalf("a block past the gap cap wants its own read, got %v", got)
+	}
+	if got := resideSpans(nil); len(got) != 0 {
+		t.Fatalf("no blocks want no reads, got %v", got)
+	}
+}

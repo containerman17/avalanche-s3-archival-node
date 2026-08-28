@@ -375,17 +375,17 @@ func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*
 		for _, nbh := range lay.Filter {
 			resident = append(resident, nbh.Handle)
 		}
-		for _, bh := range resident {
-			if err := sec.reside(bh); err != nil {
-				r.Close()
-				return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
-			}
+		if err := sec.reside(resident); err != nil {
+			r.Close()
+			return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
 		}
 		// pebble's sstable.Reader has no point-get, so the bloom gate is ours
-		// to apply: keep the filter bytes in hand for MayHave.
+		// to apply: keep the filter bytes in hand for MayHave. It reads through
+		// the section, which just made those bytes resident, so it is a copy
+		// out of RAM and not a second fetch.
 		if seed == nil && len(lay.Filter) > 0 && lay.Filter[0].Length > 0 {
-			f, err := blob.Read(r.Footer.Off[s]+lay.Filter[0].Offset, lay.Filter[0].Length)
-			if err != nil {
+			f := make([]byte, lay.Filter[0].Length)
+			if _, err := sec.ReadAt(f, int64(lay.Filter[0].Offset)); err != nil {
 				r.Close()
 				return nil, err
 			}
@@ -543,28 +543,106 @@ type residentRange struct {
 // and would send the read to the artifact anyway.
 const blockTrailer = sstblock.TrailerLen
 
-// reside pins one block handle's bytes in RAM.
-func (s *sectionReadable) reside(bh sstblock.Handle) error {
-	if bh.Length == 0 {
-		return nil
+// maxResideGap is how far reside will read ACROSS a hole to fold two blocks
+// into one artifact read. One chunk: bridging a gap that small costs at most
+// the chunk the next block already sits in, so the read is never bigger than
+// the fetch a separate read would have done anyway.
+const maxResideGap = uint64(dist.ChunkSize)
+
+// reside pins a batch of block handles in RAM, with as few artifact reads as
+// the layout allows.
+//
+// ONE READ PER HANDLE IS THE OPEN PATH'S AMPLIFICATION: a miss in the chunk
+// cache pulls a whole dist.ChunkSize chunk, so a section whose index and
+// filter blocks are a few KB each cost a 4MB fetch EACH, times three sections
+// times every run in the manifest. Measured on mainnet C: `store.Open` over a
+// 197-run corpus sat for half an hour and pulled 131GB.
+//
+// The blocks are clustered by construction: pebble writes the filter, the
+// index, the top-level index, the properties and the metaindex one after the
+// other at the tail of the section, so a real corpus has ONE span with gaps of
+// a block trailer between the ranges. Sorting them and reading each coalesced
+// span once turns those fetches into one sequential pass over the tail.
+//
+// Only the ranges themselves are kept, never the bytes bridged across a gap,
+// so the resident budget is exactly what it was when this read one block at a
+// time.
+func (s *sectionReadable) reside(bhs []sstblock.Handle) error {
+	want := make([]blockRange, 0, len(bhs))
+	for _, bh := range bhs {
+		if bh.Length == 0 {
+			continue
+		}
+		n := bh.Length + blockTrailer
+		if bh.Offset+n > s.n {
+			return fmt.Errorf("block [%d,%d) is outside a %d byte section", bh.Offset, bh.Offset+n, s.n)
+		}
+		if s.isResident(bh.Offset) { // a seed carried it across: the reopen reads nothing
+			continue
+		}
+		want = append(want, blockRange{bh.Offset, n})
 	}
-	n := bh.Length + blockTrailer
-	if bh.Offset+n > s.n {
-		return fmt.Errorf("block [%d,%d) is outside a %d byte section", bh.Offset, bh.Offset+n, s.n)
+	sort.Slice(want, func(i, j int) bool { return want[i].off < want[j].off })
+	i := 0
+	for _, j := range resideSpans(want) {
+		lo, hi := want[i].off, uint64(0)
+		for _, r := range want[i:j] {
+			hi = max(hi, r.off+r.n)
+		}
+		buf, err := s.b.Read(s.off+lo, hi-lo)
+		if err != nil {
+			return err
+		}
+		for _, r := range want[i:j] {
+			// The slice is copied, not aliased: buf holds the bytes bridged
+			// across the gaps too, and nothing should keep them alive.
+			s.insert(r.off, append([]byte(nil), buf[r.off-lo:r.off-lo+r.n]...))
+		}
+		i = j
 	}
-	b, err := s.b.Read(s.off+bh.Offset, n)
-	if err != nil {
-		return err
+	return nil
+}
+
+// blockRange is one block's [off, off+n) inside a section, trailer included.
+type blockRange struct{ off, n uint64 }
+
+// resideSpans splits ranges SORTED BY OFFSET into the spans reside reads, one
+// artifact read each, and returns the exclusive end index of every span. A new
+// span starts where the hole in front of a range is wider than maxResideGap,
+// which is what keeps two blocks at opposite ends of a 12GB section from
+// turning into a 12GB read.
+func resideSpans(want []blockRange) []int {
+	var ends []int
+	var end uint64
+	for i, r := range want {
+		if i > 0 && r.off > end+maxResideGap {
+			ends = append(ends, i)
+		}
+		end = max(end, r.off+r.n)
 	}
-	i := sort.Search(len(s.res), func(i int) bool { return s.res[i].off >= bh.Offset })
-	if i < len(s.res) && s.res[i].off == bh.Offset {
-		return nil
+	if len(want) > 0 {
+		ends = append(ends, len(want))
+	}
+	return ends
+}
+
+func (s *sectionReadable) isResident(off uint64) bool {
+	i := sort.Search(len(s.res), func(i int) bool { return s.res[i].off >= off })
+	return i < len(s.res) && s.res[i].off == off
+}
+
+// insert adds one resident range, keeping s.res sorted by offset. A range
+// already registered at that offset stays: a run is immutable, so it is the
+// same bytes.
+func (s *sectionReadable) insert(off uint64, data []byte) {
+	i := sort.Search(len(s.res), func(i int) bool { return s.res[i].off >= off })
+	if i < len(s.res) && s.res[i].off == off {
+		return
 	}
 	s.res = append(s.res, residentRange{})
 	copy(s.res[i+1:], s.res[i:])
-	s.res[i] = residentRange{off: bh.Offset, data: b}
-	s.resident += n
-	return nil
+	s.res[i] = residentRange{off: off, data: data}
+	s.resident += uint64(len(data))
 }
 
 // resideAll pulls the WHOLE section into RAM with CopySection's access pattern
