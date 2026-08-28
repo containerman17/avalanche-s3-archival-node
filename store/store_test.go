@@ -16,6 +16,7 @@ import (
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/cockroachdb/pebble/v2/sstable"
+	sstblock "github.com/cockroachdb/pebble/v2/sstable/block"
 
 	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
@@ -1307,5 +1308,93 @@ func TestResideCoalescesTheTailBlocks(t *testing.T) {
 	}
 	if got := resideSpans(nil); len(got) != 0 {
 		t.Fatalf("no blocks want no reads, got %v", got)
+	}
+}
+
+// TestSectionTailWindow: opening a run reads the SST tail ONCE and answers
+// everything else out of RAM.
+//
+// The cost this pins is the open path's, not a query's: pebble's Layout walks
+// the top-level index and reads every sub-index block separately, and each of
+// those is a 4MB chunk fetch on a cold cache. Two things make that one read:
+// the window starts at `rocksdb.data.size`, which is the first byte after the
+// last data block, so it covers every block Layout touches; and reside answers
+// out of it instead of going back to the artifact.
+//
+// ponytail: the fixture's sections are one index block deep, which is the same
+// geometry with a smaller multiplier. A two-level index needs thousands of data
+// blocks and does not belong in the default test run.
+func TestSectionTailWindow(t *testing.T) {
+	db, dir := testDB(t)
+	for h := uint64(0); h < 6; h++ {
+		if err := db.WriteBlock(block(h, 4)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	cas, err := dist.Local(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenRun(cas, db.Manifest().Runs[0].Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	for s := Section(0); s < numSections; s++ {
+		// The window is scaffolding: an open that kept it would hold a tail per
+		// section per run against a budget sized for index blocks alone.
+		if r.sec[s].tail.data != nil {
+			t.Fatalf("section %v kept its tail window past open", s)
+		}
+		lay, err := r.rd[s].Layout()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := &sectionReadable{b: r.blob, off: r.Footer.Off[s], n: r.Footer.Len[s]}
+		if err := sec.resideTail(r.rd[s]); err != nil {
+			t.Fatal(err)
+		}
+		if sec.tail.data == nil {
+			t.Fatalf("section %v got no tail window", s)
+		}
+		want := append([]sstblock.Handle{lay.TopIndex, lay.Properties, lay.MetaIndex}, lay.Index...)
+		for _, nbh := range lay.Filter {
+			want = append(want, nbh.Handle)
+		}
+		for _, bh := range want {
+			if bh.Length == 0 {
+				continue
+			}
+			if bh.Offset < sec.tail.off || bh.Offset+bh.Length+blockTrailer > sec.tail.off+uint64(len(sec.tail.data)) {
+				t.Fatalf("section %v: block [%d,%d) is outside the tail window [%d,%d)",
+					s, bh.Offset, bh.Offset+bh.Length+blockTrailer,
+					sec.tail.off, sec.tail.off+uint64(len(sec.tail.data)))
+			}
+		}
+		// A read inside the window must come out of RAM. Flipping a byte there
+		// makes the two answers differ, so the artifact cannot pass for the
+		// window: what comes back names its source.
+		idx := lay.Index[0]
+		at := idx.Offset - sec.tail.off
+		sec.tail.data[at] ^= 0xff
+		flipped := sec.tail.data[at]
+		if err := sec.reside([]sstblock.Handle{idx}); err != nil {
+			t.Fatal(err)
+		}
+		if len(sec.res) != 1 || sec.res[0].data[0] != flipped {
+			t.Fatalf("section %v: reside fetched the index block from the artifact, not the tail window", s)
+		}
+		one := make([]byte, 1)
+		sec.res = nil // out of the way: ReadAt prefers a resident range
+		if _, err := sec.ReadAt(one, int64(idx.Offset)); err != nil {
+			t.Fatal(err)
+		}
+		if one[0] != flipped {
+			t.Fatalf("section %v: ReadAt fell through to the artifact inside the tail window", s)
+		}
 	}
 }

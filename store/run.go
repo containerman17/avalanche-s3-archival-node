@@ -360,6 +360,23 @@ func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*
 			return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
 		}
 		r.rd[s] = rd
+		// THE TAIL COMES DOWN BEFORE Layout, NOT AFTER IT. Layout walks the
+		// top-level index and reads EVERY sub-index block one at a time, so on
+		// a cold chunk cache a 12GB chain section pays a 4MB chunk per index
+		// block, times three sections times every run in the manifest. The
+		// resident overlay cannot help: it is still empty at this point.
+		// resideTail puts the whole tail in RAM in ONE sequential read first,
+		// and every read Layout and reside then make is served out of it.
+		//
+		// A reopen skips it: the seed already carries those exact blocks
+		// resident, so its Layout reads nothing and a tail read would be pure
+		// loss.
+		if seed == nil {
+			if err := sec.resideTail(rd); err != nil {
+				r.Close()
+				return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
+			}
+		}
 		lay, err := rd.Layout()
 		if err != nil {
 			r.Close()
@@ -391,6 +408,11 @@ func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*
 			}
 			r.filter[s] = f
 		}
+		// The tail was scaffolding for the two steps above and nothing else.
+		// It is per section and per run, and a node opens hundreds of runs, so
+		// holding it would be the resident budget several times over. The exact
+		// handles keep their own copies; only the bridged bytes go.
+		sec.dropTail()
 	}
 	return r, nil
 }
@@ -529,6 +551,13 @@ type sectionReadable struct {
 	off, n   uint64
 	res      []residentRange // sorted by offset, one entry per index/filter block
 	resident uint64
+	// tail is the TRANSIENT window resideTail holds while the section is being
+	// opened, and it is deliberately NOT part of res: it overlaps the ranges
+	// reside pins inside it, and res is a "last range at or before the offset"
+	// lookup that overlap would break. It costs no resident budget because it
+	// is gone before openRunVersion returns, and it needs no lock because open
+	// is the only thing holding the section then.
+	tail residentRange
 }
 
 // residentRange is one section-relative byte range held in RAM for good.
@@ -589,7 +618,7 @@ func (s *sectionReadable) reside(bhs []sstblock.Handle) error {
 		for _, r := range want[i:j] {
 			hi = max(hi, r.off+r.n)
 		}
-		buf, err := s.b.Read(s.off+lo, hi-lo)
+		buf, err := s.read(lo, hi-lo)
 		if err != nil {
 			return err
 		}
@@ -677,6 +706,53 @@ func (s *sectionReadable) resideAll() error {
 	return nil
 }
 
+// resideTail pulls the section's TAIL into RAM in one sequential read, for the
+// length of the open and not one instant longer (dropTail).
+//
+// EVERY BLOCK THAT IS NOT A DATA BLOCK LIVES THERE. The writer emits the data
+// blocks, then the filter, then the index partitions, then the top-level index,
+// then the properties, the metaindex and the footer, so the tail is exactly
+// what `sstable.Reader` reads at open: Layout's walk of every sub-index block,
+// and the exact handles reside pins afterwards. One read covers all of it.
+//
+// The window is not a guess: `rocksdb.data.size` is the offset the writer
+// stamped when the last data block was done, which IS the first tail byte. It
+// costs one small read of the properties block, which sits in the chunk the
+// reader's footer read has already brought down.
+//
+// A section whose properties do not say (a foreign or empty SST) simply gets no
+// window: Layout still reads correctly, one block at a time, as it did before.
+func (s *sectionReadable) resideTail(rd *sstable.Reader) error {
+	props, err := rd.ReadPropertiesBlock(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	off := props.DataSize
+	if off == 0 || off >= s.n {
+		return nil
+	}
+	buf, err := s.b.Read(s.off+off, s.n-off)
+	if err != nil {
+		return err
+	}
+	s.tail = residentRange{off: off, data: buf}
+	return nil
+}
+
+// dropTail frees the open-time window. What reside pinned out of it stays.
+func (s *sectionReadable) dropTail() { s.tail = residentRange{} }
+
+// read is the one place a section goes for bytes it was asked for: the
+// open-time tail if that covers them, the artifact otherwise. reside goes
+// through it too, so the handles it pins are copied out of the tail instead of
+// fetched a second time.
+func (s *sectionReadable) read(off, n uint64) ([]byte, error) {
+	if t := s.tail; t.data != nil && off >= t.off && off+n <= t.off+uint64(len(t.data)) {
+		return t.data[off-t.off : off-t.off+n], nil
+	}
+	return s.b.Read(s.off+off, n)
+}
+
 // release drops the resident overlay. Reads fall back to the artifact, which is
 // correct and only slower: it is for a caller that walked the section once and
 // is done with it.
@@ -695,7 +771,7 @@ func (s *sectionReadable) ReadAt(p []byte, off int64) (int, error) {
 			return copy(p, r.data[uint64(off)-r.off:]), nil
 		}
 	}
-	b, err := s.b.Read(s.off+uint64(off), n)
+	b, err := s.read(uint64(off), n)
 	if err != nil {
 		return 0, err
 	}
