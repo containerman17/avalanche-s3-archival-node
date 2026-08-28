@@ -175,21 +175,26 @@ func (w *RunWriter) End() error {
 	return nil
 }
 
-// CopySection writes section s as the verbatim bytes [off, off+n) of blob: an
+// CopySection writes section s as the verbatim bytes [off, off+n) of src: an
 // SST section that is byte-identical between two storage versions goes through
 // the hasher and onto disk without being decoded (the migrator's chain and
 // state sections).
-func (w *RunWriter) CopySection(s Section, blob *dist.Blob, off, n uint64) error {
+//
+// src is an io.ReaderAt, not the artifact, so the caller can hand it a source
+// that already holds the bytes: the migrator resides the chain section before
+// it copies, and the copy then reads that RAM instead of pulling the section
+// out of the bucket a second time.
+func (w *RunWriter) CopySection(s Section, src io.ReaderAt, off, n uint64) error {
 	if s != w.cur+1 {
 		return fmt.Errorf("store: section %v out of order", s)
 	}
 	w.cur = s
 	w.footer.Off[s], w.footer.Len[s] = w.off, n
 	const piece = 4 << 20
+	buf := make([]byte, min(uint64(piece), n))
 	for done := uint64(0); done < n; {
-		k := min(uint64(piece), n-done)
-		b, err := blob.Read(off+done, k)
-		if err != nil {
+		b := buf[:min(uint64(piece), n-done)]
+		if _, err := src.ReadAt(b, int64(off+done)); err != nil {
 			return err
 		}
 		if _, err := w.h.Write(b); err != nil {
@@ -198,7 +203,7 @@ func (w *RunWriter) CopySection(s Section, blob *dist.Blob, off, n uint64) error
 		if _, err := w.bw.Write(b); err != nil {
 			return err
 		}
-		done += k
+		done += uint64(len(b))
 	}
 	w.off += n
 	return nil

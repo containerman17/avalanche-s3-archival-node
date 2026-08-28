@@ -202,8 +202,23 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 		return "", ph, err
 	}
 	defer w.Abort()
+	// The chain section is walked row by row below (the rcpt/ scan), so it is
+	// pulled into RAM in one sequential pass first, for the reason resideAll
+	// documents: its SST blocks are 128KB against a 4MB chunk, and on a box
+	// whose chunk cache sits at its min-free floor that walk fetched ~32x the
+	// section, which was 16m37s of a 19m8s run.
+	//
+	// IT IS RESIDED BEFORE THE COPY, NOT AFTER: CopySection then reads the
+	// resident bytes instead of the bucket, so the pull replaces the copy's
+	// read rather than adding a second one, and its time is already inside the
+	// copy phase. The section is the big one (~12GB on a mainnet C terminal
+	// run), so it is released the moment the rcpt/ scan is done, before the
+	// sort and the merge hold their own buffers.
+	if err := r.sec[SecChain].resideAll(); err != nil {
+		return "", ph, err
+	}
 	for s := SecChain; s <= SecState; s++ {
-		if err := w.CopySection(s, r.blob, f.Off[s], f.Len[s]); err != nil {
+		if err := w.CopySection(s, r.sec[s], 0, f.Len[s]); err != nil {
 			return "", ph, err
 		}
 	}
@@ -294,6 +309,7 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 		return "", ph, badRcpt
 	}
 	ph.sets = len(setBuf) / setKeyLen
+	r.sec[SecChain].release()
 	lap(&ph.rcpt)
 
 	if from == 1 {
