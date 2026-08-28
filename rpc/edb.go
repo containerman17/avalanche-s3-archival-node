@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/ava-labs/libevm/common"
 )
@@ -14,7 +15,7 @@ import (
 //
 //	edb_getLogsByEmitter          {emitter, topic0?, cursor?, limit?, ascending?}
 //	edb_getLogsByTopicValue       {value, topic0?, positions?, cursor?, limit?, ascending?}
-//	edb_getTopicGroups            {value, topic0?}
+//	edb_getTopicGroups            {value, topic0}
 //	edb_getTokenTransfersByHolder {address, standard, cursor?, limit?, ascending?}
 //	edb_getTokenTransfersByContract {token, standard, cursor?, limit?, ascending?}
 //	edb_getTokenContracts         {address}
@@ -34,7 +35,12 @@ func (s *Server) edbDispatch(method string, params []json.RawMessage) (any, *rpc
 			return s.LogsByTopicValue(p.Value, p.Topic0, p.Positions, p.Cursor, p.Limit, !p.Ascending)
 		}
 	case "edb_getTopicGroups":
-		run = func(p edbParams) (any, error) { return s.TopicGroups(p.Value, p.Topic0) }
+		run = func(p edbParams) (any, error) {
+			if p.Topic0 == nil {
+				return nil, fmt.Errorf("topic0 is required")
+			}
+			return s.TopicGroups(p.Value, *p.Topic0)
+		}
 	case "edb_getTokenTransfersByHolder":
 		run = func(p edbParams) (any, error) {
 			return s.TokenTransfersByHolder(p.Address, p.Standard, p.Cursor, p.Limit, !p.Ascending)
@@ -83,9 +89,9 @@ func (p *PagedLogs) MarshalJSON() ([]byte, error) {
 }
 
 func (g TopicGroup) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]any{"topic0": g.Topic0, "emitter": g.Emitter, "firstTxNum": g.First, "lastTxNum": g.Last})
+	return json.Marshal(map[string]any{"position": g.Position, "emitter": g.Emitter})
 }
 
 func (c TokenContract) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]any{"standard": c.Standard, "token": c.Token, "firstTxNum": c.First, "lastTxNum": c.Last})
+	return json.Marshal(map[string]any{"standard": c.Standard, "token": c.Token})
 }

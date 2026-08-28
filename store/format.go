@@ -29,7 +29,10 @@ import (
 // (DESIGN's clean-slate ruling); the bump exists so the handful of already
 // published v0 prefixes are REFUSED BY NAME at join and at open instead of
 // being read with v1 semantics and silently answering the wrong state.
-const StorageVersion = 2
+//
+// 2 replaced the per-posting lookup rows with Elias-Fano chunks; 3 added the
+// set/ family. Both have a migration (store/migrate.go, `epochdb dev migrate`).
+const StorageVersion = 3
 
 // ---------------------------------------------------------------------------
 // THE ONE DIMENSION IS TxNum, AND EVERY BLOCK OWNS A SLOT OF ITS OWN.
@@ -111,6 +114,7 @@ const (
 	PrefixELog    = "elog/"
 	PrefixTVal    = "tval/"
 	PrefixSig     = "sig/"
+	PrefixSet     = "set/"
 )
 
 // Position bits for a tval/ entry: the value stood at topic index 1, 2 or 3.
@@ -222,6 +226,19 @@ func TValPrefix(value []byte) []byte          { return join(PrefixTVal, value) }
 func TValGroup(value, topic0 []byte) []byte   { return join(PrefixTVal, value, topic0) }
 func SigGroup(topic0 []byte) []byte           { return join(PrefixSig, topic0) }
 
+// SetKey is the set/ row of (topic0, position, value, emitter); SetPrefix is
+// its bloom prefix, the range of every emitter under that triple.
+func SetKey(topic0 []byte, pos byte, value, emitter []byte) []byte {
+	return append(SetPrefix(topic0, pos, value), emitter...)
+}
+func SetPrefix(topic0 []byte, pos byte, value []byte) []byte {
+	return join(PrefixSet, topic0, []byte{pos}, value)
+}
+
+// setSplit is the length of a set/ key's bloom prefix (through the slash
+// after the value); a full key is setSplit+20.
+const setSplit = len(PrefixSet) + 32 + 1 + 1 + 1 + 32 + 1
+
 func join(prefix string, parts ...[]byte) []byte {
 	k := []byte(prefix)
 	for _, p := range parts {
@@ -281,6 +298,10 @@ func split(key []byte) int {
 	case bytes.HasPrefix(key, []byte(PrefixSig)):
 		if len(key) >= 37+8 {
 			return 37 // sig/<32>/
+		}
+	case bytes.HasPrefix(key, []byte(PrefixSet)):
+		if len(key) >= setSplit+20 {
+			return setSplit // set/<32>/<1>/<32>/
 		}
 	}
 	return len(key)

@@ -70,6 +70,7 @@ type memtable struct {
 	// kind serve both and a tx hash can never answer a block-hash probe.
 	nums map[string]uint64
 	post []posting
+	sets map[string]struct{} // set/ rows of the window, deduped
 }
 
 type memVal struct {
@@ -160,6 +161,7 @@ const (
 	recState = 'S'
 	recPost  = 'L'
 	recNum   = 'X' // a suffix-free lookup row: full key in the payload, value in num
+	recSet   = 'K' // a set/ row: full key in the payload, no value
 	recCode  = 'C'
 	recEnd   = 'E' // end of a block: the only point a torn tail may be cut at
 )
@@ -198,6 +200,7 @@ func (m *memtable) clear() {
 	m.code = map[string][]byte{}
 	m.nums = map[string]uint64{}
 	m.post = nil
+	m.sets = map[string]struct{}{}
 	for i := range m.chain {
 		m.chain[i].reset()
 	}
@@ -310,6 +313,9 @@ replay:
 		case recNum:
 			k := string(payload)
 			pend = append(pend, func() error { m.nums[k] = num; return nil })
+		case recSet:
+			k := string(payload)
+			pend = append(pend, func() error { m.sets[k] = struct{}{}; return nil })
 		case recCode:
 			if len(payload) < 32 {
 				break replay
@@ -641,6 +647,17 @@ func (m *memtable) add(b *BlockWrite) error {
 				return err
 			}
 		}
+		for _, l := range t.Logs {
+			for _, k := range logSets(l.Emitter, l.Topics) {
+				if _, ok := m.sets[string(k)]; ok {
+					continue
+				}
+				if _, _, err := m.write(recSet, n, k); err != nil {
+					return err
+				}
+				m.sets[string(k)] = struct{}{}
+			}
+		}
 		for _, r := range t.State {
 			k := stateKeyPrefix(r)
 			var kl [2]byte
@@ -725,6 +742,14 @@ func logPostings(post map[string]byte, emitter []byte, topics [][]byte) {
 	for i := 1; i < len(topics) && i <= 3; i++ {
 		post[string(TValGroup(topics[i], topic0))] |= 1 << (i - 1)
 	}
+}
+
+// logSets is one log's set/ rows: one per topic at positions 1..3.
+func logSets(emitter []byte, topics [][]byte) (keys [][]byte) {
+	for i := 1; i < len(topics) && i <= 3; i++ {
+		keys = append(keys, SetKey(topics[0], byte(i), topics[i], emitter))
+	}
+	return keys
 }
 
 func sortedKeys(m map[string]byte) []string {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -77,7 +78,11 @@ func loadManifest(dir string) (*Manifest, error) {
 		return nil, fmt.Errorf("store: manifest: %w", err)
 	}
 	if m.StorageVersion != StorageVersion {
-		return nil, fmt.Errorf("store: manifest is storage version %d, this binary is %d", m.StorageVersion, StorageVersion)
+		hint := ""
+		if m.StorageVersion == 1 || m.StorageVersion == 2 {
+			hint = " (run `epochdb dev migrate --data <dir>` with the node stopped)"
+		}
+		return nil, fmt.Errorf("store: manifest is storage version %d, this binary is %d%s", m.StorageVersion, StorageVersion, hint)
 	}
 	if err := m.checkTiling(); err != nil {
 		return nil, err
@@ -696,6 +701,9 @@ func (d *DB) writeSections(w *RunWriter, m *memtable) error {
 	for k, n := range m.nums {
 		rows = append(rows, kv{[]byte(k), beU64(n)})
 	}
+	for k := range m.sets {
+		rows = append(rows, kv{[]byte(k), nil})
+	}
 	sortKV(rows)
 	for _, r := range rows {
 		if err := w.Set(r.key, r.val); err != nil {
@@ -1193,6 +1201,60 @@ func (d *DB) Groups(prefix []byte, fn func(group []byte) bool) error {
 		}
 	}
 	return nil
+}
+
+// SetScan calls fn once per distinct set/ key under prefix across every run
+// and the window, deduped (the same row lives in every run that saw the
+// group), in key order per source.
+func (d *DB) SetScan(prefix []byte, fn func(key []byte) bool) error {
+	seen := map[string]bool{}
+	visit := func(k []byte) bool {
+		if seen[string(k)] {
+			return true
+		}
+		seen[string(k)] = true
+		return fn(k)
+	}
+	runs, done := d.snapshot()
+	defer done()
+	for _, r := range runs {
+		stop := false
+		if err := r.ScanSet(prefix, func(k []byte) bool {
+			stop = !visit(k)
+			return !stop
+		}); err != nil {
+			return err
+		}
+		if stop {
+			return nil
+		}
+	}
+	for _, k := range d.windowSets(prefix) {
+		if !visit(k) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// windowSets copies the set/ rows under prefix of both windows, sorted.
+func (d *DB) windowSets(prefix []byte) [][]byte {
+	a, f := d.mems()
+	var rows [][]byte
+	for _, m := range []*memtable{f, a} {
+		if m == nil {
+			continue
+		}
+		m.mu.RLock()
+		for k := range m.sets {
+			if strings.HasPrefix(k, string(prefix)) {
+				rows = append(rows, []byte(k))
+			}
+		}
+		m.mu.RUnlock()
+	}
+	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i], rows[j]) < 0 })
+	return rows
 }
 
 // HeightOfTx finds the block a TxNum belongs to. The blk/ rows are a monotone

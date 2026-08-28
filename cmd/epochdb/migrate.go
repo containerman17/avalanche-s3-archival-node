@@ -9,8 +9,9 @@ import (
 	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
-// migrateMain is `epochdb dev migrate --data <dir>`: rewrite a storage v1 data
-// dir as v2 in place, with the node STOPPED (it takes the dir lock). It is
+// migrateMain is `epochdb dev migrate --data <dir>`: rewrite a storage v1 or
+// v2 data dir as the current version in place, with the node STOPPED (it
+// takes the dir lock). It is
 // resumable and deletes nothing; see store.Migrate. With EPOCHDB_S3_* set it
 // reads the terminal runs through the bucket, uploads each new one as it
 // lands, and republishes the manifest pointer at the end.

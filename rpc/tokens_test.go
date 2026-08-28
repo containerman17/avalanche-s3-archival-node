@@ -37,6 +37,9 @@ func tokenServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// B answers true to any call, supportsInterface(0x80ac58cd) included:
+	// PUSH1 1 PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN. A and C have no code.
+	g.TrieAlloc[tokB] = types.Account{Code: []byte{0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}, Balance: new(big.Int)}
 	dir := t.TempDir()
 	cas, err := dist.Local(dir)
 	if err != nil {
@@ -135,16 +138,24 @@ func TestTokenReads(t *testing.T) {
 	if _, err := s.TokenTransfersByContract(tokA, "erc777", 0, 10, false); err == nil {
 		t.Fatal("unknown standard accepted")
 	}
+	// Zero receipt reads: A and B share the Transfer signature and are told
+	// apart by supportsInterface at latest; C's operator seat (position 1) is
+	// not a holder seat.
 	cs, err := s.TokenContracts(hold1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cs) != 3 || cs[0].Token != tokA || cs[0].Standard != "erc20" || cs[0].Last <= cs[0].First ||
-		cs[1].Token != tokB || cs[1].Standard != "erc721" || cs[2].Token != tokC || cs[2].Standard != "erc1155" {
+	if len(cs) != 3 || cs[0] != (TokenContract{"erc20", tokA}) || cs[1] != (TokenContract{"erc721", tokB}) || cs[2] != (TokenContract{"erc1155", tokC}) {
 		t.Fatalf("contracts of holder 1: %+v", cs)
 	}
-	gs, err := s.TopicGroups(asHash(hold1), nil)
-	if err != nil || len(gs) != 3 {
+	if cs, _ := s.TokenContracts(tokC); len(cs) != 0 {
+		t.Fatalf("operator counted as holder: %+v", cs)
+	}
+	if cs, _ := s.TokenContracts(hold2); len(cs) != 2 || cs[0].Token != tokA || cs[1].Token != tokC {
+		t.Fatalf("contracts of holder 2: %+v", cs)
+	}
+	gs, err := s.TopicGroups(asHash(hold1), SigTransfer)
+	if err != nil || len(gs) != 3 || gs[0] != (TopicGroup{1, tokA}) || gs[1] != (TopicGroup{1, tokB}) || gs[2] != (TopicGroup{2, tokA}) {
 		t.Fatalf("groups: %+v %v", gs, err)
 	}
 	p, _ = s.LogsByTopicValue(asHash(hold1), &SigTransfer, store.Pos2, 0, 10, false)

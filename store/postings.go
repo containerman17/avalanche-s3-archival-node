@@ -191,3 +191,27 @@ func (r *Run) ScanGroups(prefix []byte, fn func(group []byte) bool) error {
 	}
 	return nil
 }
+
+// ScanSet calls fn once per set/ key under prefix, in key order. The bloom
+// is keyed on the (topic0, position, value) triple, so a prefix that reaches
+// it is gated and a shorter one scans.
+func (r *Run) ScanSet(prefix []byte, fn func(key []byte) bool) error {
+	if len(prefix) >= setSplit && !r.MayHave(SecLookup, prefix[:setSplit]) {
+		return nil
+	}
+	it, err := r.newIter(SecLookup)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for kv := it.SeekGE(prefix, 0); kv != nil; kv = it.Next() {
+		k := kv.K.UserKey
+		if !bytes.HasPrefix(k, prefix) {
+			return nil
+		}
+		if !fn(append([]byte(nil), k...)) {
+			return nil
+		}
+	}
+	return nil
+}

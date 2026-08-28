@@ -90,10 +90,11 @@ func writeFixture(t *testing.T, dir string) *DB {
 	return db
 }
 
-// TestWriteV1Fixture regenerates store/testdata/v1 from the CURRENT format.
-// It ran once under storage version 1 and the output is committed; it only
-// runs again on request.
-func TestWriteV1Fixture(t *testing.T) {
+// TestWriteFixture regenerates store/testdata/v<StorageVersion> from the
+// CURRENT format. It ran once under each storage version that has a
+// migration source and the output is committed; it only runs again on
+// request.
+func TestWriteFixture(t *testing.T) {
 	if os.Getenv("EPOCHDB_WRITE_FIXTURE") == "" {
 		t.Skip("set EPOCHDB_WRITE_FIXTURE=1 to regenerate")
 	}

@@ -2231,7 +2231,7 @@ func (x *PagedLogsResponse) GetNextCursor() uint64 {
 type TopicGroupsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Value         []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
-	Topic0        []byte                 `protobuf:"bytes,2,opt,name=topic0,proto3" json:"topic0,omitempty"`
+	Topic0        []byte                 `protobuf:"bytes,2,opt,name=topic0,proto3" json:"topic0,omitempty"` // required: the listing is per signature
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2282,10 +2282,8 @@ func (x *TopicGroupsRequest) GetTopic0() []byte {
 
 type TopicGroup struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Topic0        []byte                 `protobuf:"bytes,1,opt,name=topic0,proto3" json:"topic0,omitempty"`
+	Position      uint32                 `protobuf:"varint,1,opt,name=position,proto3" json:"position,omitempty"` // the topic index the value stood at, 1..3
 	Emitter       []byte                 `protobuf:"bytes,2,opt,name=emitter,proto3" json:"emitter,omitempty"`
-	FirstTxNum    uint64                 `protobuf:"varint,3,opt,name=first_tx_num,json=firstTxNum,proto3" json:"first_tx_num,omitempty"`
-	LastTxNum     uint64                 `protobuf:"varint,4,opt,name=last_tx_num,json=lastTxNum,proto3" json:"last_tx_num,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2320,11 +2318,11 @@ func (*TopicGroup) Descriptor() ([]byte, []int) {
 	return file_epochdb_proto_rawDescGZIP(), []int{30}
 }
 
-func (x *TopicGroup) GetTopic0() []byte {
+func (x *TopicGroup) GetPosition() uint32 {
 	if x != nil {
-		return x.Topic0
+		return x.Position
 	}
-	return nil
+	return 0
 }
 
 func (x *TopicGroup) GetEmitter() []byte {
@@ -2332,20 +2330,6 @@ func (x *TopicGroup) GetEmitter() []byte {
 		return x.Emitter
 	}
 	return nil
-}
-
-func (x *TopicGroup) GetFirstTxNum() uint64 {
-	if x != nil {
-		return x.FirstTxNum
-	}
-	return 0
-}
-
-func (x *TopicGroup) GetLastTxNum() uint64 {
-	if x != nil {
-		return x.LastTxNum
-	}
-	return 0
 }
 
 type TopicGroupsResponse struct {
@@ -2500,8 +2484,6 @@ type TokenContract struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Standard      string                 `protobuf:"bytes,1,opt,name=standard,proto3" json:"standard,omitempty"`
 	Token         []byte                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`
-	FirstTxNum    uint64                 `protobuf:"varint,3,opt,name=first_tx_num,json=firstTxNum,proto3" json:"first_tx_num,omitempty"`
-	LastTxNum     uint64                 `protobuf:"varint,4,opt,name=last_tx_num,json=lastTxNum,proto3" json:"last_tx_num,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2548,20 +2530,6 @@ func (x *TokenContract) GetToken() []byte {
 		return x.Token
 	}
 	return nil
-}
-
-func (x *TokenContract) GetFirstTxNum() uint64 {
-	if x != nil {
-		return x.FirstTxNum
-	}
-	return 0
-}
-
-func (x *TokenContract) GetLastTxNum() uint64 {
-	if x != nil {
-		return x.LastTxNum
-	}
-	return 0
 }
 
 type TokenContractsResponse struct {
@@ -3438,14 +3406,11 @@ const file_epochdb_proto_rawDesc = "" +
 	"nextCursor\"B\n" +
 	"\x12TopicGroupsRequest\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\x12\x16\n" +
-	"\x06topic0\x18\x02 \x01(\fR\x06topic0\"\x80\x01\n" +
+	"\x06topic0\x18\x02 \x01(\fR\x06topic0\"B\n" +
 	"\n" +
-	"TopicGroup\x12\x16\n" +
-	"\x06topic0\x18\x01 \x01(\fR\x06topic0\x12\x18\n" +
-	"\aemitter\x18\x02 \x01(\fR\aemitter\x12 \n" +
-	"\ffirst_tx_num\x18\x03 \x01(\x04R\n" +
-	"firstTxNum\x12\x1e\n" +
-	"\vlast_tx_num\x18\x04 \x01(\x04R\tlastTxNum\"E\n" +
+	"TopicGroup\x12\x1a\n" +
+	"\bposition\x18\x01 \x01(\rR\bposition\x12\x18\n" +
+	"\aemitter\x18\x02 \x01(\fR\aemitter\"E\n" +
 	"\x13TopicGroupsResponse\x12.\n" +
 	"\x06groups\x18\x01 \x03(\v2\x16.epochdb.v0.TopicGroupR\x06groups\"s\n" +
 	"\x15TokenTransfersRequest\x12\x18\n" +
@@ -3453,13 +3418,10 @@ const file_epochdb_proto_rawDesc = "" +
 	"\bstandard\x18\x02 \x01(\tR\bstandard\x12$\n" +
 	"\x04page\x18\x03 \x01(\v2\x10.epochdb.v0.PageR\x04page\"1\n" +
 	"\x15TokenContractsRequest\x12\x18\n" +
-	"\aaddress\x18\x01 \x01(\fR\aaddress\"\x83\x01\n" +
+	"\aaddress\x18\x01 \x01(\fR\aaddress\"A\n" +
 	"\rTokenContract\x12\x1a\n" +
 	"\bstandard\x18\x01 \x01(\tR\bstandard\x12\x14\n" +
-	"\x05token\x18\x02 \x01(\fR\x05token\x12 \n" +
-	"\ffirst_tx_num\x18\x03 \x01(\x04R\n" +
-	"firstTxNum\x12\x1e\n" +
-	"\vlast_tx_num\x18\x04 \x01(\x04R\tlastTxNum\"Q\n" +
+	"\x05token\x18\x02 \x01(\fR\x05token\"Q\n" +
 	"\x16TokenContractsResponse\x127\n" +
 	"\tcontracts\x18\x01 \x03(\v2\x19.epochdb.v0.TokenContractR\tcontracts\"\x93\x01\n" +
 	"\vLogsRequest\x12\x1d\n" +

@@ -326,14 +326,12 @@ message PagedLogsResponse {
 
 message TopicGroupsRequest {
   bytes value = 1;
-  bytes topic0 = 2;
+  bytes topic0 = 2; // required: the listing is per signature
 }
 
 message TopicGroup {
-  bytes topic0 = 1;
+  uint32 position = 1; // the topic index the value stood at, 1..3
   bytes emitter = 2;
-  uint64 first_tx_num = 3;
-  uint64 last_tx_num = 4;
 }
 
 message TopicGroupsResponse {
@@ -353,8 +351,6 @@ message TokenContractsRequest {
 message TokenContract {
   string standard = 1;
   bytes token = 2;
-  uint64 first_tx_num = 3;
-  uint64 last_tx_num = 4;
 }
 
 message TokenContractsResponse {

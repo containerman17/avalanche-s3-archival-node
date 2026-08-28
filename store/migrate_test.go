@@ -2,28 +2,36 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/containerman17/avalanche-s3-archival-node/dist"
 )
 
-// TestMigrateV1: the committed v1 fixture, migrated, answers every posting
-// and hash lookup exactly as a v2 store built from the same blocks does, its
+// TestMigrate: each committed fixture, migrated, answers every posting, set
+// and hash lookup exactly as a store built from the same blocks does, its
 // chain and state sections are the same bytes, and the run chain walks back to
 // the root. A second Migrate is a no-op.
-func TestMigrateV1(t *testing.T) {
-	t.Run("with window", func(t *testing.T) { testMigrateV1(t, true) })
-	t.Run("no window", func(t *testing.T) { testMigrateV1(t, false) })
+func TestMigrate(t *testing.T) {
+	for _, v := range []string{"v1", "v2"} {
+		t.Run(v+" with window", func(t *testing.T) { testMigrate(t, v, true) })
+		t.Run(v+" no window", func(t *testing.T) { testMigrate(t, v, false) })
+	}
 }
 
-func testMigrateV1(t *testing.T, window bool) {
+func testMigrate(t *testing.T, fixture string, window bool) {
 	dir := t.TempDir()
-	if out, err := exec.Command("cp", "-r", filepath.Join("testdata", "v1")+"/.", dir).CombinedOutput(); err != nil {
+	if out, err := exec.Command("cp", "-r", filepath.Join("testdata", fixture)+"/.", dir).CombinedOutput(); err != nil {
 		t.Fatalf("cp: %v %s", err, out)
 	}
+	oldRaw, _ := os.ReadFile(filepath.Join(dir, manifestFile))
+	var old Manifest
+	json.Unmarshal(oldRaw, &old)
 	if !window {
 		os.Remove(filepath.Join(dir, "window", "window.log"))
 	}
@@ -121,6 +129,36 @@ func testMigrateV1(t *testing.T, window bool) {
 			t.Fatalf("entry %d: %q/%d/%d want %q/%d/%d", i, ge[i].g[:5], ge[i].n, ge[i].p, we[i].g[:5], we[i].n, we[i].p)
 		}
 	}
+	// Set rows: runs only when the window was dropped.
+	sets := func(db *DB) (out []string) {
+		seen := map[string]bool{}
+		add := func(k []byte) bool {
+			if !seen[string(k)] {
+				seen[string(k)] = true
+				out = append(out, string(k))
+			}
+			return true
+		}
+		if window {
+			if err := db.SetScan([]byte(PrefixSet), add); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			runs, done := db.snapshot()
+			defer done()
+			for _, r := range runs {
+				if err := r.ScanSet([]byte(PrefixSet), add); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	gs, ws := sets(got), sets(want)
+	if len(gs) == 0 || !reflect.DeepEqual(gs, ws) {
+		t.Fatalf("%d set rows, want %d", len(gs), len(ws))
+	}
 	for h := uint64(0); h < blocks; h++ {
 		first, n, ok, err := got.BlockTxRange(h)
 		if err != nil || !ok {
@@ -134,7 +172,11 @@ func testMigrateV1(t *testing.T, window bool) {
 		}
 	}
 	// The old runs are still there.
-	if _, err := os.Stat(filepath.Join(dir, "cas", "b9287504fd678672abb90b3bcb1b7755a07b429bf0e6ca2256d8778d9aa353fd")); err != nil {
-		t.Fatal("v1 terminal run was deleted")
+	for _, r := range old.Runs {
+		b, err := cas.Open(r.Name)
+		if err != nil {
+			t.Fatalf("%s run %s was deleted: %v", fixture, r.Name[:12], err)
+		}
+		b.Close()
 	}
 }

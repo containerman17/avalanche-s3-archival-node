@@ -603,9 +603,9 @@ func topicGroups(n *epochdb.Node, p params) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	topic0, err := optTopic0(p)
+	topic0, err := p.hash("topic0")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("topic0: %v", err)
 	}
 	groups, err := n.Core().TopicGroups(value, topic0)
 	if err != nil {

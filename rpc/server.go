@@ -48,6 +48,11 @@ type Server struct {
 	// live is the in-process executor (serve); nil before EnableLive
 	// serve, where every read is historical.
 	live Live
+
+	// iface721 caches TokenContracts' ERC-20 vs ERC-721 answer per emitter
+	// (rpc/tokens.go, transferStandard).
+	ifaceMu  sync.Mutex
+	iface721 map[common.Address]string
 }
 
 // heightOfHashTag resolves a block-hash TAG (the object form's blockHash, or a

@@ -836,17 +836,17 @@ func TestAdapterEquivalenceFullSurface(t *testing.T) {
 				t.Fatalf("logs by topic value %s: library %d, gRPC %d, plain %d, JSON-RPC %d",
 					value, len(libV.Logs), len(gv.Logs), len(pv["logs"].([]any)), len(jv["logs"].([]any)))
 			}
-			libG, err := n.Core().TopicGroups(value, nil)
+			libG, err := n.Core().TopicGroups(value, sig)
 			if err != nil {
 				t.Fatal(err)
 			}
-			gg, err := gc.GetTopicGroups(ctx, &grpcapi.TopicGroupsRequest{Value: value.Bytes()})
+			gg, err := gc.GetTopicGroups(ctx, &grpcapi.TopicGroupsRequest{Value: value.Bytes(), Topic0: sig.Bytes()})
 			if err != nil {
 				t.Fatal(err)
 			}
-			pg := httpGet(t, plain, "getTopicGroups", url.Values{"value": {value.Hex()}})
+			pg := httpGet(t, plain, "getTopicGroups", url.Values{"value": {value.Hex()}, "topic0": {sig.Hex()}})
 			var jg []any
-			json.Unmarshal(jsonRPC(t, jrpc, "edb_getTopicGroups", map[string]any{"value": value}), &jg)
+			json.Unmarshal(jsonRPC(t, jrpc, "edb_getTopicGroups", map[string]any{"value": value, "topic0": sig}), &jg)
 			if len(gg.Groups) != len(libG) || len(pg["groups"].([]any)) != len(libG) || len(jg) != len(libG) {
 				t.Fatalf("topic groups of %s: library %d, gRPC %d, plain %d, JSON-RPC %d", value, len(libG), len(gg.Groups), len(pg["groups"].([]any)), len(jg))
 			}

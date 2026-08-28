@@ -1,7 +1,9 @@
 package rpc
 
 import (
+	"bytes"
 	"fmt"
+	"math/big"
 	"sort"
 
 	"github.com/ava-labs/libevm/common"
@@ -31,13 +33,11 @@ type PagedLogs struct {
 	NextCursor uint64
 }
 
-// TopicGroup is one (topic0, emitter) a topic value has ever stood in, with
-// its TxNum span: the "tokens a wallet ever touched" answer.
+// TopicGroup is one (position, emitter) a topic value has ever stood in
+// under a signature: the "tokens a wallet ever touched" answer.
 type TopicGroup struct {
-	Topic0  common.Hash
-	Emitter common.Address
-	First   uint64
-	Last    uint64
+	Position byte
+	Emitter  common.Address
 }
 
 // The three token standards' event signatures.
@@ -71,53 +71,34 @@ func (s *Server) LogsByTopicValue(value common.Hash, topic0 *common.Hash, positi
 	})
 }
 
-// TopicGroups lists every (topic0, emitter) value has stood under at topics
-// 1..3, optionally only under topic0. The emitter is not in the tval/ key,
-// so each run's matching logs are read once; the cost is the value's own
-// posting count, the same as paging its whole history.
-func (s *Server) TopicGroups(value common.Hash, topic0 *common.Hash) ([]TopicGroup, error) {
-	prefix := store.TValPrefix(value[:])
-	if topic0 != nil {
-		prefix = store.TValGroup(value[:], topic0[:])
-	}
-	type key struct {
-		t0 common.Hash
-		em common.Address
-	}
-	groups := map[key]*TopicGroup{}
-	var fail error
-	err := s.db.Postings(prefix, 0, ^uint64(0), func(txnum uint64, _ byte) bool {
-		logs, err := s.txLogsBare(txnum)
+// TopicGroups lists every (position, emitter) value has stood under topic0
+// at topics 1..3: three set/ prefix scans, no receipt read. The signature is
+// required by design (set/ is signature-first, so a value-only listing is
+// not a prefix scan).
+func (s *Server) TopicGroups(value, topic0 common.Hash) ([]TopicGroup, error) {
+	var out []TopicGroup
+	for pos := byte(1); pos <= 3; pos++ {
+		emitters, err := s.setEmitters(topic0, pos, value)
 		if err != nil {
-			fail = err
-			return false
+			return nil, err
 		}
-		for _, l := range logs {
-			if len(l.Topics) == 0 || !topicAt(l, value, 0) {
-				continue
-			}
-			k := key{l.Topics[0], l.Address}
-			g := groups[k]
-			if g == nil {
-				g = &TopicGroup{Topic0: l.Topics[0], Emitter: l.Address, First: txnum}
-				groups[k] = g
-			}
-			g.Last = txnum
+		for _, e := range emitters {
+			out = append(out, TopicGroup{Position: pos, Emitter: e})
 		}
+	}
+	return out, nil
+}
+
+// setEmitters is the emitters under one set/ (topic0, position, value)
+// prefix, in key order.
+func (s *Server) setEmitters(topic0 common.Hash, pos byte, value common.Hash) ([]common.Address, error) {
+	prefix := store.SetPrefix(topic0[:], pos, value[:])
+	var out []common.Address
+	err := s.db.SetScan(prefix, func(k []byte) bool {
+		out = append(out, common.BytesToAddress(k[len(prefix):]))
 		return true
 	})
-	if err == nil {
-		err = fail
-	}
-	if err != nil {
-		return nil, err
-	}
-	out := make([]TopicGroup, 0, len(groups))
-	for _, g := range groups {
-		out = append(out, *g)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].First < out[j].First })
-	return out, nil
+	return out, err
 }
 
 // --- the ERC shortcuts: fixed (topic0, positions) over the reads above -----
@@ -190,85 +171,88 @@ func (s *Server) TokenTransfersByContract(token common.Address, standard string,
 	})
 }
 
-// TokenContract is one token a holder ever moved, with its TxNum span.
+// TokenContract is one token a holder ever moved.
 type TokenContract struct {
 	Standard string
 	Token    common.Address
-	First    uint64
-	Last     uint64
 }
 
 // TokenContracts is every token contract holder ever sent or received under
-// the three standards: = TopicGroups(holder) filtered to the transfer
-// signatures. Whether anything is still held is a balanceOf/ownerOf call.
+// the three standards: set/ prefix scans over (Transfer, positions 1 and 2),
+// (TransferSingle, 2 and 3) and (TransferBatch, 2 and 3), zero receipt reads.
+// ERC-20 and ERC-721 share the Transfer signature and are told apart by
+// supportsInterface(0x80ac58cd) at latest. Whether anything is still held is
+// a balanceOf/ownerOf call. Sorted by standard, then by address.
 func (s *Server) TokenContracts(holder common.Address) ([]TokenContract, error) {
 	value := common.BytesToHash(holder[:])
+	seen := map[TokenContract]bool{}
 	var out []TokenContract
-	seen := map[TokenContract]int{}
-	for _, name := range []string{"erc20", "erc721", "erc1155"} {
-		st := standards[name]
-		for _, sig := range st.sigs {
-			sig := sig
-			prefix := store.TValGroup(value[:], sig[:])
-			var fail error
-			err := s.db.Postings(prefix, 0, ^uint64(0), func(txnum uint64, pos byte) bool {
-				if pos&st.positions == 0 {
-					return true
-				}
-				logs, err := s.txLogsBare(txnum)
-				if err != nil {
-					fail = err
-					return false
-				}
-				for _, l := range logs {
-					if !st.matches(l) || l.Topics[0] != sig || !topicAt(l, value, st.positions) {
-						continue
-					}
-					k := TokenContract{Standard: name, Token: l.Address}
-					if i, ok := seen[k]; ok {
-						out[i].Last = txnum
-						continue
-					}
-					seen[k] = len(out)
-					k.First, k.Last = txnum, txnum
+	scan := func(sig common.Hash, positions []byte, standard func(common.Address) string) error {
+		for _, pos := range positions {
+			emitters, err := s.setEmitters(sig, pos, value)
+			if err != nil {
+				return err
+			}
+			for _, e := range emitters {
+				k := TokenContract{Standard: standard(e), Token: e}
+				if !seen[k] {
+					seen[k] = true
 					out = append(out, k)
 				}
-				return true
-			})
-			if err == nil {
-				err = fail
-			}
-			if err != nil {
-				return nil, err
 			}
 		}
+		return nil
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].First < out[j].First })
+	erc1155 := func(common.Address) string { return "erc1155" }
+	if err := scan(SigTransfer, []byte{1, 2}, s.transferStandard); err != nil {
+		return nil, err
+	}
+	if err := scan(SigTransferSingle, []byte{2, 3}, erc1155); err != nil {
+		return nil, err
+	}
+	if err := scan(SigTransferBatch, []byte{2, 3}, erc1155); err != nil {
+		return nil, err
+	}
+	rank := map[string]int{"erc20": 0, "erc721": 1, "erc1155": 2}
+	sort.Slice(out, func(i, j int) bool {
+		if a, b := rank[out[i].Standard], rank[out[j].Standard]; a != b {
+			return a < b
+		}
+		return bytes.Compare(out[i].Token[:], out[j].Token[:]) < 0
+	})
 	return out, nil
 }
 
-// txLogsBare is one transaction's logs as (emitter, topics, data) only: ONE
-// point read of its rcpt/ row, no block resolution and no addressing. It is
-// what the full-history reads (TopicGroups, TokenContracts) walk with; a
-// wallet with a million postings costs a million sequential row reads, not
-// a million block reconstructions.
-func (s *Server) txLogsBare(txnum uint64) ([]*types.Log, error) {
-	rec, ok, err := s.db.Receipt(txnum)
-	if err != nil {
-		return nil, err
+// erc165SupportsERC721 is supportsInterface(0x80ac58cd): the ERC-165 selector
+// 0x01ffc9a7 and the ERC-721 interface id, ABI-padded.
+var erc165SupportsERC721 = append([]byte{0x01, 0xff, 0xc9, 0xa7, 0x80, 0xac, 0x58, 0xcd}, make([]byte, 28)...)
+
+// transferStandard tells an ERC-721 emitter from an ERC-20 one by an
+// eth_call of supportsInterface(0x80ac58cd) at latest, cached per address
+// for the life of the process (code does not change under a contract, and a
+// proxy that flips is not worth a per-call read). A failed or reverting call
+// reports erc20.
+func (s *Server) transferStandard(token common.Address) string {
+	s.ifaceMu.Lock()
+	std, ok := s.iface721[token]
+	s.ifaceMu.Unlock()
+	if ok {
+		return std
 	}
-	if !ok {
-		return nil, fmt.Errorf("no receipt at TxNum %d", txnum)
+	std = "erc20"
+	if n := s.head(); n > 0 {
+		ret, err := s.Call(&CallMsg{To: &token, Value: new(big.Int), GasLimit: 100_000, GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), Data: erc165SupportsERC721}, n)
+		if err == nil && len(ret) == 32 && ret[31] == 1 && bytes.Equal(ret[:31], make([]byte, 31)) {
+			std = "erc721"
+		}
 	}
-	_, _, _, stored, err := store.DecodeTxReceipt(rec)
-	if err != nil {
-		return nil, err
+	s.ifaceMu.Lock()
+	if s.iface721 == nil {
+		s.iface721 = map[common.Address]string{}
 	}
-	out := make([]*types.Log, len(stored))
-	for i, l := range stored {
-		out[i] = &types.Log{Address: l.Address, Topics: l.Topics, Data: l.Data}
-	}
-	return out, nil
+	s.iface721[token] = std
+	s.ifaceMu.Unlock()
+	return std
 }
 
 // --- the walk --------------------------------------------------------------

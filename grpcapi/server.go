@@ -621,13 +621,16 @@ func (s *Server) GetLogsByTopicValue(_ context.Context, req *LogsByTopicValueReq
 }
 
 func (s *Server) GetTopicGroups(_ context.Context, req *TopicGroupsRequest) (*TopicGroupsResponse, error) {
-	groups, err := s.n.Core().TopicGroups(common.BytesToHash(req.Value), optHash(req.Topic0))
+	if len(req.Topic0) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "topic0 is required")
+	}
+	groups, err := s.n.Core().TopicGroups(common.BytesToHash(req.Value), common.BytesToHash(req.Topic0))
 	if err != nil {
 		return nil, readErr(err)
 	}
 	out := &TopicGroupsResponse{}
 	for _, g := range groups {
-		out.Groups = append(out.Groups, &TopicGroup{Topic0: g.Topic0.Bytes(), Emitter: g.Emitter.Bytes(), FirstTxNum: g.First, LastTxNum: g.Last})
+		out.Groups = append(out.Groups, &TopicGroup{Position: uint32(g.Position), Emitter: g.Emitter.Bytes()})
 	}
 	return out, nil
 }
@@ -649,7 +652,7 @@ func (s *Server) GetTokenContracts(_ context.Context, req *TokenContractsRequest
 	}
 	out := &TokenContractsResponse{}
 	for _, c := range cs {
-		out.Contracts = append(out.Contracts, &TokenContract{Standard: c.Standard, Token: c.Token.Bytes(), FirstTxNum: c.First, LastTxNum: c.Last})
+		out.Contracts = append(out.Contracts, &TokenContract{Standard: c.Standard, Token: c.Token.Bytes()})
 	}
 	return out, nil
 }
