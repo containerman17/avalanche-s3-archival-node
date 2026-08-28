@@ -232,10 +232,15 @@ func DecodeTxReceipt(rec []byte) (status uint64, gasUsed, cumulativeGasUsed uint
 		if pos+int(nt)*32 > len(rec) {
 			return 0, 0, 0, nil, fmt.Errorf("tx receipt: truncated topics")
 		}
+		// One allocation for the topics, not one per append growth step: a
+		// terminal run's migration decodes tens of millions of logs. A log
+		// with no topic keeps its NIL slice, which is what an encoder that
+		// tells nil from empty (rpc's log JSON) already sees.
+		if nt > 0 {
+			l.Topics = make([]common.Hash, nt)
+		}
 		for j := uint64(0); j < nt; j++ {
-			var t common.Hash
-			copy(t[:], rec[pos:pos+32])
-			l.Topics = append(l.Topics, t)
+			copy(l.Topics[j][:], rec[pos:pos+32])
 			pos += 32
 		}
 		dl, e := next("data len")

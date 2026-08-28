@@ -87,10 +87,11 @@ func Migrate(dir string, cas *dist.Store, logf func(string, ...any)) error {
 		}
 		t0 := time.Now()
 		var newName RunName
+		var ph migPhases
 		// A bucket read fails transiently now and then (a 503 in the middle
 		// of a 13GB run); the run is retried whole, the writer is aborted.
 		for attempt := 1; ; attempt++ {
-			newName, err = migrateRun(cas, ref, prev, from)
+			newName, ph, err = migrateRun(cas, ref, prev, from)
 			if err == nil {
 				break
 			}
@@ -107,11 +108,15 @@ func Migrate(dir string, cas *dist.Store, logf func(string, ...any)) error {
 		hex.Decode(prev[:], []byte(newName))
 		man.Runs[i].Name = newName
 		if ref.Terminal() && cas.Remote() {
+			// The upload of a 13GB run is part of the run's wall time, so it
+			// is part of the breakdown too.
+			ts := time.Now()
 			if _, err := cas.Sync(); err != nil {
 				return fmt.Errorf("store: sync after %s: %w", newName, err)
 			}
+			ph.sync = time.Since(ts)
 		}
-		logf("run %d/%d %s: %s -> %s in %s", i+1, len(man.Runs), RunLabel(ref.Level, ref.FromTx, ref.ToTx), ref.Name[:12], newName[:12], time.Since(t0).Round(time.Second))
+		logf("run %d/%d %s: %s -> %s in %s (%s)", i+1, len(man.Runs), RunLabel(ref.Level, ref.FromTx, ref.ToTx), ref.Name[:12], newName[:12], time.Since(t0).Round(time.Second), ph)
 	}
 
 	man.StorageVersion = StorageVersion
@@ -156,12 +161,35 @@ func saveJSON(path string, v any) error {
 	return os.Rename(tmp, path)
 }
 
+// migPhases is where one run's migration spent its wall time, printed on the
+// run's log line: a slow pass then says which phase is slow instead of only
+// how slow it was.
+type migPhases struct {
+	copy, lookup, rcpt, sort, write, sync time.Duration
+	sets                                  int
+}
+
+func (p migPhases) String() string {
+	return fmt.Sprintf("copy %s, lookup %s, rcpt %s, sort %s, write %s, sync %s, %.1fM sets",
+		phdur(p.copy), phdur(p.lookup), phdur(p.rcpt), phdur(p.sort), phdur(p.write), phdur(p.sync), float64(p.sets)/1e6)
+}
+
+func phdur(d time.Duration) time.Duration {
+	if d < time.Minute {
+		return d.Round(100 * time.Millisecond)
+	}
+	return d.Round(time.Second)
+}
+
 // migrateRun writes the current-version twin of one run of version from and
 // returns its name.
-func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunName, error) {
+func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunName, migPhases, error) {
+	var ph migPhases
+	mark := time.Now()
+	lap := func(d *time.Duration) { now := time.Now(); *d += now.Sub(mark); mark = now }
 	r, err := OpenRunVersion(cas, ref.Name, from)
 	if err != nil {
-		return "", err
+		return "", ph, err
 	}
 	defer r.Close()
 	f := r.Footer
@@ -171,85 +199,147 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 	}
 	w, err := NewRunWriter(RunFileName(dir, ref.Level, f.FromTx, f.ToTx)+".migrate", prev, ref.Level)
 	if err != nil {
-		return "", err
+		return "", ph, err
 	}
 	defer w.Abort()
 	for s := SecChain; s <= SecState; s++ {
 		if err := w.CopySection(s, r.blob, f.Off[s], f.Len[s]); err != nil {
-			return "", err
+			return "", ph, err
 		}
 	}
+	lap(&ph.copy)
 
-	// The old lookup section, walked whole (no bloom: it was built under the
-	// old split). From v1, addr/ rows are entries, txh/ and blkh/ rows copy and
-	// the rest is rebuilt from the receipts below; from v2 every row copies.
+	// From v1 the old lookup section is walked into memory first: its addr/
+	// rows carry roles that become posting entries, txh/ and blkh/ rows copy,
+	// and everything else is rebuilt out of the receipts below. From v2 every
+	// row copies unchanged, so that section is not read here at all: it is
+	// streamed straight into the merge at the end (buffering it was millions
+	// of two-allocation rows of live heap, and a sort of rows that the old
+	// section already holds in order).
 	var post postSet
 	var rows []kv
-	it, err := r.newIter(SecLookup)
-	if err != nil {
-		return "", err
-	}
-	for e := it.SeekGE(nil, 0); e != nil; e = it.Next() {
-		k := e.K.UserKey
-		val, _, err := e.Value(nil)
+	if from == 1 {
+		it, err := r.newIter(SecLookup)
 		if err != nil {
-			it.Close()
-			return "", err
+			return "", ph, err
 		}
-		switch {
-		case from == 1 && bytes.HasPrefix(k, []byte(PrefixAddr)):
-			post.add(k[:len(k)-8], TxNumOf(k), val[0])
-		case from == 2, bytes.HasPrefix(k, []byte(PrefixTxHash)), bytes.HasPrefix(k, []byte(PrefixBlkHash)):
-			rows = append(rows, kv{append([]byte(nil), k...), append([]byte(nil), val...)})
+		for e := it.SeekGE(nil, 0); e != nil; e = it.Next() {
+			k := e.K.UserKey
+			val, _, err := e.Value(nil)
+			if err != nil {
+				it.Close()
+				return "", ph, err
+			}
+			switch {
+			case bytes.HasPrefix(k, []byte(PrefixAddr)):
+				post.add(k[:len(k)-8], TxNumOf(k), val[0])
+			case bytes.HasPrefix(k, []byte(PrefixTxHash)), bytes.HasPrefix(k, []byte(PrefixBlkHash)):
+				rows = append(rows, kv{append([]byte(nil), k...), append([]byte(nil), val...)})
+			}
 		}
+		it.Close()
 	}
-	it.Close()
+	lap(&ph.lookup)
+
 	// Set keys go into ONE flat buffer of fixed-width records, sorted in
 	// place and deduped on the way out: a terminal run holds tens of
 	// millions of them, and a map of 92-byte strings copied a second
 	// time into rows was the migration's peak (32.8GB RSS on an 8M-tx
-	// mainnet C run).
+	// mainnet C run). They are appended in place, without the per-key
+	// allocation a [][]byte per log costs.
 	var setBuf []byte
+	var badRcpt error
+	topics := make([][]byte, 0, 4)
 	lo, hi := RcptKey(0), RcptKey(^uint64(0))
 	if err := r.ScanRange(SecChain, lo, hi, func(k, val []byte) bool {
 		txnum := NumOf(k)
 		_, _, _, logs, derr := DecodeTxReceipt(val)
 		if derr != nil {
-			err = fmt.Errorf("rcpt/%d: %w", txnum, derr)
+			badRcpt = fmt.Errorf("rcpt/%d: %w", txnum, derr)
 			return false
 		}
 		groups := map[string]byte{}
 		for _, l := range logs {
-			topics := make([][]byte, len(l.Topics))
+			topics = topics[:0]
 			for i := range l.Topics {
-				topics[i] = l.Topics[i][:]
+				topics = append(topics, l.Topics[i][:])
 			}
 			if from == 1 {
 				logPostings(groups, l.Address[:], topics)
 			}
-			for _, sk := range logSets(l.Address[:], topics) {
-				setBuf = append(setBuf, sk...)
-			}
+			setBuf = appendSetKeys(setBuf, l.Address[:], topics)
 		}
 		for g, pay := range groups {
 			post.add([]byte(g), txnum, pay)
 		}
 		return true
 	}); err != nil {
-		return "", err
+		return "", ph, err
 	}
-	if err := w.Begin(SecLookup); err != nil {
-		return "", err
+	if badRcpt != nil {
+		return "", ph, badRcpt
 	}
-	rows = append(rows, post.chunks()...)
-	sortKV(rows)
+	ph.sets = len(setBuf) / setKeyLen
+	lap(&ph.rcpt)
+
+	if from == 1 {
+		rows = append(rows, post.chunks()...)
+		sortKV(rows)
+	}
 	sort.Sort(setRecs(setBuf))
+	lap(&ph.sort)
+
+	if err := w.Begin(SecLookup); err != nil {
+		return "", ph, err
+	}
+	// The other side of the merge, one row at a time: from v1 the rows built
+	// above, from v2 the old lookup section itself.
+	var curK, curV []byte
+	var advance func() error
+	if from == 1 {
+		i := 0
+		advance = func() error {
+			curK, curV = nil, nil
+			if i < len(rows) {
+				curK, curV = rows[i].key, rows[i].val
+				i++
+			}
+			return nil
+		}
+		advance()
+	} else {
+		it, err := r.newIter(SecLookup)
+		if err != nil {
+			return "", ph, err
+		}
+		defer it.Close()
+		e := it.SeekGE(nil, 0)
+		// The row is read where the iterator stands and the iterator moves
+		// only on the next call: e.Value's bytes belong to the current block.
+		load := func() error {
+			curK, curV = nil, nil
+			if e == nil {
+				return nil
+			}
+			var err error
+			curK = e.K.UserKey
+			curV, _, err = e.Value(nil)
+			return err
+		}
+		if err := load(); err != nil {
+			return "", ph, err
+		}
+		advance = func() error {
+			e = it.Next()
+			return load()
+		}
+	}
 	// Two-way merge, so the set/ records are never materialised in rows: both
 	// sides are sorted, set/ falls between elog/ and sig/, and a set/ record is
 	// written only when it differs from the one before it.
 	var last []byte
-	for i, j := 0, 0; i < len(rows) || j < len(setBuf); {
-		if j < len(setBuf) && (i == len(rows) || bytes.Compare(setBuf[j:j+setKeyLen], rows[i].key) < 0) {
+	for j := 0; curK != nil || j < len(setBuf); {
+		if j < len(setBuf) && (curK == nil || bytes.Compare(setBuf[j:j+setKeyLen], curK) < 0) {
 			rec := setBuf[j : j+setKeyLen]
 			j += setKeyLen
 			if bytes.Equal(last, rec) {
@@ -257,20 +347,23 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 			}
 			last = rec
 			if err := w.Set(rec, nil); err != nil {
-				return "", err
+				return "", ph, err
 			}
 			continue
 		}
-		if err := w.Set(rows[i].key, rows[i].val); err != nil {
-			return "", err
+		if err := w.Set(curK, curV); err != nil {
+			return "", ph, err
 		}
-		i++
+		if err := advance(); err != nil {
+			return "", ph, err
+		}
 	}
 	if err := w.End(); err != nil {
-		return "", err
+		return "", ph, err
 	}
 	name, _, err := w.Finish(cas, f.FromTx, f.ToTx, f.FromHeight, f.ToHeight)
-	return name, err
+	lap(&ph.write)
+	return name, ph, err
 }
 
 // migrateWindowLog rewrites one window log to the current version. From v1,
@@ -443,4 +536,20 @@ func (s setRecs) Swap(i, j int) {
 	copy(t[:], a)
 	copy(a, b)
 	copy(b, t[:])
+}
+
+// appendSetKeys appends one log's set/ keys to dst, fixed width and in place:
+// the migration builds tens of millions of them per run and a [][]byte plus a
+// fresh key per topic was ~150M short-lived allocations. It writes exactly
+// what SetKey writes (see TestAppendSetKeys).
+func appendSetKeys(dst []byte, emitter []byte, topics [][]byte) []byte {
+	for i := 1; i < len(topics) && i <= 3; i++ {
+		dst = append(dst, PrefixSet...)
+		dst = append(dst, topics[0]...)
+		dst = append(dst, '/', byte(i), '/')
+		dst = append(dst, topics[i]...)
+		dst = append(dst, '/')
+		dst = append(dst, emitter...)
+	}
+	return dst
 }
