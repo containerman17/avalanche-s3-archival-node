@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/containerman17/avalanche-s3-archival-node/dist"
@@ -203,7 +204,12 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 		}
 	}
 	it.Close()
-	sets := map[string]struct{}{}
+	// Set keys go into ONE flat buffer of fixed-width records, sorted in
+	// place and deduped on the way out: a terminal run holds tens of
+	// millions of them, and a map of 92-byte strings copied a second
+	// time into rows was the migration's peak (32.8GB RSS on an 8M-tx
+	// mainnet C run).
+	var setBuf []byte
 	lo, hi := RcptKey(0), RcptKey(^uint64(0))
 	if err := r.ScanRange(SecChain, lo, hi, func(k, val []byte) bool {
 		txnum := NumOf(k)
@@ -222,7 +228,7 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 				logPostings(groups, l.Address[:], topics)
 			}
 			for _, sk := range logSets(l.Address[:], topics) {
-				sets[string(sk)] = struct{}{}
+				setBuf = append(setBuf, sk...)
 			}
 		}
 		for g, pay := range groups {
@@ -232,18 +238,33 @@ func migrateRun(cas *dist.Store, ref RunRef, prev [32]byte, from uint32) (RunNam
 	}); err != nil {
 		return "", err
 	}
-	for k := range sets {
-		rows = append(rows, kv{[]byte(k), nil})
-	}
 	if err := w.Begin(SecLookup); err != nil {
 		return "", err
 	}
 	rows = append(rows, post.chunks()...)
 	sortKV(rows)
-	for _, row := range rows {
-		if err := w.Set(row.key, row.val); err != nil {
+	sort.Sort(setRecs(setBuf))
+	// Two-way merge, so the set/ records are never materialised in rows: both
+	// sides are sorted, set/ falls between elog/ and sig/, and a set/ record is
+	// written only when it differs from the one before it.
+	var last []byte
+	for i, j := 0, 0; i < len(rows) || j < len(setBuf); {
+		if j < len(setBuf) && (i == len(rows) || bytes.Compare(setBuf[j:j+setKeyLen], rows[i].key) < 0) {
+			rec := setBuf[j : j+setKeyLen]
+			j += setKeyLen
+			if bytes.Equal(last, rec) {
+				continue
+			}
+			last = rec
+			if err := w.Set(rec, nil); err != nil {
+				return "", err
+			}
+			continue
+		}
+		if err := w.Set(rows[i].key, rows[i].val); err != nil {
 			return "", err
 		}
+		i++
 	}
 	if err := w.End(); err != nil {
 		return "", err
@@ -407,4 +428,19 @@ func windowLogVersion(path string) (uint32, error) {
 			return 1, nil
 		}
 	}
+}
+
+// setRecs sorts a flat buffer of fixed-width set/ keys IN PLACE: no per-key
+// allocation and no index, one fixed-size swap.
+type setRecs []byte
+
+func (s setRecs) Len() int           { return len(s) / setKeyLen }
+func (s setRecs) rec(i int) []byte   { return s[i*setKeyLen : (i+1)*setKeyLen] }
+func (s setRecs) Less(i, j int) bool { return bytes.Compare(s.rec(i), s.rec(j)) < 0 }
+func (s setRecs) Swap(i, j int) {
+	var t [setKeyLen]byte
+	a, b := s.rec(i), s.rec(j)
+	copy(t[:], a)
+	copy(a, b)
+	copy(b, t[:])
 }

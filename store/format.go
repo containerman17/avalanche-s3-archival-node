@@ -236,8 +236,10 @@ func SetPrefix(topic0 []byte, pos byte, value []byte) []byte {
 }
 
 // setSplit is the length of a set/ key's bloom prefix (through the slash
-// after the value); a full key is setSplit+20.
+// after the value); a full key is setSplit+20, and it is FIXED WIDTH, which
+// is what lets the migration hold a run's set/ keys in one flat buffer.
 const setSplit = len(PrefixSet) + 32 + 1 + 1 + 1 + 32 + 1
+const setKeyLen = setSplit + 20
 
 func join(prefix string, parts ...[]byte) []byte {
 	k := []byte(prefix)
