@@ -2,7 +2,9 @@ package rpc
 
 import (
 	"math/big"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
@@ -182,4 +184,45 @@ func TestTokenReads(t *testing.T) {
 	if err != nil || len(logs) != 1 || logs[0].BlockNumber != 4 {
 		t.Fatalf("getLogs topic2=holder1: %d %v", len(logs), err)
 	}
+}
+
+// The cold emitters are probed concurrently: a probe that only returns once
+// probeWorkers of them are in flight deadlocks a sequential loop.
+func TestTransferStandardsProbeConcurrently(t *testing.T) {
+	orig := probeERC721
+	t.Cleanup(func() { probeERC721 = orig })
+	var inFlight sync.WaitGroup
+	inFlight.Add(probeWorkers)
+	probeERC721 = func(_ *Server, a common.Address) string {
+		inFlight.Done()
+		inFlight.Wait()
+		if a[0]%2 == 0 {
+			return "erc721"
+		}
+		return "erc20"
+	}
+	var tokens []common.Address
+	for i := 0; i < probeWorkers; i++ {
+		tokens = append(tokens, common.BytesToAddress([]byte{byte(i), 1}))
+	}
+	s := &Server{}
+	done := make(chan map[common.Address]string, 1)
+	go func() { done <- s.transferStandards(tokens) }()
+	select {
+	case got := <-done:
+		for _, a := range tokens {
+			want := "erc20"
+			if a[0]%2 == 0 {
+				want = "erc721"
+			}
+			if got[a] != want || s.iface721[a] != want {
+				t.Fatalf("%s: %s cached %s", a, got[a], s.iface721[a])
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("probes ran in sequence")
+	}
+	// A second call is all cache hits and never probes.
+	probeERC721 = func(*Server, common.Address) string { t.Fatal("probed a cached address"); return "" }
+	s.transferStandards(tokens)
 }

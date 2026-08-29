@@ -50,7 +50,7 @@ type Server struct {
 	live Live
 
 	// iface721 caches TokenContracts' ERC-20 vs ERC-721 answer per emitter
-	// (rpc/tokens.go, transferStandard).
+	// (rpc/tokens.go, transferStandards).
 	ifaceMu  sync.Mutex
 	iface721 map[common.Address]string
 }

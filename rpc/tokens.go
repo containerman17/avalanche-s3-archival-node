@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"sync"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
@@ -188,23 +189,30 @@ func (s *Server) TokenContracts(holder common.Address) ([]TokenContract, error) 
 	seen := map[TokenContract]bool{}
 	var out []TokenContract
 	scan := func(sig common.Hash, positions []byte, standard func(common.Address) string) error {
+		var all []common.Address
 		for _, pos := range positions {
 			emitters, err := s.setEmitters(sig, pos, value)
 			if err != nil {
 				return err
 			}
-			for _, e := range emitters {
-				k := TokenContract{Standard: standard(e), Token: e}
-				if !seen[k] {
-					seen[k] = true
-					out = append(out, k)
-				}
+			all = append(all, emitters...)
+		}
+		std := standard // erc1155 is a constant; Transfer is probed, all at once
+		if sig == SigTransfer {
+			known := s.transferStandards(all)
+			std = func(a common.Address) string { return known[a] }
+		}
+		for _, e := range all {
+			k := TokenContract{Standard: std(e), Token: e}
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, k)
 			}
 		}
 		return nil
 	}
 	erc1155 := func(common.Address) string { return "erc1155" }
-	if err := scan(SigTransfer, []byte{1, 2}, s.transferStandard); err != nil {
+	if err := scan(SigTransfer, []byte{1, 2}, nil); err != nil {
 		return nil, err
 	}
 	if err := scan(SigTransferSingle, []byte{2, 3}, erc1155); err != nil {
@@ -227,32 +235,76 @@ func (s *Server) TokenContracts(holder common.Address) ([]TokenContract, error) 
 // 0x01ffc9a7 and the ERC-721 interface id, ABI-padded.
 var erc165SupportsERC721 = append([]byte{0x01, 0xff, 0xc9, 0xa7, 0x80, 0xac, 0x58, 0xcd}, make([]byte, 28)...)
 
-// transferStandard tells an ERC-721 emitter from an ERC-20 one by an
-// eth_call of supportsInterface(0x80ac58cd) at latest, cached per address
-// for the life of the process (code does not change under a contract, and a
-// proxy that flips is not worth a per-call read). A failed or reverting call
-// reports erc20.
-func (s *Server) transferStandard(token common.Address) string {
-	s.ifaceMu.Lock()
-	std, ok := s.iface721[token]
-	s.ifaceMu.Unlock()
-	if ok {
-		return std
+// probeERC721 is the uncached question: does token answer true to
+// supportsInterface(0x80ac58cd) at latest. A failed or reverting call is
+// erc20. A var so a test can swap in a probe that counts what is in flight.
+var probeERC721 = func(s *Server, token common.Address) string {
+	n := s.head()
+	if n == 0 {
+		return "erc20"
 	}
-	std = "erc20"
-	if n := s.head(); n > 0 {
-		ret, err := s.Call(&CallMsg{To: &token, Value: new(big.Int), GasLimit: 100_000, GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), Data: erc165SupportsERC721}, n)
-		if err == nil && len(ret) == 32 && ret[31] == 1 && bytes.Equal(ret[:31], make([]byte, 31)) {
-			std = "erc721"
+	ret, err := s.Call(&CallMsg{To: &token, Value: new(big.Int), GasLimit: 100_000, GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), Data: erc165SupportsERC721}, n)
+	if err == nil && len(ret) == 32 && ret[31] == 1 && bytes.Equal(ret[:31], make([]byte, 31)) {
+		return "erc721"
+	}
+	return "erc20"
+}
+
+// probeWorkers bounds the concurrent supportsInterface calls under one
+// TokenContracts. A probe is an EVM execution against latest state (CPU plus
+// state reads, ~230ms measured on the Tokyo box), not a network wait, so the
+// S3 fan-out width would just contend for cores and the state cache; 8 is
+// half the box's cores and leaves the other RPC callers room. 181 probes
+// take ~23 rounds, about 5s, down from ~40s in sequence.
+const probeWorkers = 8
+
+// transferStandards tells ERC-721 emitters from ERC-20 ones by a
+// supportsInterface(0x80ac58cd) eth_call at latest, cached per address for
+// the life of the process (code does not change under a contract, and a
+// proxy that flips is not worth a per-call read). Cache misses are probed
+// concurrently, probeWorkers wide, with no lock held across a call. Two
+// callers racing on the same cold address both probe it; the answer is a
+// pure function of chain state, so the second write is the same value and
+// the duplicate is cheaper than a per-address in-flight registry.
+func (s *Server) transferStandards(tokens []common.Address) map[common.Address]string {
+	known := make(map[common.Address]string, len(tokens))
+	var miss []common.Address
+	s.ifaceMu.Lock()
+	for _, t := range tokens {
+		if std, ok := s.iface721[t]; ok {
+			known[t] = std
+		} else if _, queued := known[t]; !queued {
+			known[t] = "" // dedupe within this call
+			miss = append(miss, t)
 		}
 	}
+	s.ifaceMu.Unlock()
+	if len(miss) == 0 {
+		return known
+	}
+	found := make([]string, len(miss))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, probeWorkers)
+	for i, t := range miss {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			found[i] = probeERC721(s, t)
+		}()
+	}
+	wg.Wait()
 	s.ifaceMu.Lock()
 	if s.iface721 == nil {
 		s.iface721 = map[common.Address]string{}
 	}
-	s.iface721[token] = std
+	for i, t := range miss {
+		s.iface721[t] = found[i]
+		known[t] = found[i]
+	}
 	s.ifaceMu.Unlock()
-	return std
+	return known
 }
 
 // --- the walk --------------------------------------------------------------
