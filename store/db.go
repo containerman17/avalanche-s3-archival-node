@@ -1104,6 +1104,86 @@ func (d *DB) StateTxNums(lo, hi uint64, fn func(txnum uint64)) error {
 	return nil
 }
 
+// THE PER-RUN SCANS FAN OUT. A run scan under one prefix is a local bloom
+// probe and then one or two blocking 4MB GETs of ~115ms each: it is latency,
+// not CPU, and the runs are independent, so the useful width is far above
+// GOMAXPROCS. A wallet that appears in every run of a 213-run corpus was 425
+// serialized round trips, 49 seconds; at scanFanout it is 7 waves, ~1.6s.
+//
+// scanFanout is 32 because that is what fits the pipe: 32 GETs in flight is
+// 32*4MB/115ms ~= 1.1GB/s, about a 10Gbps NIC, and it cuts 213 runs into 7
+// waves. scanSlots is the process-wide ceiling so the width cannot multiply:
+// edb_getTokenContracts issues six of these prefix scans and every RPC caller
+// issues its own, and all of them draw from these 64 slots.
+const scanFanout = 32
+
+var scanSlots = make(chan struct{}, 64)
+
+// scanRuns calls work(i) for every i in [0, n) over a bounded pool and hands
+// the results to emit in ASCENDING i, which is what makes this a drop-in for
+// the sequential loop it replaced:
+//
+//   - ORDER: emit sees run 0's rows, then run 1's, exactly as the loop did, so
+//     dedup, paging and the desc/asc run order are untouched. emit runs on the
+//     caller's goroutine alone, so a caller's `seen` map and callback stay
+//     single-threaded.
+//   - STOP: emit returning false means no further work is STARTED and no later
+//     result is emitted; everything emit already accepted is kept.
+//   - ERRORS: the error of the LOWEST failing index wins, as returning the
+//     first loop error did. A later run's error is discarded, as its rows were.
+//
+// Scans already in flight are always waited for, never abandoned: the caller
+// releases its run snapshot the moment this returns, and a goroutine still
+// reading a run past that point is a use-after-close.
+func scanRuns[T any](n int, work func(i int) (T, error), emit func(T) bool) error {
+	type res struct {
+		v   T
+		err error
+	}
+	slots := make(chan chan res, scanFanout)
+	quit := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(slots)
+		for i := 0; i < n; i++ {
+			ch := make(chan res, 1)
+			select { // a full pipeline is the read-ahead bound
+			case slots <- ch:
+			case <-quit:
+				return
+			}
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				select {
+				case scanSlots <- struct{}{}:
+				case <-quit:
+					return
+				}
+				v, err := work(i)
+				<-scanSlots
+				ch <- res{v, err}
+			}(i)
+		}
+	}()
+	var err error
+	for ch := range slots {
+		r := <-ch
+		if r.err != nil {
+			err = r.err
+			break
+		}
+		if !emit(r.v) {
+			break
+		}
+	}
+	close(quit)
+	wg.Wait()
+	return err
+}
+
 // Postings walks the entries of every posting group under prefix with a TxNum
 // in [loTx, hiTx], ascending, runs oldest-to-newest then the window. prefix is
 // a group key or a one-component prefix (ELogPrefix, TValPrefix): the entries
@@ -1150,21 +1230,28 @@ func (d *DB) postings(prefix []byte, loTx, hiTx uint64, desc bool, fn func(uint6
 	}
 	runs, done := d.snapshot()
 	defer done()
-	for i := range runs {
+	stop := false
+	// The read-ahead here is entries, not chunks: up to scanFanout runs worth
+	// of one prefix's postings are in RAM at once, where the sequential walk
+	// held one run's.
+	err := scanRuns(len(runs), func(i int) ([]posting, error) {
 		r := runs[i]
 		if desc {
 			r = runs[len(runs)-1-i]
 		}
 		if r.Footer.ToTx <= loTx || r.Footer.FromTx > hiTx {
-			continue
+			return nil, nil
 		}
-		ents, err := r.ScanChunks(prefix, loTx, hiTx)
-		if err != nil {
-			return err
-		}
+		return r.ScanChunks(prefix, loTx, hiTx)
+	}, func(ents []posting) bool {
 		if !emit(ents) {
-			return nil
+			stop = true
+			return false
 		}
+		return true
+	})
+	if err != nil || stop {
+		return err
 	}
 	if !desc {
 		window()
@@ -1179,17 +1266,21 @@ func (d *DB) postings(prefix []byte, loTx, hiTx uint64, desc bool, fn func(uint6
 func (d *DB) Groups(prefix []byte, fn func(group []byte) bool) error {
 	runs, done := d.snapshot()
 	defer done()
-	for _, r := range runs {
-		stop := false
-		if err := r.ScanGroups(prefix, func(g []byte) bool {
-			stop = !fn(g)
-			return !stop
-		}); err != nil {
-			return err
+	stop := false
+	err := scanRuns(len(runs), func(i int) (groups [][]byte, err error) {
+		err = runs[i].ScanGroups(prefix, func(g []byte) bool { groups = append(groups, g); return true })
+		return groups, err
+	}, func(groups [][]byte) bool {
+		for _, g := range groups {
+			if !fn(g) {
+				stop = true
+				return false
+			}
 		}
-		if stop {
-			return nil
-		}
+		return true
+	})
+	if err != nil || stop {
+		return err
 	}
 	seen := map[string]bool{}
 	for _, p := range d.windowPostings() {
@@ -1205,29 +1296,38 @@ func (d *DB) Groups(prefix []byte, fn func(group []byte) bool) error {
 
 // SetScan calls fn once per distinct set/ key under prefix across every run
 // and the window, deduped (the same row lives in every run that saw the
-// group), in key order per source.
+// group), in key order per source. The runs are scanned CONCURRENTLY
+// (scanRuns) and their rows are handed out in run order, so what fn sees is
+// the sequential walk.
 func (d *DB) SetScan(prefix []byte, fn func(key []byte) bool) error {
 	seen := map[string]bool{}
+	stop := false
 	visit := func(k []byte) bool {
 		if seen[string(k)] {
 			return true
 		}
 		seen[string(k)] = true
-		return fn(k)
+		if !fn(k) {
+			stop = true
+			return false
+		}
+		return true
 	}
 	runs, done := d.snapshot()
 	defer done()
-	for _, r := range runs {
-		stop := false
-		if err := r.ScanSet(prefix, func(k []byte) bool {
-			stop = !visit(k)
-			return !stop
-		}); err != nil {
-			return err
+	err := scanRuns(len(runs), func(i int) (keys [][]byte, err error) {
+		err = runs[i].ScanSet(prefix, func(k []byte) bool { keys = append(keys, k); return true })
+		return keys, err
+	}, func(keys [][]byte) bool {
+		for _, k := range keys {
+			if !visit(k) {
+				return false
+			}
 		}
-		if stop {
-			return nil
-		}
+		return true
+	})
+	if err != nil || stop {
+		return err
 	}
 	for _, k := range d.windowSets(prefix) {
 		if !visit(k) {
