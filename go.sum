@@ -122,8 +122,8 @@ github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 h1:zuQyyAK
 github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06/go.mod h1:7nc4anLGjupUW/PeY5qiNYsdNXj7zopG+eqsS7To5IQ=
 github.com/consensys/gnark-crypto v0.18.1 h1:RyLV6UhPRoYYzaFnPQA4qK3DyuDgkTgskDdoGqFt3fI=
 github.com/consensys/gnark-crypto v0.18.1/go.mod h1:L3mXGFTe1ZN+RSJ+CLjUt9x7PNdx8ubaYfDROyp2Z8c=
-github.com/containerman17/casfs v0.0.0-20260806014414-57040ab836bb h1:wK+SzLm3ZJpFPSpGkS3MRkU0sjLxxy17yZTAFJZjRJM=
-github.com/containerman17/casfs v0.0.0-20260806014414-57040ab836bb/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
+github.com/containerman17/casfs v0.0.0-20260829013637-9de4fc2301dc h1:MwSTj31YQaCCsnnkJsiC2fjcVuoSBQfF8kq8a82ABDA=
+github.com/containerman17/casfs v0.0.0-20260829013637-9de4fc2301dc/go.mod h1:VZCF3eWQZmxapkfTJ3W+XRm1V2iW41b6UJbX9g8aUxQ=
 github.com/containerman17/libevm v1.13.15-0.20260817022927-4c8a6553b55f h1:5/5Rem/rywRH2XHK8T3E8DejNkQ5uWnm2CvNCOGtg6o=
 github.com/containerman17/libevm v1.13.15-0.20260817022927-4c8a6553b55f/go.mod h1:6NxGoR1aLABnfLy+fncXRj0W6rUoUrXghnAWZ+Rhr4o=
 github.com/cpuguy83/go-md2man/v2 v2.0.6 h1:XJtiaUW6dEEqVuZiMTn1ldk455QWwEIsMIJlo5vtkx0=

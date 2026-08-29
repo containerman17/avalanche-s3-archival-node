@@ -10,7 +10,7 @@ require (
 	github.com/ava-labs/firewood-go-ethhash/ffi v0.8.0
 	github.com/ava-labs/libevm v1.13.15-0.20260803133207-db6d70f2748e
 	github.com/cockroachdb/pebble/v2 v2.1.6
-	github.com/containerman17/casfs v0.0.0-20260806014414-57040ab836bb
+	github.com/containerman17/casfs v0.0.0-20260829013637-9de4fc2301dc
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/gorilla/websocket v1.5.0
 	github.com/holiman/uint256 v1.2.4

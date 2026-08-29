@@ -258,6 +258,13 @@ type serveStatus struct {
 	CacheRefused uint64 `json:"cacheRefusals,omitempty"`
 	CacheFree    int64  `json:"cacheFreeBytes,omitempty"`
 	CacheMinFree int64  `json:"cacheMinFreeBytes,omitempty"`
+	// CacheEvictTarget is the free-bytes line the worker cleans back to, above
+	// CacheMinFree by design: the band between them is where fills are still
+	// admitted while cleaning runs, and CacheFreed is what the worker has
+	// actually recovered since start (an eviction that freed nothing is not
+	// progress, and the two counters together say which kind is happening).
+	CacheEvictTarget int64  `json:"cacheEvictTargetBytes,omitempty"`
+	CacheFreed       uint64 `json:"cacheFreedBytes,omitempty"`
 	// The cache-plane failures, which are the ones that leave a node working
 	// and slow rather than broken: a fill that cannot land, an eviction that
 	// cannot run, a cached chunk that cannot be read. Every one of them still
@@ -297,6 +304,7 @@ func statusOf(spec string, n *epochdb.Node) serveStatus {
 		}
 		s.CacheEvicted, s.CacheRefused = cs.Evictions, cs.Refusals
 		s.CacheFree, s.CacheMinFree = cs.FreeBytes, cs.MinFree
+		s.CacheEvictTarget, s.CacheFreed = cs.EvictTarget, cs.FreedBytes
 		s.CacheFillErrors, s.CacheEvictErrors = cs.FillErrors, cs.EvictErrors
 		s.CacheReadErrors, s.CacheLastError = cs.CacheReadErrors, cs.LastError
 	}
