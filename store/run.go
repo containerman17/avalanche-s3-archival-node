@@ -397,16 +397,17 @@ func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*
 			return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
 		}
 		// pebble's sstable.Reader has no point-get, so the bloom gate is ours
-		// to apply: keep the filter bytes in hand for MayHave. It reads through
-		// the section, which just made those bytes resident, so it is a copy
-		// out of RAM and not a second fetch.
+		// to apply: keep the filter bytes in hand for MayHave. reside just
+		// pinned that exact block, so the gate ALIASES the resident bytes
+		// rather than copying them: a copy held every bloom twice, and on
+		// mainnet C (217 runs, 20 bits/key) that second copy was 11.4GB.
 		if seed == nil && len(lay.Filter) > 0 && lay.Filter[0].Length > 0 {
-			f := make([]byte, lay.Filter[0].Length)
-			if _, err := sec.ReadAt(f, int64(lay.Filter[0].Offset)); err != nil {
+			f := sec.residentData(lay.Filter[0].Offset)
+			if f == nil {
 				r.Close()
-				return nil, err
+				return nil, fmt.Errorf("store: run %s section %v: filter block not resident after reside", name, s)
 			}
-			r.filter[s] = f
+			r.filter[s] = f[:lay.Filter[0].Length]
 		}
 		// The tail was scaffolding for the two steps above and nothing else.
 		// It is per section and per run, and a node opens hundreds of runs, so
@@ -656,8 +657,17 @@ func resideSpans(want []blockRange) []int {
 }
 
 func (s *sectionReadable) isResident(off uint64) bool {
+	return s.residentData(off) != nil
+}
+
+// residentData returns the pinned bytes of the range registered at exactly
+// off (trailer included), or nil when there is none.
+func (s *sectionReadable) residentData(off uint64) []byte {
 	i := sort.Search(len(s.res), func(i int) bool { return s.res[i].off >= off })
-	return i < len(s.res) && s.res[i].off == off
+	if i < len(s.res) && s.res[i].off == off {
+		return s.res[i].data
+	}
+	return nil
 }
 
 // insert adds one resident range, keeping s.res sorted by offset. A range
