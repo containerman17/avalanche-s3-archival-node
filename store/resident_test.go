@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,6 +56,7 @@ func TestSidecarRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(r2, "sidecar open")
+	bloom := append([]byte(nil), r2.filter[SecState]...)
 	r2.Close()
 
 	// A torn sidecar (here: truncated mid-payload) must rebuild, not fail.
@@ -73,6 +75,30 @@ func TestSidecarRoundTrip(t *testing.T) {
 	r3.Close()
 	if st, err := os.Stat(side); err != nil || st.Size() != int64(len(raw)) {
 		t.Fatalf("torn sidecar was not rewritten whole: %v size=%d want %d", err, st.Size(), len(raw))
+	}
+
+	// A sidecar of the right shape with one bit flipped inside the bloom
+	// payload must rebuild: a corrupt bloom would answer "absent" for
+	// present keys, silently.
+	at := bytes.Index(raw, bloom)
+	if at < 0 {
+		t.Fatal("state bloom not found in the sidecar")
+	}
+	for _, off := range []int{at + len(bloom)/2, len(raw) - 64} { // inside the bloom, inside some other block
+		flipped := append([]byte(nil), raw...)
+		flipped[off] ^= 0x10
+		if err := os.WriteFile(side, flipped, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r3b, err := OpenRun(cas, name)
+		if err != nil {
+			t.Fatalf("open with a bit flipped at %d: %v", off, err)
+		}
+		check(r3b, "bitflip-rebuilt open")
+		r3b.Close()
+		if got, err := os.ReadFile(side); err != nil || !bytes.Equal(got, raw) {
+			t.Fatalf("bit-flipped sidecar was not rewritten: %v", err)
+		}
 	}
 
 	// A stale-but-well-formed sidecar (bytes from another run's walk shape:

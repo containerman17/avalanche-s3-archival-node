@@ -318,9 +318,18 @@ func ReopenRun(cas *dist.Store, old *Run) (*Run, error) {
 
 func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*Run, error) {
 	r, stale, err := openRunAttempt(cas, name, seed, version)
+	if err != nil && seed == nil {
+		// ANY failure with a sidecar present is answered by a rebuild, not
+		// just the coverage check: a torn or bit-flipped block trips pebble's
+		// own trailer checksum deep inside NewReader or Layout, and the
+		// sidecar is derived state, so the artifact is the authority either
+		// way. If the artifact itself is bad the retry fails the same way and
+		// that error is the one reported.
+		if _, statErr := os.Stat(residentPath(cas, name)); statErr == nil {
+			stale = true
+		}
+	}
 	if stale {
-		// A sidecar that does not cover this binary's layout walk was written
-		// by another one; it is derived state, so the answer is a rebuild.
 		os.Remove(residentPath(cas, name))
 		r, _, err = openRunAttempt(cas, name, seed, version)
 	}
@@ -510,6 +519,18 @@ func openRunAttempt(cas *dist.Store, name RunName, seed *Run, version uint32) (_
 				if f == nil {
 					r.Close()
 					return nil, false, fmt.Errorf("store: run %s section %v: filter block not resident", name, s)
+				}
+				// THE BLOOM IS THE ONE BLOCK NOBODY ELSE CHECKS: index and
+				// meta blocks go through pebble's reader, which validates
+				// every trailer, but the filter is probed raw. A zeroed or
+				// bit-flipped bloom answers "absent" for present keys, which
+				// is the one silent wrong answer this file can produce, so
+				// its trailer is validated here once. From a sidecar that is
+				// a torn file and openRunVersion rebuilds; from the artifact
+				// it is corruption and the error stands.
+				if err := sstblock.ValidateChecksum(sstblock.ChecksumTypeCRC32c, f, bh); err != nil {
+					r.Close()
+					return nil, false, fmt.Errorf("store: run %s section %v: filter block: %w", name, s, err)
 				}
 				r.filter[s] = f[:bh.Length]
 			}
