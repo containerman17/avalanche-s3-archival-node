@@ -332,6 +332,10 @@ func (s *Store) SpoolPath(hash string) string { return filepath.Join(s.spool, ha
 // not a hash-named file (a half-built epoch is `epoch-*.tmp`).
 func (s *Store) SpoolDir() string { return s.spool }
 
+// DataDir is the directory this store was opened on, for siblings that keep
+// derived per-run state beside the spool (store's resident sidecars).
+func (s *Store) DataDir() string { return s.dir }
+
 // LocalDir holds the artifacts that NEVER reach the bucket. Sync only ever
 // looks at the spool, so being here is the whole upload gate: no flag, no
 // filter, no policy to get wrong.

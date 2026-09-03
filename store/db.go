@@ -289,6 +289,8 @@ func open(dir string, cas *dist.Store, chainRoot [32]byte, readOnly bool) (*DB, 
 	if codeBudget > 0 {
 		d.code = lru.NewSizeConstrainedCache[common.Hash, []byte](codeBudget)
 	}
+	// Sidecars for runs a merge replaced are derived state for dead runs.
+	sweepSidecars(cas, man)
 	var runs []*Run
 	for _, ref := range man.Runs {
 		r, err := OpenRun(cas, ref.Name)

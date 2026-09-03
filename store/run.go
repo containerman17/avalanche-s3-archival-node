@@ -317,14 +317,25 @@ func ReopenRun(cas *dist.Store, old *Run) (*Run, error) {
 }
 
 func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*Run, error) {
+	r, stale, err := openRunAttempt(cas, name, seed, version)
+	if stale {
+		// A sidecar that does not cover this binary's layout walk was written
+		// by another one; it is derived state, so the answer is a rebuild.
+		os.Remove(residentPath(cas, name))
+		r, _, err = openRunAttempt(cas, name, seed, version)
+	}
+	return r, err
+}
+
+func openRunAttempt(cas *dist.Store, name RunName, seed *Run, version uint32) (_ *Run, stale bool, _ error) {
 	blob, err := cas.Open(name)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	r := &Run{Name: name, blob: blob}
 	if blob.Size() < uint64(footerSize) {
 		blob.Close()
-		return nil, fmt.Errorf("store: run %s is %d bytes, too small for a footer", name, blob.Size())
+		return nil, false, fmt.Errorf("store: run %s is %d bytes, too small for a footer", name, blob.Size())
 	}
 	if seed != nil {
 		r.Footer, r.filter = seed.Footer, seed.filter
@@ -332,32 +343,60 @@ func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*
 		fb, err := blob.Read(blob.Size()-uint64(footerSize), uint64(footerSize))
 		if err != nil {
 			blob.Close()
-			return nil, err
+			return nil, false, err
 		}
 		if r.Footer, err = decodeFooterVersion(fb, version); err != nil {
 			blob.Close()
-			return nil, fmt.Errorf("store: run %s: %w", name, err)
+			return nil, false, fmt.Errorf("store: run %s: %w", name, err)
 		}
 	}
+	// A sidecar, when present, IS the open (resident.go): every byte NewReader,
+	// Layout and the bloom gate are about to want is already in the mapping, so
+	// a warm open reads nothing from the artifact at all, and the pinned bytes
+	// are file-backed: the kernel pages a cold chain's blooms out and a
+	// historical query pages back exactly what it probes.
+	var side [numSections][]residentRange
+	var mp *resMap
+	if seed == nil {
+		if m, sres, err := loadSidecar(residentPath(cas, name)); err == nil {
+			mp, side = m, sres
+		}
+	}
+	fromSidecar := mp != nil
+	if mp != nil {
+		defer mp.drop() // the loader's reference; sections take their own
+	}
+	var filterBH [numSections]sstblock.Handle
 	for s := Section(0); s < numSections; s++ {
 		sec := &sectionReadable{b: blob, off: r.Footer.Off[s], n: r.Footer.Len[s]}
-		if seed != nil {
+		switch {
+		case seed != nil:
 			// The resident ranges are a copy, never the seed's own slice: the
 			// seed is still serving reads out of it until its last reference
 			// goes, and reside appends.
 			sec.res = append([]residentRange(nil), seed.sec[s].res...)
 			sec.resident = seed.sec[s].resident
+			if sec.mp = seed.sec[s].mp; sec.mp != nil {
+				sec.mp.hold()
+			}
+		case fromSidecar:
+			sec.res = side[s]
+			for _, rr := range side[s] {
+				sec.resident += uint64(len(rr.data))
+			}
+			sec.mp = mp
+			mp.hold()
 		}
 		r.sec[s] = sec
 		readable, err := sstable.NewSimpleReadable(sec)
 		if err != nil {
 			r.Close()
-			return nil, err
+			return nil, false, err
 		}
 		rd, err := sstable.NewReader(context.Background(), readable, readerOptions())
 		if err != nil {
 			r.Close()
-			return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
+			return nil, false, fmt.Errorf("store: run %s section %v: %w", name, s, err)
 		}
 		r.rd[s] = rd
 		// THE TAIL COMES DOWN BEFORE Layout, NOT AFTER IT. Layout walks the
@@ -370,52 +409,113 @@ func openRunVersion(cas *dist.Store, name RunName, seed *Run, version uint32) (*
 		//
 		// A reopen skips it: the seed already carries those exact blocks
 		// resident, so its Layout reads nothing and a tail read would be pure
-		// loss.
-		if seed == nil {
+		// loss. A sidecar open skips it for the same reason.
+		if seed == nil && !fromSidecar {
 			if err := sec.resideTail(rd); err != nil {
 				r.Close()
-				return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
+				return nil, false, fmt.Errorf("store: run %s section %v: %w", name, s, err)
 			}
 		}
 		lay, err := rd.Layout()
 		if err != nil {
 			r.Close()
-			return nil, err
+			return nil, false, err
 		}
 		// BLOOMS AND SST INDEX BLOCKS ARE ALWAYS RESIDENT LOCALLY (DESIGN,
 		// read-through): a cold point read must cost local bloom probes plus
 		// EXACTLY ONE remote GET, and an index block re-read from the artifact
 		// would be a second one. They are read once here into the section's
-		// resident overlay, which serves those byte ranges from RAM forever
-		// after; only data blocks ever reach the blob again.
+		// resident overlay, which serves those byte ranges from RAM (the
+		// sidecar mapping, once one exists) forever after; only data blocks
+		// ever reach the blob again.
 		resident := append([]sstblock.Handle{lay.TopIndex, lay.Properties, lay.MetaIndex}, lay.Index...)
 		for _, nbh := range lay.Filter {
 			resident = append(resident, nbh.Handle)
 		}
-		if err := sec.reside(resident); err != nil {
-			r.Close()
-			return nil, fmt.Errorf("store: run %s section %v: %w", name, s, err)
-		}
-		// pebble's sstable.Reader has no point-get, so the bloom gate is ours
-		// to apply: keep the filter bytes in hand for MayHave. reside just
-		// pinned that exact block, so the gate ALIASES the resident bytes
-		// rather than copying them: a copy held every bloom twice, and on
-		// mainnet C (217 runs, 20 bits/key) that second copy was 11.4GB.
-		if seed == nil && len(lay.Filter) > 0 && lay.Filter[0].Length > 0 {
-			f := sec.residentData(lay.Filter[0].Offset)
-			if f == nil {
-				r.Close()
-				return nil, fmt.Errorf("store: run %s section %v: filter block not resident after reside", name, s)
+		if fromSidecar {
+			// A handle the mapping does not cover means the sidecar was some
+			// other binary's layout walk: stale, rebuild (openRunVersion).
+			for _, bh := range resident {
+				if bh.Length > 0 && !sec.isResident(bh.Offset) {
+					r.Close()
+					return nil, true, fmt.Errorf("store: run %s section %v: sidecar does not cover block at %d", name, s, bh.Offset)
+				}
 			}
-			r.filter[s] = f[:lay.Filter[0].Length]
+		} else {
+			if err := sec.reside(resident); err != nil {
+				r.Close()
+				return nil, false, fmt.Errorf("store: run %s section %v: %w", name, s, err)
+			}
+			// THE FOOTER GAP RIDES ALONG. On the next open NewReader reads the
+			// pebble footer before any of the handles above are known, so the
+			// bytes after the last pinned handle go into the overlay too, or a
+			// sidecar open would pay one artifact read per section right
+			// there. Served out of the tail here, so it costs nothing now.
+			if seed == nil && sec.n > 0 {
+				var end uint64
+				for _, bh := range resident {
+					if bh.Length > 0 {
+						end = max(end, bh.Offset+bh.Length+blockTrailer)
+					}
+				}
+				if end < sec.n {
+					gap, err := sec.read(end, sec.n-end)
+					if err != nil {
+						r.Close()
+						return nil, false, err
+					}
+					sec.insert(end, append([]byte(nil), gap...))
+				}
+			}
 		}
-		// The tail was scaffolding for the two steps above and nothing else.
+		if seed == nil && len(lay.Filter) > 0 && lay.Filter[0].Length > 0 {
+			filterBH[s] = lay.Filter[0].Handle
+		}
+		// The tail was scaffolding for the steps above and nothing else.
 		// It is per section and per run, and a node opens hundreds of runs, so
 		// holding it would be the resident budget several times over. The exact
 		// handles keep their own copies; only the bridged bytes go.
 		sec.dropTail()
 	}
-	return r, nil
+	// The build path persists what it just pinned and re-points the overlay at
+	// the mapping, so the heap copies are garbage the moment this returns. A
+	// failure anywhere here keeps the heap overlay, which is exactly the
+	// pre-sidecar behavior: correct and merely anonymous.
+	if seed == nil && !fromSidecar {
+		path := residentPath(cas, name)
+		if err := writeSidecar(path, r.sec); err == nil {
+			if m, sres, err := loadSidecar(path); err == nil {
+				for s := Section(0); s < numSections; s++ {
+					sec := r.sec[s]
+					sec.res, sec.resident = sres[s], 0
+					for _, rr := range sres[s] {
+						sec.resident += uint64(len(rr.data))
+					}
+					sec.mp = m
+					m.hold()
+				}
+				m.drop()
+			}
+		}
+	}
+	// pebble's sstable.Reader has no point-get, so the bloom gate is ours to
+	// apply: keep the filter bytes in hand for MayHave. It ALIASES the overlay
+	// (a copy held every bloom twice, 11.4GB on mainnet C), and it aliases
+	// AFTER the swap above so it points into the mapping, not at heap the swap
+	// just orphaned.
+	if seed == nil {
+		for s := Section(0); s < numSections; s++ {
+			if bh := filterBH[s]; bh.Length > 0 {
+				f := r.sec[s].residentData(bh.Offset)
+				if f == nil {
+					r.Close()
+					return nil, false, fmt.Errorf("store: run %s section %v: filter block not resident", name, s)
+				}
+				r.filter[s] = f[:bh.Length]
+			}
+		}
+	}
+	return r, false, nil
 }
 
 // ResidentBytes is what this run costs the node's local budget: its blooms and
@@ -447,6 +547,12 @@ func (r *Run) Close() error {
 		if rd != nil {
 			rd.Close()
 			r.rd[i] = nil
+		}
+	}
+	for _, sc := range r.sec {
+		if sc != nil {
+			sc.mp.drop()
+			sc.mp = nil
 		}
 	}
 	if r.blob != nil {
@@ -559,6 +665,10 @@ type sectionReadable struct {
 	// is gone before openRunVersion returns, and it needs no lock because open
 	// is the only thing holding the section then.
 	tail residentRange
+	// mp is the sidecar mapping res aliases when the overlay is file-backed
+	// (see resident.go). nil means the overlay is heap bytes. Refcounted
+	// because a reopen's sections share the seed's mapping.
+	mp *resMap
 }
 
 // residentRange is one section-relative byte range held in RAM for good.
@@ -713,6 +823,9 @@ func (s *sectionReadable) resideAll() error {
 	}
 	s.res = []residentRange{{off: 0, data: buf}}
 	s.resident = s.n
+	// The single heap range replaced whatever aliased the sidecar mapping.
+	s.mp.drop()
+	s.mp = nil
 	return nil
 }
 
@@ -766,7 +879,11 @@ func (s *sectionReadable) read(off, n uint64) ([]byte, error) {
 // release drops the resident overlay. Reads fall back to the artifact, which is
 // correct and only slower: it is for a caller that walked the section once and
 // is done with it.
-func (s *sectionReadable) release() { s.res, s.resident = nil, 0 }
+func (s *sectionReadable) release() {
+	s.res, s.resident = nil, 0
+	s.mp.drop()
+	s.mp = nil
+}
 
 func (s *sectionReadable) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 || uint64(off) > s.n {
