@@ -32,7 +32,10 @@ import (
 //
 // 2 replaced the per-posting lookup rows with Elias-Fano chunks; 3 added the
 // set/ family. Both have a migration (store/migrate.go, `epochdb dev migrate`).
-const StorageVersion = 3
+// 4 (2026-09-08) stores the itx/ row as libevm's callTracer JSON verbatim and
+// adds the cid/ container-ID index; frames exist only at execution time, so
+// there is NO migration: every chain re-syncs.
+const StorageVersion = 4
 
 // ---------------------------------------------------------------------------
 // THE ONE DIMENSION IS TxNum, AND EVERY BLOCK OWNS A SLOT OF ITS OWN.
@@ -55,7 +58,7 @@ const StorageVersion = 3
 //
 //	blk/<height>   -> first TxNum of the block (8B) + tx count (4B)
 //	hdr/<height>   -> header RLP verbatim
-//	itx/<txnum>    -> the tx's call frames in enter order with depth
+//	itx/<txnum>    -> the tx's callTracer JSON, verbatim (libevm native.callTracer)
 //	pvm/<height>   -> proposervm wrapper bytes verbatim (empty pre-fork)
 //	rcpt/<txnum>   -> receipt + full logs
 //	tx/<txnum>     -> tx RLP verbatim
@@ -110,6 +113,7 @@ const (
 
 	PrefixTxHash  = "txh/"
 	PrefixBlkHash = "blkh/"
+	PrefixCid     = "cid/"
 	PrefixAddr    = "addr/"
 	PrefixELog    = "elog/"
 	PrefixTVal    = "tval/"
@@ -185,6 +189,12 @@ func CodeKey(hash []byte) []byte  { return append([]byte(PrefixCode), hash...) }
 // version stays 0 because no corpus is published yet; every local corpus is
 // rebuilt from staging, clean slate.
 func BlkHashKey(h []byte) []byte { return append([]byte(PrefixBlkHash), h...) }
+
+// CidKey is cid/<containerID> -> height (storage v4): the CONTAINER id, sha256
+// of the container bytes, which is what a peer names in Get/GetAncestors. It
+// is what lets this node answer the network the way avalanchego does, so a
+// fresh node (ours or theirs) can pull history from a stored corpus.
+func CidKey(id []byte) []byte { return append([]byte(PrefixCid), id...) }
 
 // AccountPrefix is state/<addr>/a/ : the key range that is one account's
 // history.

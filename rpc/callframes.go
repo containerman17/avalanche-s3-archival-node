@@ -1,9 +1,9 @@
 package rpc
 
-// STORED FRAMES RENDERED AS geth's callTracer. The `itx/` family holds every
-// call frame in enter order with depth (DESIGN: traces are stored), and enter
-// order plus depth is the pre-order DFS callTracer itself replays, so its JSON
-// is a rendering of stored rows, not a re-execution.
+// STORED callTracer ANSWERS. The `itx/` row IS libevm's callTracer JSON,
+// captured at execution (exec/frames.go, storage v4), so a plain callTracer
+// request is a copy of stored bytes and nothing of ours stands between the
+// tracer and the wire.
 //
 // THE DOUBLE RENDER IS THE CURRENT MODE (user ruling 2026-09-07): every
 // callTracer request still re-executes, the stored frames are rendered beside
@@ -13,48 +13,22 @@ package rpc
 // (DESIGN, "stored traces are unverified data"), and a per-request error would
 // be read by nobody.
 //
-// KNOWN GAPS OF THE STORED RECORD, expected to trip the comparator until the
-// format grows: a frame carries `failed`, not the error string (callTracer
-// prints "out of gas", "invalid opcode: ..."), and the top-level frame is not
-// stored at all, so its return data is unknown. Both are named in the crash
-// message when they are the difference.
+// A DIFFERENCE HERE MEANS THE PINNED libevm NO LONGER PRODUCES THE BYTES IT
+// PRODUCED AT CAPTURE (or execution diverged, which the state root would have
+// caught first): the crash message carries both documents and the request.
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/big"
 	"os"
 	"reflect"
 	"sort"
 	"strings"
 
-	"github.com/ava-labs/libevm/accounts/abi"
-	"github.com/ava-labs/libevm/common"
-	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/core/vm"
-
-	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
-
-// callNode mirrors native.callFrame's generated JSON FIELD FOR FIELD AND IN
-// ORDER (gen_callframe_json.go): the comparison is byte-for-byte, so the
-// order, the omitempty set and the hex encodings are the contract.
-type callNode struct {
-	From         common.Address  `json:"from"`
-	Gas          hexutil.Uint64  `json:"gas"`
-	GasUsed      hexutil.Uint64  `json:"gasUsed"`
-	To           *common.Address `json:"to,omitempty"`
-	Input        hexutil.Bytes   `json:"input"`
-	Output       hexutil.Bytes   `json:"output,omitempty"`
-	Error        string          `json:"error,omitempty"`
-	RevertReason string          `json:"revertReason,omitempty"`
-	Calls        []*callNode     `json:"calls,omitempty"`
-	Value        *hexutil.Big    `json:"value,omitempty"`
-	Type         string          `json:"type"`
-}
 
 // traceMode is EPOCHDB_TRACE_MODE: "check" (default) re-executes AND renders
 // the stored frames and dies on a difference; "stored" answers from the
@@ -75,16 +49,12 @@ var traceMode = func() string {
 // storedCallTraces renders the callTracer answer for tx target of blk, or
 // every tx when target < 0, from stored rows alone.
 func (s *Server) storedCallTraces(blk *types.Block, target int) ([]json.RawMessage, *rpcError) {
-	rcpts, rerr := s.storedBlockReceipts(blk)
-	if rerr != nil {
-		return nil, rerr
-	}
 	var out []json.RawMessage
 	for i := range blk.Transactions() {
 		if target >= 0 && i != target {
 			continue
 		}
-		res, err := s.StoredCallTrace(blk, i, rcpts[i])
+		res, err := s.StoredCallTrace(blk, i)
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
@@ -113,15 +83,10 @@ func isPlainCallTracer(cfg *traceConfig) bool {
 	return !opts.OnlyTopCall && !opts.WithLog
 }
 
-// StoredCallTrace renders transaction i of blk from its stored frames as
-// callTracer JSON. Exported for the parity sweep (callframes_test at the root).
-func (s *Server) StoredCallTrace(blk *types.Block, i int, rcpt *types.Receipt) (json.RawMessage, error) {
-	tx := blk.Transactions()[i]
-	signer := types.MakeSigner(s.chainCfg, blk.Number(), blk.Time())
-	from, err := types.Sender(signer, tx)
-	if err != nil {
-		return nil, fmt.Errorf("sender of %s: %v", tx.Hash(), err)
-	}
+// StoredCallTrace is transaction i of blk's stored callTracer answer, the
+// bytes libevm's tracer produced at execution (storage v4). Exported for the
+// parity sweep (callframes_test at the root).
+func (s *Server) StoredCallTrace(blk *types.Block, i int) (json.RawMessage, error) {
 	first, _, ok, err := s.db.BlockTxRange(blk.NumberU64())
 	if err != nil {
 		return nil, err
@@ -134,91 +99,9 @@ func (s *Server) StoredCallTrace(blk *types.Block, i int, rcpt *types.Receipt) (
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("tx %s has no stored frames", tx.Hash())
+		return nil, fmt.Errorf("tx %s has no stored frames", blk.Transactions()[i].Hash())
 	}
-	frames, err := store.DecodeFrames(rec)
-	if err != nil {
-		return nil, err
-	}
-
-	// The top-level frame IS the transaction: callTracer's CaptureStart/End.
-	top := &callNode{
-		Type:    "CALL",
-		From:    from,
-		Value:   (*hexutil.Big)(tx.Value()),
-		Gas:     hexutil.Uint64(tx.Gas()),
-		GasUsed: hexutil.Uint64(rcpt.GasUsed),
-		Input:   tx.Data(),
-	}
-	if tx.To() == nil {
-		top.Type = "CREATE"
-		if rcpt.Status == types.ReceiptStatusSuccessful {
-			created := rcpt.ContractAddress
-			top.To = &created
-		}
-	} else {
-		to := *tx.To()
-		top.To = &to
-	}
-	if rcpt.Status != types.ReceiptStatusSuccessful {
-		// The record holds no top-level output or error: "execution
-		// reverted" is the common case, and the comparator names the rest.
-		top.Error = vm.ErrExecutionReverted.Error()
-	}
-
-	// Enter order plus depth is a pre-order DFS: stack[d] is the open frame
-	// at depth d, the top-level frame being depth 0's parent.
-	stack := []*callNode{top}
-	for k, f := range frames {
-		d := int(f.Depth) + 1
-		if d > len(stack) {
-			return nil, fmt.Errorf("tx %s frame %d: depth %d with %d open frames", tx.Hash(), k, f.Depth, len(stack)-1)
-		}
-		stack = stack[:d]
-		n := &callNode{
-			Type:    vm.OpCode(f.Kind).String(),
-			From:    f.From,
-			Gas:     hexutil.Uint64(f.Gas),
-			GasUsed: hexutil.Uint64(f.GasUsed),
-			Input:   f.Input,
-		}
-		to := f.To
-		n.To = &to
-		// libevm hands the tracer a value for every kind but STATICCALL
-		// (evm.go: DELEGATECALL carries the parent's), and a zero one is
-		// printed as 0x0, so absence is the kind, not the amount.
-		if vm.OpCode(f.Kind) != vm.STATICCALL {
-			v := f.Value
-			if v == nil {
-				v = new(big.Int)
-			}
-			n.Value = (*hexutil.Big)(v)
-		}
-		if !f.Failed {
-			n.Output = f.Output
-		} else {
-			// callTracer: a failed CREATE has no `to`; output is kept only
-			// on a revert, and a revert is the one failure that returns
-			// data, so data present means reverted here.
-			if vm.OpCode(f.Kind) == vm.CREATE || vm.OpCode(f.Kind) == vm.CREATE2 {
-				n.To = nil
-			}
-			if len(f.Output) > 0 {
-				n.Error = vm.ErrExecutionReverted.Error()
-				n.Output = f.Output
-				if len(f.Output) >= 4 {
-					if reason, err := abi.UnpackRevert(f.Output); err == nil {
-						n.RevertReason = reason
-					}
-				}
-			} else {
-				n.Error = "<stored frame failed: error string is not recorded>"
-			}
-		}
-		stack[d-1].Calls = append(stack[d-1].Calls, n)
-		stack = append(stack, n)
-	}
-	return json.Marshal(top)
+	return json.RawMessage(rec), nil
 }
 
 // assertStoredTraceMatches renders the stored frames of every traced
@@ -226,16 +109,12 @@ func (s *Server) StoredCallTrace(blk *types.Block, i int, rcpt *types.Receipt) (
 // output: one entry per traced tx, the last one being tx target when target
 // is set, else block order.
 func (s *Server) assertStoredTraceMatches(method string, params []json.RawMessage, blk *types.Block, target int, fresh []json.RawMessage) {
-	rcpts, rerr := s.storedBlockReceipts(blk)
-	if rerr != nil {
-		log.Fatalf("epochdb: stored-trace check: %s %s: block %d receipts: %s", method, params, blk.NumberU64(), rerr.Message)
-	}
 	for k, got := range fresh {
 		i := k
 		if target >= 0 {
 			i = target
 		}
-		stored, err := s.StoredCallTrace(blk, i, rcpts[i])
+		stored, err := s.StoredCallTrace(blk, i)
 		if err != nil {
 			log.Fatalf("epochdb: stored-trace check: %s %s: block %d tx %d (%s): render: %v",
 				method, params, blk.NumberU64(), i, blk.Transactions()[i].Hash(), err)

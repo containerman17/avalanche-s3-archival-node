@@ -245,6 +245,22 @@ func (s *Server) AccessList(msg *CallMsg, n uint64, prev types.AccessList, nonce
 // re-encode a tracer's output into something it did not say. tracer is the
 // name ("callTracer", "prestateTracer", ...); empty means the struct logger.
 
+// ContainerAt is the container bytes at height n, reassembled from the stored
+// header, transactions and proposervm wrapper: what a peer's Get answers.
+func (s *Server) ContainerAt(n uint64) ([]byte, error) {
+	raw, rerr := s.rawBlock(n)
+	if rerr != nil {
+		return nil, rerr.error()
+	}
+	return raw, nil
+}
+
+// HeightByContainerID resolves a container ID (sha256 of the container
+// bytes) to its height. ok=false is a clean "not on this chain".
+func (s *Server) HeightByContainerID(id []byte) (uint64, bool, error) {
+	return s.db.HeightByContainerID(id)
+}
+
 // TraceTransaction re-executes one transaction under a tracer. Unlike Frames
 // (the STORED call frames), this is a real re-execution, which is what a
 // caller asking for a specific tracer is asking for.

@@ -62,6 +62,7 @@ func serveMain(args []string) {
 	dataDir := fs.String("data", "./data", "data directory; ONE chain owns it, and this process serves that one chain")
 	port := fs.Int("port", 9650, "HTTP listen port: JSON-RPC at / and /ext/bc/<blockchainID>/rpc, the plain HTTP adapter at /v0/<method>, /status")
 	grpcPort := fs.Int("grpc-port", 9660, "gRPC listen port, THE PRIMARY REMOTE API (0 disables)")
+	p2pPort := fs.Int("p2p-port", 0, "listen for avalanchego peers on this port and answer Get/GetAncestors from the store (0 disables)")
 	network := fs.String("network", "fuji", "network: fuji|mainnet (the network --chain lives on)")
 	chainSpec := fs.String("chain", "C", "chain: C for --network's primary C-chain, or an L1's blockchainID")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the cross-checked validator set; default: the --node URIs, with a warning when that is one host")
@@ -155,6 +156,7 @@ func serveMain(args []string) {
 			NodeURI:       *nodeURI,
 			StateCacheGiB: *stateCacheGiB,
 			PerPeer:       *perPeer,
+			P2PPort:       *p2pPort,
 			OnExit:        report,
 		}
 		// The descriptor, not --network, names the network to dial: it is what

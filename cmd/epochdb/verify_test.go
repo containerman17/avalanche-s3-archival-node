@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -127,18 +128,12 @@ func verifyCorpus(t *testing.T, nBlocks, nTxs int, tail func(h int) []store.Stat
 	return db
 }
 
-// frameRec builds one valid itx/ record: a single CALL frame.
+// frameRec builds one valid itx/ record: callTracer JSON with a single
+// nested CALL frame (storage v4 stores the tracer's answer verbatim).
 func frameRec(t *testing.T, seed byte) []byte {
 	t.Helper()
-	rec := []byte{1} // uvarint frame count
-	rec = append(rec, 0xF1, 0)
-	rec = append(rec, common.Address{seed}.Bytes()...)
-	rec = append(rec, common.Address{seed + 1}.Bytes()...)
-	rec = append(rec, 1, seed)     // value len, value
-	rec = append(rec, 100, 90)     // gas, gasUsed (uvarint)
-	rec = append(rec, 0)           // not failed
-	rec = append(rec, 2, 'i', 'n') // input
-	rec = append(rec, 1, 'o')      // output
+	rec := []byte(fmt.Sprintf(`{"from":"%s","gas":"0x64","gasUsed":"0x5a","to":"%s","input":"0x","calls":[{"from":"%s","gas":"0x64","gasUsed":"0x5a","to":"%s","input":"0x696e","output":"0x6f","value":"0x%x","type":"CALL"}],"value":"0x0","type":"CALL"}`,
+		common.Address{seed}.Hex(), common.Address{seed + 1}.Hex(), common.Address{seed}.Hex(), common.Address{seed + 1}.Hex(), seed))
 	if _, err := store.DecodeFrames(rec); err != nil {
 		t.Fatalf("the test's own frame record does not decode: %v", err)
 	}

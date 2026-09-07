@@ -2,9 +2,13 @@ package fetch
 
 import (
 	"context"
+	"crypto"
 	"fmt"
 	"log"
+	gonet "net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -14,11 +18,14 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
 	"github.com/ava-labs/avalanchego/network"
+	"github.com/ava-labs/avalanchego/network/dialer"
+	"github.com/ava-labs/avalanchego/network/peer"
 	"github.com/ava-labs/avalanchego/proto/pb/p2p"
 	avacommon "github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/validators"
 	"github.com/ava-labs/avalanchego/staking"
 	"github.com/ava-labs/avalanchego/subnets"
+	"github.com/ava-labs/avalanchego/upgrade"
 	"github.com/ava-labs/avalanchego/utils/compression"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/logging"
@@ -68,6 +75,12 @@ type Config struct {
 	// SubnetID is the primary network) keeps the C-chain path exactly as it
 	// was: ids come from the bootstrap node's RPC, no tracked subnets, coreth.
 	Chain *chain.Chain
+	// ListenPort > 0 makes this node a PEER OTHERS CAN DIAL: a real listener,
+	// a staking cert persisted under DataDir (staker.key/.crt, so the NodeID
+	// survives restarts), and Get/GetAncestors answered from the store once
+	// Serve is wired (Fetcher.Serve). 0 is the client-only node of before.
+	ListenPort int
+	DataDir    string
 }
 
 // sources is NodeURI as the list it is: every bootstrap call tries them in
@@ -275,20 +288,64 @@ func dial(cfg Config) (*Fetcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("NewTestNetworkConfig: %w", err)
 	}
+	if cfg.ListenPort > 0 {
+		// A STABLE IDENTITY, or nobody can ManuallyTrack us by NodeID.
+		keyPath, certPath := filepath.Join(cfg.DataDir, "staker.key"), filepath.Join(cfg.DataDir, "staker.crt")
+		if _, serr := os.Stat(keyPath); serr != nil {
+			if err := staking.InitNodeStakingKeyPair(keyPath, certPath); err != nil {
+				return nil, fmt.Errorf("staking key pair: %w", err)
+			}
+		}
+		tlsCert, err := staking.LoadTLSCertFromFiles(keyPath, certPath)
+		if err != nil {
+			return nil, fmt.Errorf("staking cert: %w", err)
+		}
+		netCfg.TLSConfig = peer.TLSConfig(*tlsCert, nil)
+		netCfg.TLSKey = tlsCert.PrivateKey.(crypto.Signer)
+		netCfg.MyIPPort.Set(netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(cfg.ListenPort)))
+	}
 	stakingCert, err := staking.ParseCertificate(netCfg.TLSConfig.Certificates[0].Leaf.Raw)
 	if err != nil {
 		return nil, fmt.Errorf("ParseCertificate: %w", err)
 	}
 	netCfg.MyNodeID = ids.NodeIDFromCert(stakingCert)
 
-	net, err := network.NewTestNetwork(
-		logging.NoLog{},
-		prometheus.NewRegistry(),
-		netCfg,
-		handler,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("NewTestNetwork: %w", err)
+	var net network.Network
+	if cfg.ListenPort > 0 {
+		ln, err := gonet.Listen("tcp", fmt.Sprintf(":%d", cfg.ListenPort))
+		if err != nil {
+			return nil, fmt.Errorf("p2p listen: %w", err)
+		}
+		msgCreator, err := message.NewCreator(prometheus.NewRegistry(), avaconstants.DefaultNetworkCompressionType, avaconstants.DefaultNetworkMaximumInboundTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("message.NewCreator: %w", err)
+		}
+		// The same shape as network.NewTestNetwork, with our listener in
+		// place of its no-op one.
+		net, err = network.NewNetwork(
+			netCfg,
+			upgrade.GetConfig(networkID).GraniteTime,
+			msgCreator,
+			prometheus.NewRegistry(),
+			logging.NoLog{},
+			ln,
+			dialer.NewDialer(avaconstants.NetworkType, netCfg.DialerConfig, logging.NoLog{}),
+			handler,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("NewNetwork: %w", err)
+		}
+		log.Printf("fetch: serving p2p on :%d as %s", cfg.ListenPort, netCfg.MyNodeID)
+	} else {
+		net, err = network.NewTestNetwork(
+			logging.NoLog{},
+			prometheus.NewRegistry(),
+			netCfg,
+			handler,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("NewTestNetwork: %w", err)
+		}
 	}
 
 	creator, err := message.NewCreator(
@@ -359,6 +416,15 @@ func dial(cfg Config) (*Fetcher, error) {
 }
 
 // Close tears down the P2P network.
+// Serve wires the store behind Get/GetAncestors. Before this a peer's
+// request is dropped; after it the node answers from its own rows. Only
+// meaningful with Config.ListenPort set, harmless otherwise.
+func (f *Fetcher) Serve(src ContainerSource) {
+	f.handler.setServer(src, f.creator, func(to ids.NodeID, msg *message.OutboundMessage) {
+		noteSendGap("serve", set.Of(to), f.net.Send(msg, avacommon.SendConfig{NodeIDs: set.Of(to)}, f.subnetID, subnets.NoOpAllower))
+	})
+}
+
 func (f *Fetcher) Close() error {
 	f.net.StartClose()
 	return nil

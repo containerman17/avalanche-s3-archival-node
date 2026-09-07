@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -597,6 +598,21 @@ func (m *memtable) add(b *BlockWrite) error {
 	// THE BLOCK-HASH INDEX ROW, derived here rather than carried in: a block
 	// hash is keccak256 of the header RLP, and the header RLP is right there.
 	if err := m.numRow(BlkHashKey(crypto.Keccak256(b.HeaderRLP)), b.Height); err != nil {
+		return err
+	}
+	// THE CONTAINER-ID INDEX ROW, derived the same way: the container is pure
+	// concatenation of what is stored (Reassemble), and its id is sha256 of
+	// those bytes, which is what a peer's Get/GetAncestors names.
+	txRLPs := make([][]byte, len(b.Txs))
+	for i := range b.Txs {
+		txRLPs[i] = b.Txs[i].RLP
+	}
+	container, err := Reassemble(b.Pvm, b.HeaderRLP, txRLPs)
+	if err != nil {
+		return fmt.Errorf("block %d: reassemble container: %w", b.Height, err)
+	}
+	cid := sha256.Sum256(container)
+	if err := m.numRow(CidKey(cid[:]), b.Height); err != nil {
 		return err
 	}
 	for h, blob := range b.Code {

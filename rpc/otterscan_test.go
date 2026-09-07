@@ -1,14 +1,13 @@
 package rpc
 
 import (
-	"encoding/binary"
+	"fmt"
 	"math/big"
 	"testing"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
-	"github.com/ava-labs/libevm/core/vm"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
 
@@ -96,17 +95,9 @@ func otsFixture(t *testing.T) (*Server, common.Address, []common.Hash) {
 // otsFrameRecord builds one itx/ row: a single CALL frame moving 1 wei. The
 // layout mirrors exec/frames.go, which owns it.
 func otsFrameRecord(from, to common.Address) []byte {
-	rec := binary.AppendUvarint(nil, 1)
-	rec = append(rec, byte(vm.CALL), 0)
-	rec = append(rec, from[:]...)
-	rec = append(rec, to[:]...)
-	rec = binary.AppendUvarint(rec, 1)
-	rec = append(rec, 1) // value: 1 wei
-	rec = binary.AppendUvarint(rec, 100)
-	rec = binary.AppendUvarint(rec, 50)
-	rec = append(rec, 0)                // not failed
-	rec = binary.AppendUvarint(rec, 0)  // no input
-	return binary.AppendUvarint(rec, 0) // no output
+	// Storage v4: the row is callTracer JSON; one nested CALL of 1 wei.
+	return []byte(fmt.Sprintf(`{"from":"%s","gas":"0x64","gasUsed":"0x32","to":"%s","input":"0x","calls":[{"from":"%s","gas":"0x64","gasUsed":"0x32","to":"%s","input":"0x","value":"0x1","type":"CALL"}],"value":"0x0","type":"CALL"}`,
+		from.Hex(), to.Hex(), from.Hex(), to.Hex()))
 }
 
 func otsSearch(t *testing.T, s *Server, method string, addr common.Address, block uint64, size int) *otsSearchResult {

@@ -1,42 +1,43 @@
 package exec
 
 // STORED CALL FRAMES, THE PRODUCTION CAPTURE (DESIGN, "Principles": traces are
-// stored, and capture failure is death). Every call frame of every transaction
-// is recorded at execution into the `itx/<txnum>` chain-section family. In
-// storage v0 that is ONE MORE STREAMED FAMILY: no groups, no index sections, no
-// sort, it arrives in TxNum order exactly like `tx/` and `rcpt/`.
+// stored, and capture failure is death). Every transaction is executed under
+// libevm's OWN callTracer, and the JSON it answers is the `itx/<txnum>` row,
+// VERBATIM (storage v4, user ruling 2026-09-08). `debug_traceTransaction` with
+// the callTracer is then a copy of stored bytes: there is no renderer of ours
+// between execution and the wire that could be wrong, and the double-render
+// check in rpc/callframes.go compares bytes to bytes.
+//
+// WHY NOT OUR OWN COMPACT RECORD (storage v0..v3 had one): it held every
+// subcall exactly but not the top-level frame's output nor a failed frame's
+// error string, so a stored trace could not answer what callTracer answers,
+// and the missing pieces exist only at execution time. One resync buys the
+// whole answer; the tracer that defines the answer is the one that captures.
 //
 // THE TRACER IS ALWAYS ON. There is no env var: frames are the one thing not
 // derivable from stored bytes, so a corpus captured without them is a corpus
-// that has to be re-executed. Measured free on wall clock (66.7s with against
-// 67.6s without over the same corpus).
+// that has to be re-executed.
 //
-// THE RECORD, per transaction: uvarint frameCount, then the frames in ENTER
-// order. Enter order plus depth is a pre-order DFS, which is exactly what a
-// call tracer replays. The TOP-LEVEL FRAME IS EXCLUDED because it IS the
-// transaction, but its two addresses are participants.
+// PARTICIPANTS ride along: the wrapper records every from/to the tracer sees
+// (top-level and nested) for the addr/ postings, with no ECDSA and no JSON
+// walk at flush.
 //
-// DETERMINISM NOTES, carried from the V1 capture work: DELEGATECALL frames
-// carry the PARENT's value by design (excluded by a read-time transfer filter,
-// never by capture); SELFDESTRUCT has no hook at this pin. Frames follow
-// execution exactly, so a config that would change them diverges the state root
-// first, which the executor hard-stops on.
-//
-// ONE CALL WAS ONCE ANNOUNCED TWICE when a stateful precompile called back into
-// the EVM: libevm's precompile environment fired CaptureEnter itself, handed the
-// same call to evm.Call which fired it again, and closed its own announcement
-// with CaptureEnd instead of CaptureExit. That halted mainnet C at 5,456,905 on
-// a NativeAssetCall. libevm db6d70f2748e removed the manual tracer block, so the
-// pair is balanced at the source and this capture folds nothing: every
-// CaptureEnter is a call that happened. See exec/frames_coreth_test.go.
+// A CAPTURE THAT CANNOT CLOSE IS DEATH: callTracer refuses to answer when its
+// call stack did not fold back to one top-level frame, and take() hands that
+// refusal to the executor, which log.Fatalf's naming the transaction. libevm
+// db6d70f2748e balanced the precompile call-out that once tripped this on
+// mainnet C 5,456,905 (see exec/frames_coreth_test.go).
 
 import (
-	"encoding/binary"
-	"fmt"
+	"encoding/json"
 	"math/big"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/vm"
+	"github.com/ava-labs/libevm/eth/tracers"
+
+	// Registers callTracer in tracers.DefaultDirectory.
+	_ "github.com/ava-labs/libevm/eth/tracers/native"
 )
 
 // frames is the process's capture. One executor per process (DESIGN, one chain
@@ -47,30 +48,12 @@ var frames = newFrameCapture()
 func frameTracer() vm.EVMLogger { return frameLogger{frames} }
 
 type frameCapture struct {
-	// armed says the tracer actually ran for the transaction in flight. It is
-	// what turns "this path forgot the tracer" from a silent hole into the
-	// documented death: see Executor.captureTx.
-	armed bool
-
-	// Per transaction. arena backs every input/output/value copy (the EVM
-	// reuses its own buffers), so a frame is a fixed-size struct and the whole
-	// tx costs one growing byte slice instead of two allocations per frame.
-	arena []byte
-	cur   []openFrame
-	stack []int // indexes into cur of the frames still open
+	// inner is libevm's callTracer for the transaction in flight; nil says
+	// the tracer never ran, which turns "this path forgot the tracer" from a
+	// silent hole into the documented death: see Executor.captureTx.
+	inner tracers.Tracer
 	addrs []common.Address
 	seen  map[common.Address]struct{}
-}
-
-// openFrame is one CaptureEnter waiting for its CaptureExit.
-type openFrame struct {
-	kind, depth    byte
-	from, to       common.Address
-	valOff, valLen int
-	gas, gasUsed   uint64
-	inOff, inLen   int
-	outOff, outLen int
-	failed         bool
 }
 
 func newFrameCapture() *frameCapture {
@@ -78,59 +61,30 @@ func newFrameCapture() *frameCapture {
 }
 
 func (c *frameCapture) resetTx() {
-	c.arena, c.cur, c.stack, c.addrs = c.arena[:0], c.cur[:0], c.stack[:0], c.addrs[:0]
+	c.inner, c.addrs = nil, c.addrs[:0]
 	clear(c.seen)
-	c.armed = false
 }
 
-// take serialises the transaction in flight and starts the next one. The bytes
-// are a fresh copy, so the batched executor can hold one per buffered block
-// while the capture moves on.
+// take serialises the transaction in flight and starts the next one.
 //
-// A NON-EMPTY why IS A HOLE AND THE CALLER TURNS IT INTO DEATH. There are two
-// of them, and both are "the trace is not what execution did":
-//
-//   - the tracer never ran at all (armed is false), which at this pin means the
-//     saexec seam;
-//   - the tracer ran but the enter/exit stack did not close, so the open frames
-//     carry gasUsed 0, no output and no error flag. That is INDISTINGUISHABLE
-//     from a real zero-gas success once stored, which makes it exactly the
-//     silent hole the fail-stop exists to refuse. No shape at this pin reaches
-//     it legitimately, so anything still open here is an enter/exit contract
-//     this capture does not model.
+// A NON-EMPTY why IS A HOLE AND THE CALLER TURNS IT INTO DEATH: the tracer
+// never ran (the saexec seam at this pin), or its call stack did not close,
+// which callTracer itself refuses to serialise.
 func (c *frameCapture) take() (rec []byte, addrs [][]byte, why string) {
-	if !c.armed {
+	if c.inner == nil {
 		return nil, nil, "the frame tracer never ran for this transaction"
 	}
-	if len(c.stack) != 0 {
-		// NAME THE FRAME. "some frame never closed" cost a full wrong-turn
-		// diagnosis once; its kind and its two addresses point straight at the
-		// execution path that owes the CaptureExit.
-		f := &c.cur[c.stack[len(c.stack)-1]]
-		return nil, nil, fmt.Sprintf("the call stack did not close: %d of %d frames never got a CaptureExit, innermost is %s from %s to %s at depth %d",
-			len(c.stack), len(c.cur), vm.OpCode(f.kind), f.from, f.to, f.depth)
+	res, err := c.inner.GetResult()
+	if err != nil {
+		c.resetTx()
+		return nil, nil, "callTracer refused the transaction: " + err.Error()
 	}
-	if len(c.cur) > 0 {
-		rec = binary.AppendUvarint(nil, uint64(len(c.cur)))
-		for i := range c.cur {
-			rec = c.appendFrame(rec, &c.cur[i])
-		}
-	}
+	rec = []byte(res)
 	for _, a := range c.addrs {
 		addrs = append(addrs, a.Bytes())
 	}
 	c.resetTx()
 	return rec, addrs, ""
-}
-
-// intern copies b into the per-tx arena.
-func (c *frameCapture) intern(b []byte) (off, n int) {
-	if len(b) == 0 {
-		return 0, 0
-	}
-	off = len(c.arena)
-	c.arena = append(c.arena, b...)
-	return off, len(b)
 }
 
 func (c *frameCapture) participant(a common.Address) {
@@ -141,80 +95,60 @@ func (c *frameCapture) participant(a common.Address) {
 	c.addrs = append(c.addrs, a)
 }
 
-// appendFrame writes one frame: kind, depth, from, to, value, gas, gasUsed,
-// err, input, output.
-func (c *frameCapture) appendFrame(b []byte, f *openFrame) []byte {
-	b = append(b, f.kind, f.depth)
-	b = append(b, f.from[:]...)
-	b = append(b, f.to[:]...)
-	b = binary.AppendUvarint(b, uint64(f.valLen))
-	b = append(b, c.arena[f.valOff:f.valOff+f.valLen]...)
-	b = binary.AppendUvarint(b, f.gas)
-	b = binary.AppendUvarint(b, f.gasUsed)
-	if f.failed {
-		b = append(b, 1)
-	} else {
-		b = append(b, 0)
-	}
-	b = binary.AppendUvarint(b, uint64(f.inLen))
-	b = append(b, c.arena[f.inOff:f.inOff+f.inLen]...)
-	b = binary.AppendUvarint(b, uint64(f.outLen))
-	return append(b, c.arena[f.outOff:f.outOff+f.outLen]...)
-}
-
-// frameLogger is the vm.EVMLogger seam. The per-opcode hooks stay empty: this
-// pin has no hook-shaped tracer, so the only cheap thing to do is nothing.
+// frameLogger is the vm.EVMLogger seam: every hook goes to the callTracer,
+// and the two address hooks also feed the participants.
 type frameLogger struct{ c *frameCapture }
 
-func (l frameLogger) CaptureTxStart(uint64) {
+func (l frameLogger) CaptureTxStart(gasLimit uint64) {
 	l.c.resetTx()
-	l.c.armed = true
+	t, err := tracers.DefaultDirectory.New("callTracer", &tracers.Context{}, json.RawMessage(nil))
+	if err != nil {
+		// The name is a constant registered by the import above; this cannot
+		// fail, and a nil inner is the documented death if it ever does.
+		return
+	}
+	l.c.inner = t
+	t.CaptureTxStart(gasLimit)
 }
 
-func (l frameLogger) CaptureTxEnd(uint64) {}
+func (l frameLogger) CaptureTxEnd(restGas uint64) {
+	if l.c.inner != nil {
+		l.c.inner.CaptureTxEnd(restGas)
+	}
+}
 
-// CaptureStart is the TOP-LEVEL frame, which is never stored (it IS the
-// transaction), but its two addresses are participants: `from` is the sender
-// the EVM already recovered, `to` is the recipient or, for a creation, the
-// created contract address.
-func (l frameLogger) CaptureStart(_ *vm.EVM, from, to common.Address, _ bool, _ []byte, _ uint64, _ *big.Int) {
+// CaptureStart is the TOP-LEVEL frame: `from` is the sender the EVM already
+// recovered, `to` is the recipient or, for a creation, the created address.
+func (l frameLogger) CaptureStart(env *vm.EVM, from, to common.Address, create bool, input []byte, gas uint64, value *big.Int) {
 	l.c.participant(from)
 	l.c.participant(to)
+	if l.c.inner != nil {
+		l.c.inner.CaptureStart(env, from, to, create, input, gas, value)
+	}
 }
 
-func (l frameLogger) CaptureEnd([]byte, uint64, error) {}
+func (l frameLogger) CaptureEnd(output []byte, gasUsed uint64, err error) {
+	if l.c.inner != nil {
+		l.c.inner.CaptureEnd(output, gasUsed, err)
+	}
+}
 
 func (l frameLogger) CaptureEnter(typ vm.OpCode, from, to common.Address, input []byte, gas uint64, value *big.Int) {
-	c := l.c
-	c.participant(from)
-	c.participant(to)
-	var valBytes []byte
-	if value != nil && value.Sign() != 0 {
-		valBytes = value.Bytes()
+	l.c.participant(from)
+	l.c.participant(to)
+	if l.c.inner != nil {
+		l.c.inner.CaptureEnter(typ, from, to, input, gas, value)
 	}
-	f := openFrame{kind: byte(typ), depth: byte(len(c.stack)), from: from, to: to, gas: gas}
-	if len(valBytes) != 0 {
-		// DELEGATECALL carries the PARENT's value by design: excluded by a
-		// read-time transfer filter, never by capture (DESIGN).
-		f.valOff, f.valLen = c.intern(valBytes)
-	}
-	f.inOff, f.inLen = c.intern(input)
-	c.stack = append(c.stack, len(c.cur))
-	c.cur = append(c.cur, f)
 }
 
 func (l frameLogger) CaptureExit(output []byte, gasUsed uint64, err error) {
-	c := l.c
-	if len(c.stack) == 0 {
-		return
+	if l.c.inner != nil {
+		l.c.inner.CaptureExit(output, gasUsed, err)
 	}
-	f := &c.cur[c.stack[len(c.stack)-1]]
-	c.stack = c.stack[:len(c.stack)-1]
-	f.gasUsed = gasUsed
-	f.failed = err != nil
-	f.outOff, f.outLen = c.intern(output)
 }
 
+// The per-opcode hooks stay empty: the plain callTracer ignores them (they
+// only matter for withLog), so not forwarding them is what keeps capture free.
 func (frameLogger) CaptureState(uint64, vm.OpCode, uint64, uint64, *vm.ScopeContext, []byte, int, error) {
 }
 func (frameLogger) CaptureFault(uint64, vm.OpCode, uint64, uint64, *vm.ScopeContext, int, error) {}

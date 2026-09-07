@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/containerman17/avalanche-s3-archival-node/dist"
@@ -17,10 +18,24 @@ import (
 // and hash lookup exactly as a store built from the same blocks does, its
 // chain and state sections are the same bytes, and the run chain walks back to
 // the root. A second Migrate is a no-op.
+// STORAGE V4 HAS NO MIGRATION (frames are captured at execution): Migrate
+// must refuse every fixture by name, and the v1/v2 -> v3 walk below stays as
+// the record of the shape, unreachable until a future IO-class bump wants it.
 func TestMigrate(t *testing.T) {
 	for _, v := range []string{"v1", "v2"} {
-		t.Run(v+" with window", func(t *testing.T) { testMigrate(t, v, true) })
-		t.Run(v+" no window", func(t *testing.T) { testMigrate(t, v, false) })
+		dir := t.TempDir()
+		if out, err := exec.Command("cp", "-r", filepath.Join("testdata", v)+"/.", dir).CombinedOutput(); err != nil {
+			t.Fatalf("cp: %v %s", err, out)
+		}
+		cas, err := dist.Local(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = Migrate(dir, cas, func(string, ...any) {})
+		cas.Close()
+		if err == nil || !strings.Contains(err.Error(), "no migration") {
+			t.Fatalf("%s: Migrate to storage v%d did not refuse: %v", v, StorageVersion, err)
+		}
 	}
 }
 

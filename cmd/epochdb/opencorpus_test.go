@@ -34,7 +34,7 @@ func writeCorpus(t *testing.T, dataDir string, root [32]byte) uint64 {
 		b := &store.BlockWrite{
 			Height:    h,
 			HeaderRLP: []byte(fmt.Sprintf("header-%d", h)),
-			Pvm:       []byte(fmt.Sprintf("pvm-%d", h)),
+			Pvm:       testPvm(fmt.Sprintf("pvm-%d", h)),
 			Code:      map[string][]byte{},
 		}
 		if err := db.WriteBlock(b); err != nil {
@@ -155,3 +155,9 @@ func TestOpenCorpusOffline(t *testing.T) {
 	head := writeCorpus(t, dir, root)
 	readsBack(t, dir, root, head)
 }
+
+// testPvm is a VALID proposervm template (two zero-length prefix pieces, so
+// Reassemble is header+txs+tail) with a distinguishing tail: WriteBlock
+// derives the container-id row by reassembling, so a fake row must at least
+// parse.
+func testPvm(tail string) []byte { return append(make([]byte, 8), tail...) }

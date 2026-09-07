@@ -1,22 +1,27 @@
 package store
 
 import (
-	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math/big"
 
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/common/hexutil"
+	"github.com/ava-labs/libevm/core/vm"
 )
 
-// THE `itx/<txnum>` RECORD, read side. exec/frames.go is the writer and owns
-// the format comment; this is its inverse, and it lives in store for the reason
-// the receipt codecs do: the executor writes, rpc and verify read, and exec
-// cannot import rpc.
+// THE `itx/<txnum>` RECORD IS libevm's callTracer JSON, VERBATIM (storage v4):
+// exec/frames.go captures it, rpc serves it as bytes, and this is the reader
+// for everything that wants frames as values (Otterscan's internal
+// operations, gRPC Trace, verify). It lives in store for the reason the
+// receipt codecs do: the executor writes, rpc and verify read, and exec cannot
+// import rpc.
 //
-// Layout: uvarint frameCount, then the frames in ENTER order (a pre-order DFS
-// when read with depth). The TOP-LEVEL frame is excluded because it IS the
-// transaction. An empty record means the transaction made no nested call,
-// which is a real answer and not a missing one.
+// DecodeFrames flattens the tree to ENTER order with depth (a pre-order DFS),
+// EXCLUDING the top-level frame, which is the transaction itself: that is the
+// shape every reader had under v0..v3, so nothing downstream moved. A
+// transaction that made no nested call decodes to no frames, a real answer
+// and not a missing one.
 
 // Frame is one decoded call frame.
 type Frame struct {
@@ -24,12 +29,28 @@ type Frame struct {
 	Depth   byte
 	From    common.Address
 	To      common.Address
-	Value   *big.Int // nil when the frame moved no value
+	Value   *big.Int // nil when the tracer printed none (STATICCALL)
 	Gas     uint64
 	GasUsed uint64
 	Failed  bool
+	Error   string // callTracer's error string, "" on success
 	Input   []byte
 	Output  []byte
+}
+
+// callFrameJSON is the stored shape, field for field (libevm native.callFrame).
+type callFrameJSON struct {
+	Type         string          `json:"type"`
+	From         common.Address  `json:"from"`
+	To           *common.Address `json:"to"`
+	Value        *hexutil.Big    `json:"value"`
+	Gas          hexutil.Uint64  `json:"gas"`
+	GasUsed      hexutil.Uint64  `json:"gasUsed"`
+	Input        hexutil.Bytes   `json:"input"`
+	Output       hexutil.Bytes   `json:"output"`
+	Error        string          `json:"error"`
+	RevertReason string          `json:"revertReason"`
+	Calls        []callFrameJSON `json:"calls"`
 }
 
 // DecodeFrames decodes an itx/ row. A nil/empty record decodes to no frames.
@@ -37,74 +58,30 @@ func DecodeFrames(rec []byte) ([]Frame, error) {
 	if len(rec) == 0 {
 		return nil, nil
 	}
-	pos := 0
-	next := func(what string) (uint64, error) {
-		v, k := binary.Uvarint(rec[pos:])
-		if k <= 0 {
-			return 0, fmt.Errorf("frames: bad %s", what)
-		}
-		pos += k
-		return v, nil
+	var top callFrameJSON
+	if err := json.Unmarshal(rec, &top); err != nil {
+		return nil, fmt.Errorf("frames: %w", err)
 	}
-	take := func(n int, what string) ([]byte, error) {
-		if pos+n > len(rec) {
-			return nil, fmt.Errorf("frames: truncated %s", what)
+	var out []Frame
+	var walk func(f *callFrameJSON, depth byte)
+	walk = func(f *callFrameJSON, depth byte) {
+		for i := range f.Calls {
+			c := &f.Calls[i]
+			fr := Frame{
+				Kind: byte(vm.StringToOp(c.Type)), Depth: depth, From: c.From,
+				Gas: uint64(c.Gas), GasUsed: uint64(c.GasUsed),
+				Failed: c.Error != "", Error: c.Error, Input: c.Input, Output: c.Output,
+			}
+			if c.To != nil {
+				fr.To = *c.To
+			}
+			if c.Value != nil {
+				fr.Value = (*big.Int)(c.Value)
+			}
+			out = append(out, fr)
+			walk(c, depth+1)
 		}
-		b := rec[pos : pos+n]
-		pos += n
-		return b, nil
 	}
-	n, err := next("frame count")
-	if err != nil {
-		return nil, err
-	}
-	out := make([]Frame, 0, n)
-	for i := uint64(0); i < n; i++ {
-		var f Frame
-		hdr, err := take(2+20+20, "frame header")
-		if err != nil {
-			return nil, err
-		}
-		f.Kind, f.Depth = hdr[0], hdr[1]
-		copy(f.From[:], hdr[2:22])
-		copy(f.To[:], hdr[22:42])
-		vl, err := next("value len")
-		if err != nil {
-			return nil, err
-		}
-		val, err := take(int(vl), "value")
-		if err != nil {
-			return nil, err
-		}
-		if vl > 0 {
-			f.Value = new(big.Int).SetBytes(val)
-		}
-		if f.Gas, err = next("gas"); err != nil {
-			return nil, err
-		}
-		if f.GasUsed, err = next("gas used"); err != nil {
-			return nil, err
-		}
-		flag, err := take(1, "error flag")
-		if err != nil {
-			return nil, err
-		}
-		f.Failed = flag[0] != 0
-		il, err := next("input len")
-		if err != nil {
-			return nil, err
-		}
-		if f.Input, err = take(int(il), "input"); err != nil {
-			return nil, err
-		}
-		ol, err := next("output len")
-		if err != nil {
-			return nil, err
-		}
-		if f.Output, err = take(int(ol), "output"); err != nil {
-			return nil, err
-		}
-		out = append(out, f)
-	}
+	walk(&top, 0)
 	return out, nil
 }

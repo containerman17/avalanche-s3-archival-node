@@ -40,6 +40,13 @@ func Migrate(dir string, cas *dist.Store, logf func(string, ...any)) error {
 	if err := json.Unmarshal(raw, man); err != nil {
 		return fmt.Errorf("store: manifest: %w", err)
 	}
+	// STORAGE V4 HAS NO MIGRATION: its itx/ rows are captured at execution
+	// (libevm's callTracer output) and cannot be derived from stored bytes, so
+	// the only way to a v4 corpus is a re-sync. The v1/v2 -> v3 migrator stays
+	// as the record of how an IO-class rebuild is done.
+	if StorageVersion >= 4 {
+		return fmt.Errorf("store: storage version %d has no migration (frames are captured at execution): re-sync the chain", StorageVersion)
+	}
 	if man.StorageVersion == StorageVersion {
 		logf("manifest is already storage version %d", StorageVersion)
 		return nil

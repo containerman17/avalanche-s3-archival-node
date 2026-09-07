@@ -980,6 +980,10 @@ func (d *DB) TxNumByHash(hash []byte) (uint64, bool, error) { return d.lookupNum
 // back as the error.
 func (d *DB) HeightByHash(hash []byte) (uint64, bool, error) { return d.lookupNum(BlkHashKey(hash)) }
 
+// HeightByContainerID resolves a CONTAINER id (what a peer names in Get and
+// GetAncestors) to its height. Same contract as HeightByHash.
+func (d *DB) HeightByContainerID(id []byte) (uint64, bool, error) { return d.lookupNum(CidKey(id)) }
+
 // latest walks the descent for the newest value under prefix at or below txnum.
 func (d *DB) latest(sec Section, prefix []byte, at uint64) ([]byte, bool, error) {
 	a, f := d.mems()

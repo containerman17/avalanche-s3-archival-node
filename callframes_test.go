@@ -47,7 +47,7 @@ func TestStoredCallTraceParity(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := range blk.Transactions() {
-			stored, err := n.Core().StoredCallTrace(blk, i, rcpts[i])
+			stored, err := n.Core().StoredCallTrace(blk, i)
 			if err != nil {
 				t.Fatalf("block %d tx %d: render: %v", h, i, err)
 			}

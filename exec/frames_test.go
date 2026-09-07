@@ -1,6 +1,8 @@
 package exec
 
 import (
+	"bytes"
+	"encoding/json"
 	"math/big"
 	"testing"
 
@@ -53,15 +55,20 @@ func TestFrameCaptureRefusesAHoleAndAccountsForAWholeTx(t *testing.T) {
 	}
 
 	// 3. A transaction that made no nested call is a REAL answer, not a hole:
-	// an empty record, and take() must not confuse it with a missing tracer.
+	// the top-level frame alone (callTracer's own answer for a transfer), which
+	// decodes to no nested frames, and take() must not confuse it with a
+	// missing tracer.
 	l.CaptureTxStart(21000)
 	l.CaptureStart(nil, common.Address{1}, common.Address{2}, false, nil, 0, nil)
 	rec, _, why = c.take()
 	if why != "" {
 		t.Errorf("a plain value transfer was treated as an uncaptured trace: %s", why)
 	}
-	if len(rec) != 0 {
-		t.Errorf("a transfer with no nested call stored %d bytes of frames", len(rec))
+	if !json.Valid(rec) || !bytes.Contains(rec, []byte(`"type":"CALL"`)) {
+		t.Errorf("a transfer did not store callTracer's top-level frame: %s", rec)
+	}
+	if nested, _ := store.DecodeFrames(rec); len(nested) != 0 {
+		t.Errorf("a transfer decoded to %d nested frames", len(nested))
 	}
 
 	// 4. THE REGRESSION: an enter with no exit. Before this guard take()

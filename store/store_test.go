@@ -48,7 +48,7 @@ func block(height uint64, n int) *BlockWrite {
 	b := &BlockWrite{
 		Height:    height,
 		HeaderRLP: []byte(fmt.Sprintf("header-%d", height)),
-		Pvm:       []byte(fmt.Sprintf("pvm-%d", height)),
+		Pvm:       testPvm(fmt.Sprintf("pvm-%d", height)),
 		Code:      map[string][]byte{},
 	}
 	for i := 0; i < n; i++ {
@@ -88,7 +88,7 @@ func TestRoundTrip(t *testing.T) {
 				t.Fatalf("%s: hdr %d: %q %v %v", where, h, hdr, ok, err)
 			}
 			pvm, ok, err := db.Pvm(h)
-			if err != nil || !ok || string(pvm) != fmt.Sprintf("pvm-%d", h) {
+			if err != nil || !ok || string(pvm[8:]) != fmt.Sprintf("pvm-%d", h) {
 				t.Fatalf("%s: pvm %d: %q %v %v", where, h, pvm, ok, err)
 			}
 			first, n, ok, err := db.BlockTxRange(h)
@@ -488,7 +488,7 @@ func TestBlockHashIndex(t *testing.T) {
 	if got := crypto.Keccak256Hash(raw); got != hdr.Hash() {
 		t.Fatalf("keccak256(header RLP) = %s, header.Hash() = %s: the derived row would be wrong", got, hdr.Hash())
 	}
-	if err := db.WriteBlock(&BlockWrite{Height: 1, HeaderRLP: raw, Pvm: []byte("pvm")}); err != nil {
+	if err := db.WriteBlock(&BlockWrite{Height: 1, HeaderRLP: raw, Pvm: testPvm("pvm")}); err != nil {
 		t.Fatal(err)
 	}
 	check := func(where string) {
@@ -1398,3 +1398,9 @@ func TestSectionTailWindow(t *testing.T) {
 		}
 	}
 }
+
+// testPvm is a VALID proposervm template (two zero-length prefix pieces, so
+// Reassemble is header+txs+tail) with a distinguishing tail: WriteBlock
+// derives the container-id row by reassembling, so a fake row must at least
+// parse.
+func testPvm(tail string) []byte { return append(make([]byte, 8), tail...) }

@@ -2,12 +2,14 @@ package fetch
 
 import (
 	"context"
+	"log"
 	"sync"
 	"sync/atomic"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
 	"github.com/ava-labs/avalanchego/proto/pb/p2p"
+	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/version"
 )
@@ -66,6 +68,111 @@ type inboundHandler struct {
 	cbMu        sync.RWMutex
 	onContainer func(nodeID ids.NodeID, container []byte)
 	onChits     func(nodeID ids.NodeID, requestID uint32, preferred, preferredAtHeight, accepted ids.ID, acceptedHeight uint64)
+
+	// Serving side (nil = a peer's Get/GetAncestors is dropped, which is what
+	// this node did for its whole life before storage v4). Set once via
+	// setServer once the network exists and the store is open.
+	srvMu  sync.RWMutex
+	source ContainerSource
+	reply  func(to ids.NodeID, msg *message.OutboundMessage)
+	// answer builds the outbound message; a var so the walk is testable
+	// without a message.Creator.
+	answer answerer
+}
+
+// ContainerSource is what serving a peer needs from the store: the container
+// bytes at a height, and the height a container ID names.
+type ContainerSource interface {
+	ContainerAt(height uint64) ([]byte, error)
+	HeightByContainerID(id []byte) (uint64, bool, error)
+}
+
+type answerer interface {
+	Put(chainID ids.ID, requestID uint32, container []byte) (*message.OutboundMessage, error)
+	Ancestors(chainID ids.ID, requestID uint32, containers [][]byte) (*message.OutboundMessage, error)
+}
+
+// ancestorsMaxContainers is avalanchego's own AncestorsMaxContainersReceived
+// default: a requester drops anything longer.
+const ancestorsMaxContainers = 2000
+
+func (h *inboundHandler) setServer(src ContainerSource, ans answerer, reply func(ids.NodeID, *message.OutboundMessage)) {
+	h.srvMu.Lock()
+	h.source, h.answer, h.reply = src, ans, reply
+	h.srvMu.Unlock()
+}
+
+// ancestorsOf walks DOWN from the container id names, newest first, exactly
+// as a bootstrapping peer consumes it, and stops at height 0, at
+// ancestorsMaxContainers, or when the next container would push the batch
+// over avaconstants.MaxContainersLen. An unknown id is an empty batch.
+func ancestorsOf(src ContainerSource, id []byte) ([][]byte, error) {
+	h, ok, err := src.HeightByContainerID(id)
+	if err != nil || !ok {
+		return nil, err
+	}
+	var out [][]byte
+	size := 0
+	for len(out) < ancestorsMaxContainers {
+		c, err := src.ContainerAt(h)
+		if err != nil {
+			return out, err
+		}
+		if size += len(c); size > avaconstants.MaxContainersLen && len(out) > 0 {
+			break
+		}
+		out = append(out, c)
+		if h == 0 {
+			break
+		}
+		h--
+	}
+	return out, nil
+}
+
+// serve answers one Get or GetAncestors on its own goroutine: store reads
+// must never hold the network's inbound dispatcher.
+func (h *inboundHandler) serve(nodeID ids.NodeID, chainIDBytes []byte, requestID uint32, containerID []byte, ancestors bool) {
+	chainID, err := ids.ToID(chainIDBytes)
+	if err != nil {
+		h.drops.badPayload.Add(1)
+		return
+	}
+	h.srvMu.RLock()
+	src, ans, reply := h.source, h.answer, h.reply
+	h.srvMu.RUnlock()
+	if src == nil {
+		return
+	}
+	go func() {
+		var (
+			msg *message.OutboundMessage
+			err error
+		)
+		if ancestors {
+			cs, werr := ancestorsOf(src, containerID)
+			if werr != nil {
+				log.Printf("fetch: serve GetAncestors for %s: %v", nodeID, werr)
+			}
+			msg, err = ans.Ancestors(chainID, requestID, cs)
+		} else {
+			n, ok, gerr := src.HeightByContainerID(containerID)
+			if gerr != nil || !ok {
+				return // avalanchego semantics: an unknown Get is a timeout
+			}
+			c, gerr := src.ContainerAt(n)
+			if gerr != nil {
+				log.Printf("fetch: serve Get %d for %s: %v", n, nodeID, gerr)
+				return
+			}
+			msg, err = ans.Put(chainID, requestID, c)
+		}
+		if err != nil {
+			log.Printf("fetch: serve reply build: %v", err)
+			return
+		}
+		reply(nodeID, msg)
+	}()
 }
 
 func (h *inboundHandler) setConsensusCallbacks(
@@ -108,6 +215,20 @@ func (h *inboundHandler) HandleInbound(_ context.Context, msg *message.InboundMe
 	defer msg.OnFinishedHandling()
 
 	switch msg.Op {
+	case message.GetOp:
+		if g, ok := msg.Message.(*p2p.Get); ok {
+			h.serve(msg.NodeID, g.ChainId, g.RequestId, g.ContainerId, false)
+		} else {
+			h.drops.badPayload.Add(1)
+		}
+		return
+	case message.GetAncestorsOp:
+		if g, ok := msg.Message.(*p2p.GetAncestors); ok {
+			h.serve(msg.NodeID, g.ChainId, g.RequestId, g.ContainerId, true)
+		} else {
+			h.drops.badPayload.Add(1)
+		}
+		return
 	case message.PutOp:
 		h.cbMu.RLock()
 		cb := h.onContainer
