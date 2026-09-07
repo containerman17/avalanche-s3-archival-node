@@ -77,6 +77,7 @@ type Head struct {
 	Timestamp uint64
 	Accepted  uint64 // the follower's accepted head: the `pending` label
 	Settled   uint64 // SAE-settled: `safe`/`finalized`. == Number below Helicon
+	Txs       uint64 // transactions in [0, Number]: the head block's first TxNum + count
 }
 
 // Head reads it. An empty store answers Number 0 with a zero hash.
@@ -91,6 +92,11 @@ func (s *Server) Head() (Head, error) {
 		return Head{}, rerr.error()
 	}
 	h.Hash, h.Timestamp = header.Hash(), header.Time
+	if first, count, ok, err := s.db.BlockTxRange(n); err != nil {
+		return Head{}, err
+	} else if ok {
+		h.Txs = first + uint64(count)
+	}
 	return h, nil
 }
 

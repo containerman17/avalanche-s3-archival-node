@@ -86,6 +86,7 @@ type HeadResponse struct {
 	Timestamp     uint64                 `protobuf:"varint,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	Accepted      uint64                 `protobuf:"varint,4,opt,name=accepted,proto3" json:"accepted,omitempty"` // the follower's accepted head: `pending`
 	Settled       uint64                 `protobuf:"varint,5,opt,name=settled,proto3" json:"settled,omitempty"`   // SAE-settled: `safe`/`finalized`
+	Txs           uint64                 `protobuf:"varint,6,opt,name=txs,proto3" json:"txs,omitempty"`           // transactions in [0, number]
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -151,6 +152,13 @@ func (x *HeadResponse) GetAccepted() uint64 {
 func (x *HeadResponse) GetSettled() uint64 {
 	if x != nil {
 		return x.Settled
+	}
+	return 0
+}
+
+func (x *HeadResponse) GetTxs() uint64 {
+	if x != nil {
+		return x.Txs
 	}
 	return 0
 }
@@ -3221,13 +3229,14 @@ const file_epochdb_proto_rawDesc = "" +
 	"\n" +
 	"\repochdb.proto\x12\n" +
 	"epochdb.v0\"\r\n" +
-	"\vHeadRequest\"\x8e\x01\n" +
+	"\vHeadRequest\"\xa0\x01\n" +
 	"\fHeadResponse\x12\x16\n" +
 	"\x06number\x18\x01 \x01(\x04R\x06number\x12\x12\n" +
 	"\x04hash\x18\x02 \x01(\fR\x04hash\x12\x1c\n" +
 	"\ttimestamp\x18\x03 \x01(\x04R\ttimestamp\x12\x1a\n" +
 	"\baccepted\x18\x04 \x01(\x04R\baccepted\x12\x18\n" +
-	"\asettled\x18\x05 \x01(\x04R\asettled\"\x11\n" +
+	"\asettled\x18\x05 \x01(\x04R\asettled\x12\x10\n" +
+	"\x03txs\x18\x06 \x01(\x04R\x03txs\"\x11\n" +
 	"\x0fNodeInfoRequest\"\xb9\x02\n" +
 	"\x10NodeInfoResponse\x12\x19\n" +
 	"\bchain_id\x18\x01 \x01(\fR\achainId\x12%\n" +

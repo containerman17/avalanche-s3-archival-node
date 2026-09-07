@@ -273,7 +273,7 @@ func head(n *epochdb.Node, _ params) (any, error) {
 	}
 	return map[string]any{
 		"number": h.Number, "hash": h.Hash, "timestamp": h.Timestamp,
-		"accepted": h.Accepted, "settled": h.Settled,
+		"accepted": h.Accepted, "settled": h.Settled, "txs": h.Txs,
 	}, nil
 }
 

@@ -72,7 +72,7 @@ func (s *Server) height(h uint64) (uint64, error) {
 func headPB(h rpc.Head) *HeadResponse {
 	return &HeadResponse{
 		Number: h.Number, Hash: h.Hash[:], Timestamp: h.Timestamp,
-		Accepted: h.Accepted, Settled: h.Settled,
+		Accepted: h.Accepted, Settled: h.Settled, Txs: h.Txs,
 	}
 }
 

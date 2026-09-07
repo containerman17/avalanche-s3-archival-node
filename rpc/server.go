@@ -386,6 +386,17 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return hexutil.EncodeBig(tip), nil
 	case "eth_feeHistory":
 		return s.feeHistory(req.Params)
+	case "epochdb_head":
+		// The plain-HTTP/gRPC head object under the JSON-RPC envelope: the
+		// one place the cumulative tx count is reachable over this wire.
+		h, err := s.Head()
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return map[string]any{
+			"number": hexutil.EncodeUint64(h.Number), "hash": h.Hash, "timestamp": hexutil.EncodeUint64(h.Timestamp),
+			"accepted": hexutil.EncodeUint64(h.Accepted), "settled": hexutil.EncodeUint64(h.Settled), "txs": hexutil.EncodeUint64(h.Txs),
+		}, nil
 	case "net_version":
 		return s.chainCfg.ChainID.String(), nil
 	case "web3_clientVersion":

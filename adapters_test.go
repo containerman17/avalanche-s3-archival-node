@@ -213,6 +213,11 @@ func TestAdapterEquivalence(t *testing.T) {
 		jn != fmt.Sprintf("0x%x", head.Number) {
 		t.Fatalf("head: library %d, gRPC %d, plain %v, JSON-RPC %s", head.Number, gh.Number, ph["number"], jn)
 	}
+	var jh struct{ Txs hexutil.Uint64 }
+	json.Unmarshal(jsonRPC(t, jrpc, "epochdb_head"), &jh)
+	if gh.Txs != head.Txs || uint64(ph["txs"].(float64)) != head.Txs || uint64(jh.Txs) != head.Txs {
+		t.Fatalf("head txs: library %d, gRPC %d, plain %v, JSON-RPC %d", head.Txs, gh.Txs, ph["txs"], jh.Txs)
+	}
 	if !bytes.Equal(gh.Hash, head.Hash[:]) || ph["hash"].(string) != head.Hash.Hex() {
 		t.Fatalf("head hash: library %s, gRPC %x, plain %v", head.Hash, gh.Hash, ph["hash"])
 	}

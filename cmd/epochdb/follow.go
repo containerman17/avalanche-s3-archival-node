@@ -252,6 +252,7 @@ type serveStatus struct {
 	Target       uint64 `json:"target,omitempty"`
 	Fetched      uint64 `json:"fetched"`
 	Executed     uint64 `json:"executed"`
+	Txs          uint64 `json:"txs,omitempty"`
 	Cooked       uint64 `json:"cooked"`
 	CacheHorizon string `json:"cacheHorizon,omitempty"`
 	CacheEvicted uint64 `json:"cacheEvictions,omitempty"`
@@ -298,6 +299,9 @@ func statusOf(spec string, n *epochdb.Node) serveStatus {
 		return serveStatus{Chain: spec}
 	}
 	s := serveStatusOf(n.Status(), spec)
+	if h, err := n.Head(); err == nil {
+		s.Txs = h.Txs
+	}
 	if cs, ok := n.CAS().CacheStats(); ok {
 		if cs.VictimAge > 0 {
 			s.CacheHorizon = cs.VictimAge.String()

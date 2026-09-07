@@ -81,6 +81,7 @@ message HeadResponse {
   uint64 timestamp = 3;
   uint64 accepted = 4;  // the follower's accepted head: `pending`
   uint64 settled = 5;   // SAE-settled: `safe`/`finalized`
+  uint64 txs = 6;       // transactions in [0, number]
 }
 
 message NodeInfoRequest {}
