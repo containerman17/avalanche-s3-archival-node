@@ -57,6 +57,8 @@ type Config struct {
 	// P2PPort > 0 listens for avalanchego peers and answers Get/GetAncestors
 	// from the store (fetch.Config.ListenPort). 0 is client-only.
 	P2PPort int
+	// Peers are extra "NodeID-...@host:port" archival peers (fetch.Config.Peers).
+	Peers []string
 	// TipOverride replaces the consensus follower with a bounded forward
 	// fetch that stops at this CONTAINER's height (serve --tip-override): a
 	// fixed, reproducible corpus. Empty follows the live tip.
@@ -137,6 +139,7 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 			VdrSources: cfg.VdrSources,
 			ListenPort: cfg.P2PPort,
 			DataDir:    cfg.DataDir,
+			Peers:      cfg.Peers,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("fetch: %w", err)

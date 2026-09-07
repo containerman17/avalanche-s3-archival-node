@@ -3,6 +3,7 @@ package fetch
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
@@ -67,5 +68,18 @@ func TestAncestorsWalk(t *testing.T) {
 	out, err = ancestorsOf(many, idOf(many, uint64(ancestorsMaxContainers+5)))
 	if err != nil || len(out) != ancestorsMaxContainers {
 		t.Fatalf("count cap: %d containers, err %v", len(out), err)
+	}
+}
+
+func TestParsePeersRefusesBadShapesByName(t *testing.T) {
+	good := "NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg@127.0.0.1:29638"
+	m, err := parsePeers([]string{good})
+	if err != nil || len(m) != 1 {
+		t.Fatalf("good peer refused: %v", err)
+	}
+	for _, bad := range []string{"NodeID-7Xhw2mDxuDS44j42TCB6U5579esbSt3Lg", "nope@127.0.0.1:1", good[:len(good)-6] + ":x"} {
+		if _, err := parsePeers([]string{bad}); err == nil || !strings.Contains(err.Error(), bad) {
+			t.Errorf("%q: err %v, want a refusal naming it", bad, err)
+		}
 	}
 }

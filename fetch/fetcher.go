@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,6 +82,33 @@ type Config struct {
 	// Serve is wired (Fetcher.Serve). 0 is the client-only node of before.
 	ListenPort int
 	DataDir    string
+	// Peers are extra archival peers, "NodeID-...@host:port" each: another
+	// epochdb's --p2p-port, dialed and asked for ancestors like any archival
+	// validator, NEVER added to the validator manager (the cross-check rule
+	// stays). A serving node advertises 127.0.0.1 today, so this works on
+	// the same host only.
+	Peers []string
+}
+
+// parsePeers reads Config.Peers. A bad entry is refused by name.
+func parsePeers(specs []string) (map[ids.NodeID]netip.AddrPort, error) {
+	out := make(map[ids.NodeID]netip.AddrPort, len(specs))
+	for _, spec := range specs {
+		id, addr, ok := strings.Cut(spec, "@")
+		if !ok {
+			return nil, fmt.Errorf("peer %q: want NodeID-...@host:port", spec)
+		}
+		nodeID, err := ids.NodeIDFromString(id)
+		if err != nil {
+			return nil, fmt.Errorf("peer %q: %w", spec, err)
+		}
+		ap, err := netip.ParseAddrPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("peer %q: %w", spec, err)
+		}
+		out[nodeID] = ap
+	}
+	return out, nil
 }
 
 // sources is NodeURI as the list it is: every bootstrap call tries them in
@@ -266,6 +294,15 @@ func dial(cfg Config) (*Fetcher, error) {
 	if cfg.l1() {
 		peerIDs = set.Of(validatorIDs...)
 	}
+	// Manual peers join the candidate set HERE, after the L1 override: they
+	// are the one kind of non-validator an L1 fetch may ask.
+	manual, err := parsePeers(cfg.Peers)
+	if err != nil {
+		return nil, err
+	}
+	for id := range manual {
+		peerIDs.Add(id)
+	}
 
 	pool := newPeerPool()
 	handler := newHandler(peerIDs, pool)
@@ -388,6 +425,10 @@ func dial(cfg Config) (*Fetcher, error) {
 	// that name the validators.
 	for _, p := range peerInfos {
 		net.ManuallyTrack(p.ID, peerAddr(p))
+	}
+	for id, ap := range manual {
+		net.ManuallyTrack(id, ap)
+		log.Printf("fetch: manual peer %s at %s", id, ap)
 	}
 
 	// The dial budget starts HERE, after the bootstrap RPC: a retried upstream
