@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -53,6 +54,43 @@ type callNode struct {
 	Calls        []*callNode     `json:"calls,omitempty"`
 	Value        *hexutil.Big    `json:"value,omitempty"`
 	Type         string          `json:"type"`
+}
+
+// traceMode is EPOCHDB_TRACE_MODE: "check" (default) re-executes AND renders
+// the stored frames and dies on a difference; "stored" answers from the
+// frames alone, no re-execution (the measurement the format decision waits
+// on); "reexec" is the old path, no stored render at all.
+var traceMode = func() string {
+	switch m := os.Getenv("EPOCHDB_TRACE_MODE"); m {
+	case "", "check":
+		return "check"
+	case "stored", "reexec":
+		return m
+	default:
+		log.Fatalf("epochdb: EPOCHDB_TRACE_MODE=%q: want check, stored or reexec", m)
+		return ""
+	}
+}()
+
+// storedCallTraces renders the callTracer answer for tx target of blk, or
+// every tx when target < 0, from stored rows alone.
+func (s *Server) storedCallTraces(blk *types.Block, target int) ([]json.RawMessage, *rpcError) {
+	rcpts, rerr := s.storedBlockReceipts(blk)
+	if rerr != nil {
+		return nil, rerr
+	}
+	var out []json.RawMessage
+	for i := range blk.Transactions() {
+		if target >= 0 && i != target {
+			continue
+		}
+		res, err := s.StoredCallTrace(blk, i, rcpts[i])
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		out = append(out, res)
+	}
+	return out, nil
 }
 
 // isPlainCallTracer says the request is the callTracer with no option that

@@ -164,11 +164,18 @@ func (s *Server) debugTraceTransaction(params []json.RawMessage) (any, *rpcError
 	if !found {
 		return nil, &rpcError{Code: -32000, Message: fmt.Sprintf("transaction %s not found", hash)}
 	}
+	if isPlainCallTracer(cfg) && traceMode == "stored" {
+		res, rerr := s.storedCallTraces(blk, i)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return res[0], nil
+	}
 	res, rerr := s.traceTxsInBlock(blk, i, cfg)
 	if rerr != nil {
 		return nil, rerr
 	}
-	if isPlainCallTracer(cfg) {
+	if isPlainCallTracer(cfg) && traceMode == "check" {
 		s.assertStoredTraceMatches("debug_traceTransaction", params, blk, i, res[len(res)-1:])
 	}
 	return res[len(res)-1], nil
@@ -190,11 +197,16 @@ func (s *Server) debugTraceBlock(params []json.RawMessage) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	results, rerr := s.traceTxsInBlock(blk, -1, cfg)
+	var results []json.RawMessage
+	if isPlainCallTracer(cfg) && traceMode == "stored" {
+		results, rerr = s.storedCallTraces(blk, -1)
+	} else {
+		results, rerr = s.traceTxsInBlock(blk, -1, cfg)
+	}
 	if rerr != nil {
 		return nil, rerr
 	}
-	if isPlainCallTracer(cfg) {
+	if isPlainCallTracer(cfg) && traceMode == "check" {
 		s.assertStoredTraceMatches("debug_traceBlockByNumber", params, blk, -1, results)
 	}
 	out := make([]txTraceResult, len(results))
