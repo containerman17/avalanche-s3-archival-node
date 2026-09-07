@@ -300,7 +300,7 @@ func dispatch(args []string, w io.Writer) int {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage: epochdb serve [--data <dir>] [--network mainnet] [--chain C|<blockchainID>]")
-	fmt.Fprintln(w, "       epochdb proxy [--listen 127.0.0.1:8545] [--ladder ladder.tsv] [--log proxy.log]   (the fleet's public door)")
+	fmt.Fprintln(w, "       epochdb proxy [--listen 127.0.0.1:8545] [--ladder ladder.tsv] [--log proxy.log]   (the public door of a box running many chains)")
 	fmt.Fprintln(w, "                     [--port 9650] [--vdr-sources <p-chain rpcs>] [--verify] [--tip-override <containerID>]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "serve is the only command. It follows the chain, executes it, indexes it, cuts and publishes")

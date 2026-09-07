@@ -53,7 +53,7 @@ func TestParseTipOverrideRefusesAHeight(t *testing.T) {
 // retired, and a stale script that says `epochdb fetch` gets the usage.
 var retired = []string{"exec", "verify", "probe"}
 
-// TestUsageIsServeOnly pins the surface: `epochdb serve` and nothing else, with
+// TestUsageIsServeOnly pins the surface: `epochdb serve` and `epochdb proxy`, with
 // no retired name and no `fleet` anywhere in what an operator is shown.
 func TestUsageIsServeOnly(t *testing.T) {
 	var buf bytes.Buffer
