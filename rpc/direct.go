@@ -77,7 +77,7 @@ type Head struct {
 	Timestamp uint64
 	Accepted  uint64 // the follower's accepted head: the `pending` label
 	Settled   uint64 // SAE-settled: `safe`/`finalized`. == Number below Helicon
-	Txs       uint64 // transactions in [0, Number]: the head block's first TxNum + count
+	Txs       uint64 // transactions in [0, Number], boundary slots excluded
 }
 
 // Head reads it. An empty store answers Number 0 with a zero hash.
@@ -92,10 +92,13 @@ func (s *Server) Head() (Head, error) {
 		return Head{}, rerr.error()
 	}
 	h.Hash, h.Timestamp = header.Hash(), header.Time
+	// TxNum counts one BOUNDARY SLOT per block above genesis besides the
+	// transactions (store/format.go), so the head's last slot is txs plus
+	// n-1 boundaries; genesis owns no slot at all.
 	if first, count, ok, err := s.db.BlockTxRange(n); err != nil {
 		return Head{}, err
-	} else if ok {
-		h.Txs = first + uint64(count)
+	} else if ok && n > 0 {
+		h.Txs = first + uint64(count) - (n - 1)
 	}
 	return h, nil
 }
