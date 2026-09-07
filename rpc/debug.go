@@ -168,6 +168,9 @@ func (s *Server) debugTraceTransaction(params []json.RawMessage) (any, *rpcError
 	if rerr != nil {
 		return nil, rerr
 	}
+	if isPlainCallTracer(cfg) {
+		s.assertStoredTraceMatches("debug_traceTransaction", params, blk, i, res[len(res)-1:])
+	}
 	return res[len(res)-1], nil
 }
 
@@ -190,6 +193,9 @@ func (s *Server) debugTraceBlock(params []json.RawMessage) (any, *rpcError) {
 	results, rerr := s.traceTxsInBlock(blk, -1, cfg)
 	if rerr != nil {
 		return nil, rerr
+	}
+	if isPlainCallTracer(cfg) {
+		s.assertStoredTraceMatches("debug_traceBlockByNumber", params, blk, -1, results)
 	}
 	out := make([]txTraceResult, len(results))
 	for i, r := range results {
