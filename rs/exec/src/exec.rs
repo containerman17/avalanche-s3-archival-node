@@ -32,7 +32,9 @@ use crate::{allowlist, feemanager, nativeminter, rewardmanager};
 use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, TxType};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
-use alloy_rpc_types_trace::geth::CallConfig;
+use alloy_rpc_types_trace::geth::{CallConfig, GethDefaultTracingOptions, PreStateConfig};
+use revm::context::result::ResultAndState;
+use revm::DatabaseRef;
 use anyhow::{anyhow, bail, Context as _, Result};
 use revm::{
     context::{
@@ -113,8 +115,23 @@ pub struct CallMsg {
     pub data: Bytes,
 }
 
-#[derive(Debug, Clone)]
+/// What execute_block / call render per tx into `trace_json` (debug_ tracers).
+#[derive(Clone, Debug)]
+pub enum Trace {
+    /// geth callTracer (the store's default row is `Call(CallConfig::default())`).
+    Call(CallConfig),
+    PreState(PreStateConfig),
+    /// The struct logger (geth's default tracer).
+    Struct(GethDefaultTracingOptions),
+    /// noopTracer: `{}`.
+    Noop,
+    /// No rendering (eth_call).
+    Off,
+}
+
 pub struct CallOut {
+    /// The rendered trace under the executor's `Trace`, "" when Off.
+    pub trace_json: String,
     pub gas_used: u64,
     pub output: Bytes,
     pub revert: bool,
@@ -455,6 +472,26 @@ pub struct Executor<D: StateDb = Db> {
     pub t_evm: std::time::Duration,
     pub t_trace: std::time::Duration,
     pub t_commit: std::time::Duration,
+    pub trace: Trace,
+}
+
+/// DatabaseRef over a `&mut Database` (the prestate render reads the pre-tx
+/// state out of the executor's own db).
+struct RefDb<'a, D>(std::cell::RefCell<&'a mut D>);
+impl<D: Database> DatabaseRef for RefDb<'_, D> {
+    type Error = D::Error;
+    fn basic_ref(&self, a: Address) -> std::result::Result<Option<AccountInfo>, D::Error> {
+        self.0.borrow_mut().basic(a)
+    }
+    fn code_by_hash_ref(&self, h: B256) -> std::result::Result<Bytecode, D::Error> {
+        self.0.borrow_mut().code_by_hash(h)
+    }
+    fn storage_ref(&self, a: Address, i: revm::primitives::StorageKey) -> std::result::Result<revm::primitives::StorageValue, D::Error> {
+        self.0.borrow_mut().storage(a, i)
+    }
+    fn block_hash_ref(&self, n: u64) -> std::result::Result<B256, D::Error> {
+        self.0.borrow_mut().block_hash(n)
+    }
 }
 
 impl Executor<Db> {
@@ -489,7 +526,44 @@ impl<D: StateDb> Executor<D> {
             t_evm: Default::default(),
             t_trace: Default::default(),
             t_commit: Default::default(),
+            trace: Trace::Call(CallConfig::default()),
         }
+    }
+
+    /// Switches the rendered trace (and the inspector's capture config).
+    pub fn set_trace(&mut self, t: Trace) {
+        let cfg = match &t {
+            Trace::Call(c) => TracingInspectorConfig::from_geth_call_config(c),
+            Trace::PreState(c) => TracingInspectorConfig::from_geth_prestate_config(c),
+            Trace::Struct(o) => TracingInspectorConfig::from_geth_config(o),
+            Trace::Noop | Trace::Off => TracingInspectorConfig::none(),
+        };
+        self.evm.inspector.tracer = TracingInspector::new(cfg);
+        self.trace = t;
+    }
+
+    /// The trace of the tx just run, under `self.trace`; `state` is the
+    /// finalized journal (post-tx, not yet committed).
+    fn render_trace(&mut self, res: &ExecutionResult, state: &EvmState, gas_used: u64, gas_limit: u64) -> Result<String> {
+        // callTracer's root frame reports the tx gas limit as `gas` (CaptureTxStart), not the
+        // post-intrinsic gas the top call started with.
+        self.evm.inspector.tracer.set_transaction_gas_limit(gas_limit);
+        Ok(match self.trace.clone() {
+            Trace::Off => String::new(),
+            Trace::Noop => "{}".to_string(),
+            Trace::Call(c) => serde_json::to_string(&self.evm.inspector.tracer.geth_builder().geth_call_traces(c, gas_used)).context("trace json")?,
+            Trace::Struct(o) => {
+                let ret = res.output().cloned().unwrap_or_default();
+                serde_json::to_string(&self.evm.inspector.tracer.geth_builder().geth_traces(gas_used, ret, o)).context("trace json")?
+            }
+            Trace::PreState(c) => {
+                let ras = ResultAndState { result: res.clone(), state: state.clone() };
+                let (ctx, insp) = (&mut self.evm.ctx, &self.evm.inspector);
+                let db = RefDb(std::cell::RefCell::new(ctx.db_mut()));
+                let f = insp.tracer.geth_builder().geth_prestate_traces(&ras, &c, &db).map_err(|e| anyhow!("prestate: {e:?}"))?;
+                serde_json::to_string(&f).context("trace json")?
+            }
+        })
     }
 
     /// Seeds db with what the genesis materialises: the alloc and every
@@ -529,28 +603,7 @@ impl<D: StateDb> Executor<D> {
     /// An executor over a state that already holds some block's post-state
     /// (a window replay): no genesis is materialised.
     pub fn resume(cfg: Config, db: D) -> Result<Executor<D>> {
-        let spec = cfg.spec(cfg.genesis_timestamp);
-        let ctx = Context::mainnet()
-            .with_db(db)
-            .with_cfg(CfgEnv::new_with_spec(spec))
-            .modify_cfg_chained(|c| c.chain_id = cfg.chain_id);
-        let trace_cfg = TracingInspectorConfig::from_geth_call_config(&CallConfig::default());
-        let inspector = SevmInspector { tracer: TracingInspector::new(trace_cfg), deployer_allow_list: false };
-        let mut precompiles = SevmPrecompiles::new(spec);
-        precompiles.env.network_id = cfg.network_id;
-        precompiles.env.blockchain_id = cfg.blockchain_id;
-        let evm = Evm::new_with_inspector(ctx, inspector, EthInstructions::new_mainnet_with_spec(spec), precompiles);
-        Ok(Executor {
-            cfg,
-            evm,
-            validator_state: None,
-            prev_pchain_height: None,
-            predicates_verified: 0,
-            predicates_trusted: 0,
-            t_evm: Default::default(),
-            t_trace: Default::default(),
-            t_commit: Default::default(),
-        })
+        Ok(Executor::open(cfg, db))
     }
 
     pub fn db(&self) -> &D {
@@ -812,17 +865,12 @@ impl<D: StateDb> Executor<D> {
             let gas_used = res.tx_gas_used();
             cumulative += gas_used;
             let status = res.is_success();
+            let trace_json = self.render_trace(&res, &state, gas_used, t.gas_limit)?;
             let logs = res.into_logs();
             let receipt = Receipt { status: Eip658Value::Eip658(status), cumulative_gas_used: cumulative, logs }.with_bloom();
             bloom |= receipt.logs_bloom;
             let tx_type = TxType::try_from(t.tx_type).map_err(|e| anyhow!("tx type {}: {e}", t.tx_type))?;
             let receipt = ReceiptEnvelope::from_typed(tx_type, receipt);
-
-            // callTracer's root frame reports the tx gas limit as `gas` (CaptureTxStart), not the
-            // post-intrinsic gas the top call started with.
-            self.evm.inspector.tracer.set_transaction_gas_limit(t.gas_limit);
-            let frame = self.evm.inspector.tracer.geth_builder().geth_call_traces(CallConfig::default(), gas_used);
-            let trace_json = serde_json::to_string(&frame).context("trace json")?;
             let t2 = std::time::Instant::now();
             self.t_trace += t2 - t1;
 
@@ -909,6 +957,7 @@ impl<D: StateDb> Executor<D> {
         self.evm.ctx.set_tx(tx_env);
         self.evm.inspector.tracer.fuse();
         let res = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default().inspect_run(&mut self.evm);
+        let state = self.evm.ctx.journal_mut().finalize();
         self.evm.ctx.journal_mut().clear();
         self.evm.ctx.modify_cfg(|c| {
             c.disable_base_fee = false;
@@ -919,10 +968,11 @@ impl<D: StateDb> Executor<D> {
         });
         let res = res.map_err(|e| anyhow!("{e:?}"))?;
         let gas_used = res.tx_gas_used();
+        let trace_json = self.render_trace(&res, &state, gas_used, msg.gas)?;
         Ok(match res {
-            ExecutionResult::Success { output, .. } => CallOut { gas_used, output: output.into_data(), revert: false, halt: None },
-            ExecutionResult::Revert { output, .. } => CallOut { gas_used, output, revert: true, halt: None },
-            ExecutionResult::Halt { reason, .. } => CallOut { gas_used, output: Bytes::new(), revert: false, halt: Some(format!("{reason:?}")) },
+            ExecutionResult::Success { output, .. } => CallOut { trace_json, gas_used, output: output.into_data(), revert: false, halt: None },
+            ExecutionResult::Revert { output, .. } => CallOut { trace_json, gas_used, output, revert: true, halt: None },
+            ExecutionResult::Halt { reason, .. } => CallOut { trace_json, gas_used, output: Bytes::new(), revert: false, halt: Some(format!("{reason:?}")) },
         })
     }
 

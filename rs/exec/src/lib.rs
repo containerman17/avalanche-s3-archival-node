@@ -13,7 +13,7 @@ pub mod rpc;
 pub mod warp;
 
 pub use config::Config;
-pub use exec::{BlockResult, CallMsg, CallOut, Executor, StateDb, StateRow, TxResult};
+pub use exec::{BlockResult, CallMsg, CallOut, Executor, StateDb, StateRow, Trace, TxResult};
 pub use warp::{ValidatorState, WarpSet, WarpValidator};
 
 #[cfg(test)]

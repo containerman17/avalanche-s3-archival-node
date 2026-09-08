@@ -31,7 +31,7 @@ use state::commit::file::File;
 use state::commit::roll::roll;
 use state::view::{merge, View};
 
-use crate::genesis;
+use rpc::genesis;
 use crate::layered::{Layered, Pending};
 use crate::log::{BlockLog, BlockStore, CodeLog, Record};
 use crate::tree::{hex, Engine, Error, Id, Meta};
@@ -92,10 +92,12 @@ fn tick(a: &AtomicU64, t0: Instant) {
 pub struct NodeEngine {
     pub chain_id: u64,
     pub genesis: Arc<Block>,
-    pub inner: Mutex<Inner>,
+    pub inner: Arc<Mutex<Inner>>,
     pub store: Arc<Mutex<Box<dyn BlockStore>>>,
     code_log: Arc<Mutex<CodeLog>>,
-    pub head: Mutex<Arc<Block>>,
+    pub head: Arc<Mutex<Arc<Block>>>,
+    pub rpc_store: Arc<crate::rpc_store::PluginStore>,
+    pub rpc: rpc::Server,
     /// Accepted, not yet in the store (the checker is behind by at most CHECK_DEPTH).
     pub recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>,
     parsed: Mutex<HashMap<Id, Arc<Block>>>,
@@ -299,13 +301,23 @@ impl NodeEngine {
             sync_roll >> 20,
             tip_roll >> 20
         );
+        let inner = Arc::new(Mutex::new(Inner { ex, roller, roll_budget: sync_roll }));
+        let head = Arc::new(Mutex::new(head));
+        let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), store.clone(), recent.clone()));
+        let t1 = Instant::now();
+        let ntx = rpc_store.build_index().context("tx index")?;
+        eprintln!("epochdb-rs: rpc tx index: {ntx} txs in {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
+        let chain_config = serde_json::from_slice::<serde_json::Value>(&init.genesis_bytes).ok().and_then(|g| g.get("config").cloned()).unwrap_or_default();
+        let rpc = rpc::Server::new(rpc_store.clone(), Arc::new(cfg.clone()), genesis.clone(), chain_config);
         Ok(NodeEngine {
             chain_id: cfg.chain_id,
             genesis,
-            inner: Mutex::new(Inner { ex, roller, roll_budget: sync_roll }),
+            inner,
             store,
             code_log,
-            head: Mutex::new(head),
+            head,
+            rpc_store,
+            rpc,
             recent,
             parsed: Mutex::new(HashMap::new()),
             check_tx: Mutex::new(Some(check_tx)),
@@ -555,6 +567,7 @@ impl NodeEngine {
         be.set_block_hash(b.height, b.hash);
         *self.head.lock().unwrap() = b.clone();
         self.recent.lock().unwrap().insert(b.hash.0, b.clone());
+        self.rpc_store.index_block(b);
         // From here the block's root is the header's or the checker dies.
         inner.roller.maybe_roll(be, inner.roll_budget, b.height, b.header.root);
         self.stats.executed.fetch_add(1, Ordering::Relaxed);
