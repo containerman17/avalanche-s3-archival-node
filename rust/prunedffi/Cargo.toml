@@ -1,0 +1,21 @@
+[package]
+name = "prunedffi"
+version = "0.1.0"
+edition = "2021"
+description = "Pruned flat state store with Ethereum MPT roots, exposed over a C ABI for subnet-evm."
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+tiny-keccak = { version = "2", features = ["keccak"] }
+rayon = "1"
+crc32fast = "1"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
