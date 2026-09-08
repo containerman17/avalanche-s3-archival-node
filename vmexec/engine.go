@@ -35,6 +35,13 @@ type engine struct {
 	file    *commit.File
 	dirty   *commit.Dirty
 	gen     int
+	// owners is the set of accounts with a slot written into the fresh
+	// overlay; frozenOwners the same for the frozen one. An account delete
+	// scans the overlays for slots to tombstone ONLY when one of these or the
+	// runs says it has any: Overlay.Iter is a full snapshot and sort, and
+	// EIP-158 empty-account deletes happen on most blocks.
+	owners       map[common.Hash]struct{}
+	frozenOwners map[common.Hash]struct{}
 
 	rollRoot common.Hash // the root the frozen overlay's state must roll to
 	rollH    uint64
@@ -88,7 +95,7 @@ func newEngine(dir string, alloc types.GenesisAlloc, want common.Hash) (*engine,
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &engine{dir: dir, overlay: latest.NewOverlay(), rollDone: make(chan rollResult, 1)}
+	s := &engine{dir: dir, overlay: latest.NewOverlay(), rollDone: make(chan rollResult, 1), owners: map[common.Hash]struct{}{}}
 	for addr, a := range alloc {
 		ah := crypto.Keccak256Hash(addr[:])
 		row := accountRow{Nonce: a.Nonce, Balance: new(uint256.Int), CodeHash: types.EmptyCodeHash[:]}
@@ -162,8 +169,11 @@ func (s *engine) get(key []byte) ([]byte, bool) { return s.view.Get(key) }
 // (Dirty wipes the storage itself).
 func (s *engine) apply(ws *writeSet) error {
 	for _, op := range ws.ops {
-		if len(op.k) == 33 && len(op.v) == 0 {
+		switch {
+		case len(op.k) == 33 && len(op.v) == 0:
 			s.tombstoneSlots(op.k[:32])
+		case len(op.k) == 65 && len(op.v) > 0:
+			s.owners[common.BytesToHash(op.k[:32])] = struct{}{}
 		}
 		s.overlay.Put(op.k, op.v)
 		if err := s.dirty.Apply(op.k, op.v); err != nil {
@@ -176,6 +186,12 @@ func (s *engine) apply(ws *writeSet) error {
 func (s *engine) tombstoneSlots(ah []byte) {
 	lo := append(append([]byte{}, ah...), 1)
 	hi := append(append([]byte{}, ah...), 2)
+	h := common.BytesToHash(ah)
+	_, fresh := s.owners[h]
+	_, frozen := s.frozenOwners[h]
+	if !fresh && !frozen && !latest.NewView(nil, s.runs...).Iter(lo, hi).Next() {
+		return
+	}
 	var keys [][]byte
 	it := s.view.Iter(lo, hi)
 	for it.Next() {
@@ -197,6 +213,7 @@ func (s *engine) maybeRoll(budget int, h uint64, root common.Hash) {
 		return
 	}
 	s.frozen, s.overlay = s.overlay, latest.NewOverlay()
+	s.frozenOwners, s.owners = s.owners, map[common.Hash]struct{}{}
 	s.rebuildView()
 	s.rollRoot, s.rollH, s.rollT0 = root, h, time.Now()
 	gen := s.gen + 1
@@ -240,6 +257,7 @@ func (s *engine) finishRoll() error {
 		s.runs = []*latest.Run{r.run}
 		s.file = r.file
 		s.frozen = nil
+		s.frozenOwners = nil
 		s.rebuildView()
 		s.dirty.Reset(r.file)
 		n := 0
