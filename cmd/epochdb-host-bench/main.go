@@ -57,6 +57,7 @@ import (
 	proposerblock "github.com/ava-labs/avalanchego/vms/proposervm/block"
 	"github.com/ava-labs/avalanchego/vms/rpcchainvm"
 	"github.com/ava-labs/avalanchego/vms/rpcchainvm/runtime"
+	ethcommon "github.com/ava-labs/libevm/common"
 	ethtypes "github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/prometheus/client_golang/prometheus"
@@ -68,7 +69,7 @@ import (
 func main() {
 	fs := flag.NewFlagSet("epochdb-host-bench", flag.ExitOnError)
 	dumpPath := fs.String("dump", "", "container dump file ([u64 height][u32 len][container], heights from 1); chain.json and upgrade.json beside it")
-	from := fs.Uint64("from", 1, "first height to feed (the plugin's last accepted height + 1 must equal it)")
+	from := fs.Uint64("from", 0, "first height to feed (0 = the plugin's last accepted height + 1, how the host resumes; otherwise it must equal that)")
 	to := fs.Uint64("to", 0, "last height to feed (0 = the file's end)")
 	vmPath := fs.String("vm", "", "plugin binary (stock subnet-evm or epochdb-rs)")
 	dataDir := fs.String("data", "./data", "data directory: plugin db, chain data dir, BLS key")
@@ -94,26 +95,18 @@ func main() {
 	// The libevm extras: subnet-evm headers decode (tx and gas counts, the
 	// header hash of the check).
 	fetch.RegisterExtras(chain.SubnetEVM)
-	d, err := openDump(*dumpPath, *from, *to)
+	d, err := openDump(*dumpPath, 1, *to)
 	if err != nil {
 		log.Fatalf("epochdb-host-bench: %v", err)
 	}
-	log.Printf("epochdb-host-bench: dump %s heights %d..%d chain %s subnet %s network %d", *dumpPath, *from, d.Last(), c.blockchainID, c.subnetID, c.networkID)
-	// The genesis hash, for epochdb-rs's TrivialEngine (it executes nothing,
-	// so it cannot compute the genesis header): block 1's parent, added to the
-	// config bytes as "genesis-id". Stock subnet-evm ignores unknown keys.
+	log.Printf("epochdb-host-bench: dump %s heights 1..%d chain %s subnet %s network %d", *dumpPath, d.Last(), c.blockchainID, c.subnetID, c.networkID)
+	// The genesis hash the plugin must compute: block 1's parent.
+	var genesisHash string
 	if raw, ok, err := d.GetByHeight(1); err == nil && ok {
 		inner, _ := unwrap(raw, &upgrade.Config{}, new(uint64))
 		var eb ethtypes.Block
 		if err := rlp.DecodeBytes(inner, &eb); err == nil {
-			var cfg map[string]any
-			if err := json.Unmarshal([]byte(*configJSON), &cfg); err != nil {
-				log.Fatalf("epochdb-host-bench: --config: %v", err)
-			}
-			cfg["genesis-id"] = eb.ParentHash().Hex()
-			b, _ := json.Marshal(cfg)
-			*configJSON = string(b)
-			log.Printf("epochdb-host-bench: genesis hash %s (block 1's parent), config %s", eb.ParentHash().Hex(), *configJSON)
+			genesisHash = eb.ParentHash().Hex()
 		}
 	}
 
@@ -206,10 +199,20 @@ func main() {
 		log.Fatalf("epochdb-host-bench: GetBlock(last): %v", err)
 	}
 	log.Printf("epochdb-host-bench: plugin last accepted height=%d id=%s", last.Height(), lastID)
+	if *from == 0 {
+		*from = last.Height() + 1
+	}
 	if last.Height()+1 != *from {
 		log.Fatalf("epochdb-host-bench: plugin is at height %d, --from is %d: use --from %d", last.Height(), *from, last.Height()+1)
 	}
-
+	if last.Height() == 0 && genesisHash != "" && lastID.String() != ids.ID(ethcommon.HexToHash(genesisHash)).String() {
+		log.Fatalf("epochdb-host-bench: genesis hash check: plugin's genesis id %s != block 1's parent %s", lastID, genesisHash)
+	}
+	if *from <= d.Last() {
+		if d, err = openDump(*dumpPath, *from, *to); err != nil {
+			log.Fatalf("epochdb-host-bench: %v", err)
+		}
+	}
 	p := &pipe{
 		d: d, from: *from, batch: *batch,
 		ring:    make(chan item, 4096),
@@ -228,7 +231,7 @@ func main() {
 	}
 	b.exit()
 	if err == nil {
-		check(ctx, vm, mux, rpcPath, d, b.height.Load())
+		check(ctx, vm, mux, rpcPath, d, b.height.Load(), genesisHash)
 		if *serve {
 			log.Printf("epochdb-host-bench: --serve: HTTP stays up at %s until SIGINT", *httpAddr)
 			<-ctx.Done()
@@ -286,7 +289,7 @@ func loadChain(dir string) (*chainDesc, error) {
 // check asks the mounted /rpc handler what the plugin says about the head and
 // compares it with the dump: eth_blockNumber == the last fed height, and
 // eth_getBlockByNumber(head).hash == keccak(header) of that container.
-func check(ctx context.Context, vm block.ChainVM, mux *http.ServeMux, rpcPath string, d *dumpSource, head uint64) {
+func check(ctx context.Context, vm block.ChainVM, mux *http.ServeMux, rpcPath string, d *dumpSource, head uint64, genesisHash string) {
 	if rpcPath == "" {
 		log.Print("check: no /rpc handler mounted")
 		return
@@ -342,6 +345,16 @@ func check(ctx context.Context, vm block.ChainVM, mux *http.ServeMux, rpcPath st
 	lastID, _ := vm.LastAccepted(ctx)
 	log.Printf("check eth_blockNumber=%d want=%d hash=%s keccak(header)=%s last_accepted=%s match=%v",
 		num, head, blk.Hash, want, lastID, num == head && blk.Hash == want)
+	var g struct {
+		Hash string `json:"hash"`
+	}
+	if r, err := call("eth_getBlockByNumber", "0x0", false); err != nil {
+		log.Printf("check genesis: %v", err)
+	} else if err := json.Unmarshal(r, &g); err != nil {
+		log.Printf("check genesis: %v", err)
+	} else {
+		log.Printf("check genesis eth_getBlockByNumber(0x0).hash=%s block1.parentHash=%s match=%v", g.Hash, genesisHash, g.Hash == genesisHash)
+	}
 }
 
 // item is one container after unwrap: the inner VM bytes, the P-chain height

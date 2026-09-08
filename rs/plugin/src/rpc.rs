@@ -65,6 +65,37 @@ fn parse_hash(v: Option<&Value>) -> Result<B256, RpcError> {
     v.and_then(Value::as_str).ok_or_else(|| invalid("missing hash"))?.parse().map_err(|_| invalid("invalid hash"))
 }
 
+/// geth's revert error: -32000 "execution reverted" for an empty revert,
+/// else code 3 with the data and the Error(string) reason in the message.
+fn revert_error(output: &[u8]) -> RpcError {
+    if output.is_empty() {
+        return RpcError { code: -32000, message: "execution reverted".into(), data: None };
+    }
+    let mut message = "execution reverted".to_string();
+    if output.len() >= 68 && output[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        let off = U256::from_be_slice(&output[4..36]).to::<usize>() + 4;
+        if output.len() >= off + 32 {
+            let n = U256::from_be_slice(&output[off..off + 32]).to::<usize>();
+            if output.len() >= off + 32 + n {
+                message = format!("execution reverted: {}", String::from_utf8_lossy(&output[off + 32..off + 32 + n]));
+            }
+        }
+    }
+    RpcError { code: 3, message, data: Some(json!(hex(output))) }
+}
+
+/// The executor's invalid-message errors in geth's words where the door's
+/// clients match on them.
+fn call_error(e: anyhow::Error, gas: u64) -> RpcError {
+    let s = format!("{e:#}");
+    if let Some(rest) = s.strip_prefix("Transaction(CallGasCostMoreThanGasLimit { initial_gas: ") {
+        if let Some(want) = rest.split(',').next().and_then(|n| n.trim().parse::<u64>().ok()) {
+            return format!("err: intrinsic gas too low: have {gas}, want {want} (supplied gas {gas})").into();
+        }
+    }
+    s.into()
+}
+
 /// geth's DefaultRPCGasCap (subnet-evm: 50M).
 const RPC_GAS_CAP: u64 = 50_000_000;
 const TX_GAS: u64 = 21_000;
@@ -74,10 +105,12 @@ const ESTIMATE_ERROR_RATIO: f64 = 0.015;
 
 fn tx_json(b: &Block, i: usize) -> Value {
     let t = &b.txs[i];
+    // A block read back from the store has no senders recovered.
+    let from = t.sender.or_else(|| block::recover(t)).unwrap_or_default();
     let mut v = json!({
         "blockHash": b.hash,
         "blockNumber": qty(b.height),
-        "from": t.sender.unwrap_or_default(),
+        "from": from,
         "gas": qty(t.gas_limit),
         "gasPrice": qty(t.gas_price as u64),
         "hash": t.hash,
@@ -126,6 +159,9 @@ fn block_json(b: &Block, full: bool) -> Value {
         "timestamp": qty(h.time),
         "transactionsRoot": h.tx_hash,
         "receiptsRoot": h.receipt_hash,
+        // ponytail: subnet-evm blocks carry difficulty 1 each over a genesis of 0, so
+        // td = height; a chain with another genesis difficulty needs the sum.
+        "totalDifficulty": qty(h.number),
         "transactions": txs,
         "uncles": [],
     });
@@ -203,7 +239,7 @@ impl NodeEngine {
             to: field("to").map(|v| parse_addr(Some(v))).transpose()?,
             gas: match field("gas") {
                 Some(v) => parse_qty(v)?,
-                None => head.header.gas_limit.max(RPC_GAS_CAP),
+                None => head.header.gas_limit,
             }
             .min(RPC_GAS_CAP),
             gas_price: match field("gasPrice").or_else(|| field("maxFeePerGas")) {
@@ -263,9 +299,9 @@ impl NodeEngine {
             "eth_call" => {
                 let head = self.latest(params.get(1))?;
                 let msg = self.call_msg(params.first().ok_or_else(|| invalid("missing call object"))?, &head)?;
-                let r = self.inner.lock().unwrap().ex.call(&head.header, &msg).map_err(|e| format!("{e:#}"))?;
+                let r = self.inner.lock().unwrap().ex.call(&head.header, &msg).map_err(|e| call_error(e, msg.gas))?;
                 if r.revert {
-                    return Err(RpcError { code: 3, message: "execution reverted".into(), data: Some(json!(hex(&r.output))) });
+                    return Err(revert_error(&r.output));
                 }
                 if let Some(h) = r.halt {
                     return Err(format!("execution halted: {h}").into());
@@ -278,7 +314,7 @@ impl NodeEngine {
                 let mut g = self.inner.lock().unwrap();
                 // gasestimator.Estimate: hi = the message's gas (or the cap), capped by the
                 // sender's balance at a non-zero gas price; the run at hi must succeed.
-                let mut lo = TX_GAS - 1;
+                let mut lo;
                 let mut hi = msg.gas;
                 if msg.gas_price > 0 {
                     let bal = g.ex.db_mut().basic(msg.from).unwrap().map(|a| a.balance).unwrap_or_default();
@@ -287,27 +323,32 @@ impl NodeEngine {
                         hi = avail.to::<u64>();
                     }
                 }
+                // A plain transfer to an account without code: 21000 is tried first.
+                let plain = msg.data.is_empty() && msg.to.is_some_and(|to| !g.ex.db_mut().basic(to).unwrap().is_some_and(|a| !a.is_empty_code_hash()));
                 let mut run = |gas: u64| -> Result<(bool, exec::CallOut), RpcError> {
                     msg.gas = gas;
-                    let r = g.ex.call(&head.header, &msg).map_err(|e| format!("{e:#}"))?;
+                    let r = g.ex.call(&head.header, &msg).map_err(|e| call_error(e, gas))?;
                     let failed = r.revert || r.halt.is_some();
                     Ok((failed, r))
                 };
+                if plain && hi >= TX_GAS && !run(TX_GAS)?.0 {
+                    return Ok(json!(qty(TX_GAS)));
+                }
                 let (failed, r) = run(hi)?;
                 if failed {
                     if r.revert {
-                        return Err(RpcError { code: 3, message: "execution reverted".into(), data: Some(json!(hex(&r.output))) });
+                        return Err(revert_error(&r.output));
                     }
                     return Err(format!("gas required exceeds allowance ({hi})").into());
                 }
-                if lo + 1 < hi {
-                    let optimistic = (r.gas_used + CALL_STIPEND) * 64 / 63;
-                    if optimistic < hi {
-                        if run(optimistic)?.0 {
-                            lo = optimistic;
-                        } else {
-                            hi = optimistic;
-                        }
+                // The unconstrained run's gas lower-bounds the limit; no refunds under subnet-evm.
+                lo = r.gas_used - 1;
+                let optimistic = (r.gas_used + CALL_STIPEND) * 64 / 63;
+                if optimistic < hi {
+                    if run(optimistic)?.0 {
+                        lo = optimistic;
+                    } else {
+                        hi = optimistic;
                     }
                 }
                 while lo + 1 < hi {

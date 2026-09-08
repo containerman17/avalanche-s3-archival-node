@@ -148,6 +148,11 @@ impl BlockLog {
         Ok((BlockLog { f, end: off, idx, by_id }, torn))
     }
 
+    /// A second handle on the file for the fsync thread (the lock stays free).
+    pub fn dup(&self) -> io::Result<File> {
+        self.f.try_clone()
+    }
+
     fn record_at(&self, off: u64) -> io::Result<Vec<u8>> {
         let mut head = [0u8; HEAD];
         self.f.read_exact_at(&mut head, off)?;
@@ -306,6 +311,10 @@ impl CodeLog {
 
     pub fn sync(&self) -> io::Result<()> {
         self.f.sync_data()
+    }
+
+    pub fn dup(&self) -> io::Result<File> {
+        self.f.try_clone()
     }
 }
 

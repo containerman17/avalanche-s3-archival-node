@@ -77,6 +77,16 @@ pub struct Stats {
     pub txs: AtomicU64,
     pub gas: AtomicU64,
     pub checked: AtomicU64,
+    /// Nanoseconds inside parse_batch / parse / verify / accept / the checker's block work.
+    pub t_parse_batch: AtomicU64,
+    pub t_parse: AtomicU64,
+    pub t_verify: AtomicU64,
+    pub t_accept: AtomicU64,
+    pub t_check: AtomicU64,
+}
+
+fn tick(a: &AtomicU64, t0: Instant) {
+    a.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 pub struct NodeEngine {
@@ -112,6 +122,7 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn
             Msg::Block(it) => it,
         };
         let h = it.record.height;
+        let t0 = Instant::now();
         {
             let mut d = dirty.lock().unwrap();
             let root = if it.record.ws.is_empty() {
@@ -131,6 +142,7 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn
         code_log.lock().unwrap().append(&it.record.code).with_context(|| format!("block {h}: code append"))?;
         recent.lock().unwrap().remove(&it.record.id);
         stats.checked.fetch_add(1, Ordering::Relaxed);
+        tick(&stats.t_check, t0);
         if h % FLUSH_EVERY == 0 {
             let _ = flush.try_send(()); // flusher busy: coalesce into the next multiple
         }
@@ -260,24 +272,22 @@ impl NodeEngine {
         let dirty = Arc::new(Mutex::new(dirty));
         let roller = Roller::new(dir, gen, dirty.clone(), cpus);
         let ex = Executor::open(cfg.clone(), Layered::new(be));
+        let (blocks_fd, code_fd) = (store.dup()?, code_log.dup()?);
         let store: Arc<Mutex<Box<dyn BlockStore>>> = Arc::new(Mutex::new(Box::new(store)));
         let code_log = Arc::new(Mutex::new(code_log));
         let recent = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
         let (check_tx, check_rx) = sync_channel::<Msg>(CHECK_DEPTH);
         let (flush_tx, flush_rx) = sync_channel::<()>(1);
-        {
-            let (store, code_log) = (store.clone(), code_log.clone());
-            std::thread::spawn(move || {
-                for _ in flush_rx {
-                    let r = store.lock().unwrap().sync().and_then(|_| code_log.lock().unwrap().sync());
-                    if let Err(e) = r {
-                        eprintln!("epochdb-rs: store fsync: {e}");
-                        std::process::exit(1);
-                    }
+        // The flusher fsyncs through its own handles so the store lock stays free.
+        std::thread::spawn(move || {
+            for _ in flush_rx {
+                if let Err(e) = blocks_fd.sync_data().and_then(|_| code_fd.sync_data()) {
+                    eprintln!("epochdb-rs: store fsync: {e}");
+                    std::process::exit(1);
                 }
-            });
-        }
+            }
+        });
         let checker = {
             let (dirty, store, code_log, recent, stats) = (dirty.clone(), store.clone(), code_log.clone(), recent.clone(), stats.clone());
             std::thread::spawn(move || checker(check_rx, dirty, store, code_log, recent, stats, flush_tx))
@@ -337,29 +347,18 @@ impl Engine for NodeEngine {
     type Pending = Pending;
 
     fn parse(&self, bytes: Bytes) -> Result<Self::Block, Error> {
-        let mut b = block::decode_container(bytes)?;
-        if let Some(c) = self.parsed.lock().unwrap().get(&b.hash.0) {
-            return Ok(c.clone());
-        }
-        for t in &mut b.txs {
-            t.sender = block::recover(t);
-        }
-        let b = Arc::new(b);
-        let mut p = self.parsed.lock().unwrap();
-        if p.len() >= PARSED_MAX {
-            let head = self.head.lock().unwrap().height;
-            p.retain(|_, x| x.height > head);
-            if p.len() >= PARSED_MAX {
-                p.clear();
-            }
-        }
-        p.insert(b.hash.0, b.clone());
-        Ok(b)
+        let t0 = Instant::now();
+        let r = self.parse_inner(bytes);
+        tick(&self.stats.t_parse, t0);
+        r
     }
 
     /// BatchedParseBlock: the batch decoded and recovered on the pool.
     fn parse_batch(&self, raws: Vec<Bytes>) -> Result<Vec<Self::Block>, Error> {
-        self.pool.install(|| raws.into_par_iter().map(|r| self.parse(r)).collect())
+        let t0 = Instant::now();
+        let r = self.pool.install(|| raws.into_par_iter().map(|r| self.parse_inner(r)).collect());
+        tick(&self.stats.t_parse_batch, t0);
+        r
     }
 
     fn meta(&self, b: &Self::Block) -> Meta {
@@ -371,65 +370,17 @@ impl Engine for NodeEngine {
     }
 
     fn verify(&self, b: &Self::Block, parent: Option<&Arc<Pending>>, _pchain_height: Option<u64>) -> Result<Pending, Error> {
-        let mut g = self.inner.lock().unwrap();
-        let (ph, pn, pt) = match parent {
-            Some(p) => (p.hash, p.number, p.time),
-            None => {
-                let h = self.head.lock().unwrap();
-                (h.hash, h.height, h.header.time)
-            }
-        };
-        if b.header.parent_hash != ph || b.height != pn + 1 {
-            return Err(format!("block {} {} parent {} does not follow {} {}", b.height, b.hash, b.header.parent_hash, pn, ph).into());
-        }
-        let inner = &mut *g;
-        inner.ex.db_mut().begin(parent.cloned());
-        let r = inner.ex.execute_block(b, pt).map_err(|e| format!("block {}: {e:#}", b.height))?;
-        let h = &b.header;
-        if r.gas_used != h.gas_used {
-            return Err(format!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used).into());
-        }
-        if r.receipts_root != h.receipt_hash {
-            return Err(format!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash).into());
-        }
-        if r.bloom != h.bloom {
-            return Err(format!("block {}: logsBloom differs from the header", h.number).into());
-        }
-        let mut receipts = Vec::new();
-        let mut traces = Vec::with_capacity(r.txs.len());
-        for t in r.txs {
-            t.receipt.encode_2718(&mut receipts);
-            traces.push(t.trace_json);
-        }
-        let txs = traces.len() as u64;
-        Ok(inner.ex.db_mut().finish(b.height, b.hash, h.time, receipts, traces, r.gas_used, txs))
+        let t0 = Instant::now();
+        let r = self.verify_inner(b, parent);
+        tick(&self.stats.t_verify, t0);
+        r
     }
 
     fn accept(&self, b: &Self::Block, p: &Pending) -> Result<(), Error> {
-        let mut g = self.inner.lock().unwrap();
-        let inner = &mut *g;
-        self.swap_roll(inner, false)?;
-        let payload = p.payload.lock().unwrap().take().ok_or("block accepted twice")?;
-        let be = &mut inner.ex.db_mut().backend;
-        be.apply_ws(&payload.ws);
-        for (h, c) in &p.code {
-            be.code.insert(*h, c.clone());
-        }
-        be.set_block_hash(b.height, b.hash);
-        *self.head.lock().unwrap() = b.clone();
-        self.recent.lock().unwrap().insert(b.hash.0, b.clone());
-        // From here the block's root is the header's or the checker dies.
-        inner.roller.maybe_roll(be, inner.roll_budget, b.height, b.header.root);
-        self.stats.executed.fetch_add(1, Ordering::Relaxed);
-        self.stats.txs.fetch_add(payload.txs, Ordering::Relaxed);
-        self.stats.gas.fetch_add(payload.gas_used, Ordering::Relaxed);
-        let record = Record { height: b.height, id: b.hash.0, container: b.container.clone(), receipts: payload.receipts, traces: payload.traces, ws: payload.ws, code: payload.code };
-        let tx = self.check_tx.lock().unwrap().clone().ok_or("checker stopped")?;
-        tx.send(Msg::Block(Box::new(CheckItem { want: b.header.root, record }))).map_err(|_| "checker stopped")?;
-        if b.height % 256 == 0 {
-            self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
-        }
-        Ok(())
+        let t0 = Instant::now();
+        let r = self.accept_inner(b, p);
+        tick(&self.stats.t_accept, t0);
+        r
     }
 
     fn last_accepted(&self) -> Self::Block {
@@ -515,17 +466,109 @@ impl Engine for NodeEngine {
         let s = &self.stats;
         let (blocks, txs, gas, checked) = (s.executed.load(Ordering::Relaxed), s.txs.load(Ordering::Relaxed), s.gas.load(Ordering::Relaxed), s.checked.load(Ordering::Relaxed));
         let busy = ex.t_evm + ex.t_trace + ex.t_commit;
+        let secs = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
         eprintln!(
-            "epochdb-rs: exit: blocks={blocks} txs={txs} gas={gas} root-checked={checked} rolls={} head={} | evm={:.2}s trace={:.2}s commit={:.2}s exec-thread {:.1} mgas/s | uptime {:.0}s",
+            "epochdb-rs: exit: blocks={blocks} txs={txs} gas={gas} root-checked={checked} rolls={} head={} | evm={:.2}s trace={:.2}s commit={:.2}s exec-thread {:.1} mgas/s | parse-batch={:.2}s parse={:.2}s verify={:.2}s accept={:.2}s checker={:.2}s | uptime {:.0}s",
             inner.roller.rolls,
             self.head.lock().unwrap().height,
             ex.t_evm.as_secs_f64(),
             ex.t_trace.as_secs_f64(),
             ex.t_commit.as_secs_f64(),
             if busy.is_zero() { 0.0 } else { gas as f64 / busy.as_secs_f64() / 1e6 },
+            secs(&s.t_parse_batch),
+            secs(&s.t_parse),
+            secs(&s.t_verify),
+            secs(&s.t_accept),
+            secs(&s.t_check),
             self.t0.elapsed().as_secs_f64()
         );
     }
+}
+
+impl NodeEngine {
+    fn parse_inner(&self, bytes: Bytes) -> Result<Arc<Block>, Error> {
+        let mut b = block::decode_container(bytes)?;
+        if let Some(c) = self.parsed.lock().unwrap().get(&b.hash.0) {
+            return Ok(c.clone());
+        }
+        for t in &mut b.txs {
+            t.sender = block::recover(t);
+        }
+        let b = Arc::new(b);
+        let mut p = self.parsed.lock().unwrap();
+        if p.len() >= PARSED_MAX {
+            let head = self.head.lock().unwrap().height;
+            p.retain(|_, x| x.height > head);
+            if p.len() >= PARSED_MAX {
+                p.clear();
+            }
+        }
+        p.insert(b.hash.0, b.clone());
+        Ok(b)
+    }
+
+    fn verify_inner(&self, b: &Arc<Block>, parent: Option<&Arc<Pending>>) -> Result<Pending, Error> {
+        let mut g = self.inner.lock().unwrap();
+        let (ph, pn, pt) = match parent {
+            Some(p) => (p.hash, p.number, p.time),
+            None => {
+                let h = self.head.lock().unwrap();
+                (h.hash, h.height, h.header.time)
+            }
+        };
+        if b.header.parent_hash != ph || b.height != pn + 1 {
+            return Err(format!("block {} {} parent {} does not follow {} {}", b.height, b.hash, b.header.parent_hash, pn, ph).into());
+        }
+        let inner = &mut *g;
+        inner.ex.db_mut().begin(parent.cloned());
+        let r = inner.ex.execute_block(b, pt).map_err(|e| format!("block {}: {e:#}", b.height))?;
+        let h = &b.header;
+        if r.gas_used != h.gas_used {
+            return Err(format!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used).into());
+        }
+        if r.receipts_root != h.receipt_hash {
+            return Err(format!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash).into());
+        }
+        if r.bloom != h.bloom {
+            return Err(format!("block {}: logsBloom differs from the header", h.number).into());
+        }
+        let mut receipts = Vec::new();
+        let mut traces = Vec::with_capacity(r.txs.len());
+        for t in r.txs {
+            t.receipt.encode_2718(&mut receipts);
+            traces.push(t.trace_json);
+        }
+        let txs = traces.len() as u64;
+        Ok(inner.ex.db_mut().finish(b.height, b.hash, h.time, receipts, traces, r.gas_used, txs))
+    }
+
+    fn accept_inner(&self, b: &Arc<Block>, p: &Pending) -> Result<(), Error> {
+        let mut g = self.inner.lock().unwrap();
+        let inner = &mut *g;
+        self.swap_roll(inner, false)?;
+        let payload = p.payload.lock().unwrap().take().ok_or("block accepted twice")?;
+        let be = &mut inner.ex.db_mut().backend;
+        be.apply_ws(&payload.ws);
+        for (h, c) in &p.code {
+            be.code.insert(*h, c.clone());
+        }
+        be.set_block_hash(b.height, b.hash);
+        *self.head.lock().unwrap() = b.clone();
+        self.recent.lock().unwrap().insert(b.hash.0, b.clone());
+        // From here the block's root is the header's or the checker dies.
+        inner.roller.maybe_roll(be, inner.roll_budget, b.height, b.header.root);
+        self.stats.executed.fetch_add(1, Ordering::Relaxed);
+        self.stats.txs.fetch_add(payload.txs, Ordering::Relaxed);
+        self.stats.gas.fetch_add(payload.gas_used, Ordering::Relaxed);
+        let record = Record { height: b.height, id: b.hash.0, container: b.container.clone(), receipts: payload.receipts, traces: payload.traces, ws: payload.ws, code: payload.code };
+        let tx = self.check_tx.lock().unwrap().clone().ok_or("checker stopped")?;
+        tx.send(Msg::Block(Box::new(CheckItem { want: b.header.root, record }))).map_err(|_| "checker stopped")?;
+        if b.height % 256 == 0 {
+            self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
+        }
+        Ok(())
+    }
+
 }
 
 pub fn id_hex(id: &Id) -> String {
