@@ -9,6 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
 
@@ -88,14 +89,18 @@ fn channel(addr: &str) -> Result<Channel, Status> {
 }
 
 /// Server settings after grpcutils.DefaultServerOptions: unbounded message
-/// sizes (set per service) and TCP_NODELAY (grpc-go sets it on every
-/// connection; without it Nagle plus the client's delayed ACK cost 40 ms
-/// per round trip, 20 blk/s).
+/// sizes (set per service), keepalive as the Go server.
 fn server() -> Server {
     Server::builder()
-        .tcp_nodelay(true)
         .http2_keepalive_interval(Some(Duration::from_secs(2 * 3600)))
         .http2_keepalive_timeout(Some(Duration::from_secs(20)))
+}
+
+/// TCP_NODELAY on every accepted connection (grpc-go sets it on its side;
+/// without it Nagle plus the client's delayed ACK cost 40 ms per round trip,
+/// 20 blk/s). The builder's tcp_nodelay is ignored by serve_with_incoming.
+fn incoming(listener: TcpListener) -> TcpIncoming {
+    TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
 impl<E: Engine> VmService<E> {
@@ -204,8 +209,7 @@ impl<E: Engine> Vm for VmService<E> {
             let addr = listener.local_addr().map_err(|e| Status::internal(e.to_string()))?;
             let svc = HttpServer::new(HttpService { handler: handler.clone() }).max_decoding_message_size(usize::MAX).max_encoding_message_size(usize::MAX);
             let task = tokio::spawn(async move {
-                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-                if let Err(e) = server().add_service(svc).serve_with_incoming(incoming).await {
+                if let Err(e) = server().add_service(svc).serve_with_incoming(incoming(listener)).await {
                     eprintln!("epochdb-rs: handler server {addr}: {e}");
                 }
             });
@@ -443,10 +447,9 @@ pub async fn serve<E: Engine>(factory: Factory<E>) -> Result<(), Error> {
         .map_err(|e| format!("failed to initialize vm runtime: {e}"))?;
 
     let vm = VmServer::from_arc(svc).max_decoding_message_size(usize::MAX).max_encoding_message_size(usize::MAX);
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     server()
         .add_service(vm)
-        .serve_with_incoming_shutdown(incoming, async {
+        .serve_with_incoming_shutdown(incoming(listener), async {
             let _ = stop_rx.await;
         })
         .await?;

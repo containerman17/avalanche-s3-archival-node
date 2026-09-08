@@ -21,7 +21,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 tonic = "0.14"
 tonic-prost = "0.14"
-tokio-stream = { version = "0.1", features = ["net"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
