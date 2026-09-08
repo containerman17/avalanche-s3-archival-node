@@ -94,3 +94,73 @@ height. A restart already at the stop height executes no additional block. The
 measurement script requires it to match systemd `MainPID`, so stale ready lines
 from an earlier run cannot satisfy restart readiness. RPC stays open until the
 host is stopped. The publication build uses `subnetbench,netgo,osusergo` tags.
+
+## Current-state RPC
+
+Generate the request file on baseline A at the fixed accepted height, before
+the process restart used for the cold pass:
+
+```sh
+python3 ops/subnetbench/rpcbench.py generate --url "$RPC_A" --height 100000 \
+  --seed 17 --output /path/to/requests.jsonl
+```
+
+The default selection samples 128 blocks from the last 10,000 blocks. It uses
+transaction senders, targets, and observed transaction inputs from those blocks.
+Those block reads select inputs; every state read and call uses `latest`.
+Selection uses a 100-second phase budget and a five-second HTTP timeout. The
+seed fixes sampling and request order for the probes completed within that
+budget. Machine speed can change which probes finish, so generate once and
+reuse the saved file for all passes and both backends.
+
+For sampled contracts with current code, storage selection probes direct slots
+0 through 31 and candidate balance mapping positions for four sampled addresses
+and slots 0 through 7. It computes mapping keys with `web3_sha3`. Selection must
+find populated storage; it then draws approximately 70% of storage requests from
+populated slots and 30% from zero slots when both are available. Call selection
+keeps successful current calls using observed transaction inputs and candidate
+`balanceOf(address)`, `totalSupply()`, and `decimals()` inputs, with a gas limit of
+2,000,000. These are sampled candidates, not traced storage accesses or verified
+token interfaces. Metadata records successful empty call results separately.
+
+The output contains exactly 1,000 requests per method, shuffled together. Small
+pools require repeated requests. The `.meta.json` sidecar records the chain ID,
+head hash, request file SHA-256, actual sampled heights, contracts, probe counts,
+successful storage and call probes with their results, nonzero and zero storage
+counts, and unique request counts. Copy the request file and its sidecar together.
+Every command refuses to overwrite an existing output file.
+
+After restarting A and waiting for readiness at the same height, run the cold
+pass first and then the warm pass:
+
+```sh
+python3 ops/subnetbench/rpcbench.py replay --url "$RPC_A" \
+  --requests /path/to/requests.jsonl --output /path/to/a-cold.jsonl --label a-cold
+python3 ops/subnetbench/rpcbench.py replay --url "$RPC_A" \
+  --requests /path/to/requests.jsonl --output /path/to/a-warm.jsonl --label a-warm
+```
+
+Repeat those two commands for B, changing only the URL, output paths, and labels.
+Cold means the first workload pass after a process restart. Requests within that
+pass can warm caches, and the operating system cache is not cleared. Generation
+is outside the measurement and occurs before the restart.
+
+Replay uses one sequential HTTP connection with keepalive. Each JSONL record
+contains the method, parameters, complete response body, parsed response, HTTP
+status, and latency in nanoseconds. Timing starts before the HTTP request and
+ends after reading the complete body; JSON encoding and decoding are excluded.
+Replay verifies the chain ID, head hash, and height before and after each pass.
+
+```sh
+python3 ops/subnetbench/rpcbench.py compare /path/to/a-cold.jsonl /path/to/b-cold.jsonl
+python3 ops/subnetbench/rpcbench.py compare /path/to/a-warm.jsonl /path/to/b-warm.jsonl
+python3 ops/subnetbench/rpcbench.py summarize /path/to/a-cold.jsonl
+python3 -m unittest discover -s ops/subnetbench -p test_rpcbench.py
+```
+
+Also compare cold and warm responses within each backend. Comparison ignores
+only the top-level JSON-RPC ID and dictionary key order. Errors, missing results,
+different responses, changed heads, or failed file hashes fail validation.
+Reports include per-method success and error counts, p50 and p95 latency for
+successful requests, and nonzero and zero storage response counts. The optional
+`--output` argument on `compare` and `summarize` saves the report as JSON.
