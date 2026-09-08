@@ -39,7 +39,7 @@ func main() {
 	dataDir := fs.String("data", "./data", "data directory (must be empty: no restart path yet)")
 	port := fs.Int("port", 9650, "HTTP listen port: JSON-RPC at / and /ext/bc/<blockchainID>/rpc, /status")
 	p2pPort := fs.Int("p2p-port", 0, "listen for avalanchego peers on this port (0 disables)")
-	peers := flag.String("peers", "", "comma-separated extra archival peers, NodeID-...@host:port each (an epochdb --p2p-port or epochdb-archive-serve)")
+	peers := fs.String("peers", "", "comma-separated extra archival peers, NodeID-...@host:port each (an epochdb --p2p-port or epochdb-archive-serve)")
 	network := fs.String("network", "fuji", "network: fuji|mainnet")
 	chainSpec := fs.String("chain", "", "the L1's blockchainID (subnet-evm only)")
 	nodeURI := fs.String("node", "", "comma-separated bootstrap RPC node URIs")
