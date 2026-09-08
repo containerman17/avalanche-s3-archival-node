@@ -1488,6 +1488,7 @@ name = "epochdb-layout"
 version = "0.1.0"
 dependencies = [
  "epochdb-state",
+ "libc",
  "lz4_flex",
  "memmap2",
  "zstd",

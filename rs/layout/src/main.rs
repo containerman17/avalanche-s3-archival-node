@@ -3,7 +3,7 @@
 //! answers `get` with no cache layer, and scans it whole (the roll's need).
 //! Nothing here is a store format; run.rs is the production layout (A).
 //!
-//!   layout <rows.bin> [--raw] [--rounds N] [--set A,B,C,D,E,F,S] [--only name-substr]
+//!   layout <rows.bin> [--raw] [--rounds N] [--set A,B,C,D,E,F,S,G,H] [--only name-substr]
 //!
 //! Prints one Markdown table row per candidate.
 
@@ -77,6 +77,8 @@ enum ValEnc {
     Raw,
     Packed,
     Dict,
+    /// Dict plus a table of the top 127 code hashes (1-byte codes).
+    Subst,
 }
 
 /// Value codec. Packed: account RLP[nonce, balance, codeHash] becomes
@@ -87,9 +89,11 @@ struct Vals {
     enc: ValEnc,
     dict: Vec<Vec<u8>>,
     idx: HashMap<Vec<u8>, u8>,
+    codes: Vec<[u8; 32]>,
+    code_idx: HashMap<[u8; 32], u8>,
 }
 
-fn pack(k: &[u8], v: &[u8], out: &mut Vec<u8>) {
+fn pack(k: &[u8], v: &[u8], out: &mut Vec<u8>, codes: &HashMap<[u8; 32], u8>) {
     out.clear();
     if k.len() != 33 || v.is_empty() {
         out.extend_from_slice(v);
@@ -100,20 +104,29 @@ fn pack(k: &[u8], v: &[u8], out: &mut Vec<u8>) {
     let (bal, r) = rlp::split_string(r).unwrap();
     let (code, _) = rlp::split_string(r).unwrap();
     let empty = code == EMPTY_CODE_HASH;
-    out.push(((nonce.len() as u8) << 1) | empty as u8);
+    let ci = if empty { None } else { codes.get(<&[u8; 32]>::try_from(code).unwrap()) };
+    out.push(((nonce.len() as u8) << 2) | ((ci.is_some() as u8) << 1) | empty as u8);
     out.push(bal.len() as u8);
     out.extend_from_slice(nonce);
     out.extend_from_slice(bal);
-    if !empty {
-        out.extend_from_slice(code);
+    match ci {
+        Some(&i) => out.push(i),
+        None if !empty => out.extend_from_slice(code),
+        None => {}
     }
 }
 
-fn unpack<'a>(p: &[u8], out: &'a mut Vec<u8>) -> &'a [u8] {
-    let (nl, empty, bl) = ((p[0] >> 1) as usize, p[0] & 1 == 1, p[1] as usize);
+fn unpack<'a>(p: &[u8], out: &'a mut Vec<u8>, codes: &'a [[u8; 32]]) -> &'a [u8] {
+    let (nl, empty, coded, bl) = ((p[0] >> 2) as usize, p[0] & 1 == 1, p[0] & 2 == 2, p[1] as usize);
     let nonce = &p[2..2 + nl];
     let bal = &p[2 + nl..2 + nl + bl];
-    let code: &[u8] = if empty { &EMPTY_CODE_HASH } else { &p[2 + nl + bl..2 + nl + bl + 32] };
+    let code: &[u8] = if empty {
+        &EMPTY_CODE_HASH
+    } else if coded {
+        &codes[p[2 + nl + bl] as usize]
+    } else {
+        &p[2 + nl + bl..2 + nl + bl + 32]
+    };
     out.clear();
     out.extend_from_slice(&[0, 0]);
     rlp::put_bytes(out, nonce);
@@ -132,23 +145,43 @@ fn unpack<'a>(p: &[u8], out: &'a mut Vec<u8>) -> &'a [u8] {
 
 impl Vals {
     fn train(enc: ValEnc, rows: &[Row]) -> Vals {
+        let mut codes: Vec<[u8; 32]> = vec![];
+        if enc == ValEnc::Subst {
+            let mut cnt: HashMap<[u8; 32], u64> = HashMap::new();
+            for (k, v) in rows {
+                if k.len() == 33 && !v.is_empty() {
+                    let (c, _) = rlp::split_list(v).unwrap();
+                    let (_, r) = rlp::split_string(c).unwrap();
+                    let (_, r) = rlp::split_string(r).unwrap();
+                    let (code, _) = rlp::split_string(r).unwrap();
+                    if code != EMPTY_CODE_HASH {
+                        *cnt.entry(code.try_into().unwrap()).or_default() += 1;
+                    }
+                }
+            }
+            let mut all: Vec<([u8; 32], u64)> = cnt.into_iter().filter(|(_, c)| *c > 1).collect();
+            all.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+            codes = all.into_iter().take(127).map(|(h, _)| h).collect();
+        }
+        let code_idx: HashMap<[u8; 32], u8> = codes.iter().enumerate().map(|(i, h)| (*h, i as u8)).collect();
         let mut dict = vec![];
-        if enc == ValEnc::Dict {
+        if enc == ValEnc::Dict || enc == ValEnc::Subst {
             let mut cnt: HashMap<Vec<u8>, u64> = HashMap::new();
             let mut p = Vec::new();
             for (k, v) in rows {
-                pack(k, v, &mut p);
+                pack(k, v, &mut p, &code_idx);
                 *cnt.entry(p.clone()).or_default() += 1;
             }
             let mut all: Vec<(Vec<u8>, u64)> = cnt.into_iter().filter(|(v, c)| *c > 1 && !v.is_empty()).collect();
             all.sort_by_key(|(v, c)| std::cmp::Reverse(v.len() as u64 * c));
             dict = all.into_iter().take(127).map(|(v, _)| v).collect();
         }
-        Vals::with_dict(enc, dict)
+        Vals::with_dict(enc, dict, codes)
     }
-    fn with_dict(enc: ValEnc, dict: Vec<Vec<u8>>) -> Vals {
+    fn with_dict(enc: ValEnc, dict: Vec<Vec<u8>>, codes: Vec<[u8; 32]>) -> Vals {
         let idx = dict.iter().enumerate().map(|(i, v)| (v.clone(), i as u8)).collect();
-        Vals { enc, dict, idx }
+        let code_idx = codes.iter().enumerate().map(|(i, h)| (*h, i as u8)).collect();
+        Vals { enc, dict, idx, codes, code_idx }
     }
     fn to_bytes(&self) -> Vec<u8> {
         let mut b = vec![self.enc as u8, self.dict.len() as u8];
@@ -156,13 +189,18 @@ impl Vals {
             b.push(d.len() as u8);
             b.extend_from_slice(d);
         }
+        b.push(self.codes.len() as u8);
+        for c in &self.codes {
+            b.extend_from_slice(c);
+        }
         b
     }
     fn from_bytes(b: &[u8]) -> Vals {
         let enc = match b[0] {
             0 => ValEnc::Raw,
             1 => ValEnc::Packed,
-            _ => ValEnc::Dict,
+            2 => ValEnc::Dict,
+            _ => ValEnc::Subst,
         };
         let (mut dict, mut i) = (vec![], 2);
         for _ in 0..b[1] {
@@ -170,7 +208,10 @@ impl Vals {
             dict.push(b[i + 1..i + 1 + l].to_vec());
             i += 1 + l;
         }
-        Vals::with_dict(enc, dict)
+        let n = b[i] as usize;
+        i += 1;
+        let codes = (0..n).map(|j| b[i + 32 * j..i + 32 * j + 32].try_into().unwrap()).collect();
+        Vals::with_dict(enc, dict, codes)
     }
     /// Stored form: the vlen byte and the bytes (in `out`).
     fn encode(&self, k: &[u8], v: &[u8], out: &mut Vec<u8>) -> u8 {
@@ -179,9 +220,9 @@ impl Vals {
                 out.clear();
                 out.extend_from_slice(v);
             }
-            _ => pack(k, v, out),
+            _ => pack(k, v, out, &self.code_idx),
         }
-        if self.enc == ValEnc::Dict {
+        if self.enc == ValEnc::Dict || self.enc == ValEnc::Subst {
             if let Some(&i) = self.idx.get(out.as_slice()) {
                 out.clear();
                 return 128 + i;
@@ -196,7 +237,7 @@ impl Vals {
         if self.enc == ValEnc::Raw || k.len() != 33 || raw.is_empty() {
             return raw;
         }
-        unpack(raw, sc)
+        unpack(raw, sc, &self.codes)
     }
 }
 
@@ -743,7 +784,7 @@ impl Reader for FixedReader<'_> {
 
 enum Layout {
     Run,
-    Front { cfg: FrontCfg, idx: Idx, enc: ValEnc, sidecar: bool },
+    Front { cfg: FrontCfg, idx: Idx, enc: ValEnc, sidecar: bool, heap: bool },
     Fixed { cfg: FixedCfg, idx: Idx, enc: ValEnc },
 }
 
@@ -751,8 +792,8 @@ impl Layout {
     fn name(&self) -> String {
         match self {
             Layout::Run => "A run.rs 4K/p40".into(),
-            Layout::Front { cfg, idx, enc, sidecar } => format!(
-                "{} front {}K R{} {:?}{}",
+            Layout::Front { cfg, idx, enc, sidecar, heap } => format!(
+                "{} front {}K R{} {:?}{}{}",
                 if *sidecar { "E" } else { "B" },
                 cfg.bs / 1024,
                 cfg.restart,
@@ -760,7 +801,8 @@ impl Layout {
                 match enc {
                     ValEnc::Raw => "".into(),
                     e => format!(" {:?}", e),
-                }
+                },
+                if *heap { " heap" } else { "" }
             ),
             Layout::Fixed { cfg, idx, enc } => format!(
                 "D fixed {} {:?}{} {:?}{}",
@@ -859,9 +901,21 @@ impl Layout {
     fn open<'a>(&self, path: &Path, mm: &'a [u8]) -> Box<dyn Reader + 'a> {
         match self {
             Layout::Run => Box::new(RunReader(run::Run::open(path).unwrap())),
-            Layout::Front { cfg, idx, .. } => {
+            Layout::Front { cfg, idx, heap, .. } => {
                 let s = sections(mm);
-                Box::new(FrontReader { blocks: s[0], bs: cfg.bs, idx: Index::new(u64s(s[1]), u64s(s[2]), *idx), vals: Vals::from_bytes(s[3]), tab: u64s(s[4]) })
+                // heap: the index and the sidecar in anonymous THP memory
+                // instead of the 4K-paged file mapping (the TLB question)
+                let cp = |b: &[u8]| -> &'static [u64] {
+                    if !*heap {
+                        return unsafe { std::mem::transmute::<&[u64], &'static [u64]>(u64s(b)) };
+                    }
+                    let n = b.len() / 8;
+                    let mut v: Vec<u64> = Vec::with_capacity(n + (1 << 18));
+                    unsafe { libc::madvise(v.as_mut_ptr() as *mut libc::c_void, v.capacity() * 8, libc::MADV_HUGEPAGE) };
+                    v.extend_from_slice(u64s(b));
+                    Box::leak(v.into_boxed_slice())
+                };
+                Box::new(FrontReader { blocks: s[0], bs: cfg.bs, idx: Index::new(cp(s[1]), cp(s[2]), *idx), vals: Vals::from_bytes(s[3]), tab: cp(s[4]) })
             }
             Layout::Fixed { cfg, idx, .. } => {
                 let s = sections(mm);
@@ -1052,8 +1106,9 @@ fn miss_keys(rows: &[Row], n: usize) -> Vec<Vec<u8>> {
                 let tail = k.len() - 8;
                 rng.fill(&mut k[tail..]);
             } else {
-                // an address never seen
-                rng.fill(&mut k[..32]);
+                // an address never seen (raw keys: addr + 'a')
+                let n = k.len().min(32);
+                rng.fill(&mut k[..n]);
             }
             k
         })
@@ -1068,14 +1123,14 @@ fn candidates(set: &str) -> Vec<Layout> {
             "B" => {
                 for bs in [2048, 4096, 8192] {
                     for restart in [0, 8, 16, 32] {
-                        v.push(Layout::Front { cfg: FrontCfg { bs, restart }, idx: Idx::Bin, enc: ValEnc::Raw, sidecar: false });
+                        v.push(Layout::Front { cfg: FrontCfg { bs, restart }, idx: Idx::Bin, enc: ValEnc::Raw, sidecar: false, heap: false });
                     }
                 }
             }
             "C" => {
                 for bs in [4096, 8192] {
                     for idx in [Idx::Interp, Idx::Mixed] {
-                        v.push(Layout::Front { cfg: FrontCfg { bs, restart: 16 }, idx, enc: ValEnc::Raw, sidecar: false });
+                        v.push(Layout::Front { cfg: FrontCfg { bs, restart: 16 }, idx, enc: ValEnc::Raw, sidecar: false, heap: false });
                     }
                 }
             }
@@ -1091,12 +1146,43 @@ fn candidates(set: &str) -> Vec<Layout> {
             }
             "E" => {
                 for restart in [8, 16] {
-                    v.push(Layout::Front { cfg: FrontCfg { bs: 4096, restart }, idx: Idx::Bin, enc: ValEnc::Raw, sidecar: true });
+                    v.push(Layout::Front { cfg: FrontCfg { bs: 4096, restart }, idx: Idx::Bin, enc: ValEnc::Raw, sidecar: true, heap: false });
                 }
+            }
+            "S" => {
+                let f = |bs, restart, idx, enc, sidecar, heap| Layout::Front { cfg: FrontCfg { bs, restart }, idx, enc, sidecar, heap };
+                v.push(Layout::Run);
+                v.push(f(2048, 0, Idx::Bin, ValEnc::Raw, false, false));
+                v.push(f(4096, 0, Idx::Bin, ValEnc::Raw, false, false));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Raw, false, false));
+                v.push(f(8192, 0, Idx::Bin, ValEnc::Raw, false, false));
+                v.push(f(4096, 16, Idx::Interp, ValEnc::Raw, false, false));
+                v.push(f(4096, 16, Idx::Mixed, ValEnc::Raw, false, false));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Raw, false, true));
+                v.push(Layout::Fixed { cfg: FixedCfg { bs: 512, codec: Codec::Zstd(1), dict: true }, idx: Idx::Bin, enc: ValEnc::Raw });
+                v.push(Layout::Fixed { cfg: FixedCfg { bs: 4096, codec: Codec::Zstd(1), dict: true }, idx: Idx::Bin, enc: ValEnc::Raw });
+                v.push(f(4096, 8, Idx::Bin, ValEnc::Raw, true, false));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Raw, true, false));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Raw, true, true));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Packed, false, false));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Dict, false, false));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Dict, true, true));
+            }
+            "G" => {
+                let f = |bs, restart, idx, enc, sidecar, heap| Layout::Front { cfg: FrontCfg { bs, restart }, idx, enc, sidecar, heap };
+                v.push(f(2048, 0, Idx::Interp, ValEnc::Subst, false, false));
+                v.push(f(4096, 0, Idx::Interp, ValEnc::Subst, false, false));
+                v.push(f(4096, 16, Idx::Interp, ValEnc::Subst, true, false));
+            }
+            "H" => {
+                let f = |bs, restart, idx, enc, sidecar, heap| Layout::Front { cfg: FrontCfg { bs, restart }, idx, enc, sidecar, heap };
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Raw, false, true));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Raw, true, true));
+                v.push(f(4096, 16, Idx::Bin, ValEnc::Dict, true, true));
             }
             "F" => {
                 for enc in [ValEnc::Packed, ValEnc::Dict] {
-                    v.push(Layout::Front { cfg: FrontCfg { bs: 4096, restart: 16 }, idx: Idx::Bin, enc, sidecar: false });
+                    v.push(Layout::Front { cfg: FrontCfg { bs: 4096, restart: 16 }, idx: Idx::Bin, enc, sidecar: false, heap: false });
                 }
             }
             _ => panic!("unknown set {s}"),

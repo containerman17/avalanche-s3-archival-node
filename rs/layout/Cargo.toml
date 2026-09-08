@@ -12,3 +12,4 @@ state = { package = "epochdb-state", path = "../state" }
 memmap2 = "0.9"
 zstd = "0.13"
 lz4_flex = "0.11"
+libc = "0.2"
