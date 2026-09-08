@@ -14,7 +14,8 @@ ARG GOFLAGS=
 # distroless/cc-debian13 matches the builder's Debian 13 and carries the
 # libgcc_s.so.1 the binary needs; distroless/base does not ship it.
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 go build -o /epochdb ./cmd/epochdb
+    CGO_ENABLED=1 go build -o /epochdb ./cmd/epochdb && \
+    CGO_ENABLED=1 go build -o /out/ ./cmd/epochdb-vm ./cmd/epochdb-host ./cmd/epochdb-vm-plugin ./cmd/epochdb-archive-serve
 
 # THE PINNED zstd CLI LAYER IS GONE, as DESIGN said it would be: it existed for
 # the sealer's per-epoch dictionary training, and storage v0 deleted both the
@@ -25,6 +26,8 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 FROM gcr.io/distroless/cc-debian13
 LABEL org.opencontainers.image.source=https://github.com/containerman17/avalanche-s3-archival-node
 COPY --from=build /epochdb /usr/local/bin/epochdb
+# The rework's binaries ride beside the old one; `epochdb` stays the entrypoint.
+COPY --from=build /out/ /usr/local/bin/
 # GO RETURNS FREED HEAP PAGES LAZILY BY DEFAULT (MADV_FREE): they stay RESIDENT
 # until the kernel reclaims them, so the arena ratchets to its high-water mark
 # and never gives the ground back. This node's speed comes from the page cache,
