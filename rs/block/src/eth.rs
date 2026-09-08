@@ -85,6 +85,46 @@ pub fn decode_header(rlp: &[u8]) -> Result<Header, Error> {
     Ok(hd)
 }
 
+/// encode_header is the inverse of decode_header: the optional tail is
+/// written through the last field that is Some (an earlier None in front of
+/// a Some is an error, subnet-evm never produces one).
+pub fn encode_header(h: &Header) -> Result<Vec<u8>, Error> {
+    use alloy_rlp::Encodable;
+    let mut body = Vec::with_capacity(600);
+    h.parent_hash.encode(&mut body);
+    h.uncle_hash.encode(&mut body);
+    h.coinbase.encode(&mut body);
+    h.root.encode(&mut body);
+    h.tx_hash.encode(&mut body);
+    h.receipt_hash.encode(&mut body);
+    h.bloom.encode(&mut body);
+    h.difficulty.encode(&mut body);
+    h.number.encode(&mut body);
+    h.gas_limit.encode(&mut body);
+    h.gas_used.encode(&mut body);
+    h.time.encode(&mut body);
+    h.extra.encode(&mut body);
+    h.mix_digest.encode(&mut body);
+    h.nonce.encode(&mut body);
+    let tail: [Option<Vec<u8>>; 7] = [
+        h.base_fee.map(|v| { let mut b = Vec::new(); v.encode(&mut b); b }),
+        h.block_gas_cost.map(|v| { let mut b = Vec::new(); v.encode(&mut b); b }),
+        h.blob_gas_used.map(|v| { let mut b = Vec::new(); v.encode(&mut b); b }),
+        h.excess_blob_gas.map(|v| { let mut b = Vec::new(); v.encode(&mut b); b }),
+        h.parent_beacon_root.map(|v| { let mut b = Vec::new(); v.encode(&mut b); b }),
+        h.time_milliseconds.map(|v| { let mut b = Vec::new(); v.encode(&mut b); b }),
+        h.min_delay_excess.map(|v| { let mut b = Vec::new(); v.encode(&mut b); b }),
+    ];
+    let last = tail.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+    for (i, t) in tail.iter().take(last).enumerate() {
+        body.extend_from_slice(t.as_ref().ok_or_else(|| format!("header optional field {i} is None before a later Some"))?);
+    }
+    let mut out = Vec::with_capacity(body.len() + 3);
+    RlpHeader { list: true, payload_length: body.len() }.encode(&mut out);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessItem {
     pub address: Address,

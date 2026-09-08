@@ -179,6 +179,8 @@ impl<E: Engine> Vm for VmService<E> {
         let st = req.into_inner().state();
         *self.state.lock().unwrap() = st;
         eprintln!("epochdb-rs: state {}", st.as_str_name());
+        let t = self.tree()?;
+        tokio::task::spawn_blocking(move || t.engine.set_state(st == State::NormalOp)).await.map_err(|e| Status::internal(e.to_string()))?;
         let (last_accepted_id, last_accepted_parent_id, height, bytes, timestamp) = self.last_response()?;
         Ok(Response::new(SetStateResponse { last_accepted_id, last_accepted_parent_id, height, bytes, timestamp }))
     }
@@ -334,17 +336,18 @@ impl<E: Engine> Vm for VmService<E> {
         let t = self.tree()?;
         let raws = req.into_inner().request;
         let response = tokio::task::spawn_blocking(move || {
-            raws.into_iter()
-                .map(|raw| {
-                    let b = t.parse(Bytes::from(raw))?;
-                    let m = t.engine.meta(&b);
-                    Ok(ParseBlockResponse { id: m.id.to_vec(), parent_id: m.parent.to_vec(), height: m.height, timestamp: ts(m.timestamp), verify_with_context: false })
+            let blocks = t.engine.parse_batch(raws.into_iter().map(Bytes::from).collect())?;
+            Ok(blocks
+                .iter()
+                .map(|b| {
+                    let m = t.engine.meta(b);
+                    ParseBlockResponse { id: m.id.to_vec(), parent_id: m.parent.to_vec(), height: m.height, timestamp: ts(m.timestamp), verify_with_context: false }
                 })
-                .collect::<Result<Vec<_>, crate::tree::Error>>()
+                .collect::<Vec<_>>())
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(unknown)?;
+        .map_err(|e: crate::tree::Error| unknown(e))?;
         Ok(Response::new(BatchedParseBlockResponse { response }))
     }
 

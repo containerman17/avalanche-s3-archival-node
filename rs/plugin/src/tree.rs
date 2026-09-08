@@ -33,6 +33,10 @@ pub trait Engine: Send + Sync + 'static {
     type Pending: Send + Sync + 'static;
 
     fn parse(&self, bytes: Bytes) -> Result<Self::Block, Error>;
+    /// BatchedParseBlock: the engine may decode the batch in parallel.
+    fn parse_batch(&self, raws: Vec<Bytes>) -> Result<Vec<Self::Block>, Error> {
+        raws.into_iter().map(|r| self.parse(r)).collect()
+    }
     fn meta(&self, b: &Self::Block) -> Meta;
     fn bytes(&self, b: &Self::Block) -> Bytes;
     /// Execute `b` on top of its parent's state: `parent` is the parent's
@@ -50,6 +54,10 @@ pub trait Engine: Send + Sync + 'static {
         Ok(serde_json::json!({"height": self.meta(&self.last_accepted()).height}))
     }
     fn shutdown(&self) {}
+    /// SetState: true in NormalOp (the tip), false while bootstrapping.
+    fn set_state(&self, normal: bool) {
+        let _ = normal;
+    }
 }
 
 struct Verified<E: Engine> {

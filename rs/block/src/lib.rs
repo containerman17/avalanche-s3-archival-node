@@ -44,21 +44,29 @@ pub struct Block {
 
 /// decode parses one dump record into a Block, senders not recovered.
 pub fn decode(r: Record) -> Result<Block, Error> {
-    let u = pvm::unwrap(&r.container).map_err(|e| format!("height {}: {e}", r.height))?;
-    let (header_rlp, txs) = eth::decode_block(&u.inner).map_err(|e| format!("height {}: {e}", r.height))?;
-    let header = eth::decode_header(&header_rlp).map_err(|e| format!("height {}: header: {e}", r.height))?;
-    if header.number != r.height {
-        return Err(format!("height {}: header says number {}", r.height, header.number).into());
+    let b = decode_container(r.container).map_err(|e| format!("height {}: {e}", r.height))?;
+    if b.height != r.height {
+        return Err(format!("height {}: header says number {}", r.height, b.height).into());
     }
+    Ok(b)
+}
+
+/// decode_container parses a container (or the bare inner block bytes a
+/// plugin receives) into a Block, senders not recovered; the height is the
+/// header's.
+pub fn decode_container(container: Bytes) -> Result<Block, Error> {
+    let u = pvm::unwrap(&container)?;
+    let (header_rlp, txs) = eth::decode_block(&u.inner)?;
+    let header = eth::decode_header(&header_rlp).map_err(|e| format!("header: {e}"))?;
     let hash = keccak256(&header_rlp);
     Ok(Block {
-        height: r.height,
+        height: header.number,
         hash,
         container_id: u.id.map(B256::from).unwrap_or(hash),
         header,
         header_rlp,
         txs,
-        container: r.container,
+        container,
         pvm: u.pvm,
     })
 }

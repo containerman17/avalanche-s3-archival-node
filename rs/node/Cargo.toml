@@ -3,9 +3,9 @@ name = "epochdb-node"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "epochdb-rs"
-path = "src/main.rs"
+[lib]
+name = "node"
+path = "src/lib.rs"
 
 [dependencies]
 block = { package = "epochdb-block", path = "../block" }

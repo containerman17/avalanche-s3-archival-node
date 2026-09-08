@@ -73,6 +73,27 @@ pub struct TxResult {
     pub rows: Vec<StateRow>,
 }
 
+/// An eth_call / eth_estimateGas message.
+#[derive(Debug, Clone)]
+pub struct CallMsg {
+    pub from: Address,
+    pub to: Option<Address>,
+    pub gas: u64,
+    pub gas_price: u128,
+    pub value: U256,
+    pub data: Bytes,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallOut {
+    pub gas_used: u64,
+    pub output: Bytes,
+    pub revert: bool,
+    /// A halt (out of gas, invalid opcode, ...) by reason; None when the call
+    /// returned or reverted.
+    pub halt: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct BlockResult {
     pub gas_used: u64,
@@ -230,9 +251,9 @@ impl Executor<Db> {
 }
 
 impl<D: StateDb> Executor<D> {
-    /// Seeds db with what the genesis materialises: the alloc and every
-    /// precompile enabled at genesis (trieAlloc in vmexec/genesis.go).
-    pub fn with_db(cfg: Config, db: D) -> Result<Executor<D>> {
+    /// An executor over a db that already holds a state (a node reopening
+    /// its rolled state): nothing is seeded.
+    pub fn open(cfg: Config, db: D) -> Executor<D> {
         let spec = cfg.spec(cfg.genesis_timestamp);
         let ctx = Context::mainnet()
             .with_db(db)
@@ -240,7 +261,13 @@ impl<D: StateDb> Executor<D> {
             .modify_cfg_chained(|c| c.chain_id = cfg.chain_id);
         let trace_cfg = TracingInspectorConfig::from_geth_call_config(&CallConfig::default());
         let evm = Evm::new_with_inspector(ctx, TracingInspector::new(trace_cfg), EthInstructions::new_mainnet_with_spec(spec), SevmPrecompiles::new(spec));
-        let mut ex = Executor { cfg, evm, t_evm: Default::default(), t_trace: Default::default(), t_commit: Default::default() };
+        Executor { cfg, evm, t_evm: Default::default(), t_trace: Default::default(), t_commit: Default::default() }
+    }
+
+    /// Seeds db with what the genesis materialises: the alloc and every
+    /// precompile enabled at genesis (trieAlloc in vmexec/genesis.go).
+    pub fn with_db(cfg: Config, db: D) -> Result<Executor<D>> {
+        let mut ex = Executor::open(cfg, db);
 
         // Genesis.toBlock: ApplyPrecompileActivations with no parent, then the alloc on top.
         let acts: Vec<_> = ex.cfg.activating(None, ex.cfg.genesis_timestamp).into_iter().cloned().collect();
@@ -329,30 +356,7 @@ impl<D: StateDb> Executor<D> {
             return Ok(out);
         }
 
-        let spec = self.cfg.spec(time);
-        let basefee = h.base_fee.ok_or_else(|| anyhow!("block {} has no base fee", h.number))?;
-        let mut block_env = BlockEnv {
-            number: U256::from(h.number),
-            beneficiary: h.coinbase,
-            timestamp: U256::from(time),
-            gas_limit: h.gas_limit,
-            basefee: basefee.to::<u64>(),
-            difficulty: h.difficulty,
-            prevrandao: Some(B256::from(h.difficulty)),
-            ..Default::default()
-        };
-        if spec.is_enabled_in(SpecId::CANCUN) {
-            block_env.set_blob_excess_gas_and_price(h.excess_blob_gas.unwrap_or(0), revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
-        }
-        self.evm.ctx.set_block(block_env);
-        self.evm.ctx.modify_cfg(|c| c.spec = spec);
-        let durango = self.cfg.is_durango(time);
-        self.evm.precompiles.fee_manager = self.cfg.precompile_enabled(FEE_MANAGER, time);
-        self.evm.precompiles.durango = durango;
-        self.evm.precompiles.block_number = h.number;
-        if durango && self.cfg.is_granite(time) {
-            bail!("Granite rules (P256Verify, precompile delegatecall revert) are not implemented");
-        }
+        self.set_block_env(h)?;
 
         let mut cumulative = 0u64;
         let mut receipts = Vec::with_capacity(b.txs.len());
@@ -419,6 +423,84 @@ impl<D: StateDb> Executor<D> {
         out.bloom = bloom;
         out.receipts_root = alloy_trie::root::ordered_trie_root_with_encoder(&receipts, |r, buf| r.encode_2718(buf));
         Ok(out)
+    }
+
+    /// The block context of h: spec, fee rules, active precompiles.
+    fn set_block_env(&mut self, h: &block::Header) -> Result<()> {
+        let time = h.time;
+        let spec = self.cfg.spec(time);
+        let basefee = h.base_fee.ok_or_else(|| anyhow!("block {} has no base fee", h.number))?;
+        let mut block_env = BlockEnv {
+            number: U256::from(h.number),
+            beneficiary: h.coinbase,
+            timestamp: U256::from(time),
+            gas_limit: h.gas_limit,
+            basefee: basefee.to::<u64>(),
+            difficulty: h.difficulty,
+            prevrandao: Some(B256::from(h.difficulty)),
+            ..Default::default()
+        };
+        if spec.is_enabled_in(SpecId::CANCUN) {
+            block_env.set_blob_excess_gas_and_price(h.excess_blob_gas.unwrap_or(0), revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
+        }
+        self.evm.ctx.set_block(block_env);
+        self.evm.ctx.modify_cfg(|c| c.spec = spec);
+        let durango = self.cfg.is_durango(time);
+        self.evm.precompiles.fee_manager = self.cfg.precompile_enabled(FEE_MANAGER, time);
+        self.evm.precompiles.durango = durango;
+        self.evm.precompiles.block_number = h.number;
+        if durango && self.cfg.is_granite(time) {
+            bail!("Granite rules (P256Verify, precompile delegatecall revert) are not implemented");
+        }
+        Ok(())
+    }
+
+    /// eth_call: one message against the current state in the block context
+    /// of `head` (subnet-evm DoCall: no base fee, balance or nonce checks,
+    /// EIP-3607 off), nothing committed. Invalid messages are Err.
+    pub fn call(&mut self, head: &block::Header, msg: &CallMsg) -> Result<CallOut> {
+        self.set_block_env(head)?;
+        let tx_env = TxEnv {
+            tx_type: 0,
+            caller: msg.from,
+            gas_limit: msg.gas,
+            gas_price: msg.gas_price,
+            gas_priority_fee: None,
+            kind: match msg.to {
+                Some(a) => TxKind::Call(a),
+                None => TxKind::Create,
+            },
+            value: msg.value,
+            data: msg.data.clone(),
+            nonce: self.db_mut().basic(msg.from).unwrap().map_or(0, |a| a.nonce),
+            chain_id: Some(self.cfg.chain_id),
+            ..Default::default()
+        };
+        self.evm.ctx.modify_cfg(|c| {
+            c.disable_base_fee = true;
+            c.disable_balance_check = true;
+            c.disable_nonce_check = true;
+            c.disable_eip3607 = true;
+            c.disable_block_gas_limit = true;
+        });
+        self.evm.ctx.set_tx(tx_env);
+        self.evm.inspector.fuse();
+        let res = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default().inspect_run(&mut self.evm);
+        self.evm.ctx.journal_mut().clear();
+        self.evm.ctx.modify_cfg(|c| {
+            c.disable_base_fee = false;
+            c.disable_balance_check = false;
+            c.disable_nonce_check = false;
+            c.disable_eip3607 = false;
+            c.disable_block_gas_limit = false;
+        });
+        let res = res.map_err(|e| anyhow!("{e:?}"))?;
+        let gas_used = res.tx_gas_used();
+        Ok(match res {
+            ExecutionResult::Success { output, .. } => CallOut { gas_used, output: output.into_data(), revert: false, halt: None },
+            ExecutionResult::Revert { output, .. } => CallOut { gas_used, output, revert: true, halt: None },
+            ExecutionResult::Halt { reason, .. } => CallOut { gas_used, output: Bytes::new(), revert: false, halt: Some(format!("{reason:?}")) },
+        })
     }
 
     /// Commit a tx's journal state; the backend forgets the accounts it left

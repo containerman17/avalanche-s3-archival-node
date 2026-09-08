@@ -1570,11 +1570,21 @@ dependencies = [
 name = "epochdb-plugin"
 version = "0.1.0"
 dependencies = [
+ "alloy-eips",
  "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "anyhow",
  "bytes",
+ "crc32fast",
  "epochdb-block",
+ "epochdb-exec",
+ "epochdb-node",
+ "epochdb-state",
  "prost",
  "prost-types",
+ "rayon",
+ "revm",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
