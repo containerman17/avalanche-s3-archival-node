@@ -428,8 +428,10 @@ pub fn finish_trace(s: &Server, cfg: &TraceCfg, header: &Header, trace_json: &st
                 }
             }
             // geth looks the created contract up after its nonce was set to 1
-            // (EIP-161), so its pre-state reads {balance 0, nonce 1}.
-            if let Some(c) = created {
+            // (EIP-161), so its pre-state reads {balance 0, nonce 1}. An empty
+            // prestate is a create that never entered the EVM (no lookups at all).
+            let entered = v.get("pre").unwrap_or(&v).as_object().is_some_and(|o| !o.is_empty());
+            if let Some(c) = created.filter(|_| entered) {
                 let key = format!("{c:#x}");
                 let diff = v.get("pre").is_some();
                 let pre = if diff { v.get_mut("pre") } else { Some(&mut v) };

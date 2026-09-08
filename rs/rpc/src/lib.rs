@@ -356,7 +356,43 @@ fn stock_chain_config(cfg: &exec::Config, mut c: Value, upgrades: Option<Value>)
     }
     // Helicon is unscheduled on every network today (upgrade.UnscheduledActivationTime).
     o.insert("heliconTimestamp".into(), json!(253399622400u64));
+    remarshal(&mut c);
     c
+}
+
+/// Stock re-marshals the parsed config: common.Address (allow-list roles,
+/// initialMint keys, rewardAddress) as lowercase hex whatever case the genesis
+/// wrote, and the fields without omitempty (warp's quorumNumerator and
+/// requirePrimaryNetworkSigners, the reward manager's allowFeeRecipients) even
+/// when the genesis left them out.
+fn remarshal(v: &mut Value) {
+    fn is_addr(s: &str) -> bool {
+        s.len() == 42 && s.starts_with("0x") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    match v {
+        Value::String(s) if is_addr(s) => *s = s.to_ascii_lowercase(),
+        Value::Array(a) => a.iter_mut().for_each(remarshal),
+        Value::Object(o) => {
+            for (k, x) in std::mem::take(o) {
+                let mut x = x;
+                remarshal(&mut x);
+                if let Some(m) = x.as_object_mut() {
+                    match k.as_str() {
+                        "warpConfig" => {
+                            m.entry("quorumNumerator").or_insert(json!(0));
+                            m.entry("requirePrimaryNetworkSigners").or_insert(json!(false));
+                        }
+                        "initialRewardConfig" => {
+                            m.entry("allowFeeRecipients").or_insert(json!(false));
+                        }
+                        _ => {}
+                    }
+                }
+                o.insert(if is_addr(&k) { k.to_ascii_lowercase() } else { k }, x);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn reply(id: Option<Value>, res: RpcResult) -> Value {

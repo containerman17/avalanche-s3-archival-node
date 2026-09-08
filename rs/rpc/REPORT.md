@@ -115,11 +115,46 @@ The store path is 2.6x stock and 5x the Go node on receipts, 3.3x stock and 7.8x
 
 - WebSocket `/ws` and eth_subscribe (newHeads, logs, newPendingTransactions): the plugin's ghttp `Handle` (upgrade requests over the reader / writer streams, the `responsewriter` / `reader` / `writer` / `conn` protos not yet copied) is still Unimplemented, and the standalone bin is plain HTTP. filters.rs already has the polling half.
 - The interim plugin Store (state at head only, no postings): replaced by rs-storewire's DbStore behind `Store`.
-- Classes 2, 4, 5, 6 above: revm-inspectors' prestate on an OOG'd SSTORE and the struct logger's last gasCost; rs/exec's frame for an allow-list-refused create (beam 0x86, 0x88); the beam eth_gasPrice window decay; checksummed addresses in eth_getChainConfig.
 - flatCallTracer (revm-inspectors' parity builder is available, not wired) and JS tracers.
 - eth_createAccessList is derived from the prestate, not from an access-list inspector; equal on the probes.
 - The ERC-721 / ERC-1155 classification paths in tokens.rs need a corpus with 4-topic Transfer and TransferSingle logs.
-- `cargo test --workspace`: 33 tests pass (state 14, exec 2, block 1, plugin 3, store 6 + 8) and the rpc doctests (a text block in edb.rs was parsed as Rust and fenced). No unit test in rs/rpc itself: the differential is its check.
+- `cargo test --workspace`: 35 tests pass (exec 15, plugin 2, rpc 2, state 2 + 6 + 8). rs/rpc's own unit test is the fee window against Go vectors; the differential is the rest of its check.
+
+## rs-tracefix: the four residual classes (Round 3)
+
+Fixes to classes 2, 4, 5 and 6 of the Oracle results above, plus the module error texts the beam corpus surfaced. The spec is stock v1.14.2 under the same harness config; the Go source lines are libevm `core/vm/evm.go create`, `eth/tracers/native/call.go`, `eth/tracers/logger/logger.go`, `eth/tracers/native/prestate.go`, subnet-evm `plugin/evm/customheader/dynamic_fee_windower.go`, `eth/gasprice/gasprice.go`.
+
+What changed:
+
+- Class 4 (persistent data, `rs/exec`): libevm's `evm.create` refuses a create the deployer allow list denies (and a `CreateCollision`) before `CaptureStart` / `CaptureEnter`, so the tracer never learns of it. At depth 0 the callTracer keeps its untouched `callstack[0]` with `CaptureTxEnd`'s gasUsed: `{"from":"0x0000000000000000000000000000000000000000","gas":"0x0","gasUsed":"0x61a800","input":"0x","type":"STOP"}`; the struct logger answers `{"gas":6400000,"failed":false,"returnValue":"","structLogs":[]}` (no CaptureEnd, so no error); prestate `{}` (diffMode `{"post":{},"pre":{}}`); 4byte `{}`. At depth > 0 the refused CREATE leaves no child frame and the parent goes on (`SevmInspector::create` skips the tracer and swallows `create_end`). Frames libevm's `Call` / `Create` never enter (depth, balance, collision, nonce overflow) are pruned from the tree. The stored rows for beam 0x86 and 0x88 are now byte-equal to stock's `debug_traceBlockByNumber` output (checked from `epochdb-exec --traces-out` after the re-execution). Tx allow list refusal is a `preCheck` error in Go (`core/state_transition.go:255`): the block is invalid, no receipt and no frame on either side (rs bails per tx in `execute_block`). Unit test `refused_create_and_module_error_frames` in `rs/exec/src/tests.rs` covers the three tracers at depth 0, the nested refusal, the admin's normal create and a module error text, through `Executor::call` (same inspector and render path as the stored row).
+- Module error texts (`rs/exec`, beam 0x7f27, 5 probes): libevm's frame `error` for a failed stateful precompile is `err.Error()` (`cannot modify allow list: modify address: 0x2772…, from role: NoRole, to role: EnabledRole`); revm-inspectors only knows "precompiled failed". The provider records each module's `Halt::Err` text per tx (`SevmPrecompiles::errors`) and the frame tree takes them in post-order (call_end order) on module addresses only.
+- Class 2 (`rs/exec`, 9 Step probes): geth's interpreter logs the errored SLOAD / SSTORE through the deferred `CaptureState` with the full static + dynamic cost (`gasSStoreEIP2929`: cold 2100 + 20000 / 2900 / 100, 0 when the 2300 reentrancy sentry fails) while revm spends what is left; the prestate tracer's `CaptureState` returns on `err` before `lookupStorage`. `SevmInspector::step` computes the cost from the journal before the op runs and `step_end` records it when the op halted; the struct logger's `gasCost` is patched from that list and the first-loaded slots of errored ops are dropped from the prestate. Only on for the prestate / struct tracers (`oog_hook`), never for the stored row.
+- Class 5 (`rs/rpc`): the root cause was the fee config read from the FeeManager's storage keys 0..7 instead of 1..8 (`feemanager/contract.go`: `Hash{byte(i)}` for i = 1..8), so `minBaseFee` was garbage and the wall-clock estimate decayed below the real floor. `eth_feeConfig` (with `lastChangedAt`) added; `fee_config_at` follows `GetFeeConfigAt` (DefaultFeeConfig before SubnetEVM, chain config without the FeeManager, else its state). The window arithmetic is now the free function `fee::next_base_fee` and its unit test `next_base_fee_matches_go` holds 47 vectors printed by `go run ./exp/feecheck synth` (customheader.EstimateNextBaseFee, the very call `eth_gasPrice` makes with `clock.Time().UnixMilli()`): over / under target, shifts of 0..1000 s, the `windowsElapsed > 1` multiplier, the exact-target early return, the floor. Live: `eth_gasPrice` equal to stock at three wall-clock seconds each on beam (`0xe8d4a51001`) and Step (`0x3b9aca01`); both heads are years old, so the live value is always the min base fee plus the 1 wei tip, and no block in either corpus 1..50000 carries a base fee above its floor (scanned), hence the Go vectors for the decay branches. `EPOCHDB_RPC_NOW=<unix s>` pins rs's clock for a deterministic comparison; `exp/feecheck URL BLOCK off...` prints stock's estimate for a live head at offsets.
+- Class 6 (`rs/rpc`): stock re-marshals the parsed config: `common.Address` lowercase (allow-list roles, initialMint keys, rewardAddress) and the fields without `omitempty` present at their zero value (warp `quorumNumerator` 0 and `requirePrimaryNetworkSigners` false, also on a `disable` entry; `initialRewardConfig.allowFeeRecipients`). `stock_chain_config` applies both.
+
+Probe counts after the fixes (`$S/tracefix/cmp-step.out`, `cmp-beam.out`; stores rebuilt with the new exec by `$S/tracefix/stores.sh`):
+
+| corpus | before | after | remaining differences |
+|---|---|---|---|
+| Step 1..50,000, epochdb-rpc-serve over the rs/store dir | 861 of 875 | 869 of 875 | 6, all by construction (below) |
+| beam 1..50,000, epochdb-rpc-serve over the rs/store dir | 878 of 920 | 914 of 920 | 6, all by construction (below) |
+
+Remaining differences, each corpus: `web3_clientVersion` (`epochdb/v0.1.0` vs `v1.14.2`); `debug_traceBlockByNumber` with an unknown tracer name (stock evaluates it as a JS tracer and answers a per-tx `ReferenceError`, rs -32602); `eth_getProof` (stock serves Merkle proofs, this node stores no tries); `personal_listAccounts` (stock `[]` from its keystore under `internal-personal`, rs -32601: no accounts); `eth_newFilter` / `eth_newBlockFilter` (random ids). Message-only differences (same code and data): 4 on Step, 6 on beam (parse and not-found texts, `eth_sendRawTransaction` on a read server, `eth_estimateGas` fee-cap wording).
+
+Re-execution: beam 1..1,000,000 with the fixed exec (`epochdb-exec --checkpoint 10000`): receipts, gasUsed and bloom equal on every block (asserted per block), roots ok at the 108 checkpoints and activations, 41 precompile txs, 101.6 s wall (`$S/tracefix/exec-1m.log`).
+
+Rerun:
+```
+S=/tmp/claude-1000/-home-ilia-epochdb/222c563c-789d-46b6-8726-b8af4b2a6f62/scratchpad
+# stock: Step :19920 (data hb-stock-archive), beam :19941 (data beam-stock), same CFG as start-stock.sh, from this worktree
+bash $S/tracefix/stores.sh                      # rebuild $S/tracefix/{step,beam}-store with rs/target/release/storecheck
+./rs/target/release/epochdb-rpc-serve --data $S/tracefix/step-store --genesis $S/rs/step/chain.json --upgrade $S/rs/step/upgrade.json --http 127.0.0.1:19942
+./rs/target/release/epochdb-rpc-serve --data $S/tracefix/beam-store --genesis $S/rs/beam/chain.json --upgrade $S/rs/beam/upgrade.json --http 127.0.0.1:19943
+python3 $S/rpc/rpccmp2.py http://127.0.0.1:19920/ext/bc/2jRZ.../rpc http://127.0.0.1:19942/ --scan 1500
+python3 $S/rpc/rpccmp2.py http://127.0.0.1:19941/ext/bc/2tmrrBo1.../rpc http://127.0.0.1:19943/ --scan 3000
+go run ./exp/feecheck synth                     # the Go vectors behind fee::tests::next_base_fee_matches_go
+```
+Kill servers by the pid `ss -ltnp` reports for the port; a `pgrep -f` pattern that also appears later in the same command line (a nohup launch) kills the calling shell.
 
 ## Rerun
 
