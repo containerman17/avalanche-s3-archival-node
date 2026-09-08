@@ -129,6 +129,9 @@ struct Inner {
     published: Mutex<Option<String>>,
     merge: Mutex<MergeState>,
     terminal_txs: u64,
+    /// A TEST HOOK (merge.go mergeCrash): the merge stops dead after the
+    /// named stage ("written", "swapped"); None in every real open.
+    merge_crash: Mutex<Option<&'static str>>,
 }
 
 pub struct DB {
@@ -176,6 +179,7 @@ impl DB {
             published: Mutex::new(None),
             merge: Mutex::new(MergeState::default()),
             terminal_txs,
+            merge_crash: Mutex::new(None),
         });
         let db = DB { inner, mem: RwLock::new(Memtable::open(&dir.join("window").join("window.log"), read_only)?), cut: Mutex::new(None), read_only, flush_txs: FLUSH_TXS, flush_blocks: FLUSH_BLOCKS };
         // A frozen log is a cut that did not finish: sealed first, its blocks come before the active log's.
@@ -513,6 +517,9 @@ impl Inner {
         }
         let rows = w.rows;
         let (name, _) = w.finish(&self.cas, from.from_tx, to.to_tx, from.from_height, to.to_height)?;
+        if *self.merge_crash.lock().unwrap() == Some("written") {
+            bail!("store: merge crash hook: written");
+        }
         // Verified: the merged run reopens and every row reads back out.
         let merged = Run::open(&self.cas, &name).with_context(|| format!("store: merged run {name} does not reopen"))?;
         let f = &merged.footer;
@@ -544,6 +551,9 @@ impl Inner {
             let mut runs = g.runs.clone();
             runs.splice(start..end, [merged]);
             *g = Arc::new(Version { man, runs });
+        }
+        if *self.merge_crash.lock().unwrap() == Some("swapped") {
+            bail!("store: merge crash hook: swapped");
         }
         // Only now may the inputs go: unlink; the mapping closes with the
         // last version holding it.
@@ -1232,6 +1242,78 @@ mod tests {
         }
         anyhow::ensure!(db.account_at(&addr(0, 0), first + 3)? == Some(vec![h as u8]), "tail {h}");
         Ok(())
+    }
+
+    /// The merge's write order survives a crash at each stage: after the
+    /// terminal is written but before the manifest swap, the inputs are
+    /// still the manifest and the retry produces the same terminal name;
+    /// after the swap but before the inputs are unlinked, the manifest
+    /// already names the terminal and the leftover inputs are harmless.
+    #[test]
+    fn merge_crash_points_leave_the_inputs() {
+        let dir = std::env::temp_dir().join(format!("epochdb-mergecrash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("EPOCHDB_TERMINAL_TXS", "800");
+        let open = || {
+            let mut db = DB::open(&dir, Store::local(&dir).unwrap(), [1u8; 32]).unwrap();
+            db.flush_blocks = 40;
+            db
+        };
+        let names = |sub: &str| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir.join(sub)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect();
+            v.sort();
+            v
+        };
+        // 200 blocks = 5 L0 runs of 160 slots each; the boundary (800) is
+        // reached on the 5th seal, so the merge would start there: hold it.
+        let db = open();
+        *db.inner.merge_crash.lock().unwrap() = Some("written");
+        for h in 1..=200 {
+            db.write_block(&block(h)).unwrap();
+        }
+        db.wait_cut().unwrap(); // the 5th seal is what starts the merge
+        assert!(db.wait_merge().unwrap_err().to_string().contains("written"));
+        let man = db.manifest();
+        assert_eq!(man.runs.len(), 5, "the manifest still lists the inputs");
+        assert!(man.runs.iter().all(|r| r.level == 0));
+        assert_eq!(names("runs").len(), 5);
+        assert_eq!(names("cas").len(), 1, "the terminal is in the spool, unreferenced");
+        let stray = names("cas")[0].clone();
+        drop(db);
+        // Reopen: same span, same name, the merge completes; inputs gone.
+        let db = open();
+        for h in 1..=200 {
+            check(&db, h).unwrap();
+        }
+        db.maybe_merge().unwrap();
+        db.wait_merge().unwrap();
+        let man = db.manifest();
+        assert_eq!(man.runs.len(), 1);
+        assert_eq!(man.runs[0].name, stray, "the retry recomputed the same terminal");
+        assert_eq!((man.runs[0].from_height, man.runs[0].to_height, man.runs[0].level), (1, 200, 1));
+        assert!(names("runs").is_empty());
+        for h in 1..=200 {
+            check(&db, h).unwrap();
+        }
+        // Crash after the swap: the manifest names the terminal, the inputs are leftovers.
+        *db.inner.merge_crash.lock().unwrap() = Some("swapped");
+        for h in 201..=400 {
+            db.write_block(&block(h)).unwrap();
+        }
+        db.wait_cut().unwrap();
+        assert!(db.wait_merge().unwrap_err().to_string().contains("swapped"));
+        let man = db.manifest();
+        assert_eq!(man.runs.len(), 2);
+        assert_eq!(man.runs[1].level, 1);
+        assert_eq!(names("runs").len(), 5, "inputs left behind by the crash");
+        drop(db);
+        let db = open();
+        assert_eq!(db.manifest().runs.len(), 2);
+        for h in 1..=400 {
+            check(&db, h).unwrap();
+        }
+        assert_eq!(db.manifest().publishable().runs.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 8 readers hammer every read path against a writer that appends,
