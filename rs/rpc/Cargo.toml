@@ -28,3 +28,6 @@ anyhow = "1"
 bytes = "1"
 sha2 = "0.10"
 base64 = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+tokio-tungstenite = "0.28"
+futures-util = "0.3"

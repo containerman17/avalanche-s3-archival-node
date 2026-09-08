@@ -20,6 +20,14 @@ pub mod pb {
     }
     pub mod http {
         tonic::include_proto!("http");
+        pub mod responsewriter {
+            tonic::include_proto!("http.responsewriter");
+        }
+    }
+    pub mod net {
+        pub mod conn {
+            tonic::include_proto!("net.conn");
+        }
     }
     pub mod validatorstate {
         tonic::include_proto!("validatorstate");
@@ -40,6 +48,12 @@ pub mod pb {
         tonic::include_proto!("aliasreader");
     }
     pub mod io {
+        pub mod reader {
+            tonic::include_proto!("io.reader");
+        }
+        pub mod writer {
+            tonic::include_proto!("io.writer");
+        }
         pub mod prometheus {
             pub mod client {
                 tonic::include_proto!("io.prometheus.client");

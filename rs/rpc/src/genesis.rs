@@ -85,13 +85,11 @@ pub fn block(cfg: &Config, genesis_json: &[u8]) -> Result<Block, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// Step's genesis: the hash must be block 1's parentHash.
-    #[test]
-    fn step_genesis_hash() {
-        let g = r#"{"config":{"chainId":1234,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,
+    /// Step's genesis JSON (ws.rs' fixture too).
+    pub(crate) const STEP_GENESIS: &str = r#"{"config":{"chainId":1234,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,
             "constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"muirGlacierBlock":0,"subnetEVMTimestamp":0,
             "feeConfig":{"gasLimit":20000000,"minBaseFee":1000000000,"targetGas":100000000,"baseFeeChangeDenominator":48,
             "minBlockGasCost":0,"maxBlockGasCost":10000000,"targetBlockRate":2,"blockGasCostStep":500000},"allowFeeRecipients":true},
@@ -99,6 +97,11 @@ mod tests {
             "mixHash":"0x0000000000000000000000000000000000000000000000000000000000000000","coinbase":"0x0000000000000000000000000000000000000000",
             "alloc":{"7212Ac7f1146e5e59a6d58B0de00E73CA7ea57C9":{"balance":"0x1027e72f1f12813088000000"}},
             "number":"0x0","gasUsed":"0x0","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+
+    /// Step's genesis: the hash must be block 1's parentHash.
+    #[test]
+    fn step_genesis_hash() {
+        let g = STEP_GENESIS;
         let cfg = Config::from_genesis(g.as_bytes(), b"", 1).unwrap();
         let b = block(&cfg, g.as_bytes()).unwrap();
         assert_eq!(b.header.root.to_string(), "0x51736d52ef12525c8a48a4d2215b34a7573e871efb62008ac8b45c25590f0d21");

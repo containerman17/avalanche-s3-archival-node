@@ -1,7 +1,9 @@
 //! The vm.proto service, method for method after avalanchego's
 //! vms/rpcchainvm/vm_server.go, for a follower VM: no BuildBlock, no App
 //! messages, no state sync, WaitForEvent blocks until Shutdown.
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -13,7 +15,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status};
 
-use crate::ghttp::{Handler, HttpService};
+use crate::ghttp::{Handler, HttpService, WsServe};
 use crate::pb::http::http_server::HttpServer;
 use crate::pb::rpcdb::database_client::DatabaseClient;
 use crate::pb::validatorstate::validator_state_client::ValidatorStateClient;
@@ -204,12 +206,26 @@ impl<E: Engine> Vm for VmService<E> {
 
     async fn create_handlers(&self, _: Request<()>) -> Result<Response<CreateHandlersResponse>, Status> {
         let t = self.tree()?;
-        let handler: Handler = Arc::new(move |body: &[u8]| t.engine.rpc(body));
+        let handler: Handler = {
+            let t = t.clone();
+            Arc::new(move |body: &[u8]| t.engine.rpc(body))
+        };
+        // The Go follower mounts /rpc and /ws; /ws only when the engine serves it.
+        let ws: Option<WsServe> = t.engine.ws_server().map(|_| {
+            let t = t.clone();
+            Arc::new(move |stream: rpc::ws::BoxStream| {
+                let t = t.clone();
+                Box::pin(async move { rpc::ws::serve(t.engine.ws_server().expect("ws server"), stream).await }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            }) as WsServe
+        });
         let mut handlers = Vec::new();
-        for prefix in ["/rpc"] {
+        for prefix in ["/rpc", "/ws"] {
+            if prefix == "/ws" && ws.is_none() {
+                continue;
+            }
             let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| Status::internal(e.to_string()))?;
             let addr = listener.local_addr().map_err(|e| Status::internal(e.to_string()))?;
-            let svc = HttpServer::new(HttpService { handler: handler.clone() }).max_decoding_message_size(usize::MAX).max_encoding_message_size(usize::MAX);
+            let svc = HttpServer::new(HttpService { handler: handler.clone(), ws: if prefix == "/ws" { ws.clone() } else { None } }).max_decoding_message_size(usize::MAX).max_encoding_message_size(usize::MAX);
             let task = tokio::spawn(async move {
                 if let Err(e) = server().add_service(svc).serve_with_incoming(incoming(listener)).await {
                     eprintln!("epochdb-rs: handler server {addr}: {e}");

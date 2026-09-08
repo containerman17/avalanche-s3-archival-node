@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package io.reader;
+
+option go_package = "github.com/ava-labs/avalanchego/proto/pb/io/reader";
+
+// Reader is an io.Reader see: https://pkg.go.dev/io#Reader
+service Reader {
+  rpc Read(ReadRequest) returns (ReadResponse);
+}
+
+message ReadRequest {
+  // length is the request in bytes
+  int32 length = 1;
+}
+
+message ReadResponse {
+  // read is the payload in bytes
+  bytes read = 1;
+  // error is an error message
+  Error error = 2;
+}
+
+message Error {
+  ErrorCode error_code = 1;
+  string message = 2;
+}
+
+// ErrorCode provides information for special sentinel error types
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_EOF = 1;
+}

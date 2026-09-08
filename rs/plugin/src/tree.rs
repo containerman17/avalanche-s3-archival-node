@@ -50,6 +50,10 @@ pub trait Engine: Send + Sync + 'static {
     fn block_id_at_height(&self, height: u64) -> Option<Id>;
     /// One JSON-RPC request body in, one response body out (the /rpc handler).
     fn rpc(&self, body: &[u8]) -> Vec<u8>;
+    /// The RPC server behind /ws (None: no websocket handler is mounted).
+    fn ws_server(&self) -> Option<&rpc::Server> {
+        None
+    }
     fn health(&self) -> Result<serde_json::Value, Error> {
         Ok(serde_json::json!({"height": self.meta(&self.last_accepted()).height}))
     }
