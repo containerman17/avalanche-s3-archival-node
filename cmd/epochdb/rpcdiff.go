@@ -65,7 +65,7 @@ func rpcdiffMain(args []string) {
 
 	// The local side answers over its REAL wire path, so the diff covers the
 	// JSON shaping too and not just the handlers.
-	srv := rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db), g.Config)
+	srv := rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db, g.Header), g.Config)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatalf("epochdb: rpcdiff: listen: %v", err)

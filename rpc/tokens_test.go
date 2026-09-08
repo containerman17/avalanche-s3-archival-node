@@ -92,7 +92,7 @@ func tokenServer(t *testing.T) *Server {
 			t.Fatal(err)
 		}
 	}
-	return NewServer(db, g.TrieAlloc, StoreChainContext(db), g.Config)
+	return NewServer(db, g.TrieAlloc, StoreChainContext(db, g.Header), g.Config)
 }
 
 func TestTokenReads(t *testing.T) {

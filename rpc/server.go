@@ -104,11 +104,14 @@ func (s *Server) EnableLive(l Live) { s.live = l }
 // StoreChainContext serves BLOCKHASH headers straight out of storage v0. It is
 // VM-neutral: the consensus engine the two VMs disagree about is added by
 // whichever backend the seam picks (rpc/vm.go).
-func StoreChainContext(db *store.DB) ChainContext {
-	return storeChainCtx{db}
+func StoreChainContext(db *store.DB, genesis *types.Header) ChainContext {
+	return storeChainCtx{db, genesis}
 }
 
-type storeChainCtx struct{ db *store.DB }
+type storeChainCtx struct {
+	db      *store.DB
+	genesis *types.Header // block 0 is not a stored container
+}
 
 func (c storeChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
 	h, _ := c.headerAt(n) // the error is only visible through captureHeaders
@@ -118,6 +121,9 @@ func (c storeChainCtx) GetHeader(_ common.Hash, n uint64) *types.Header {
 // headerAt is GetHeader plus the error the ChainContext signature cannot
 // carry. (nil, nil) means the header is genuinely absent.
 func (c storeChainCtx) headerAt(n uint64) (*types.Header, error) {
+	if n == 0 {
+		return c.genesis, nil
+	}
 	raw, ok, err := c.db.HeaderRLP(n)
 	if err != nil {
 		return nil, fmt.Errorf("read header %d: %w", n, err)

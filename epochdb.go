@@ -211,7 +211,7 @@ func Open(ctx context.Context, cfg Config) (n *Node, err error) {
 		accepted: accepted, chainID: g.Config.ChainID,
 		execDone: make(chan struct{}),
 	}
-	n.srv = rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db), g.Config)
+	n.srv = rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db, g.Header), g.Config)
 	if fetcher != nil {
 		fetcher.Serve(n.srv)
 	}

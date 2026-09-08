@@ -44,6 +44,7 @@ import (
 type Genesis struct {
 	Config    *params.ChainConfig
 	TrieAlloc types.GenesisAlloc
+	Header    *types.Header // block 1's parent, which no container carries
 	Timestamp uint64
 	Hash      common.Hash
 	Root      common.Hash
@@ -116,7 +117,7 @@ func parseGenesis(c *chain.Chain, snowCtx *snow.Context) (*Genesis, error) {
 		return nil, err
 	}
 	blk := g.ToBlock()
-	return &Genesis{Config: g.Config, TrieAlloc: alloc, Timestamp: g.Timestamp, Hash: blk.Hash(), Root: blk.Root()}, nil
+	return &Genesis{Config: g.Config, TrieAlloc: alloc, Timestamp: g.Timestamp, Hash: blk.Hash(), Root: blk.Root(), Header: blk.Header()}, nil
 }
 
 // trieAlloc returns what this genesis actually MATERIALISES: the alloc plus

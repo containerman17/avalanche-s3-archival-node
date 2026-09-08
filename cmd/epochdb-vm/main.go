@@ -125,7 +125,7 @@ func main() {
 	}
 	blocks := fetcher.StartForward(ctx, from, anchor)
 
-	srv := rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db), g.Config)
+	srv := rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db, g.Header), g.Config)
 	fetcher.Serve(srv)
 
 	e, err := vmexec.New(vmexec.Config{

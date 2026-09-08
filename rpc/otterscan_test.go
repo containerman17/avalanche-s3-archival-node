@@ -89,7 +89,7 @@ func otsFixture(t *testing.T) (*Server, common.Address, []common.Hash) {
 			}
 		}
 	}
-	return NewServer(db, g.TrieAlloc, StoreChainContext(db), g.Config), sender, hashes
+	return NewServer(db, g.TrieAlloc, StoreChainContext(db, g.Header), g.Config), sender, hashes
 }
 
 // otsFrameRecord builds one itx/ row: a single CALL frame moving 1 wei. The

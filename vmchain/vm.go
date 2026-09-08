@@ -127,7 +127,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	}
 	vm.e = e
 	vm.rec = newRecoverer(g.Config, e.LiveHead)
-	vm.srv = rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db), g.Config)
+	vm.srv = rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db, g.Header), g.Config)
 	vm.srv.EnableLive(vm)
 
 	ctx, cancel := context.WithCancel(context.Background())

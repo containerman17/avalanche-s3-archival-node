@@ -51,6 +51,10 @@ type Genesis struct {
 	// missing from it reads back as "account does not exist".
 	TrieAlloc types.GenesisAlloc
 
+	// Header is the genesis block header: the parent of block 1, which no
+	// container carries, so the read side has to be handed it.
+	Header *types.Header
+
 	Timestamp uint64
 	Hash      common.Hash // genesis block hash
 	Root      common.Hash // genesis state root

@@ -90,7 +90,7 @@ func testServer(t *testing.T) (*Server, *types.Transaction, common.Address, comm
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(db, g.TrieAlloc, StoreChainContext(db), g.Config), tx, logAddr, topic
+	return NewServer(db, g.TrieAlloc, StoreChainContext(db, g.Header), g.Config), tx, logAddr, topic
 }
 
 func call(t *testing.T, s *Server, method string, params ...any) (any, *rpcError) {

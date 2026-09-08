@@ -103,6 +103,7 @@ func (sevmVM) genesis(c *chain.Chain, snowCtx *snow.Context) (*Genesis, error) {
 	return &Genesis{
 		Config:    g.Config,
 		TrieAlloc: alloc,
+		Header:    blk.Header(),
 		Timestamp: g.Timestamp,
 		Hash:      blk.Hash(),
 		Root:      blk.Root(),

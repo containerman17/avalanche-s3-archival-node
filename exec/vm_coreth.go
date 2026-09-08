@@ -53,6 +53,7 @@ func (corethVM) genesis(c *chain.Chain, snowCtx *snow.Context) (*Genesis, error)
 		// every local network alike) and none sets an airdrop, so there is
 		// nothing to add and this path stays what it always was, map for map.
 		TrieAlloc: g.Alloc,
+		Header:    blk.Header(),
 		Timestamp: g.Timestamp,
 		Hash:      blk.Hash(),
 		Root:      blk.Root(),
