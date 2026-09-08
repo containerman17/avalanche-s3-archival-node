@@ -436,7 +436,17 @@ impl Roller {
     /// rolls it in the background; h and root are what the overlay's state
     /// is at, the oracle for the rolled file.
     pub fn maybe_roll(&mut self, be: &mut Backend, budget: usize, h: u64, root: B256) {
-        if self.rolling.is_some() || be.overlay.bytes() < budget {
+        if self.rolling.is_some() {
+            return;
+        }
+        // The budget is over the overlay AND Dirty: Dirty keeps every trie
+        // node touched since the last roll and only a roll drops them, and on
+        // a chain of small rows (beam, 4M blocks) neither alone reaches 2 GB
+        // while the two together hold 3 GB and keep growing. try_lock: the
+        // checker holds Dirty for a whole block's root; a miss is checked
+        // again next block.
+        let dirty = self.dirty.try_lock().map(|d| d.bytes()).unwrap_or(0);
+        if be.overlay.bytes() + dirty < budget {
             return;
         }
         let frozen = be.freeze();
