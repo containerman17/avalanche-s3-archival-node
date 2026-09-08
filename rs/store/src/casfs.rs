@@ -303,7 +303,7 @@ pub fn verify_chunk(hash: &str, list: &[u8], idx: u64, b: &[u8]) -> Result<()> {
         bail!("casfs: {hash}: chunk {idx} outside the list");
     }
     let sum = Sha256::digest(b);
-    if sum.as_slice() != &list[off..off + 32] {
+    if sum[..] != list[off..off + 32] {
         bail!("casfs: {hash} chunk {idx}: content does not match the artifact's own list");
     }
     Ok(())

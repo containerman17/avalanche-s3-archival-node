@@ -224,7 +224,7 @@ impl Run {
         let mut out = Vec::new();
         let mut pend: Option<(Vec<u8>, Vec<u8>)> = None;
         let mut err = None;
-        let mut decode = |pend: &mut Option<(Vec<u8>, Vec<u8>)>, out: &mut Vec<(Vec<u8>, u64, u8)>| -> Result<()> {
+        let decode = |pend: &mut Option<(Vec<u8>, Vec<u8>)>, out: &mut Vec<(Vec<u8>, u64, u8)>| -> Result<()> {
             if let Some((k, v)) = pend.take() {
                 let group = k[..k.len() - 8].to_vec();
                 let (nums, pay) = crate::ef::decode(txnum_of(&k), &v)?;
@@ -250,7 +250,10 @@ impl Run {
                 return false;
             }
             if first > hi {
-                return true;
+                // A full group's chunks are ascending: nothing later can hold
+                // an entry in range. A one-component prefix spans groups, so
+                // the next group may.
+                return k.len() != prefix.len() + 8;
             }
             pend = Some((k.to_vec(), v.to_vec()));
             true
