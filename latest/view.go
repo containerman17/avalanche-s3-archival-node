@@ -102,20 +102,31 @@ func (it *sliceIter) Key() []byte {
 func (it *sliceIter) Value() []byte { return it.s[it.i].v }
 func (it *sliceIter) Err() error    { return nil }
 
-// View is an overlay (may be nil) over runs, newest first.
+// View is overlays (newest first, may be empty) over runs, newest first.
 type View struct {
-	overlay *Overlay
-	runs    []*Run
+	overlays []*Overlay
+	runs     []*Run
 }
 
-func NewView(o *Overlay, runs ...*Run) *View { return &View{overlay: o, runs: runs} }
+func NewView(o *Overlay, runs ...*Run) *View {
+	if o == nil {
+		return &View{runs: runs}
+	}
+	return &View{overlays: []*Overlay{o}, runs: runs}
+}
 
-// Get consults the overlay, then the runs in order. A tombstone or an empty
+// NewMultiView stacks several overlays (newest first) over runs: a fresh
+// overlay over a frozen one being merged, over the base.
+func NewMultiView(overlays []*Overlay, runs ...*Run) *View {
+	return &View{overlays: overlays, runs: runs}
+}
+
+// Get consults the overlays, then the runs in order. A tombstone or an empty
 // value at any level ends the descent as not found. val aliases the level
 // it came from (see Overlay.Get and Run.Get).
 func (v *View) Get(key []byte) (val []byte, ok bool) {
-	if v.overlay != nil {
-		if val, ok, dead := v.overlay.Get(key); ok {
+	for _, o := range v.overlays {
+		if val, ok, dead := o.Get(key); ok {
 			if dead {
 				return nil, false
 			}
@@ -137,8 +148,8 @@ func (v *View) Get(key []byte) (val []byte, ok bool) {
 // empty values dropped.
 func (v *View) Iter(lo, hi []byte) Iterator {
 	var its []Iterator
-	if v.overlay != nil {
-		its = append(its, v.overlay.Iter(lo, hi))
+	for _, o := range v.overlays {
+		its = append(its, o.Iter(lo, hi))
 	}
 	for _, r := range v.runs {
 		its = append(its, r.Iter(lo, hi))
