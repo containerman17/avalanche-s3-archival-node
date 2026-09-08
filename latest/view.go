@@ -6,46 +6,110 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"strings"
 	"sync"
-	"unsafe"
 )
 
 // Overlay holds the writes since the last checkpoint. An empty value is a
 // tombstone: it shadows the runs below and Merge drops the key.
 // Single writer; readers may run concurrently with it.
+//
+// Entries live in one byte slab behind a pointer-free index (fixed-size
+// array keys), so the GC has nothing to scan here. A slab entry is
+// [klen u8][vlen u8][vcap u8][key][value, padded to vcap]; a Put of an
+// existing key rewrites the value in place when it fits, else appends a
+// new entry and leaves the old one dead. ponytail: dead entries are never
+// reclaimed (a value outgrows its 16-byte slack rarely); compact if the
+// slab ever runs far past Bytes.
 type Overlay struct {
 	mu    sync.RWMutex
-	m     map[string][]byte
+	idx   map[[fixedKey]byte]uint64 // [len u8][key...] zero padded -> slab offset
+	long  map[string]uint64         // keys of fixedKey-1 bytes or more
+	slab  []byte
 	bytes int
 }
 
 // entryOverhead is the accounted per-entry cost on top of key+value bytes.
 const entryOverhead = 64
 
-func NewOverlay() *Overlay { return &Overlay{m: map[string][]byte{}} }
+// fixedKey is the index key width: keys shorter than it are inlined.
+const fixedKey = 72
+
+func NewOverlay() *Overlay {
+	return &Overlay{idx: map[[fixedKey]byte]uint64{}, long: map[string]uint64{}}
+}
+
+func fixed(key []byte) (k [fixedKey]byte, ok bool) {
+	if len(key) >= fixedKey {
+		return k, false
+	}
+	k[0] = byte(len(key))
+	copy(k[1:], key)
+	return k, true
+}
+
+func (o *Overlay) find(key []byte) (uint64, bool) {
+	if k, ok := fixed(key); ok {
+		off, ok := o.idx[k]
+		return off, ok
+	}
+	off, ok := o.long[string(key)]
+	return off, ok
+}
+
+func (o *Overlay) set(key []byte, off uint64) {
+	if k, ok := fixed(key); ok {
+		o.idx[k] = off
+	} else {
+		o.long[string(key)] = off
+	}
+}
+
+func keyAt(slab []byte, off uint64) []byte {
+	return slab[off+3 : off+3+uint64(slab[off])]
+}
+
+func valueAt(slab []byte, off uint64) []byte {
+	k := off + 3 + uint64(slab[off])
+	return slab[k : k+uint64(slab[off+1])]
+}
+
+var zeros [maxValue]byte
 
 // Put copies key and value in. An empty value is a tombstone.
 func (o *Overlay) Put(key, value []byte) {
 	if len(key) == 0 || len(key) > maxKey || len(value) > maxValue {
 		panic(fmt.Sprintf("latest: key %d bytes, value %d bytes (limits 1..%d and 0..%d)", len(key), len(value), maxKey, maxValue))
 	}
-	v := append(make([]byte, 0, len(value)), value...)
 	o.mu.Lock()
-	if old, ok := o.m[string(key)]; ok {
-		o.bytes -= len(key) + len(old) + entryOverhead
+	defer o.mu.Unlock()
+	if off, ok := o.find(key); ok {
+		o.bytes += len(value) - int(o.slab[off+1])
+		if len(value) <= int(o.slab[off+2]) {
+			o.slab[off+1] = byte(len(value))
+			copy(o.slab[off+3+uint64(len(key)):], value)
+			return
+		}
+	} else {
+		o.bytes += len(key) + len(value) + entryOverhead
 	}
-	o.m[string(key)] = v
-	o.bytes += len(key) + len(value) + entryOverhead
-	o.mu.Unlock()
+	vcap := min(maxValue, (len(value)+15)&^15)
+	off := uint64(len(o.slab))
+	o.slab = append(o.slab, byte(len(key)), byte(len(value)), byte(vcap))
+	o.slab = append(o.slab, key...)
+	o.slab = append(o.slab, value...)
+	o.slab = append(o.slab, zeros[:vcap-len(value)]...)
+	o.set(key, off)
 }
 
 // Get returns the stored value; tombstone is true when the key is present
-// as a deletion. val aliases the stored copy, which is never mutated, so it
-// stays valid after later Puts.
+// as a deletion. val aliases the slab: a later Put of the same key may
+// rewrite it in place, so use it before that.
 func (o *Overlay) Get(key []byte) (val []byte, ok, tombstone bool) {
 	o.mu.RLock()
-	val, ok = o.m[string(key)]
+	off, ok := o.find(key)
+	if ok {
+		val = valueAt(o.slab, off)
+	}
 	o.mu.RUnlock()
 	return val, ok, ok && len(val) == 0
 }
@@ -53,7 +117,7 @@ func (o *Overlay) Get(key []byte) (val []byte, ok, tombstone bool) {
 func (o *Overlay) Len() int {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	return len(o.m)
+	return len(o.idx) + len(o.long)
 }
 
 // Bytes is the accounted size: key + value + entryOverhead per entry.
@@ -63,44 +127,46 @@ func (o *Overlay) Bytes() int {
 	return o.bytes
 }
 
-type kv struct {
-	k string
-	v []byte
-}
-
-// Iter walks a sorted snapshot of [lo, hi) taken now; nil means unbounded.
-// Tombstones are included (empty values).
+// Iter walks a sorted snapshot of the keys in [lo, hi) taken now; nil means
+// unbounded. Tombstones are included (empty values). Values are read from
+// the slab as the iterator advances.
 func (o *Overlay) Iter(lo, hi []byte) Iterator {
-	los, his := string(lo), string(hi)
+	in := func(k []byte) bool {
+		return (lo == nil || bytes.Compare(k, lo) >= 0) && (hi == nil || bytes.Compare(k, hi) < 0)
+	}
 	o.mu.RLock()
-	s := make([]kv, 0, len(o.m))
-	for k, v := range o.m {
-		if (lo == nil || k >= los) && (hi == nil || k < his) {
-			s = append(s, kv{k, v})
+	slab := o.slab
+	offs := make([]uint64, 0, len(o.idx)+len(o.long))
+	for k, off := range o.idx {
+		if in(k[1 : 1+k[0]]) {
+			offs = append(offs, off)
+		}
+	}
+	for k, off := range o.long {
+		if in([]byte(k)) {
+			offs = append(offs, off)
 		}
 	}
 	o.mu.RUnlock()
-	slices.SortFunc(s, func(a, b kv) int { return strings.Compare(a.k, b.k) })
-	return &sliceIter{s: s, i: -1}
+	slices.SortFunc(offs, func(a, b uint64) int { return bytes.Compare(keyAt(slab, a), keyAt(slab, b)) })
+	return &slabIter{slab: slab, offs: offs, i: -1}
 }
 
-type sliceIter struct {
-	s []kv
-	i int
+type slabIter struct {
+	slab []byte
+	offs []uint64
+	i    int
 }
 
-func (it *sliceIter) Next() bool {
+func (it *slabIter) Next() bool {
 	it.i++
-	return it.i < len(it.s)
+	return it.i < len(it.offs)
 }
 
-// Key aliases the string's bytes; callers must not write to it.
-func (it *sliceIter) Key() []byte {
-	k := it.s[it.i].k
-	return unsafe.Slice(unsafe.StringData(k), len(k))
-}
-func (it *sliceIter) Value() []byte { return it.s[it.i].v }
-func (it *sliceIter) Err() error    { return nil }
+// Key and Value alias the slab; callers must not write to them.
+func (it *slabIter) Key() []byte   { return keyAt(it.slab, it.offs[it.i]) }
+func (it *slabIter) Value() []byte { return valueAt(it.slab, it.offs[it.i]) }
+func (it *slabIter) Err() error    { return nil }
 
 // View is overlays (newest first, may be empty) over runs, newest first.
 type View struct {
