@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"runtime/debug"
 
 	"github.com/ava-labs/avalanchego/vms/rpcchainvm"
 
 	"github.com/containerman17/avalanche-s3-archival-node/vmchain"
-	"github.com/containerman17/avalanche-s3-archival-node/vmexec"
 )
 
 func main() {
@@ -21,16 +19,7 @@ func main() {
 		fmt.Println(vmchain.Version)
 		return
 	}
-	// As cmd/epochdb-vm: 7/10 of the cgroup ceiling as the soft limit, GOGC
-	// 50 unless the environment says otherwise.
-	if os.Getenv("GOMEMLIMIT") == "" {
-		if limit, ok := vmexec.CgroupMemoryLimit(); ok {
-			debug.SetMemoryLimit(int64(limit / 10 * 7))
-		}
-	}
-	if os.Getenv("GOGC") == "" {
-		debug.SetGCPercent(50)
-	}
+	// GOMEMLIMIT and GOGC are the executor's (vmexec/budget.go).
 	if err := rpcchainvm.Serve(context.Background(), &vmchain.VM{}); err != nil {
 		log.Fatalf("epochdb-vm-plugin: %v", err)
 	}

@@ -19,6 +19,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/database"
@@ -68,6 +69,7 @@ type VM struct {
 	cancel  context.CancelFunc
 	runDone chan struct{}
 	once    sync.Once
+	normal  atomic.Bool // NormalOp: consensus is at the tip, the executor's budget follows
 }
 
 func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.Database,
@@ -107,8 +109,16 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	vm.headID = ids.ID(g.Hash)
 	vm.src = newSource()
 	e, err := vmexec.New(vmexec.Config{
-		DataDir: dir, Blocks: vm.src, Store: db, Misc: misc, Chain: c,
+		DataDir: dir, Blocks: vm.src, Store: db, CAS: cas, Misc: misc, Chain: c,
 		OnBlock: func(uint64, ethcommon.Hash) { vm.mu.Lock(); vm.cond.Broadcast(); vm.mu.Unlock() },
+		// Bootstrapping is catch-up (accepted head unknown); in NormalOp
+		// the last published block is the accepted head, so the lag is 0.
+		Budget: vmexec.Budget{Accepted: func() uint64 {
+			if !vm.normal.Load() {
+				return 0
+			}
+			return vm.e.LiveHead()
+		}},
 	})
 	if err != nil {
 		misc.Close()
@@ -138,7 +148,10 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	return nil
 }
 
-func (vm *VM) SetState(context.Context, snow.State) error { return nil }
+func (vm *VM) SetState(_ context.Context, st snow.State) error {
+	vm.normal.Store(st == snow.NormalOp)
+	return nil
+}
 
 func (vm *VM) Shutdown(context.Context) error {
 	if vm.e == nil {
