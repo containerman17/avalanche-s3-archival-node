@@ -23,6 +23,7 @@ import (
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
+	"github.com/ava-labs/libevm/eth/tracers"
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/triedb"
@@ -91,6 +92,7 @@ type Executor struct {
 	curHeader  *types.Header
 	curStatedb *ethstate.StateDB
 	signer     types.Signer
+	curTracers []tracers.Tracer // one per tx of the open block: the checker renders them
 
 	spl             struct{ read, evm time.Duration }
 	hashNs, writeNs goatomic.Int64 // the checker's split
@@ -131,7 +133,8 @@ type checkItem struct {
 	ws       *writeSet // nil for an empty block: nothing to hash
 	receipts types.Receipts
 	statedb  *ethstate.StateDB
-	stats    Stats         // the executor's side of the snapshot; Dirty is filled in by the checker
+	tracers  []tracers.Tracer // per tx; rendered into bw.Txs[i].Frames by the checker
+	stats    Stats            // the executor's side of the snapshot; Dirty is filled in by the checker
 	sync     chan struct{} // a sync item: the checker parks on it until told to go on
 }
 
@@ -277,6 +280,7 @@ func (e *Executor) check(it *checkItem) error {
 		}
 	}
 	e.dirtyBytes.Store(int64(e.eng.dirty.Bytes()))
+	e.renderFrames(it)
 	t0 := time.Now()
 	if err := e.cfg.Store.WriteBlock(it.bw); err != nil {
 		return err
@@ -290,6 +294,24 @@ func (e *Executor) check(it *checkItem) error {
 		e.cfg.OnBlock(blockNum, it.blk.Hash())
 	}
 	return nil
+}
+
+// renderFrames serialises the block's callTracer captures into the itx
+// rows (checker goroutine: encoding/json was 1.9 s of the executor's 26 s
+// on Step). The tracers are final once CaptureTxEnd ran; GetResult only
+// reads them. A tracer whose call stack did not close refuses here, and
+// that is the documented death (frames.go).
+func (e *Executor) renderFrames(it *checkItem) {
+	for i, t := range it.tracers {
+		res, err := t.GetResult()
+		if err != nil {
+			log.Fatalf("epochdb-vm: block %d (%x): THE CALL TRACE WAS NOT CAPTURED, so this block cannot be stored.\n  Cause: callTracer refused the transaction: %v.\n  "+
+				"The contract this capture models is in vmexec/frames.go: every CaptureEnter is paired with a CaptureExit. "+
+				"An unpaired shape is an execution path the capture does not model yet.", it.blk.NumberU64(), it.bw.Txs[i].Hash, err)
+		}
+		it.bw.Txs[i].Frames = []byte(res)
+	}
+	it.tracers = nil
 }
 
 // enqueue hands a checked-later block to the checker; it blocks while
@@ -440,6 +462,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				signer := types.MakeSigner(e.chainCfg, blk.Number(), blk.Time())
 				for _, tx := range blk.Transactions() {
 					types.Sender(signer, tx)
+					tx.Hash() // cached on the tx too; SetTxContext and the receipt read it
 				}
 			}()
 			select {
@@ -643,11 +666,13 @@ func (e *Executor) executeBlock(blk *types.Block, pvm []byte) (*checkItem, error
 	}
 	e.unpublished = append(e.unpublished, u)
 	it.ws, it.receipts, it.statedb = ws, receipts, statedb
+	it.tracers, e.curTracers = e.curTracers, nil
 	return it, nil
 }
 
 func (e *Executor) beginCapture(c *capture, bw *store.BlockWrite, header *types.Header, parentRoot common.Hash) {
 	e.capture, e.curBW, e.curHeader = c, bw, header
+	e.curTracers = nil
 	e.signer = types.MakeSigner(e.chainCfg, header.Number, header.Time)
 	e.wrapDB.setCapture(c)
 	e.flat.begin(parentRoot)
@@ -669,18 +694,18 @@ func (e *Executor) captureTx(_ int, tx *types.Transaction, r *types.Receipt) err
 	if err != nil {
 		return fmt.Errorf("encode tx %s: %w", tx.Hash(), err)
 	}
-	frameRec, frameAddrs, why := frames.take()
+	tracer, frameAddrs, why := frames.take()
 	if why != "" {
 		e.dieOnUncapturedTrace(tx.Hash().String(), why,
 			"The contract this capture models is in vmexec/frames.go: every CaptureEnter is paired with a CaptureExit. "+
 				"An unpaired shape is an execution path the capture does not model yet.")
 	}
+	e.curTracers = append(e.curTracers, tracer)
 	tw := store.TxWrite{
 		Hash:       tx.Hash().Bytes(),
 		RLP:        raw,
 		Receipt:    store.EncodeTxReceipt(r, r.CumulativeGasUsed),
-		Frames:     frameRec,
-		FrameAddrs: frameAddrs,
+		FrameAddrs: frameAddrs, // Frames: rendered by the checker (renderFrames)
 		State:      e.capture.take(),
 	}
 	if from, err := types.Sender(e.signer, tx); err == nil {

@@ -65,26 +65,24 @@ func (c *frameCapture) resetTx() {
 	clear(c.seen)
 }
 
-// take serialises the transaction in flight and starts the next one.
+// take hands over the transaction in flight's tracer and starts the next
+// one. The JSON is rendered later, off the executor thread (Executor.
+// renderFrames): the tracer is final once CaptureTxEnd ran.
 //
 // A NON-EMPTY why IS A HOLE AND THE CALLER TURNS IT INTO DEATH: the tracer
-// never ran (the saexec seam at this pin), or its call stack did not close,
-// which callTracer itself refuses to serialise.
-func (c *frameCapture) take() (rec []byte, addrs [][]byte, why string) {
+// never ran (the saexec seam at this pin). A call stack that did not close
+// is the other hole; callTracer refuses to serialise it, and renderFrames
+// dies on that refusal.
+func (c *frameCapture) take() (t tracers.Tracer, addrs [][]byte, why string) {
 	if c.inner == nil {
 		return nil, nil, "the frame tracer never ran for this transaction"
 	}
-	res, err := c.inner.GetResult()
-	if err != nil {
-		c.resetTx()
-		return nil, nil, "callTracer refused the transaction: " + err.Error()
-	}
-	rec = []byte(res)
+	t = c.inner
 	for _, a := range c.addrs {
 		addrs = append(addrs, a.Bytes())
 	}
 	c.resetTx()
-	return rec, addrs, ""
+	return t, addrs, ""
 }
 
 func (c *frameCapture) participant(a common.Address) {
