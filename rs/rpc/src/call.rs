@@ -371,7 +371,6 @@ pub fn finish_trace(s: &Server, cfg: &TraceCfg, header: &Header, trace_json: &st
                     for l in logs {
                         if let Some(o) = l.as_object_mut() {
                             o.remove("index");
-                            o.remove("position");
                         }
                     }
                 }
@@ -410,13 +409,12 @@ pub fn finish_trace(s: &Server, cfg: &TraceCfg, header: &Header, trace_json: &st
             // A stateful precompile reads its slots from Go, not through SLOAD:
             // geth's tracer never sees them.
             let modules: Vec<String> = exec::precompile::MODULES.iter().map(|(_, a)| format!("{a:#x}")).collect();
+            // diffMode: a precompile whose only change was its own storage is no diff at all.
             for key in ["pre", "post"] {
                 let m = if v.get(key).is_some() { v.get_mut(key) } else { None };
                 if let Some(o) = m.and_then(Value::as_object_mut) {
                     for a in &modules {
-                        if let Some(acc) = o.get_mut(a).and_then(Value::as_object_mut) {
-                            acc.remove("storage");
-                        }
+                        o.remove(a);
                     }
                 }
             }

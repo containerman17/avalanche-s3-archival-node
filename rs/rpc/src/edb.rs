@@ -5,12 +5,14 @@
 //! TxNum to continue from, 0 means the end the walk starts at, newest-first
 //! unless ascending.
 //!
+//! ```text
 //!     edb_getLogsByEmitter            {emitter, topic0?, cursor?, limit?, ascending?}
 //!     edb_getLogsByTopicValue         {value, topic0?, positions?, cursor?, limit?, ascending?}
 //!     edb_getTopicGroups              {value, topic0}
 //!     edb_getTokenTransfersByHolder   {address, standard, cursor?, limit?, ascending?}
 //!     edb_getTokenTransfersByContract {token, standard, cursor?, limit?, ascending?}
 //!     edb_getTokenContracts           {address}
+//! ```
 use alloy_primitives::{Address, B256};
 use serde_json::Value;
 
