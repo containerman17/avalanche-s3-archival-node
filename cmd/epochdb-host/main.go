@@ -70,6 +70,9 @@ func main() {
 	holdSpec := fs.String("hold-until", "", "hand the VM its first block only once this much is fetched ahead of it: N blocks, or N txs as Ntx (100000, 250000tx)")
 	queueAhead := fs.Int("queue-ahead", 100_000, "blocks the host keeps fetched ahead of the VM in its own ring, in front of the fetch package's fixed window")
 	batch := fs.Int("batch", 256, "blocks per BatchedParseBlock; up to 2 parsed batches wait ahead of verification")
+	corpus := fs.String("corpus", "", "local EPCORP01 container file; disables fetching and following")
+	configPath := fs.String("config", "", "VM config JSON file (required with --corpus)")
+	stopHeight := fs.Uint64("stop", 0, "last corpus height to accept; keep RPC open at this height")
 	fs.Parse(os.Args[1:])
 	if *chainSpec == "" || *vmPath == "" {
 		log.Fatal("epochdb-host: --chain and --vm are required")
@@ -100,6 +103,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *corpus != "" {
+		if *configPath == "" || *stopHeight == 0 {
+			log.Fatal("epochdb-host: --corpus requires --config and --stop greater than zero")
+		}
+		if _, err := os.Stat(filepath.Join(*dataDir, "chain.json")); err != nil {
+			log.Fatalf("epochdb-host: corpus mode requires local chain.json: %v", err)
+		}
+	}
 
 	rctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	c, err := chain.Resolve(rctx, *chainSpec, networkID, *dataDir, sources...)
@@ -109,6 +120,12 @@ func main() {
 	}
 	if c.SubnetID == constants.PrimaryNetworkID {
 		log.Fatal("epochdb-host: the primary network's C-chain is not an L1 (coreth is not a plugin)")
+	}
+	if *corpus != "" {
+		if err := runCorpus(ctx, c, sources, *vmPath, *dataDir, *httpAddr, *corpus, *configPath, *stopHeight, *queueAhead, *batch); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("epochdb-host: corpus: %v", err)
+		}
+		return
 	}
 
 	// The fetcher dials first: it is what persists the staking identity, and
@@ -531,7 +548,10 @@ func (p *pipe) step(ctx context.Context, vm block.ChainVM, x parsed, b *bench, n
 	// goes to normal operation and the preference follows every
 	// block, as under avalanchego; during catch-up it is refreshed
 	// now and then.
-	tip := p.f.AcceptedHead()
+	tip := uint64(0)
+	if p.f != nil {
+		tip = p.f.AcceptedHead()
+	}
 	if !*normal && tip > 0 && h >= tip {
 		if err := vm.SetState(ctx, snow.NormalOp); err != nil {
 			return fmt.Errorf("SetState(NormalOp): %w", err)
@@ -659,13 +679,16 @@ func (b *bench) elapsed() time.Duration {
 
 func (b *bench) line(tag string, blocks, txs, gas uint64, waitNs, fullNs int64, window time.Duration) string {
 	elapsed := b.elapsed()
-	var cum float64
+	var cum, rate float64
 	if elapsed > 0 {
 		cum = float64(b.gas.Load()) / 1e6 / elapsed.Seconds()
 	}
+	if window > 0 {
+		rate = float64(gas) / 1e6 / window.Seconds()
+	}
 	return fmt.Sprintf("bench %st=%ds h=%d blk=%d tx=%d mgas/s=%.1f cum=%.1f wait=%.1fs full=%.1fs host_rss=%dMB vm_rss=%dMB",
 		tag, int(elapsed.Seconds()), b.height.Load(), blocks, txs,
-		float64(gas)/1e6/window.Seconds(), cum,
+		rate, cum,
 		float64(waitNs)/1e9, float64(fullNs)/1e9,
 		rssMB(os.Getpid()), rssMB(int(b.tracker.pid.Load())))
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/ava-labs/libevm/common"
@@ -33,14 +34,15 @@ type SeekFunc func(prefix []byte) (key, value []byte)
 // slab offset, rewritten in place when the new blob fits, else appended
 // (the old slot is dead; Root compacts when dead space passes live).
 type Dirty struct {
-	f    *File
-	seek SeekFunc
-	root common.Hash
-	idx  map[nodeKey]uint64 // owner + path -> slab offset
-	long map[string]uint64  // paths over 15 nibbles: owner + path -> slab offset
-	slab []byte
-	dead int // slab bytes no index entry points at
-	acct map[common.Hash]*pending
+	f      *File
+	seek   SeekFunc
+	parent database.Reader
+	root   common.Hash
+	idx    map[nodeKey]uint64 // owner + path -> slab offset
+	long   map[string]uint64  // paths over 15 nibbles: owner + path -> slab offset
+	slab   []byte
+	dead   int // slab bytes no index entry points at
+	acct   map[common.Hash]*pending
 
 	// Workers bounds the storage-trie hashing pool (default GOMAXPROCS).
 	Workers int
@@ -60,10 +62,25 @@ func NewDirty(f *File, seek SeekFunc) *Dirty {
 	return d
 }
 
+// NewLayer starts a private node overlay at root. Missing nodes are read
+// from parent. The caller must keep parent stable while the layer is used
+// and synchronize access to the layer.
+func NewLayer(root common.Hash, parent database.Reader) *Dirty {
+	return &Dirty{
+		parent:  parent,
+		root:    root,
+		idx:     map[nodeKey]uint64{},
+		long:    map[string]uint64{},
+		acct:    map[common.Hash]*pending{},
+		Workers: runtime.GOMAXPROCS(0),
+	}
+}
+
 // Reset drops every retained node and rebinds the overlay to a freshly
 // rolled file.
 func (d *Dirty) Reset(f *File) {
 	d.f = f
+	d.parent = nil
 	d.root = f.Root()
 	d.idx = map[nodeKey]uint64{}
 	d.long = map[string]uint64{}
@@ -303,6 +320,55 @@ func (d *Dirty) Root() (common.Hash, error) {
 	return root, nil
 }
 
+// NodeChange is a retained trie node. An empty Blob deletes the node at
+// Owner and Path, shadowing any node in the parent.
+type NodeChange struct {
+	Owner common.Hash
+	Path  []byte
+	Blob  []byte
+}
+
+// NodeChanges copies all retained nodes, including deletions. Call Root
+// successfully first to include queued writes. The result order is unspecified.
+func (d *Dirty) NodeChanges() []NodeChange {
+	changes := make([]NodeChange, 0, len(d.idx)+len(d.long))
+	add := func(owner common.Hash, path []byte, off uint64) {
+		n := uint64(binary.LittleEndian.Uint16(d.slab[off+2:]))
+		changes = append(changes, NodeChange{
+			Owner: owner,
+			Path:  path,
+			Blob:  append([]byte(nil), d.slab[off+4:off+4+n]...),
+		})
+	}
+	for key, off := range d.idx {
+		var path []byte
+		for packed := key.path; packed > 15; packed >>= 4 {
+			path = append(path, byte(packed&15))
+		}
+		slices.Reverse(path)
+		add(key.owner, path, off)
+	}
+	for key, off := range d.long {
+		add(common.BytesToHash([]byte(key[:32])), []byte(key[32:]), off)
+	}
+	return changes
+}
+
+// ApplyNodes installs computed nodes and their state root without rehashing.
+// The changes must have been computed against the receiver's current root.
+// Queued writes must be hashed before applying nodes.
+func (d *Dirty) ApplyNodes(root common.Hash, changes []NodeChange) error {
+	if len(d.acct) != 0 {
+		return errors.New("commit: cannot apply nodes with queued writes")
+	}
+	for _, change := range changes {
+		d.put(change.Owner, change.Path, change.Blob)
+	}
+	d.compact()
+	d.root = root
+	return nil
+}
+
 func (d *Dirty) storage(j *job) (common.Hash, *trienode.NodeSet, error) {
 	t, err := trie.New(trie.StorageTrieID(d.root, j.hash, j.root), d)
 	if err != nil {
@@ -335,14 +401,17 @@ func (d *Dirty) merge(set *trienode.NodeSet) {
 }
 
 // Reader and Node make Dirty a database.Database for trie.New: dirty nodes
-// first, then the file, then a leaf fabricated from the rolled flat row.
+// first, then the parent reader or the file and rolled flat rows.
 func (d *Dirty) Reader(common.Hash) (database.Reader, error) { return d, nil }
 func (d *Dirty) Preimage(common.Hash) []byte                 { return nil }
 func (d *Dirty) InsertPreimage(map[common.Hash][]byte)       {}
 
-func (d *Dirty) Node(owner common.Hash, path []byte, _ common.Hash) ([]byte, error) {
+func (d *Dirty) Node(owner common.Hash, path []byte, hash common.Hash) ([]byte, error) {
 	if blob, ok := d.lookup(owner, path); ok {
 		return blob, nil
+	}
+	if d.parent != nil {
+		return d.parent.Node(owner, path, hash)
 	}
 	if blob, ok := d.f.Node(owner, path); ok {
 		return blob, nil

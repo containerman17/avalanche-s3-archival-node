@@ -1,0 +1,106 @@
+--- a/core/blockchain.go
++++ b/core/blockchain.go
+@@ -223,6 +223,12 @@
+ // triedbConfig derives the configures for trie database.
+ func (c *CacheConfig) triedbConfig() *triedb.Config {
+ 	config := &triedb.Config{Preimages: c.Preimages}
++	if trieDBConstructor.Registered() {
++		if constructor := trieDBConstructor.Get()(c); constructor != nil {
++			config.DBOverride = constructor
++			return config
++		}
++	}
+ 	if c.StateScheme == rawdb.HashScheme || c.StateScheme == "" {
+ 		config.DBOverride = hashdb.Config{
+ 			CleanCacheSize:                  c.TrieCleanLimit * 1024 * 1024,
+@@ -1908,7 +1914,7 @@
+ 
+ 	// If the state is already available and the acceptor tip is up to date, skip re-processing.
+ 	if bc.HasState(current.Root()) && acceptorTipUpToDate {
+-		if t, ok := bc.triedb.Backend().(*firewood.TrieDB); ok {
++		if t, ok := bc.triedb.Backend().(RevisionTrieDB); ok {
+ 			t.SetHashAndHeight(current.Hash(), current.NumberU64())
+ 		}
+ 		log.Info("Skipping state reprocessing", "root", current.Root())
+@@ -1967,7 +1973,7 @@
+ 	)
+ 	// Note: we add 1 since in each iteration, we attempt to re-execute the next block.
+ 	log.Info("Re-executing blocks to generate state for last accepted block", "from", current.NumberU64()+1, "to", origin)
+-	if t, ok := bc.triedb.Backend().(*firewood.TrieDB); ok {
++	if t, ok := bc.triedb.Backend().(RevisionTrieDB); ok {
+ 		t.SetHashAndHeight(current.Hash(), current.NumberU64())
+ 	}
+ 
+@@ -2046,7 +2052,7 @@
+ }
+ 
+ func (bc *BlockChain) recommitGenesis() error {
+-	if tdb, ok := bc.triedb.Backend().(*firewood.TrieDB); ok {
++	if tdb, ok := bc.triedb.Backend().(RevisionTrieDB); ok {
+ 		// clear all state, allows rebuilding genesis on top
+ 		if err := tdb.ClearAll(); err != nil {
+ 			return err
+--- a/core/genesis.go
++++ b/core/genesis.go
+@@ -34,7 +34,6 @@
+ 	"math/big"
+ 	"time"
+ 
+-	"github.com/ava-labs/avalanchego/graft/evm/firewood"
+ 	"github.com/ava-labs/avalanchego/graft/evm/triedb/pathdb"
+ 	"github.com/ava-labs/avalanchego/graft/subnet-evm/core/extstate"
+ 	"github.com/ava-labs/avalanchego/graft/subnet-evm/params"
+@@ -171,7 +170,7 @@
+ 		if hash != stored {
+ 			return genesis.Config, common.Hash{}, &GenesisMismatchError{stored, hash}
+ 		}
+-		if _, ok := triedb.Backend().(*firewood.TrieDB); ok {
++		if _, ok := triedb.Backend().(RevisionTrieDB); ok {
+ 			// With Firewood's deferred persistence, a crash before the
+ 			// first persist leaves the trie database empty while LevelDB
+ 			// already has blocks beyond genesis. In this case, only recommit
+--- /dev/null
++++ b/core/trie_backend.go
+@@ -0,0 +1,29 @@
++// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
++// See the file LICENSE for licensing terms.
++
++package core
++
++import (
++	"github.com/ava-labs/libevm/common"
++	"github.com/ava-labs/libevm/libevm/register"
++	"github.com/ava-labs/libevm/triedb"
++)
++
++// RevisionTrieDB manages a separate state database whose persistence can lag
++// the block database. Recovery restores its block identity or resets its state.
++// Firewood and replacement backends use the same recovery operations.
++type RevisionTrieDB interface {
++	SetHashAndHeight(common.Hash, uint64)
++	ClearAll() error
++}
++
++var trieDBConstructor register.AtMostOnce[func(*CacheConfig) triedb.DBConstructor]
++
++// RegisterTrieDBConstructor installs a backend selector before VM startup.
++// It must be called at most once. Returning nil preserves the stock constructor.
++func RegisterTrieDBConstructor(selectBackend func(*CacheConfig) triedb.DBConstructor) {
++	if selectBackend == nil {
++		panic("nil trie database constructor selector")
++	}
++	trieDBConstructor.MustRegister(selectBackend)
++}
+--- a/plugin/evm/vm.go
++++ b/plugin/evm/vm.go
+@@ -673,6 +673,10 @@
+ 	case customrawdb.FirewoodScheme:
+ 		tdb, ok := vm.eth.BlockChain().TrieDB().Backend().(*firewood.TrieDB)
+ 		if !ok {
++			if _, replacement := vm.eth.BlockChain().TrieDB().Backend().(core.RevisionTrieDB); replacement && !vm.config.StateSyncEnabled {
++				// The replacement backend serves block execution with state sync disabled.
++				break
++			}
+ 			return fmt.Errorf("expected a %T with %s scheme, got %T", tdb, customrawdb.FirewoodScheme, vm.eth.BlockChain().TrieDB().Backend())
+ 		}
+ 		n := vm.Network.P2PNetwork()
