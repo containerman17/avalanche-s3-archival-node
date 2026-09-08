@@ -20,11 +20,6 @@ pub fn keccak256(data: &[u8]) -> Hash {
     out
 }
 
-pub fn keccak256_sha3(data: &[u8]) -> Hash {
-    use sha3::Digest;
-    sha3::Keccak256::digest(data).into()
-}
-
 /// keccak256 of RLP(""), the root of an empty trie.
 pub const EMPTY_ROOT: Hash = [
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,

@@ -212,10 +212,16 @@ impl Run {
         let mut kp = [0u8; PREFIX_LEN];
         let n = key.len().min(PREFIX_LEN);
         kp[..n].copy_from_slice(&key[..n]);
+        // Random keys decide on the first 8 bytes nearly always, so compare
+        // those as one word before the 40-byte memcmp.
+        let kp0 = u64::from_be_bytes(kp[..8].try_into().unwrap());
         let (mut lo, mut hi) = (0usize, self.nblk);
         while lo < hi {
             let m = (lo + hi) / 2;
-            if self.prefix(m) <= &kp[..] {
+            let p = self.prefix(m);
+            let p0 = u64::from_be_bytes(p[..8].try_into().unwrap());
+            let le = if p0 != kp0 { p0 < kp0 } else { p <= &kp[..] };
+            if le {
                 lo = m + 1;
             } else {
                 hi = m;

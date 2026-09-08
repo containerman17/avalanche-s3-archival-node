@@ -13,7 +13,6 @@ crc32fast = "1"
 hashbrown = "0.15"
 foldhash = "0.1"
 tiny-keccak = { version = "2", features = ["keccak"] }
-sha3 = "0.10"
 keccak-asm = { version = "0.1", optional = true }
 
 [features]

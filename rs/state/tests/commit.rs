@@ -7,7 +7,7 @@ use state::commit::{compact_to_hex, parse_leaf};
 use state::keccak::{keccak256, EMPTY_ROOT};
 use state::sample::*;
 use state::{rlp, Hash, RowsIter};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn tmp(name: &str) -> PathBuf {
@@ -218,8 +218,6 @@ fn file_nodes() {
             let (_, ok) = f.storage_root(&h);
             assert!(!ok);
             let leaf = d.leaf(&[0; 32], &state::commit::key_to_nibbles(&h)).unwrap();
-            let (_, rest) = rlp::split_list(&leaf).unwrap();
-            let _ = rest;
             let (content, _) = rlp::split_list(&leaf).unwrap();
             let (_, rest) = rlp::split_string(content).unwrap();
             let (val, _) = rlp::split_string(rest).unwrap();
@@ -250,5 +248,4 @@ fn open_refuses_corrupt_footer() {
         std::fs::write(&p, bad).unwrap();
         assert!(File::open(&p).is_err(), "mutation {i}: opened");
     }
-    let _ = Path::new("");
 }
