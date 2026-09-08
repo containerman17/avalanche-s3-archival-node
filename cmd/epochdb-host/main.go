@@ -48,6 +48,7 @@ import (
 	proposerblock "github.com/ava-labs/avalanchego/vms/proposervm/block"
 	"github.com/ava-labs/avalanchego/vms/rpcchainvm"
 	"github.com/ava-labs/avalanchego/vms/rpcchainvm/runtime"
+	ethtypes "github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -202,20 +203,21 @@ func main() {
 		}
 	}()
 
-	var height atomic.Uint64
-	height.Store(last.Height())
-	go rateLoop(ctx, &height, f, tracker)
+	b := &bench{tracker: tracker, q: blocks}
+	b.height.Store(last.Height())
+	go b.loop(ctx)
 
-	err = drive(ctx, vm, blocks, f, from, &height, &snowCtx.NetworkUpgrades)
+	err = drive(ctx, vm, blocks, f, from, b, &snowCtx.NetworkUpgrades)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("epochdb-host: FATAL: %v", err)
 	}
+	b.exit()
 	sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := vm.Shutdown(sctx); err != nil {
 		log.Printf("epochdb-host: plugin shutdown: %v", err)
 	}
-	log.Printf("epochdb-host: stopped at height=%d", height.Load())
+	log.Printf("epochdb-host: stopped at height=%d", b.height.Load())
 }
 
 // drive is the whole host loop: for every container in height order, unwrap
@@ -228,13 +230,13 @@ func main() {
 // container has no header and gets 0. Proposer signature, timing and epoch
 // checks are NOT redone here: the follower took the container from the
 // validators' accepted chain.
-func drive(ctx context.Context, vm block.ChainVM, blocks *fetch.Queue, f *fetch.Fetcher, from uint64, height *atomic.Uint64, upgrades *upgrade.Config) error {
+func drive(ctx context.Context, vm block.ChainVM, blocks *fetch.Queue, f *fetch.Fetcher, from uint64, b *bench, upgrades *upgrade.Config) error {
 	var (
 		parentPCH uint64
 		normal    bool
 	)
 	for h := from; ; h++ {
-		raw, _, err := blocks.GetByHeight(h)
+		raw, _, err := b.wait(blocks, h)
 		if err != nil {
 			return err
 		}
@@ -267,7 +269,7 @@ func drive(ctx context.Context, vm block.ChainVM, blocks *fetch.Queue, f *fetch.
 		if err := blk.Accept(ctx); err != nil {
 			return fmt.Errorf("height %d: Accept: %w", h, err)
 		}
-		height.Store(h)
+		b.accepted(h, inner)
 		// The tip is where the follower says it is. At it, the plugin goes to
 		// normal operation and the preference follows every block, as under
 		// avalanchego; during catch-up it is refreshed now and then.
@@ -318,26 +320,113 @@ func unwrap(raw []byte, upgrades *upgrade.Config, parentPCH *uint64) ([]byte, ui
 	return pb.Block(), pch
 }
 
-// rateLoop is the one-line summary the benchmark reads, every 30s: height,
-// blocks/s over the window, host RSS, plugin RSS.
-func rateLoop(ctx context.Context, height *atomic.Uint64, f *fetch.Fetcher, tracker *pidTracker) {
-	const window = 30 * time.Second
-	t := time.NewTicker(window)
-	defer t.Stop()
-	prev := height.Load()
+// bench is the grep-friendly 10s sample line the A/B against `epochdb serve`
+// reads: height, blocks, txs and gas in the window, cumulative mgas/s since
+// the first accepted block, and who starved whom. wait is the time the VM
+// loop spent blocked on GetByHeight (fetch is the limiter); full is the time
+// the fetch queue held at least fetch.RefillBelow blocks of runway ahead of
+// the VM, sampled at 100ms (execution is the limiter: the fetcher is throttled
+// by its own window rule).
+type bench struct {
+	tracker *pidTracker
+	q       *fetch.Queue
+
+	height    atomic.Uint64
+	blocks    atomic.Uint64
+	txs       atomic.Uint64
+	gas       atomic.Uint64
+	waitNs    atomic.Int64
+	waitSince atomic.Int64 // unix nanos since the VM loop began its current wait, 0 while it runs
+	fullNs    atomic.Int64
+	firstAt   atomic.Int64 // unix nanos of the first accepted block, 0 before
+}
+
+// wait is GetByHeight with the blocked time on the books AS IT PASSES, so a
+// long wait lands in the windows it spans rather than in the one it ends in.
+func (b *bench) wait(q *fetch.Queue, h uint64) ([]byte, bool, error) {
+	t0 := time.Now()
+	b.waitSince.Store(t0.UnixNano())
+	raw, ok, err := q.GetByHeight(h)
+	b.waitSince.Store(0)
+	b.waitNs.Add(int64(time.Since(t0)))
+	return raw, ok, err
+}
+
+// waited is the blocked time so far, the wait in progress included.
+func (b *bench) waited() int64 {
+	w := b.waitNs.Load()
+	if since := b.waitSince.Load(); since > 0 {
+		w += time.Now().UnixNano() - since
+	}
+	return w
+}
+
+// accepted folds one accepted block in. The inner bytes are decoded once
+// more here, for the header's gasUsed and the tx count; the libevm extras
+// fetch.New registered make that the same decode the fetcher does.
+func (b *bench) accepted(h uint64, inner []byte) {
+	b.firstAt.CompareAndSwap(0, time.Now().UnixNano())
+	b.height.Store(h)
+	b.blocks.Add(1)
+	var blk ethtypes.Block
+	if err := rlp.DecodeBytes(inner, &blk); err != nil {
+		return
+	}
+	b.txs.Add(uint64(len(blk.Transactions())))
+	b.gas.Add(blk.GasUsed())
+}
+
+func (b *bench) loop(ctx context.Context) {
+	const window = 10 * time.Second
+	const sample = 100 * time.Millisecond
+	print := time.NewTicker(window)
+	defer print.Stop()
+	probe := time.NewTicker(sample)
+	defer probe.Stop()
+	var (
+		pBlocks, pTxs, pGas uint64
+		pWait, pFull        int64
+	)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-probe.C:
+			if b.q.Head()-b.q.Consumed() >= fetch.RefillBelow {
+				b.fullNs.Add(int64(sample))
+			}
+		case <-print.C:
+			blocks, txs, gas := b.blocks.Load(), b.txs.Load(), b.gas.Load()
+			wait, full := b.waited(), b.fullNs.Load()
+			log.Print(b.line("", blocks-pBlocks, txs-pTxs, gas-pGas, wait-pWait, full-pFull, window))
+			pBlocks, pTxs, pGas, pWait, pFull = blocks, txs, gas, wait, full
 		}
-		cur := height.Load()
-		p := f.Progress()
-		log.Printf("host: height=%d rate=%.1f blk/s fetched=%d accepted=%d host_rss=%dMB plugin_rss=%dMB queue=%.0fMB",
-			cur, float64(cur-prev)/window.Seconds(), p.Head, f.AcceptedHead(),
-			rssMB(os.Getpid()), rssMB(int(tracker.pid.Load())), float64(p.QueueBytes)/1e6)
-		prev = cur
 	}
+}
+
+// exit prints the whole run as one window.
+func (b *bench) exit() {
+	log.Print(b.line("exit ", b.blocks.Load(), b.txs.Load(), b.gas.Load(), b.waited(), b.fullNs.Load(), b.elapsed()))
+}
+
+func (b *bench) elapsed() time.Duration {
+	if first := b.firstAt.Load(); first > 0 {
+		return time.Since(time.Unix(0, first))
+	}
+	return 0
+}
+
+func (b *bench) line(tag string, blocks, txs, gas uint64, waitNs, fullNs int64, window time.Duration) string {
+	elapsed := b.elapsed()
+	var cum float64
+	if elapsed > 0 {
+		cum = float64(b.gas.Load()) / 1e6 / elapsed.Seconds()
+	}
+	return fmt.Sprintf("bench %st=%ds h=%d blk=%d tx=%d mgas/s=%.1f cum=%.1f wait=%.1fs full=%.1fs host_rss=%dMB vm_rss=%dMB",
+		tag, int(elapsed.Seconds()), b.height.Load(), blocks, txs,
+		float64(gas)/1e6/window.Seconds(), cum,
+		float64(waitNs)/1e9, float64(fullNs)/1e9,
+		rssMB(os.Getpid()), rssMB(int(b.tracker.pid.Load())))
 }
 
 // rssMB reads a process's resident set from /proc; 0 when it cannot.
