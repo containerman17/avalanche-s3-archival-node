@@ -17,9 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -45,17 +42,18 @@ func main() {
 	nodeURI := fs.String("node", "", "comma-separated bootstrap RPC node URIs")
 	vdrSources := fs.String("vdr-sources", "", "comma-separated platform RPC URIs for the validator set")
 	perPeer := fs.Int("per-peer", 1, "max outstanding requests per archival peer")
-	rollBudget := fs.Int64("roll-budget", 2<<30, "overlay bytes that trigger a background merge + trie roll")
+	rollSync := fs.Int64("roll-budget-sync", 2<<30, "overlay bytes that trigger a background merge + trie roll while catching up")
+	fs.Int64Var(rollSync, "roll-budget", 2<<30, "alias of --roll-budget-sync")
+	rollTip := fs.Int64("roll-budget-tip", 128<<20, "overlay bytes that trigger a roll at the tip")
+	tipLag := fs.Uint64("tip-lag", 5000, "blocks behind the accepted head that count as the tip; catch-up resumes past twice this")
 	stopAt := fs.Uint64("stop", 0, "stop after executing this height (0 = follow)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
-	gogc := fs.Int("gogc", 400, "GC target percent (GOGC); the memory limit still caps the heap")
+	gogcSync := fs.Int("gogc-sync", 400, "GOGC while catching up; the memory limit still caps the heap")
+	fs.IntVar(gogcSync, "gogc", 400, "alias of --gogc-sync")
+	gogcTip := fs.Int("gogc-tip", 100, "GOGC at the tip")
 	fs.Parse(os.Args[1:])
 	if *chainSpec == "" || *chainSpec == "C" {
 		log.Fatalf("epochdb-vm: --chain must be an L1's blockchainID (subnet-evm only)")
-	}
-	setGoMemLimit()
-	if os.Getenv("GOGC") == "" {
-		debug.SetGCPercent(*gogc)
 	}
 	release, err := lockDataDir(*dataDir)
 	if err != nil {
@@ -132,7 +130,11 @@ func main() {
 
 	e, err := vmexec.New(vmexec.Config{
 		DataDir: *dataDir, Blocks: blocks, Store: db, CAS: cas, Misc: misc, Chain: c,
-		RollBudget: int(*rollBudget), StopAt: *stopAt,
+		StopAt: *stopAt,
+		Budget: vmexec.Budget{
+			Accepted: fetcher.AcceptedHead, TipLag: *tipLag,
+			SyncGOGC: *gogcSync, TipGOGC: *gogcTip, SyncRoll: int(*rollSync), TipRoll: int(*rollTip),
+		},
 	})
 	if err != nil {
 		log.Fatalf("epochdb-vm: vmexec.New: %v", err)
@@ -173,7 +175,7 @@ func main() {
 			stop()
 		}
 	}()
-	log.Printf("epochdb-vm: %s on :%d chainId=%s roll-budget=%dMB", id, *port, g.Config.ChainID, *rollBudget>>20)
+	log.Printf("epochdb-vm: %s on :%d chainId=%s roll-budget=%dMB/%dMB tip-lag=%d", id, *port, g.Config.ChainID, *rollSync>>20, *rollTip>>20, *tipLag)
 
 	go func() { report("follower", fetcher.Follow(ctx)) }()
 	execDone := make(chan struct{})
@@ -268,21 +270,8 @@ func (b *bench) line(tag string) {
 	}
 	log.Printf("%s t=%.0f h=%d blk=%d tx=%d mgas/s=%.2f cum=%.2f wait=%.1f full=%.0f rss=%d overlay=%d dirty=%d rolls=%d rolling=%v",
 		tag, now.Sub(b.t0).Seconds(), s.Height, s.Blocks, s.Txs, window, cum,
-		s.Wait.Seconds(), float64(b.fullNs)/1e9, rssMB(), s.Overlay>>20, s.Dirty>>20, s.Rolls, s.Rolling)
+		s.Wait.Seconds(), float64(b.fullNs)/1e9, vmexec.RSSMB(), s.Overlay>>20, s.Dirty>>20, s.Rolls, s.Rolling)
 	b.last, b.lastT = s, now
-}
-
-func rssMB() int {
-	b, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return 0
-	}
-	f := strings.Fields(string(b))
-	if len(f) < 2 {
-		return 0
-	}
-	pages, _ := strconv.Atoi(f[1])
-	return pages * os.Getpagesize() >> 20
 }
 
 // liveNode is the rpc.Live surface: no SAE, so settled == live.
@@ -305,20 +294,6 @@ func netParams(network string) (uint32, string) {
 	}
 	log.Fatalf("epochdb-vm: unknown --network %q (fuji|mainnet)", network)
 	return 0, ""
-}
-
-// setGoMemLimit: 7/10 of the container's ceiling, as epochdb serve does.
-func setGoMemLimit() {
-	if os.Getenv("GOMEMLIMIT") != "" {
-		return
-	}
-	limit, ok := vmexec.CgroupMemoryLimit()
-	if !ok {
-		return
-	}
-	soft := int64(limit / 10 * 7)
-	debug.SetMemoryLimit(soft)
-	log.Printf("epochdb-vm: GOMEMLIMIT %d MB (7/10 of this container's %d MB ceiling)", soft>>20, limit>>20)
 }
 
 // lockDataDir takes the dir's exclusive writer flock for the life of the process.

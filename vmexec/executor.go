@@ -13,15 +13,16 @@ import (
 	"log"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	goatomic "sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
-	"github.com/ava-labs/libevm/crypto"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/ava-labs/libevm/triedb"
@@ -47,11 +48,11 @@ type Config struct {
 	CAS     *dist.Store // the store's artifact store: recovery reads the runs
 	Misc    *store.MiscStore
 	Chain   *chain.Chain
-	// RollBudget is the overlay size (accounted bytes) that triggers a
-	// background merge + trie roll.
-	RollBudget int
-	StopAt     uint64
-	OnBlock    func(num uint64, hash common.Hash)
+	// Budget is the memory profile pair; Run switches between them by
+	// distance to the tip (budget.go).
+	Budget  Budget
+	StopAt  uint64
+	OnBlock func(num uint64, hash common.Hash)
 }
 
 // Stats is the bench snapshot.
@@ -115,6 +116,10 @@ type Executor struct {
 	flushReq  chan uint64
 	flushErr  chan error
 	flushDone chan struct{}
+
+	gate       tipGate
+	rollBudget int  // overlay bytes that trigger a roll, per the gate's side
+	freeOS     bool // give freed heap back to the OS after the next roll swap
 }
 
 // checkDepth is how many executed blocks may wait for their root check.
@@ -159,9 +164,7 @@ func New(cfg Config) (*Executor, error) {
 	if cfg.Blocks == nil || cfg.DataDir == "" || cfg.Store == nil || cfg.CAS == nil || cfg.Misc == nil || cfg.Chain == nil {
 		return nil, fmt.Errorf("config: Blocks, DataDir, Store, CAS, Misc and Chain are required")
 	}
-	if cfg.RollBudget <= 0 {
-		cfg.RollBudget = 2 << 30
-	}
+	cfg.Budget.defaults()
 	g, err := ChainGenesis(cfg.Chain)
 	if err != nil {
 		return nil, err
@@ -338,6 +341,10 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 	lastGas, lastBlocks, lastTxs := uint64(0), uint64(0), uint64(0)
 	lastWait := time.Time{}
 	next := e.headNum + 1
+	setMemLimit()
+	e.gate = tipGate{lag: e.lag, limit: e.cfg.Budget.TipLag}
+	e.applyProfile("start")
+	lastBudget := start
 
 	e.flushReq = make(chan uint64, 1)
 	e.flushErr = make(chan error, 1)
@@ -450,6 +457,12 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			log.Printf("vmexec: reached --stop height %d", e.cfg.StopAt)
 			return nil
 		}
+		if time.Since(lastBudget) >= 2*time.Second {
+			lastBudget = time.Now()
+			if err := e.tickBudget(); err != nil {
+				return err
+			}
+		}
 		tRead := time.Now()
 		var pvm []byte
 		var blk *types.Block
@@ -515,18 +528,8 @@ func (e *Executor) executeDecoded(blockNum uint64, pvm []byte, blk *types.Block)
 	if got := blk.NumberU64(); got != blockNum {
 		return fmt.Errorf("block %d has internal number %d", blockNum, got)
 	}
-	if e.eng.rollReady() {
-		// The swap rebases Dirty and reads the store: park the checker,
-		// which has then verified every block up to this one.
-		resume, err := e.parkChecker()
-		if err != nil {
-			return err
-		}
-		err = e.eng.finishRoll()
-		resume()
-		if err != nil {
-			log.Fatalf("vmexec: %v", err)
-		}
+	if err := e.swapRoll(); err != nil {
+		return err
 	}
 	e.forgetPublished()
 	it, err := e.executeBlock(blk, pvm)
@@ -539,12 +542,34 @@ func (e *Executor) executeDecoded(blockNum uint64, pvm []byte, blk *types.Block)
 	e.headTime = blk.Time()
 	e.totalGas += blk.GasUsed()
 	e.totalTxs += uint64(len(blk.Transactions()))
-	e.eng.maybeRoll(e.cfg.RollBudget, blockNum, e.headRoot)
+	e.eng.maybeRoll(e.rollBudget, blockNum, e.headRoot)
 	it.stats = Stats{
 		Height: blockNum, Blocks: e.blocksDone + 1, Txs: e.totalTxs, Gas: e.totalGas,
 		Overlay: e.eng.overlay.Bytes(), Rolls: e.eng.rolls, Rolling: e.eng.frozen != nil,
 	}
 	return e.enqueue(it)
+}
+
+// swapRoll swaps a finished roll in. The swap rebases Dirty and reads the
+// store: park the checker, which has then verified every block handed to it.
+func (e *Executor) swapRoll() error {
+	if !e.eng.rollReady() {
+		return nil
+	}
+	resume, err := e.parkChecker()
+	if err != nil {
+		return err
+	}
+	err = e.eng.finishRoll()
+	resume()
+	if err != nil {
+		log.Fatalf("vmexec: %v", err)
+	}
+	if e.freeOS {
+		e.freeOS = false
+		go debug.FreeOSMemory()
+	}
+	return nil
 }
 
 // maybeFlush advances the durable watermark every flushEvery blocks.
