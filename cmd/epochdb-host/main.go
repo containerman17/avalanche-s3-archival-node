@@ -33,6 +33,7 @@ import (
 	"github.com/ava-labs/avalanchego/genesis"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
+	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
 	"github.com/ava-labs/avalanchego/snow/validators"
@@ -66,9 +67,19 @@ func main() {
 	nodeURI := fs.String("node", "", "comma-separated Avalanche RPC node URIs (bootstrap peers, P-chain validator state)")
 	httpAddr := fs.String("http", "127.0.0.1:19900", "HTTP listen address; the plugin's handlers mount at /ext/bc/<chainID>/<path>")
 	p2pPort := fs.Int("p2p-port", 0, "p2p listen port (persists staker.key/.crt under --data, so the NodeID is stable)")
+	holdSpec := fs.String("hold-until", "", "hand the VM its first block only once this much is fetched ahead of it: N blocks, or N txs as Ntx (100000, 250000tx)")
+	queueAhead := fs.Int("queue-ahead", 100_000, "blocks the host keeps fetched ahead of the VM in its own ring, in front of the fetch package's fixed window")
+	batch := fs.Int("batch", 256, "blocks per BatchedParseBlock; up to 2 parsed batches wait ahead of verification")
 	fs.Parse(os.Args[1:])
 	if *chainSpec == "" || *vmPath == "" {
 		log.Fatal("epochdb-host: --chain and --vm are required")
+	}
+	if *queueAhead < 1 || *batch < 1 {
+		log.Fatal("epochdb-host: --queue-ahead and --batch must be at least 1")
+	}
+	holdN, holdTx, err := parseHold(*holdSpec)
+	if err != nil {
+		log.Fatalf("epochdb-host: --hold-until: %v", err)
 	}
 	var networkID uint32
 	switch *network {
@@ -203,11 +214,20 @@ func main() {
 		}
 	}()
 
-	b := &bench{tracker: tracker, q: blocks}
+	p := &pipe{
+		q: blocks, f: f, from: from, batch: *batch,
+		holdSpec: *holdSpec, holdN: holdN, holdTx: holdTx,
+		ring:    make(chan item, *queueAhead),
+		batches: make(chan []parsed, 2),
+		stop:    stop,
+	}
+	b := &bench{tracker: tracker, ring: p.ring}
 	b.height.Store(last.Height())
 	go b.loop(ctx)
+	go p.pull(ctx, &snowCtx.NetworkUpgrades)
+	go p.parse(ctx, vm)
 
-	err = drive(ctx, vm, blocks, f, from, b, &snowCtx.NetworkUpgrades)
+	err = p.drive(ctx, vm, b)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("epochdb-host: FATAL: %v", err)
 	}
@@ -220,9 +240,220 @@ func main() {
 	log.Printf("epochdb-host: stopped at height=%d", b.height.Load())
 }
 
-// drive is the whole host loop: for every container in height order, unwrap
-// the proposervm header, ParseBlock the inner bytes, Verify (with the P-chain
-// height the proposervm would hand the inner VM), Accept.
+// item is one container after unwrap: the inner VM bytes, the P-chain height
+// for its block.Context, and the header facts the bench line wants, decoded
+// once here (the libevm extras fetch.New registered make it the fetcher's
+// decode).
+type item struct {
+	h     uint64
+	inner []byte
+	pch   uint64
+	txs   uint64
+	gas   uint64
+}
+
+// parsed is an item the VM has parsed, ahead of its verification.
+type parsed struct {
+	item
+	blk snowman.Block
+}
+
+// pipe is the host loop in three stages: pull (fetch queue -> ring, in
+// height order, unwrapped), parse (ring -> batches of VM-parsed blocks, up to
+// 2 waiting) and drive (Verify + Accept, strictly sequential per block). The
+// first error stops the host; each stage closes its output so drive sees it.
+type pipe struct {
+	q        *fetch.Queue
+	f        *fetch.Fetcher
+	from     uint64
+	batch    int
+	holdSpec string
+	holdN    uint64
+	holdTx   bool
+	ring     chan item
+	batches  chan []parsed
+
+	pulledTxs atomic.Uint64
+	stop      context.CancelFunc
+	once      sync.Once
+	err       error
+}
+
+func (p *pipe) fail(err error) {
+	p.once.Do(func() {
+		p.err = err
+		p.stop()
+	})
+}
+
+// parseHold reads --hold-until: "N" blocks or "Ntx" transactions.
+func parseHold(spec string) (n uint64, txs bool, err error) {
+	if spec == "" {
+		return 0, false, nil
+	}
+	txs = strings.HasSuffix(spec, "tx")
+	n, err = strconv.ParseUint(strings.TrimSuffix(spec, "tx"), 10, 64)
+	return n, txs, err
+}
+
+// pull moves containers from the fetch queue into the host ring. The
+// fetcher's window is a constant of that package (fetch.WindowBlocks ahead of
+// what GetByHeight handed out, refilling under fetch.RefillBelow), so the
+// runway ahead of the VM is this ring plus that window: draining the queue
+// into the ring is what makes the fetcher refill earlier.
+func (p *pipe) pull(ctx context.Context, upgrades *upgrade.Config) {
+	defer close(p.ring)
+	var parentPCH uint64
+	for h := p.from; ; h++ {
+		raw, _, err := p.q.GetByHeight(h)
+		if err != nil {
+			p.fail(err)
+			return
+		}
+		inner, pch := unwrap(raw, upgrades, &parentPCH)
+		it := item{h: h, inner: inner, pch: pch}
+		var blk ethtypes.Block
+		if err := rlp.DecodeBytes(inner, &blk); err == nil {
+			it.txs, it.gas = uint64(len(blk.Transactions())), blk.GasUsed()
+		}
+		p.pulledTxs.Add(it.txs)
+		select {
+		case p.ring <- it:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// hold is the --hold-until gate: it blocks until the runway fetched ahead of
+// the VM reaches the target, N blocks (fetch queue plus ring) or N txs (ring
+// only: the fetch queue does not count txs), or until nothing more can
+// arrive (the ring is full and, for a block target, the fetch window is full
+// or at the tip).
+func (p *pipe) hold(ctx context.Context) error {
+	if p.holdN == 0 {
+		return nil
+	}
+	t0 := time.Now()
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for i := 0; ; i++ {
+		head := p.q.Head()
+		blocks, txs := head-(p.from-1), p.pulledTxs.Load()
+		have := blocks
+		if p.holdTx {
+			have = txs
+		}
+		tip := p.f.AcceptedHead()
+		capped := len(p.ring) == cap(p.ring) &&
+			(p.holdTx || head-p.q.Consumed() >= fetch.WindowBlocks || (tip > 0 && head >= tip))
+		if have >= p.holdN || capped {
+			log.Printf("epochdb-host: feeding starts after %s: %d blocks, %d txs fetched ahead (target %s, capped=%v)",
+				time.Since(t0).Round(time.Second), blocks, txs, p.holdSpec, capped)
+			return nil
+		}
+		if i%10 == 0 {
+			log.Printf("epochdb-host: holding: %d blocks, %d txs fetched ahead (target %s)", blocks, txs, p.holdSpec)
+		}
+		select {
+		case <-tick.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// take is the next batch: it blocks for one item, then takes what the ring
+// holds, up to n. ok is false once the ring is closed and drained.
+func take(ring <-chan item, n int) (items []item, ok bool) {
+	first, ok := <-ring
+	if !ok {
+		return nil, false
+	}
+	items = append(make([]item, 0, n), first)
+	for len(items) < n {
+		select {
+		case it, ok := <-ring:
+			if !ok {
+				return items, true
+			}
+			items = append(items, it)
+		default:
+			return items, true
+		}
+	}
+	return items, true
+}
+
+// parse hands the VM the ring's contents in batches of up to p.batch blocks,
+// one BatchedParseBlock per batch (one round trip to a plugin; the
+// rpcchainvm client always offers it and returns ErrRemoteVMNotImplemented
+// for a plugin without it, then it is ParseBlock one by one), and queues
+// the parsed batches for drive. A batch is what the ring holds when the
+// previous one is done, so at the tip it is one block. A VM that does work
+// at parse time (sender recovery) gets it up to 3 batches ahead of Verify.
+func (p *pipe) parse(ctx context.Context, vm block.ChainVM) {
+	defer close(p.batches)
+	if err := p.hold(ctx); err != nil {
+		return
+	}
+	bvm, _ := vm.(block.BatchedChainVM)
+	log.Printf("epochdb-host: batched parse=%v batch=%d ring=%d", bvm != nil, p.batch, cap(p.ring))
+	for {
+		items, ok := take(p.ring, p.batch)
+		if !ok {
+			return
+		}
+		raws := make([][]byte, len(items))
+		for i := range items {
+			raws[i] = items[i].inner
+		}
+		var (
+			blks []snowman.Block
+			err  error
+		)
+		if bvm != nil {
+			blks, err = bvm.BatchedParseBlock(ctx, raws)
+			if errors.Is(err, block.ErrRemoteVMNotImplemented) {
+				log.Print("epochdb-host: plugin has no BatchedParseBlock, parsing one block at a time")
+				bvm, err = nil, nil
+			} else if err != nil {
+				err = fmt.Errorf("heights %d..%d: BatchedParseBlock: %w", items[0].h, items[len(items)-1].h, err)
+			}
+		}
+		if bvm == nil && err == nil {
+			blks = make([]snowman.Block, len(raws))
+			for i := range raws {
+				if blks[i], err = vm.ParseBlock(ctx, raws[i]); err != nil {
+					err = fmt.Errorf("height %d: ParseBlock: %w", items[i].h, err)
+					break
+				}
+			}
+		}
+		if err != nil {
+			p.fail(err)
+			return
+		}
+		out := make([]parsed, len(items))
+		for i, it := range items {
+			if blks[i].Height() != it.h {
+				p.fail(fmt.Errorf("height %d: plugin parsed it as height %d", it.h, blks[i].Height()))
+				return
+			}
+			out[i] = parsed{it, blks[i]}
+		}
+		select {
+		case p.batches <- out:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// drive is the VM loop proper: for every parsed block in height order,
+// Verify (with the P-chain height the proposervm would hand the inner VM),
+// then Accept. Strictly sequential: a block is verified only after its
+// parent is accepted.
 //
 // The block.Context rule is proposervm's (vms/proposervm/block.go Verify):
 // Granite active at the block's timestamp: the epoch's P-chain height; Etna:
@@ -230,60 +461,60 @@ func main() {
 // container has no header and gets 0. Proposer signature, timing and epoch
 // checks are NOT redone here: the follower took the container from the
 // validators' accepted chain.
-func drive(ctx context.Context, vm block.ChainVM, blocks *fetch.Queue, f *fetch.Fetcher, from uint64, b *bench, upgrades *upgrade.Config) error {
-	var (
-		parentPCH uint64
-		normal    bool
-	)
-	for h := from; ; h++ {
-		raw, _, err := b.wait(blocks, h)
-		if err != nil {
-			return err
-		}
-		inner, pch := unwrap(raw, upgrades, &parentPCH)
-		blk, err := vm.ParseBlock(ctx, inner)
-		if err != nil {
-			return fmt.Errorf("height %d: ParseBlock: %w", h, err)
-		}
-		if blk.Height() != h {
-			return fmt.Errorf("height %d: plugin parsed it as height %d", h, blk.Height())
-		}
-		verified := false
-		if wc, ok := blk.(block.WithVerifyContext); ok {
-			should, err := wc.ShouldVerifyWithContext(ctx)
-			if err != nil {
-				return fmt.Errorf("height %d: ShouldVerifyWithContext: %w", h, err)
+func (p *pipe) drive(ctx context.Context, vm block.ChainVM, b *bench) error {
+	var normal bool
+	for {
+		t0 := time.Now()
+		b.waitSince.Store(t0.UnixNano())
+		batch, ok := <-p.batches
+		b.waitSince.Store(0)
+		b.waitNs.Add(int64(time.Since(t0)))
+		if !ok {
+			if p.err != nil {
+				return p.err
 			}
-			if should {
-				if err := wc.VerifyWithContext(ctx, &block.Context{PChainHeight: pch}); err != nil {
-					return fmt.Errorf("height %d: VerifyWithContext(pChainHeight=%d): %w", h, pch, err)
+			return ctx.Err()
+		}
+		for _, x := range batch {
+			h, blk := x.h, x.blk
+			verified := false
+			if wc, ok := blk.(block.WithVerifyContext); ok {
+				should, err := wc.ShouldVerifyWithContext(ctx)
+				if err != nil {
+					return fmt.Errorf("height %d: ShouldVerifyWithContext: %w", h, err)
 				}
-				verified = true
+				if should {
+					if err := wc.VerifyWithContext(ctx, &block.Context{PChainHeight: x.pch}); err != nil {
+						return fmt.Errorf("height %d: VerifyWithContext(pChainHeight=%d): %w", h, x.pch, err)
+					}
+					verified = true
+				}
 			}
-		}
-		if !verified {
-			if err := blk.Verify(ctx); err != nil {
-				return fmt.Errorf("height %d: Verify: %w", h, err)
+			if !verified {
+				if err := blk.Verify(ctx); err != nil {
+					return fmt.Errorf("height %d: Verify: %w", h, err)
+				}
 			}
-		}
-		if err := blk.Accept(ctx); err != nil {
-			return fmt.Errorf("height %d: Accept: %w", h, err)
-		}
-		b.accepted(h, inner)
-		// The tip is where the follower says it is. At it, the plugin goes to
-		// normal operation and the preference follows every block, as under
-		// avalanchego; during catch-up it is refreshed now and then.
-		tip := f.AcceptedHead()
-		if !normal && tip > 0 && h >= tip {
-			if err := vm.SetState(ctx, snow.NormalOp); err != nil {
-				return fmt.Errorf("SetState(NormalOp): %w", err)
+			if err := blk.Accept(ctx); err != nil {
+				return fmt.Errorf("height %d: Accept: %w", h, err)
 			}
-			normal = true
-			log.Printf("epochdb-host: caught up at height=%d, plugin in NormalOp", h)
-		}
-		if normal || h%1000 == 0 {
-			if err := vm.SetPreference(ctx, blk.ID()); err != nil {
-				return fmt.Errorf("height %d: SetPreference: %w", h, err)
+			b.accepted(x.item)
+			// The tip is where the follower says it is. At it, the plugin
+			// goes to normal operation and the preference follows every
+			// block, as under avalanchego; during catch-up it is refreshed
+			// now and then.
+			tip := p.f.AcceptedHead()
+			if !normal && tip > 0 && h >= tip {
+				if err := vm.SetState(ctx, snow.NormalOp); err != nil {
+					return fmt.Errorf("SetState(NormalOp): %w", err)
+				}
+				normal = true
+				log.Printf("epochdb-host: caught up at height=%d, plugin in NormalOp", h)
+			}
+			if normal || h%1000 == 0 {
+				if err := vm.SetPreference(ctx, blk.ID()); err != nil {
+					return fmt.Errorf("height %d: SetPreference: %w", h, err)
+				}
 			}
 		}
 	}
@@ -322,14 +553,13 @@ func unwrap(raw []byte, upgrades *upgrade.Config, parentPCH *uint64) ([]byte, ui
 
 // bench is the grep-friendly 10s sample line the A/B against `epochdb serve`
 // reads: height, blocks, txs and gas in the window, cumulative mgas/s since
-// the first accepted block, and who starved whom. wait is the time the VM
-// loop spent blocked on GetByHeight (fetch is the limiter); full is the time
-// the fetch queue held at least fetch.RefillBelow blocks of runway ahead of
-// the VM, sampled at 100ms (execution is the limiter: the fetcher is throttled
-// by its own window rule).
+// the first accepted block, and who starved whom. wait is the time the
+// verify loop spent blocked for its next parsed batch, the --hold-until gate
+// excluded (fetch or parse is the limiter); full is the time the host ring
+// was at capacity, sampled at 100ms (the VM is the limiter).
 type bench struct {
 	tracker *pidTracker
-	q       *fetch.Queue
+	ring    chan item
 
 	height    atomic.Uint64
 	blocks    atomic.Uint64
@@ -341,18 +571,8 @@ type bench struct {
 	firstAt   atomic.Int64 // unix nanos of the first accepted block, 0 before
 }
 
-// wait is GetByHeight with the blocked time on the books AS IT PASSES, so a
+// waited is the blocked time so far, the wait in progress included, so a
 // long wait lands in the windows it spans rather than in the one it ends in.
-func (b *bench) wait(q *fetch.Queue, h uint64) ([]byte, bool, error) {
-	t0 := time.Now()
-	b.waitSince.Store(t0.UnixNano())
-	raw, ok, err := q.GetByHeight(h)
-	b.waitSince.Store(0)
-	b.waitNs.Add(int64(time.Since(t0)))
-	return raw, ok, err
-}
-
-// waited is the blocked time so far, the wait in progress included.
 func (b *bench) waited() int64 {
 	w := b.waitNs.Load()
 	if since := b.waitSince.Load(); since > 0 {
@@ -361,19 +581,13 @@ func (b *bench) waited() int64 {
 	return w
 }
 
-// accepted folds one accepted block in. The inner bytes are decoded once
-// more here, for the header's gasUsed and the tx count; the libevm extras
-// fetch.New registered make that the same decode the fetcher does.
-func (b *bench) accepted(h uint64, inner []byte) {
+// accepted folds one accepted block in.
+func (b *bench) accepted(it item) {
 	b.firstAt.CompareAndSwap(0, time.Now().UnixNano())
-	b.height.Store(h)
+	b.height.Store(it.h)
 	b.blocks.Add(1)
-	var blk ethtypes.Block
-	if err := rlp.DecodeBytes(inner, &blk); err != nil {
-		return
-	}
-	b.txs.Add(uint64(len(blk.Transactions())))
-	b.gas.Add(blk.GasUsed())
+	b.txs.Add(it.txs)
+	b.gas.Add(it.gas)
 }
 
 func (b *bench) loop(ctx context.Context) {
@@ -392,7 +606,7 @@ func (b *bench) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-probe.C:
-			if b.q.Head()-b.q.Consumed() >= fetch.RefillBelow {
+			if len(b.ring) == cap(b.ring) {
 				b.fullNs.Add(int64(sample))
 			}
 		case <-print.C:

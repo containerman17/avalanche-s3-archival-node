@@ -41,3 +41,36 @@ func TestUnwrapPChainHeight(t *testing.T) {
 		t.Fatalf("pre-fork: got %x pch=%d", got, pch)
 	}
 }
+
+// take blocks for one item, then drains what is there up to the batch size,
+// and reports the closed ring once it is empty.
+func TestTakeBatches(t *testing.T) {
+	ring := make(chan item, 8)
+	for h := uint64(1); h <= 5; h++ {
+		ring <- item{h: h}
+	}
+	got, ok := take(ring, 3)
+	if !ok || len(got) != 3 || got[0].h != 1 || got[2].h != 3 {
+		t.Fatalf("first batch: ok=%v %+v", ok, got)
+	}
+	got, ok = take(ring, 3)
+	if !ok || len(got) != 2 || got[1].h != 5 {
+		t.Fatalf("partial batch: ok=%v %+v", ok, got)
+	}
+	close(ring)
+	if _, ok = take(ring, 3); ok {
+		t.Fatal("closed ring reported as open")
+	}
+	for spec, want := range map[string]struct {
+		n   uint64
+		txs bool
+	}{"": {0, false}, "100000": {100000, false}, "250000tx": {250000, true}} {
+		n, txs, err := parseHold(spec)
+		if err != nil || n != want.n || txs != want.txs {
+			t.Fatalf("parseHold(%q) = %d %v %v", spec, n, txs, err)
+		}
+	}
+	if _, _, err := parseHold("12blocks"); err == nil {
+		t.Fatal("parseHold accepted garbage")
+	}
+}
