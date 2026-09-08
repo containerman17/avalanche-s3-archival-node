@@ -255,7 +255,7 @@ func runCorpus(ctx context.Context, c *chain.Chain, sources []string, vmPath, da
 	}
 	stopBench()
 	b.exit()
-	log.Printf("corpus ready height=%d id=%s vm_pid=%d rpc=http://%s/ext/bc/%s/rpc", stopHeight, lastID, tracker.pid.Load(), listener.Addr(), c.BlockchainID)
+	log.Printf("corpus ready height=%d host_pid=%d id=%s vm_pid=%d rpc=http://%s/ext/bc/%s/rpc", stopHeight, os.Getpid(), lastID, tracker.pid.Load(), listener.Addr(), c.BlockchainID)
 	<-ctx.Done()
 	return ctx.Err()
 }

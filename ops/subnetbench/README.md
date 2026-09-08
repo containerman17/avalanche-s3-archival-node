@@ -90,5 +90,7 @@ The host feeds no block after `--stop`. On restart it skips earlier records,
 checks the plugin's accepted block against the corpus, and resumes at the next
 height. A restart already at the stop height executes no additional block. The
 `corpus ready` log appears after acceptance, preference, normal operation, and an
-`eth_blockNumber` response at the stop height. RPC stays open until the host is
-stopped. The publication build uses `subnetbench,netgo,osusergo` tags.
+`eth_blockNumber` response at the stop height. It includes the host PID, and the
+measurement script requires it to match systemd `MainPID`, so stale ready lines
+from an earlier run cannot satisfy restart readiness. RPC stays open until the
+host is stopped. The publication build uses `subnetbench,netgo,osusergo` tags.

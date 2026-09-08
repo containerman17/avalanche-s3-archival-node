@@ -45,6 +45,26 @@ def disk_size(path, apparent):
     return int(subprocess.check_output(command, text=True).split()[0])
 
 
+def systemctl_value(unit, prop):
+    return subprocess.check_output([
+        "systemctl", "show", unit, f"--property={prop}", "--value"
+    ], text=True).strip()
+
+
+def positive_systemd_int(unit, prop, description):
+    try:
+        value = int(systemctl_value(unit, prop))
+    except ValueError as err:
+        raise SystemExit(f"unit has invalid {description}: {err}") from err
+    if value <= 0:
+        raise SystemExit(f"unit has no {description}")
+    return value
+
+
+def ready_marker(height, host_pid):
+    return re.compile(rf"corpus ready height={height} host_pid={host_pid}(?:\s|$)")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit", required=True)
@@ -56,14 +76,11 @@ def main():
     parser.add_argument("--timeout", type=float, default=7200)
     parser.add_argument("--settle", type=float, default=10)
     args = parser.parse_args()
-    started_us = int(subprocess.check_output([
-        "systemctl", "show", args.unit, "--property=ExecMainStartTimestampMonotonic", "--value"
-    ], text=True).strip())
-    if started_us <= 0:
-        raise SystemExit("unit has no process start timestamp")
+    started_us = positive_systemd_int(args.unit, "ExecMainStartTimestampMonotonic", "process start timestamp")
+    main_pid = positive_systemd_int(args.unit, "MainPID", "main PID")
     started = started_us * 1000
     group = Path("/sys/fs/cgroup/system.slice") / args.unit
-    marker = re.compile(rf"corpus ready height={args.height}(?:\s|$)")
+    marker = ready_marker(args.height, main_pid)
     offset = 0
     tail = ""
     ready = None
@@ -77,7 +94,8 @@ def main():
             output.flush()
 
         emit({"type": "start", "unit": args.unit, "started_monotonic_ns": started,
-              "height": args.height, "sample_seconds": 1, "ready_poll_seconds": 0.1})
+              "main_pid": main_pid, "height": args.height,
+              "sample_seconds": 1, "ready_poll_seconds": 0.1})
         while True:
             now = time.monotonic_ns()
             elapsed = (now - started) / 1e9
@@ -105,7 +123,7 @@ def main():
                     ready = time.monotonic_ns()
                     if observed != args.height:
                         raise RuntimeError(f"ready marker has RPC height {observed}, expected {args.height}")
-                    emit({"type": "ready", "height": observed,
+                    emit({"type": "ready", "height": observed, "main_pid": main_pid,
                           "ready_seconds": (ready - started) / 1e9})
             if ready is not None and now - ready >= args.settle * 1e9:
                 block = rpc(args.rpc, "eth_getBlockByNumber", [hex(args.height), False])
@@ -118,7 +136,7 @@ def main():
                     if path.exists():
                         sizes[label] = {"apparent_bytes": disk_size(path, True),
                                         "allocated_bytes": disk_size(path, False)}
-                summary = {"type": "summary", "height": args.height,
+                summary = {"type": "summary", "height": args.height, "main_pid": main_pid,
                            "block_hash": block["hash"], "state_root": block["stateRoot"],
                            "ready_seconds": (ready - started) / 1e9,
                            "sampled_peak_rss_bytes": peak_rss,
