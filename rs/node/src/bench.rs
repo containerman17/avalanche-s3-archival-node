@@ -298,12 +298,19 @@ pub fn main(args: Vec<String>) -> Result<()> {
     };
     let data = PathBuf::from(arg(&args, "--data").ok_or_else(|| anyhow!("--data DIR"))?);
     let mut network: u32 = num(&args, "--network", 1)?;
+    let (mut blockchain_id, mut subnet_id) = (B256::ZERO, B256::ZERO);
     if let Ok(desc) = serde_json::from_slice::<serde_json::Value>(&genesis) {
         if let Some(gd) = desc.get("genesisData").and_then(|v| v.as_str()) {
             use base64::Engine;
             genesis = base64::engine::general_purpose::STANDARD.decode(gd).context("genesisData base64")?;
             if let Some(n) = desc.get("networkID").and_then(|v| v.as_u64()) {
                 network = n as u32;
+            }
+            if let Some(id) = desc.get("blockchainID").and_then(|v| v.as_str()) {
+                blockchain_id = exec::config::cb58(id)?;
+            }
+            if let Some(id) = desc.get("subnetID").and_then(|v| v.as_str()) {
+                subnet_id = exec::config::cb58(id)?;
             }
         }
     }
@@ -319,7 +326,7 @@ pub fn main(args: Vec<String>) -> Result<()> {
     }
     let t0 = Instant::now();
 
-    let cfg = Config::from_genesis(&genesis, &upgrade, network).context("config")?;
+    let cfg = Config::from_genesis(&genesis, &upgrade, network).context("config")?.with_chain(blockchain_id, subnet_id);
     let dirty_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
     // Genesis: the alloc into the first run, the first trie rolled from it,

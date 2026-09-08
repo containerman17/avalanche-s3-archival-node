@@ -172,7 +172,12 @@ impl NodeEngine {
 
     fn open_inner(init: &Init) -> anyhow::Result<NodeEngine> {
         let t0 = Instant::now();
-        let cfg = Config::from_genesis(&init.genesis_bytes, &init.upgrade_bytes, init.network_id).context("config")?;
+        // The snow context's ids: warp's getBlockchainID answers chain_id and predicate
+        // verification signs over subnet_id; without them the executor runs with zeros
+        // (state root mismatch at beam 3,423,561, a constructor storing getBlockchainID).
+        let cfg = Config::from_genesis(&init.genesis_bytes, &init.upgrade_bytes, init.network_id)
+            .context("config")?
+            .with_chain(B256::from(init.chain_id), B256::from(init.subnet_id));
         let genesis = Arc::new(genesis::block(&cfg, &init.genesis_bytes).map_err(|e| anyhow!("genesis: {e}"))?);
         let conf: serde_json::Value = serde_json::from_slice(&init.config_bytes).unwrap_or(serde_json::Value::Null);
         let sync_roll = conf.get("roll-budget-mb").and_then(|v| v.as_u64()).map(|m| (m as usize) << 20).unwrap_or(SYNC_ROLL);

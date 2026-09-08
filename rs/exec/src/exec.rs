@@ -248,6 +248,13 @@ where
 pub struct SevmPrecompiles {
     eth: EthPrecompiles,
     warm: AddressSet,
+    /// `warm` changed since revm last asked `set_spec`: revm re-warms the
+    /// journal's precompile set only when set_spec answers true, so a rebuild
+    /// from `set_granite` (P256Verify joins at the Granite block, the eth
+    /// spec unchanged) must be reported through the next set_spec or 0x100
+    /// stays cold in the journal (2600 instead of 100: beam 8,182,073 ran out
+    /// of gas by exactly that).
+    warm_changed: bool,
     /// Enabled modules by MODULES index.
     pub enabled: [bool; 6],
     pub block_time: u64,
@@ -262,7 +269,7 @@ impl SevmPrecompiles {
     fn new(spec: SpecId) -> Self {
         let eth = EthPrecompiles::new(spec);
         let warm = eth.warm_addresses().clone();
-        SevmPrecompiles { eth, warm, enabled: [false; 6], block_time: 0, env: Env::default(), errors: Vec::new() }
+        SevmPrecompiles { eth, warm, warm_changed: false, enabled: [false; 6], block_time: 0, env: Env::default(), errors: Vec::new() }
     }
 
     fn rebuild_warm(&mut self) {
@@ -270,6 +277,7 @@ impl SevmPrecompiles {
         if self.env.granite {
             self.warm.insert(P256_VERIFY);
         }
+        self.warm_changed = true;
     }
 
     pub fn set_granite(&mut self, granite: bool) {
@@ -288,7 +296,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for SevmPrecompiles {
         if changed {
             self.rebuild_warm();
         }
-        changed
+        std::mem::take(&mut self.warm_changed) || changed
     }
 
     fn run(&mut self, ctx: &mut CTX, inputs: &CallInputs) -> Result<Option<InterpreterResult>, String> {
