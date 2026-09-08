@@ -171,6 +171,13 @@ type countingWriter struct {
 	n      int64
 }
 
+// Unwrap lets the ReverseProxy hijack the connection for a WebSocket upgrade.
+func (w *countingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func isUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
 func (w *countingWriter) WriteHeader(s int) { w.status = s; w.ResponseWriter.WriteHeader(s) }
 func (w *countingWriter) Write(b []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(b)
@@ -208,7 +215,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// /ext/bc/<id>/rpc, exactly as avalanchego. Anything else is a 404 with
 	// no fingerprint of what runs behind.
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 4 || parts[0] != "ext" || parts[1] != "bc" || parts[3] != "rpc" {
+	if len(parts) != 4 || parts[0] != "ext" || parts[1] != "bc" || (parts[3] != "rpc" && parts[3] != "ws") {
 		http.NotFound(w, r)
 		return
 	}
@@ -217,13 +224,22 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
-	if err != nil {
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-		return
+	// A WebSocket upgrade has no body: it is charged as one request and the
+	// ReverseProxy tunnels the connection (Go's httputil handles Upgrade).
+	// ponytail: frames inside the socket are not paced or counted; add a
+	// per-message budget if a socket ever becomes the hot client in the log.
+	var body []byte
+	n, traces, methods := 1, 0, []string{"ws"}
+	if !isUpgrade(r) {
+		var err error
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+		if err != nil {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		n, traces, methods = countMethods(body)
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	n, traces, methods := countMethods(body)
 
 	// Who: the token, else the client address (cloudflared and any proxy in
 	// front put the real one in CF-Connecting-IP / X-Forwarded-For).

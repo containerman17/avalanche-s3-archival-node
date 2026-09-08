@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestProxyRoutesPacesAndLogs(t *testing.T) {
@@ -72,4 +74,63 @@ func TestProxyRoutesPacesAndLogs(t *testing.T) {
 	if !strings.Contains(string(logged), `"status":429`) || !strings.Contains(string(logged), `"token":true`) {
 		t.Fatalf("log misses the 429 or the token line:\n%s", logged)
 	}
+}
+
+// A WebSocket upgrade on /ext/bc/<id>/ws tunnels through to the node and the
+// frames flow both ways (blockstream's head tracker needs eth_subscribe).
+func TestProxyTunnelsWebSocket(t *testing.T) {
+	up := websocket.Upgrader{}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("backend upgrade: %v", err)
+			return
+		}
+		defer c.Close()
+		mt, msg, err := c.ReadMessage()
+		if err != nil {
+			return
+		}
+		c.WriteMessage(mt, append([]byte("echo:"), msg...))
+	}))
+	defer backend.Close()
+	u, _ := url.Parse(backend.URL)
+	lf, _ := os.Create(filepath.Join(t.TempDir(), "log"))
+	p := &proxy{
+		routes: map[string]*httputil.ReverseProxy{}, names: map[string]string{"X": "x"},
+		anon: limits{rps: 2, traceRPS: 1, bytesPerSec: 1e6}, boost: 100, maxWait: 50 * time.Millisecond,
+		clients: map[string]*client{}, logw: bufio.NewWriter(lf),
+	}
+	p.routes["X"] = newRoute(u.Host)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	c, res, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/ext/bc/X/ws", nil)
+	if err != nil {
+		status := 0
+		if res != nil {
+			status = res.StatusCode
+		}
+		t.Fatalf("dial through proxy: %v (status %d)", err, status)
+	}
+	defer c.Close()
+	if err := c.WriteMessage(websocket.TextMessage, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	_, msg, err := c.ReadMessage()
+	if err != nil || string(msg) != "echo:hi" {
+		t.Fatalf("got %q, %v; want echo:hi", msg, err)
+	}
+	// The log line is written when the socket closes, like any other request ending.
+	c.Close()
+	var raw []byte
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		p.logmu.Lock()
+		p.logw.Flush()
+		p.logmu.Unlock()
+		if raw, _ = os.ReadFile(lf.Name()); strings.Contains(string(raw), `"methods":["ws"]`) {
+			return
+		}
+	}
+	t.Fatalf("log line missing ws method: %s", raw)
 }
