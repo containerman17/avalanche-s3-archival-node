@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -519,4 +520,49 @@ func (s *Server) accessListAt(msg *callMsg, n uint64, prev types.AccessList, non
 			return nil, 0, "", &rpcError{Code: -32000, Message: "access list did not converge"}
 		}
 	}
+}
+
+// edb_checkTraces [blockNumber]: the check-mode oracle as a report. It
+// re-executes the block with the plain callTracer, renders the stored frames
+// of every tx and returns the differences instead of killing the process, so
+// a cron sweep can audit a fleet that serves in stored mode.
+type traceCheckResult struct {
+	Block      uint64            `json:"block"`
+	Txs        int               `json:"txs"`
+	Mismatches []traceCheckEntry `json:"mismatches"`
+}
+
+type traceCheckEntry struct {
+	Tx   int         `json:"tx"`
+	Hash common.Hash `json:"hash"`
+	Diff string      `json:"diff"`
+}
+
+func (s *Server) edbCheckTraces(params []json.RawMessage) (any, *rpcError) {
+	blk, rerr := s.blockParam(params)
+	if rerr != nil {
+		return nil, rerr
+	}
+	tracer := "callTracer"
+	fresh, rerr := s.traceTxsInBlock(blk, -1, &traceConfig{Tracer: &tracer})
+	if rerr != nil {
+		return nil, rerr
+	}
+	out := traceCheckResult{Block: blk.NumberU64(), Txs: len(fresh), Mismatches: []traceCheckEntry{}}
+	for i, got := range fresh {
+		stored, err := s.StoredCallTrace(blk, i)
+		diff := ""
+		switch {
+		case err != nil:
+			diff = "render stored: " + err.Error()
+		case !bytes.Equal(got, stored):
+			if diff = JSONDiff(got, stored); diff == "" {
+				diff = "same structure, different bytes (field order or encoding)"
+			}
+		default:
+			continue
+		}
+		out.Mismatches = append(out.Mismatches, traceCheckEntry{Tx: i, Hash: blk.Transactions()[i].Hash(), Diff: diff})
+	}
+	return out, nil
 }

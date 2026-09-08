@@ -39,3 +39,24 @@ func TestGetBlockZeroIsGenesis(t *testing.T) {
 		t.Fatalf("block 0 has %d txs", len(txs))
 	}
 }
+
+// edb_checkTraces reports instead of dying: on the test block (one tx, no
+// stored frames, sender unfunded) it must either answer a report with one
+// mismatch entry naming the missing frames or a plain RPC error, never exit.
+func TestCheckTracesReportsInsteadOfDying(t *testing.T) {
+	s, _, _, _ := testServer(t)
+	res, rerr := call(t, s, "edb_checkTraces", "0x1")
+	if rerr != nil {
+		return // a re-execution refusal is an answer too
+	}
+	r, ok := res.(traceCheckResult)
+	if !ok {
+		t.Fatalf("result type %T", res)
+	}
+	if r.Block != 1 || r.Txs != len(r.Mismatches) || len(r.Mismatches) == 0 {
+		t.Fatalf("want every tx reported as missing frames, got %+v", r)
+	}
+	if !strings.Contains(r.Mismatches[0].Diff, "no stored frames") {
+		t.Fatalf("diff %q", r.Mismatches[0].Diff)
+	}
+}

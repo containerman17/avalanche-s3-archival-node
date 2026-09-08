@@ -453,6 +453,8 @@ func (s *Server) dispatch(req *rpcRequest) (any, *rpcError) {
 		return s.debugTraceTransaction(req.Params)
 	case "debug_traceBlockByNumber":
 		return s.debugTraceBlock(req.Params)
+	case "edb_checkTraces":
+		return s.edbCheckTraces(req.Params)
 	case "debug_getRawBlock":
 		return s.debugGetRawBlock(req.Params)
 	case "debug_getRawHeader":
