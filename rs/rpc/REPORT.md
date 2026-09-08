@@ -117,7 +117,7 @@ The store path is 2.6x stock and 5x the Go node on receipts, 3.3x stock and 7.8x
 - flatCallTracer (revm-inspectors' parity builder is available, not wired) and JS tracers.
 - eth_createAccessList is derived from the prestate, not from an access-list inspector; equal on the probes.
 - The ERC-721 / ERC-1155 classification paths in tokens.rs need a corpus with 4-topic Transfer and TransferSingle logs.
-- `cargo test --workspace`: 35 tests pass (exec 15, plugin 2, rpc 2, state 2 + 6 + 8). rs/rpc's own unit test is the fee window against Go vectors; the differential is the rest of its check.
+- `cargo test --workspace --release` on branch `rust` (everything merged): 44 tests pass (exec 15, plugin 1, rpc 5, state 2 + 6 + 12, store 3). rs/rpc's own unit tests are the fee window against Go vectors and the three ws.rs tests; the differential is the rest of its check.
 
 ## rs-tracefix: the four residual classes (Round 3)
 
@@ -154,7 +154,6 @@ python3 $S/rpc/rpccmp2.py http://127.0.0.1:19941/ext/bc/2tmrrBo1.../rpc http://1
 go run ./exp/feecheck synth                     # the Go vectors behind fee::tests::next_base_fee_matches_go
 ```
 Kill servers by the pid `ss -ltnp` reports for the port; a `pgrep -f` pattern that also appears later in the same command line (a nohup launch) kills the calling shell.
-- `cargo test --workspace`: 33 tests pass (state 14, exec 2, block 1, plugin 3, store 6 + 8) and the rpc doctests (a text block in edb.rs was parsed as Rust and fenced). rs/rpc's own unit tests are the three in ws.rs (rs-ws); the differential is the check for the rest.
 
 ## rs-ws: WebSocket `/ws` and eth_subscribe
 
