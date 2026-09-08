@@ -482,6 +482,12 @@ impl Run {
         let u32at = |o: usize| u32::from_le_bytes(ft[o..o + 4].try_into().unwrap());
         let u64at = |o: usize| u64::from_le_bytes(ft[o..o + 8].try_into().unwrap());
         if &ft[..8] != MAGIC {
+            // Version 1 had a 76-byte footer; name it rather than "bad magic".
+            let old = &mm[size - 76..];
+            if &old[..8] == MAGIC {
+                let v = u32::from_le_bytes(old[8..12].try_into().unwrap());
+                return Err(bad(format!("latest: {}: run format version {v}, this build reads version {VERSION}", path.display())));
+            }
             return Err(bad(format!("latest: {}: bad magic", path.display())));
         }
         if u32at(8) != VERSION {
