@@ -10,7 +10,7 @@ import (
 )
 
 func TestBackendConfig(t *testing.T) {
-	for _, backend := range []string{"firewood", "epochdb"} {
+	for _, backend := range []string{"firewood", "epochdb", "rust"} {
 		t.Run(backend, func(t *testing.T) {
 			input := []byte(`{"benchmark-state-backend":"` + backend + `","state-scheme":"firewood","pruning-enabled":true,"state-sync-enabled":false,"snapshot-cache":0}`)
 			got, stripped, err := backendConfig(input, constants.FujiID)

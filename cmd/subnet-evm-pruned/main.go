@@ -28,6 +28,7 @@ import (
 	"github.com/ava-labs/libevm/triedb"
 
 	"github.com/containerman17/avalanche-s3-archival-node/pruned"
+	"github.com/containerman17/avalanche-s3-archival-node/prunedffi"
 )
 
 const backendField = "benchmark-state-backend"
@@ -35,6 +36,8 @@ const backendField = "benchmark-state-backend"
 var (
 	_ core.RevisionTrieDB = (*pruned.DB)(nil)
 	_ triedb.HashDB       = (*pruned.DB)(nil)
+	_ core.RevisionTrieDB = (*prunedffi.DB)(nil)
+	_ triedb.HashDB       = (*prunedffi.DB)(nil)
 )
 
 type prunedVM struct {
@@ -79,7 +82,7 @@ func backendConfig(data []byte, networkID uint32) (string, []byte, error) {
 			}
 		}
 	}
-	if backend != "firewood" && backend != "epochdb" {
+	if backend != "firewood" && backend != "epochdb" && backend != "rust" {
 		return "", nil, fmt.Errorf("unsupported %s %q", backendField, backend)
 	}
 	cfg, _, err := config.GetConfig(data, networkID)
@@ -93,20 +96,33 @@ func backendConfig(data []byte, networkID uint32) (string, []byte, error) {
 }
 
 func (vm *prunedVM) constructor(c *core.CacheConfig) triedb.DBConstructor {
-	if vm.backend != "epochdb" {
-		return nil
-	}
-	return func(ethdb.Database) triedb.DBOverride {
-		db, err := pruned.New(pruned.Config{
-			Dir:            filepath.Join(c.ChainDataDir, "epochdb"),
-			Retain:         c.StateHistory,
-			CommitInterval: c.CommitInterval,
-		})
-		if err != nil {
-			log.Crit("creating epochdb state backend", "error", err)
+	switch vm.backend {
+	case "epochdb":
+		return func(ethdb.Database) triedb.DBOverride {
+			db, err := pruned.New(pruned.Config{
+				Dir:            filepath.Join(c.ChainDataDir, "epochdb"),
+				Retain:         c.StateHistory,
+				CommitInterval: c.CommitInterval,
+			})
+			if err != nil {
+				log.Crit("creating epochdb state backend", "error", err)
+			}
+			return db
 		}
-		return db
+	case "rust":
+		return func(ethdb.Database) triedb.DBOverride {
+			db, err := prunedffi.New(prunedffi.Config{
+				Dir:            filepath.Join(c.ChainDataDir, "prunedffi"),
+				Retain:         c.StateHistory,
+				CommitInterval: c.CommitInterval,
+			})
+			if err != nil {
+				log.Crit("creating rust state backend", "error", err)
+			}
+			return db
+		}
 	}
+	return nil
 }
 
 func run() error {
@@ -116,7 +132,7 @@ func run() error {
 		return err
 	}
 	if printVersion {
-		fmt.Printf("Subnet-EVM/%s [rpcchainvm=%d, state-backends=firewood,epochdb]\n", version.Current.SemanticWithCommit(version.GitCommit), version.RPCChainVMProtocol)
+		fmt.Printf("Subnet-EVM/%s [rpcchainvm=%d, state-backends=firewood,epochdb,rust]\n", version.Current.SemanticWithCommit(version.GitCommit), version.RPCChainVMProtocol)
 		return nil
 	}
 	if err := ulimit.Set(ulimit.DefaultFDLimit, logging.NoLog{}); err != nil {
@@ -124,7 +140,9 @@ func run() error {
 	}
 	vm := &prunedVM{}
 	core.RegisterTrieDBConstructor(vm.constructor)
-	state.RegisterDatabaseInterceptor(pruned.NewStateAccessor)
+	state.RegisterDatabaseInterceptor(func(db state.Database) state.Database {
+		return prunedffi.NewStateAccessor(pruned.NewStateAccessor(db))
+	})
 	return rpcchainvm.Serve(context.Background(), vm)
 }
 
