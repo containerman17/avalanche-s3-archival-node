@@ -18,11 +18,13 @@ node = { package = "epochdb-node", path = "../node" }
 rpc = { package = "epochdb-rpc", path = "../rpc" }
 alloy-consensus = { version = "2", features = ["std"] }
 state = { package = "epochdb-state", path = "../state" }
+store = { package = "epochdb-store", path = "../store" }
 alloy-primitives = { version = "1.6", features = ["asm-keccak", "map", "rlp", "serde"] }
 alloy-rlp = "0.3"
 alloy-eips = { version = "2", features = ["std"] }
 alloy-trie = "0.9"
 anyhow = "1"
+hex = "0.4"
 crc32fast = "1"
 rayon = "1"
 revm = { version = "43", features = ["std", "serde"] }

@@ -260,6 +260,63 @@ impl DB {
     pub fn receipt(&self, txnum: u64) -> Result<Option<Vec<u8>>> {
         self.chain_row(FAM_RCPT, txnum)
     }
+    /// The block's receipts blob as the producer handed it (empty if none).
+    pub fn receipts_blob(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        self.chain_row(FAM_RCB, height)
+    }
+    /// The state engine's write set and code hashes of a block (recovery replay).
+    pub fn write_set(&self, height: u64) -> Result<Option<(Vec<(Vec<u8>, Vec<u8>)>, Vec<[u8; 32]>)>> {
+        match self.chain_row(FAM_WS, height)? {
+            None => Ok(None),
+            Some(b) if b.is_empty() => Ok(Some((Vec::new(), Vec::new()))),
+            Some(b) => Ok(Some(crate::window::unframe_ws(&b)?)),
+        }
+    }
+    /// TxNum of the idx-th tx of a block, None past its count.
+    pub fn txnum_at(&self, height: u64, idx: u32) -> Result<Option<u64>> {
+        Ok(self.block_tx_range(height)?.filter(|(_, c)| idx < *c).map(|(f, _)| f + idx as u64))
+    }
+    pub fn receipt_at(&self, height: u64, idx: u32) -> Result<Option<Vec<u8>>> {
+        match self.txnum_at(height, idx)? {
+            Some(n) => self.receipt(n),
+            None => Ok(None),
+        }
+    }
+    pub fn frames_at(&self, height: u64, idx: u32) -> Result<Option<Vec<u8>>> {
+        match self.txnum_at(height, idx)? {
+            Some(n) => self.frames(n),
+            None => Ok(None),
+        }
+    }
+    /// (height, index, txnum) of a tx hash.
+    pub fn locate_tx(&self, hash: &[u8]) -> Result<Option<(u64, u32, u64)>> {
+        let Some(n) = self.txnum_by_hash(hash)? else { return Ok(None) };
+        let Some(h) = self.height_of_tx(n)? else { return Ok(None) };
+        let (first, _) = self.block_tx_range(h)?.ok_or_else(|| anyhow!("store: blk/{h} missing"))?;
+        Ok(Some((h, (n - first) as u32, n)))
+    }
+    pub fn receipt_by_hash(&self, hash: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.txnum_by_hash(hash)? {
+            Some(n) => self.receipt(n),
+            None => Ok(None),
+        }
+    }
+    pub fn frames_by_hash(&self, hash: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.txnum_by_hash(hash)? {
+            Some(n) => self.frames(n),
+            None => Ok(None),
+        }
+    }
+    /// Every tx element of a block plus every receipt row and trace, in order.
+    pub fn block_txs(&self, height: u64) -> Result<Option<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>>> {
+        let Some((first, count)) = self.block_tx_range(height)? else { return Ok(None) };
+        let mut out = Vec::with_capacity(count as usize);
+        for n in first..first + count as u64 {
+            let miss = |w: &str| anyhow!("store: {w}/{n} of block {height} missing");
+            out.push((self.tx_rlp(n)?.ok_or_else(|| miss("tx"))?, self.receipt(n)?.ok_or_else(|| miss("rcpt"))?, self.frames(n)?.ok_or_else(|| miss("itx"))?));
+        }
+        Ok(Some(out))
+    }
     /// The verbatim container at height (Reassemble).
     pub fn container_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
         let Some(hdr) = self.header_rlp(height)? else { return Ok(None) };
@@ -591,7 +648,7 @@ pub fn walk_runs(cas: &Store, runs: &[RunRef], chain_root: [u8; 32]) -> Result<(
 /// Streams the window into the three sections in key order.
 fn write_sections(w: &mut RunWriter, m: &Memtable) -> Result<()> {
     let mut chain: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for fam in 0..6 {
+    for fam in 0..NUM_FAMS {
         m.each_chain(fam, |n, v| {
             chain.push((num_key(FAM_PREFIX[fam], n), v));
             Ok(())

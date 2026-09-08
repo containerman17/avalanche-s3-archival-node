@@ -13,6 +13,11 @@ pub const PREFIX_ITX: &[u8] = b"itx/";
 pub const PREFIX_PVM: &[u8] = b"pvm/";
 pub const PREFIX_RCPT: &[u8] = b"rcpt/";
 pub const PREFIX_TX: &[u8] = b"tx/";
+/// The block's receipts blob (EIP-2718 receipt list) verbatim, what the
+/// plugin was handed; and the state engine's write set of the block
+/// (hashed keys) plus the code hashes it deployed, for recovery replay.
+pub const PREFIX_RCB: &[u8] = b"rcb/";
+pub const PREFIX_WS: &[u8] = b"ws/";
 pub const PREFIX_CODE: &[u8] = b"code/";
 pub const PREFIX_STATE: &[u8] = b"state/";
 pub const PREFIX_TXH: &[u8] = b"txh/";
@@ -35,13 +40,16 @@ pub const FAM_BLK: usize = 0;
 pub const FAM_HDR: usize = 1;
 pub const FAM_ITX: usize = 2;
 pub const FAM_PVM: usize = 3;
-pub const FAM_RCPT: usize = 4;
-pub const FAM_TX: usize = 5;
-pub const FAM_PREFIX: [&[u8]; 6] = [PREFIX_BLK, PREFIX_HDR, PREFIX_ITX, PREFIX_PVM, PREFIX_RCPT, PREFIX_TX];
+pub const FAM_RCB: usize = 4;
+pub const FAM_RCPT: usize = 5;
+pub const FAM_TX: usize = 6;
+pub const FAM_WS: usize = 7;
+pub const NUM_FAMS: usize = 8;
+pub const FAM_PREFIX: [&[u8]; NUM_FAMS] = [PREFIX_BLK, PREFIX_HDR, PREFIX_ITX, PREFIX_PVM, PREFIX_RCB, PREFIX_RCPT, PREFIX_TX, PREFIX_WS];
 pub const TX_KEYED_FAMS: [usize; 3] = [FAM_ITX, FAM_RCPT, FAM_TX];
 
 pub fn fam_by_height(fam: usize) -> bool {
-    fam == FAM_BLK || fam == FAM_HDR || fam == FAM_PVM
+    !TX_KEYED_FAMS.contains(&fam)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

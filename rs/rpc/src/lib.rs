@@ -14,6 +14,7 @@ pub mod filters;
 pub mod json;
 pub mod ots;
 pub mod storedb;
+pub mod tokens;
 pub mod genesis;
 
 use std::sync::{Arc, Mutex};

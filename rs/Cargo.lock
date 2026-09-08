@@ -1615,6 +1615,8 @@ dependencies = [
  "epochdb-node",
  "epochdb-rpc",
  "epochdb-state",
+ "epochdb-store",
+ "hex",
  "prost",
  "prost-types",
  "rayon",
