@@ -13,15 +13,24 @@ use store::format::*;
 
 use crate::{Account, BlockCache, Log, Receipt, Result, StateRead, Store};
 
+type Floor = revm::database::CacheDB<revm::database::EmptyDB>;
+
 pub struct StoreDb {
     pub db: Mutex<DB>,
     pub cfg: Arc<exec::Config>,
+    /// The genesis state (alloc plus the precompiles configured at genesis),
+    /// the floor every read falls through to: the store holds no block-0 rows.
+    floor: Floor,
     cache: BlockCache,
 }
 
 impl StoreDb {
     pub fn new(db: DB, cfg: Arc<exec::Config>) -> StoreDb {
-        StoreDb { db: Mutex::new(db), cfg, cache: BlockCache::new(512) }
+        let floor = exec::Executor::with_db((*cfg).clone(), Floor::new(revm::database::EmptyDB::default())).map(|ex| ex.db().clone()).unwrap_or_else(|e| {
+            eprintln!("epochdb-rpc: genesis state: {e:#}; falling back to the alloc");
+            Floor::new(revm::database::EmptyDB::default())
+        });
+        StoreDb { db: Mutex::new(db), cfg, floor, cache: BlockCache::new(512) }
     }
 
     /// The TxNum ceiling of the state after block h (its boundary slot).
@@ -55,7 +64,7 @@ impl StateRead for State<'_> {
                 return Ok(Some(Account { nonce, balance, code_hash }));
             }
         }
-        Ok(self.s.cfg.alloc.get(&a).map(|g| Account { nonce: g.nonce, balance: g.balance, code_hash: if g.code.is_empty() { alloy_primitives::KECCAK256_EMPTY } else { alloy_primitives::keccak256(&g.code) } }))
+        Ok(self.s.floor.cache.accounts.get(&a).and_then(|d| d.info()).map(|i| Account { nonce: i.nonce, balance: i.balance, code_hash: i.code_hash }))
     }
     fn storage(&mut self, a: Address, slot: U256) -> Result<U256> {
         let key = B256::from(slot);
@@ -64,13 +73,13 @@ impl StateRead for State<'_> {
                 return Ok(U256::from_be_slice(&v));
             }
         }
-        Ok(self.s.cfg.alloc.get(&a).and_then(|g| g.storage.get(&key)).map(|v| U256::from_be_bytes(v.0)).unwrap_or_default())
+        Ok(self.s.floor.cache.accounts.get(&a).and_then(|d| d.storage.get(&slot)).copied().unwrap_or_default())
     }
     fn code(&mut self, h: B256) -> Result<Option<Bytes>> {
         if let Some(c) = self.s.db.lock().unwrap().code(h.as_slice())? {
             return Ok(Some(c.into()));
         }
-        Ok(self.s.cfg.alloc.values().find(|g| !g.code.is_empty() && alloy_primitives::keccak256(&g.code) == h).map(|g| g.code.clone()))
+        Ok(self.s.floor.cache.contracts.get(&h).map(|c| c.original_bytes()))
     }
 }
 

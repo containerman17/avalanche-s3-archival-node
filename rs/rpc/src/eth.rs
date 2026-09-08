@@ -7,7 +7,7 @@ use block::Block;
 use serde_json::{json, Value};
 
 use crate::json::*;
-use crate::{invalid, Log, RpcError, RpcResult, Server};
+use crate::{bad_arg, invalid, missing_arg, Log, RpcError, RpcResult, Server};
 
 /// eth_getLogs range cap (blocks per query).
 pub const GET_LOGS_MAX_RANGE: u64 = 10_000;
@@ -49,7 +49,7 @@ impl Server {
     /// *ByHash = its *ByNumber twin behind one blkh lookup; an unknown hash is
     /// null (strict: an error, debug_traceBlockByHash).
     pub fn by_hash(&self, params: &[Value], f: impl FnOnce(&Server, &[Value]) -> RpcResult, strict: bool) -> RpcResult {
-        let hash = parse_hash(params.first()).map_err(|e| invalid(format!("bad block hash: {}", e.message)))?;
+        let hash = parse_hash(Some(params.first().ok_or_else(|| missing_arg(0))?)).map_err(|e| bad_arg(0, e))?;
         let Some(n) = self.store.height_by_hash(&hash)? else {
             if strict {
                 return Err(format!("block {hash} is not on this chain").into());
@@ -73,12 +73,7 @@ impl Server {
         if params.is_empty() {
             return Err(invalid("need [blockTag, fullTx]"));
         }
-        let n = match self.block_number(params.first()) {
-            Ok(n) => n,
-            // stock subnet-evm: a number past the head is null, not an error
-            Err(e) if e.message.contains("beyond head") => return Ok(Value::Null),
-            Err(e) => return Err(e),
-        };
+        let n = self.block_number(params.first())?;
         let full = Self::full_tx_flag(params, 1)?;
         let b = self.block_at(n)?;
         block_json(&b, full)
@@ -88,11 +83,7 @@ impl Server {
         if params.is_empty() {
             return Err(invalid("need [blockTag]"));
         }
-        let n = match self.block_number(params.first()) {
-            Ok(n) => n,
-            Err(e) if e.message.contains("beyond head") => return Ok(Value::Null),
-            Err(e) => return Err(e),
-        };
+        let n = self.block_number(params.first())?;
         let b = self.block_at(n)?;
         Ok(header_fields(&b))
     }
@@ -111,7 +102,7 @@ impl Server {
         }
         let n = match self.block_number(params.first()) {
             Ok(n) => n,
-            Err(e) if e.message.contains("beyond head") => return Ok(Value::Null),
+            Err(e) if e.message == "cannot query unfinalized data" => return Ok(Value::Null),
             Err(e) => return Err(e),
         };
         Ok(json!(qty(self.block_at(n)?.txs.len() as u64)))
@@ -123,11 +114,7 @@ impl Server {
     }
 
     fn tx_by_block_and_index(&self, params: &[Value]) -> RpcResult {
-        let n = match self.block_number(params.first()) {
-            Ok(n) => n,
-            Err(e) if e.message.contains("beyond head") => return Ok(Value::Null),
-            Err(e) => return Err(e),
-        };
+        let n = self.block_number(params.first())?;
         let b = self.block_at(n)?;
         let i = Self::tx_index_param(params)? as usize;
         if i >= b.txs.len() {
@@ -156,7 +143,7 @@ impl Server {
     }
 
     fn tx_hash_param(params: &[Value]) -> Result<B256, RpcError> {
-        parse_hash32(params.first()).map_err(|e| invalid(format!("bad tx hash: {}", e.message)))
+        parse_hash(Some(params.first().ok_or_else(|| missing_arg(0))?)).map_err(|e| bad_arg(0, e))
     }
 
     fn get_transaction_by_hash(&self, params: &[Value]) -> RpcResult {
@@ -202,11 +189,7 @@ impl Server {
     }
 
     fn get_block_receipts(&self, params: &[Value]) -> RpcResult {
-        let n = match self.block_number(params.first()) {
-            Ok(n) => n,
-            Err(e) if e.message.contains("beyond head") => return Ok(Value::Null),
-            Err(e) => return Err(e),
-        };
+        let n = self.block_number(params.first())?;
         let b = self.block_at(n)?;
         let (rs, first) = self.block_receipts(&b)?;
         Ok(Value::Array((0..rs.len()).map(|i| receipt_json(&b, i, &rs[i], first[i])).collect::<Result<_, _>>()?))
@@ -239,9 +222,9 @@ impl Server {
         if to < from {
             return Err(invalid(format!("toBlock {to} below fromBlock {from}")));
         }
-        if to - from + 1 > GET_LOGS_MAX_RANGE {
-            return Err(invalid(format!("block range {} exceeds {GET_LOGS_MAX_RANGE}", to - from + 1)));
-        }
+        // ponytail: no range cap (stock has none); the Go node caps at 10,000 blocks,
+        // put the cap back when a scan over the interim log hurts.
+        let _ = GET_LOGS_MAX_RANGE;
         Ok((from, to))
     }
 
@@ -274,11 +257,8 @@ impl Server {
     // --- state --------------------------------------------------------------
 
     fn account_field(&self, method: &str, params: &[Value]) -> RpcResult {
-        if params.is_empty() {
-            return Err(invalid("need [address, blockTag]"));
-        }
-        let addr = parse_addr(params.first()).map_err(|e| invalid(format!("bad address: {}", e.message)))?;
-        let n = self.block_number(params.get(1))?;
+        let addr = parse_addr(Some(params.first().ok_or_else(|| missing_arg(0))?)).map_err(|e| bad_arg(0, e))?;
+        let n = self.block_number(params.get(1)).map_err(|e| if e.code == -32602 { bad_arg(1, e) } else { e })?;
         let mut st = self.store.state_at(n)?;
         let acct = st.account(addr)?;
         Ok(match method {
@@ -292,59 +272,69 @@ impl Server {
     }
 
     fn get_storage_at(&self, params: &[Value]) -> RpcResult {
-        if params.len() < 2 {
-            return Err(invalid("need [address, slot, blockTag]"));
-        }
-        let addr = parse_addr(params.first()).map_err(|e| invalid(format!("bad address: {}", e.message)))?;
-        let slot_s = params[1].as_str().ok_or_else(|| invalid("bad slot"))?;
+        let addr = parse_addr(Some(params.first().ok_or_else(|| missing_arg(0))?)).map_err(|e| bad_arg(0, e))?;
+        let slot_s = params.get(1).ok_or_else(|| missing_arg(1))?.as_str().ok_or_else(|| bad_arg(1, invalid("json: cannot unmarshal non-string into Go value of type string")))?;
         // common.HexToHash: any hex, left-padded / left-truncated to 32 bytes.
         let raw = alloy_primitives::hex::decode(slot_s.trim_start_matches("0x")).or_else(|_| alloy_primitives::hex::decode(format!("0{}", slot_s.trim_start_matches("0x")))).map_err(|_| invalid("bad slot"))?;
         let slot = B256::left_padding_from(&raw[raw.len().saturating_sub(32)..]);
-        let n = self.block_number(params.get(2))?;
+        let n = self.block_number(params.get(2)).map_err(|e| if e.code == -32602 { bad_arg(2, e) } else { e })?;
         let v = self.store.state_at(n)?.storage(addr, slot.into())?;
         Ok(json!(B256::from(v)))
     }
 
-    // --- fees ---------------------------------------------------------------
+    // --- fees (subnet-evm eth/gasprice, defaults: 40 blocks, 40th percentile,
+    // 80 s lookback against the wall clock, 1 wei floor, 150 gwei cap) ----
 
     pub fn base_fee_at(&self, n: u64) -> Result<Option<u128>, RpcError> {
         Ok(self.block_at(n)?.header.base_fee.map(|f| f.to::<u128>()))
     }
 
-    /// The 60th percentile gas price of the txs in the last 20 non-empty
-    /// blocks (up to 100 txs); the chain's minBaseFee with nothing to sample.
-    pub fn gas_oracle(&self) -> Result<u128, RpcError> {
-        let mut prices = Vec::new();
-        let mut n = self.head();
-        let mut scanned = 0;
-        while n > 0 && scanned < 20 && prices.len() < 100 {
-            let b = self.block_at(n)?;
-            n -= 1;
-            if b.txs.is_empty() {
-                continue;
-            }
-            scanned += 1;
-            prices.extend(b.txs.iter().map(|t| t.gas_price));
-        }
-        if prices.is_empty() {
-            return Ok(self.cfg.fee_config.min_base_fee.to::<u128>());
-        }
-        prices.sort_unstable();
-        Ok(prices[prices.len() * 60 / 100])
+    fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
     }
 
+    /// Oracle.suggestTip: the 40th percentile of the effective tips of the
+    /// last 40 blocks that are within 80 s of now, floored at 1 wei.
     pub fn suggest_tip(&self) -> Result<u128, RpcError> {
-        let price = self.gas_oracle()?;
-        Ok(match self.base_fee_at(self.head())? {
-            None => price,
-            Some(b) => price.saturating_sub(b),
+        let head = self.head();
+        let now = Self::now();
+        let lower = head.saturating_sub(40);
+        let mut tips: Vec<u128> = Vec::new();
+        let mut i = head;
+        while i > lower {
+            let b = self.block_at(i)?;
+            if b.header.time + 80 < now {
+                break;
+            }
+            let base = b.header.base_fee;
+            for t in &b.txs {
+                tips.push(effective_gas_price(t, base) - base.map(|f| f.to::<u128>()).unwrap_or(0));
+            }
+            i -= 1;
+        }
+        let mut price = 1u128;
+        if !tips.is_empty() {
+            tips.sort_unstable();
+            price = tips[(tips.len() - 1) * 40 / 100];
+        }
+        Ok(price.clamp(1, 150_000_000_000))
+    }
+
+    /// Oracle.SuggestPrice: tip + the next base fee estimated at the wall clock.
+    pub fn gas_oracle(&self) -> Result<u128, RpcError> {
+        let tip = self.suggest_tip()?;
+        let head = self.block_at(self.head())?;
+        Ok(match self.next_base_fee_at(&head.header, Self::now())? {
+            None => tip,
+            Some(b) => tip + b.to::<u128>(),
         })
     }
 
     fn suggest_price_options(&self) -> RpcResult {
         let tip = self.suggest_tip()?;
-        let head = self.head();
-        let Some(next) = self.next_base_fee(head)? else { return Ok(Value::Null) };
+        let head = self.block_at(self.head())?;
+        let Some(next) = self.next_base_fee_at(&head.header, Self::now())? else { return Ok(Value::Null) };
+        let next = next.to::<u128>();
         let capped = tip.min(20_000_000_000);
         let slow = (capped * 95 / 100).max(1);
         let fast = tip * 105 / 100;
@@ -353,44 +343,80 @@ impl Server {
         Ok(json!({"slow": opt(slow), "normal": opt(capped), "fast": opt(fast)}))
     }
 
-    /// subnet-evm's next base fee over the fee window in parent.Extra.
-    pub fn next_base_fee(&self, n: u64) -> Result<Option<u128>, RpcError> {
-        let b = self.block_at(n)?;
-        Ok(self.next_base_fee_of(&b.header)?.map(|f| f.to::<u128>()))
-    }
-
+    /// Oracle.FeeHistory: blockCount entries (no trailing projection), the
+    /// 25,000-block history limit, 2048 blocks per call.
     fn fee_history(&self, params: &[Value]) -> RpcResult {
-        if params.len() < 2 {
-            return Err(invalid("need [blockCount, newestBlock, rewardPercentiles]"));
-        }
-        let mut count = parse_qty(&params[0]).map_err(|e| invalid(format!("bad blockCount: {}", e.message)))?;
-        if count == 0 {
-            return Err(invalid("bad blockCount \"0x0\""));
-        }
-        let newest = self.block_number(params.get(1))?;
+        let mut count = match params.first() {
+            None => return Err(missing_arg(0)),
+            Some(v) => parse_qty(v).map_err(|e| bad_arg(0, e))?,
+        };
+        let head = self.head();
+        let tag = params.get(1).ok_or_else(|| missing_arg(1))?;
+        let pending = tag.as_str() == Some("pending");
         let percentiles: Vec<f64> = match params.get(2) {
             None | Some(Value::Null) => Vec::new(),
-            Some(v) => serde_json::from_value(v.clone()).map_err(|e| invalid(format!("bad rewardPercentiles: {e}")))?,
+            Some(v) => serde_json::from_value(v.clone()).map_err(|_| bad_arg(2, invalid("json: cannot unmarshal into Go value of type []float64")))?,
         };
-        count = count.min(1024);
-        if !percentiles.is_empty() && count > 128 {
-            return Err(invalid("reward percentiles capped at 128 blocks"));
+        let empty = || json!({"oldestBlock": "0x0", "baseFeePerGas": Value::Null, "gasUsedRatio": Value::Null});
+        if count == 0 {
+            return Ok(empty());
         }
-        let oldest = (newest + 1).saturating_sub(count);
+        if percentiles.len() > 100 {
+            return Err(format!("invalid reward percentile: over the query limit 100").into());
+        }
+        count = count.min(2048);
+        for (i, p) in percentiles.iter().enumerate() {
+            if *p < 0.0 || *p > 100.0 {
+                return Err(format!("invalid reward percentile: {p:.6}").into());
+            }
+            if i > 0 && *p <= percentiles[i - 1] {
+                return Err(format!("invalid reward percentile: #{}:{:.6} >= #{}:{:.6}", i - 1, percentiles[i - 1], i, p).into());
+            }
+        }
+        if pending {
+            count -= 1;
+            if count == 0 {
+                return Ok(empty());
+            }
+        }
+        let last = match tag.as_str() {
+            Some("latest" | "pending" | "safe" | "finalized" | "accepted") => head,
+            _ => {
+                let n = match tag {
+                    Value::Number(n) => n.as_u64().ok_or_else(|| bad_arg(1, invalid("bad block number")))?,
+                    v => parse_qty(v).map_err(|e| bad_arg(1, e))?,
+                };
+                let max_depth = 25_000u64 - 1;
+                if head > max_depth && head - max_depth > n {
+                    return Err(format!("request beyond historical limit: requested {n}, head {head}").into());
+                }
+                if n > head {
+                    return Err(format!("request beyond head block: requested {n}, head {head}").into());
+                }
+                n
+            }
+        };
+        if count > last + 1 {
+            count = last + 1;
+        }
+        let oldest = last + 1 - count;
+        let depth = head - oldest;
+        if depth > 25_000 - 1 {
+            count -= depth - (25_000 - 1);
+        }
+        let oldest = last + 1 - count;
         let mut base_fees = Vec::new();
         let mut ratios = Vec::new();
         let mut rewards = Vec::new();
-        for n in oldest..=newest {
+        for n in oldest..=last {
             let b = self.block_at(n)?;
             let bf = b.header.base_fee.map(|f| f.to::<u128>()).unwrap_or(0);
             base_fees.push(json!(qty128(bf)));
-            ratios.push(if b.header.gas_limit > 0 { b.header.gas_used as f64 / b.header.gas_limit as f64 } else { 0.0 });
+            ratios.push(b.header.gas_used as f64 / b.header.gas_limit as f64);
             if !percentiles.is_empty() {
                 rewards.push(self.reward_row(&b, bf, &percentiles)?);
             }
         }
-        let next = if newest < self.head() { self.base_fee_at(newest + 1)?.unwrap_or(0) } else { self.next_base_fee(newest)?.unwrap_or(0) };
-        base_fees.push(json!(qty128(next)));
         let mut out = json!({"oldestBlock": qty(oldest), "baseFeePerGas": base_fees, "gasUsedRatio": ratios});
         if !percentiles.is_empty() {
             out["reward"] = Value::Array(rewards);
@@ -398,27 +424,22 @@ impl Server {
         Ok(out)
     }
 
+    /// slimBlock.processPercentiles.
     fn reward_row(&self, b: &Block, base_fee: u128, percentiles: &[f64]) -> RpcResult {
-        if b.height == 0 || b.txs.is_empty() {
+        if b.txs.is_empty() {
             return Ok(json!(vec!["0x0"; percentiles.len()]));
         }
         let (rs, _) = self.block_receipts(b)?;
-        let mut items: Vec<(u128, u64)> = Vec::with_capacity(b.txs.len());
-        for (i, t) in b.txs.iter().enumerate() {
-            if t.gas_price < base_fee {
-                return Err(format!("block {} tx {}: effective tip against base fee {base_fee}: max fee per gas less than block base fee", b.height, t.hash).into());
-            }
-            items.push((effective_gas_price(t, Some(U256::from(base_fee))) - base_fee, rs[i].gas_used));
-        }
+        let mut items: Vec<(u128, u64)> = b.txs.iter().enumerate().map(|(i, t)| (effective_gas_price(t, Some(U256::from(base_fee))).saturating_sub(base_fee), rs[i].gas_used)).collect();
         items.sort_by_key(|x| x.0);
-        let mut cum = 0u64;
         let mut idx = 0;
+        let mut sum = items[0].1;
         let mut row = Vec::with_capacity(percentiles.len());
         for p in percentiles {
             let threshold = (b.header.gas_used as f64 * p / 100.0) as u64;
-            while idx < items.len() - 1 && cum + items[idx].1 < threshold {
-                cum += items[idx].1;
+            while sum < threshold && idx < items.len() - 1 {
                 idx += 1;
+                sum += items[idx].1;
             }
             row.push(json!(qty128(items[idx].0)));
         }

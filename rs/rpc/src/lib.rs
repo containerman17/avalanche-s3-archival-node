@@ -118,6 +118,20 @@ pub fn invalid(m: impl Into<String>) -> RpcError {
     RpcError { code: -32602, message: m.into(), data: None }
 }
 
+/// subnet-evm's ErrUnfinalizedData: a height past the accepted head.
+pub fn unfinalized() -> RpcError {
+    "cannot query unfinalized data".into()
+}
+
+/// geth's "invalid argument N: ..." for a bad param.
+pub fn bad_arg(i: usize, e: RpcError) -> RpcError {
+    invalid(format!("invalid argument {i}: {}", e.message))
+}
+
+pub fn missing_arg(i: usize) -> RpcError {
+    invalid(format!("missing value for required argument {i}"))
+}
+
 pub type RpcResult = std::result::Result<Value, RpcError>;
 
 /// web3_clientVersion.
@@ -138,7 +152,8 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(store: Arc<dyn Store>, cfg: Arc<exec::Config>, genesis: Arc<Block>, chain_config: Value) -> Server {
+    pub fn new(store: Arc<dyn Store>, cfg: Arc<exec::Config>, genesis: Arc<Block>, chain_config: Value, upgrades: Option<Value>) -> Server {
+        let chain_config = stock_chain_config(&cfg, chain_config, upgrades);
         Server { store, cfg, genesis, chain_config, filters: Mutex::new(Default::default()), iface721: Mutex::new(Default::default()) }
     }
 
@@ -180,9 +195,9 @@ impl Server {
                     "latest" | "pending" | "" | "safe" | "finalized" => Ok(head),
                     "earliest" => Ok(0),
                     _ => {
-                        let n = json::parse_qty(v).map_err(|e| invalid(format!("bad block number {s:?}: {}", e.message)))?;
+                        let n = json::parse_qty(v)?;
                         if n > head {
-                            return Err(invalid(format!("block {n} beyond head {head}")));
+                            return Err(unfinalized());
                         }
                         Ok(n)
                     }
@@ -191,7 +206,7 @@ impl Server {
             Value::Number(n) => {
                 let n = n.as_u64().ok_or_else(|| invalid("bad block number"))?;
                 if n > head {
-                    return Err(invalid(format!("block {n} beyond head {head}")));
+                    return Err(unfinalized());
                 }
                 Ok(n)
             }
@@ -199,9 +214,9 @@ impl Server {
         }
     }
 
-    /// A block-hash tag: an unknown hash is an ERROR, not a null.
+    /// A block-hash tag: an unknown hash is an ERROR, not a null (stock's text).
     pub fn height_of_hash_tag(&self, h: &B256) -> std::result::Result<u64, RpcError> {
-        self.store.height_by_hash(h)?.ok_or_else(|| invalid(format!("block {h} is not on this chain")))
+        self.store.height_by_hash(h)?.ok_or_else(|| "header for hash not found".into())
     }
 
     fn dispatch(&self, method: &str, params: &[Value]) -> RpcResult {
@@ -212,11 +227,11 @@ impl Server {
             "net_version" => Ok(json!(self.cfg.chain_id.to_string())),
             "web3_clientVersion" => Ok(json!(CLIENT_VERSION)),
             "web3_sha3" => {
-                let b: Bytes = p(0).and_then(Value::as_str).ok_or_else(|| invalid("need [data]"))?.parse().map_err(|e| invalid(format!("bad data: {e}")))?;
+                let b: Bytes = json::parse_bytes(p(0).ok_or_else(|| missing_arg(0))?).map_err(|e| bad_arg(0, e))?;
                 Ok(json!(alloy_primitives::keccak256(&b)))
             }
             "eth_syncing" => Ok(json!(false)),
-            "net_listening" => Ok(json!(false)),
+            "net_listening" => Ok(json!(true)),
             "net_peerCount" => Ok(json!("0x0")),
             "eth_accounts" => Ok(json!([])),
             "eth_coinbase" | "eth_etherbase" => Ok(json!("0x0100000000000000000000000000000000000000")),
@@ -255,12 +270,7 @@ impl Server {
                 if let Some(r) = edb::dispatch(self, method, params) {
                     return r;
                 }
-                if let Some((ns, _)) = method.split_once('_') {
-                    if matches!(ns, "personal" | "miner" | "admin" | "les" | "clique" | "ethash") {
-                        return Err(format!("{method}: not an archive method (this node serves reads only)").into());
-                    }
-                }
-                Err(RpcError { code: -32601, message: format!("method not found: {method}"), data: None })
+                Err(RpcError { code: -32601, message: format!("the method {method} does not exist/is not available"), data: None })
             }
         }
     }
@@ -318,6 +328,35 @@ impl Server {
         };
         out.to_string().into_bytes()
     }
+}
+
+/// params.ChainConfig as subnet-evm marshals it (eth_getChainConfig): the
+/// genesis config with every block fork at 0, the libevm time forks, and the
+/// Avalanche network upgrade timestamps; eip150Hash is not a field there.
+fn stock_chain_config(cfg: &exec::Config, mut c: Value, upgrades: Option<Value>) -> Value {
+    let Some(o) = c.as_object_mut() else { return c };
+    if let Some(u) = upgrades.filter(|u| u.is_object()) {
+        o.insert("upgrades".into(), u);
+    }
+    o.remove("eip150Hash");
+    for k in ["homesteadBlock", "eip150Block", "eip155Block", "eip158Block", "byzantiumBlock", "constantinopleBlock", "petersburgBlock", "istanbulBlock", "muirGlacierBlock", "berlinBlock", "londonBlock"] {
+        o.entry(k).or_insert(json!(0));
+    }
+    o.entry("subnetEVMTimestamp").or_insert(json!(cfg.subnet_evm));
+    if let Some(t) = cfg.durango {
+        o.insert("durangoTimestamp".into(), json!(t));
+        o.insert("shanghaiTime".into(), json!(t));
+    }
+    if let Some(t) = cfg.etna {
+        o.insert("etnaTimestamp".into(), json!(t));
+        o.insert("cancunTime".into(), json!(t));
+    }
+    if let Some(t) = cfg.granite {
+        o.insert("graniteTimestamp".into(), json!(t));
+    }
+    // Helicon is unscheduled on every network today (upgrade.UnscheduledActivationTime).
+    o.insert("heliconTimestamp".into(), json!(253399622400u64));
+    c
 }
 
 pub fn reply(id: Option<Value>, res: RpcResult) -> Value {

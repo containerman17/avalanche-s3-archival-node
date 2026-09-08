@@ -263,7 +263,11 @@ impl NodeEngine {
         let head = if head_h == 0 {
             genesis.clone()
         } else {
-            Arc::new(block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?)
+            let mut b = block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?;
+            for t in &mut b.txs {
+                t.sender = block::recover(t);
+            }
+            Arc::new(b)
         };
         eprintln!(
             "epochdb-rs: recovered: rolled at {rolled_h} (gen {gen}), head {head_h} {}, rows replayed {rows}, root ok, in {:.0} ms",
@@ -308,7 +312,8 @@ impl NodeEngine {
         let ntx = rpc_store.build_index().context("tx index")?;
         eprintln!("epochdb-rs: rpc tx index: {ntx} txs in {:.0} ms", t1.elapsed().as_secs_f64() * 1e3);
         let chain_config = serde_json::from_slice::<serde_json::Value>(&init.genesis_bytes).ok().and_then(|g| g.get("config").cloned()).unwrap_or_default();
-        let rpc = rpc::Server::new(rpc_store.clone(), Arc::new(cfg.clone()), genesis.clone(), chain_config);
+        let upgrades = serde_json::from_slice::<serde_json::Value>(&init.upgrade_bytes).ok();
+        let rpc = rpc::Server::new(rpc_store.clone(), Arc::new(cfg.clone()), genesis.clone(), chain_config, upgrades);
         Ok(NodeEngine {
             chain_id: cfg.chain_id,
             genesis,

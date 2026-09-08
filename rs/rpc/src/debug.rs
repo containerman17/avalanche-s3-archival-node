@@ -95,11 +95,7 @@ impl Server {
             return Err(invalid("need [blockTag]"));
         }
         let n = self.block_number(params.first())?;
-        if n == 0 {
-            return Ok(json!(hex(&self.genesis.container)));
-        }
-        let c = self.store.container(n)?.ok_or_else(|| RpcError::from(format!("block {n} is not stored")))?;
-        Ok(json!(hex(&c)))
+        Ok(json!(hex(&block_rlp(&*self.block_at(n)?))))
     }
 
     fn debug_get_raw_header(&self, params: &[Value]) -> RpcResult {
@@ -167,8 +163,11 @@ impl Server {
     }
 
     fn get_accessible_state(&self, params: &[Value]) -> RpcResult {
-        if params.len() < 2 {
-            return Err(invalid("need [fromBlock, toBlock]"));
+        // subnet-evm takes rpc.BlockNumber strings here (a JSON number is refused).
+        for (i, p) in params.iter().enumerate().take(2) {
+            if p.is_number() {
+                return Err(invalid(format!("invalid argument {i}: hex string without 0x prefix")));
+            }
         }
         let from = self.block_number_param(params.first())?;
         let to = self.block_number_param(params.get(1))?;

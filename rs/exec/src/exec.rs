@@ -949,7 +949,8 @@ impl<D: StateDb> Executor<D> {
         };
         self.evm.ctx.modify_cfg(|c| {
             c.disable_base_fee = true;
-            c.disable_balance_check = true;
+            // geth's DoCall keeps buyGas's balance check (gas * price + value).
+            c.disable_balance_check = false;
             c.disable_nonce_check = true;
             c.disable_eip3607 = true;
             c.disable_block_gas_limit = true;

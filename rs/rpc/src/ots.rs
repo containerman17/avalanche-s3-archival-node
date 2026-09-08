@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, U256};
 use block::Block;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use store::format::{addr_prefix, ROLE_CREATED, ROLE_SENDER};
 
 use crate::json::*;
@@ -35,12 +35,17 @@ pub fn dispatch(s: &Server, method: &str, params: &[Value]) -> Option<RpcResult>
 
 fn addr_param(params: &[Value], i: usize) -> Result<Address, RpcError> {
     let Some(v) = params.get(i) else { return Err(invalid(format!("need an address at position {i}"))) };
-    let s = v.as_str().ok_or_else(|| invalid(format!("bad address: json: cannot unmarshal {} into Go value of type common.Address", go_kind(v))))?;
-    let h = s.strip_prefix("0x").ok_or_else(|| invalid("bad address: hex string without 0x prefix"))?;
-    if h.len() != 40 {
-        return Err(invalid(format!("bad address: hex string has length {}, want 40 for common.Address", h.len())));
+    let b = crate::tokens::unmarshal_fixed(v, 20).map_err(|e| invalid(format!("bad address: {}", fixed_err(e, "common.Address"))))?;
+    Ok(Address::from_slice(&b))
+}
+
+/// A hexutil error in encoding/json's words at the top level of a parameter.
+fn fixed_err((msg, wrapped): (String, bool), ty: &str) -> String {
+    if wrapped {
+        format!("json: cannot unmarshal {msg} into Go value of type {ty}")
+    } else {
+        msg.replace("TYPE", ty)
     }
-    s.parse().map_err(|_| invalid("bad address: invalid hex string"))
 }
 
 fn go_kind(v: &Value) -> &'static str {
@@ -93,12 +98,8 @@ fn page_size(params: &[Value], i: usize) -> Result<usize, RpcError> {
 
 fn tx_hash_param(params: &[Value]) -> Result<B256, RpcError> {
     let Some(v) = params.first() else { return Err(invalid("need [txHash]")) };
-    let s = v.as_str().ok_or_else(|| invalid(format!("bad tx hash: json: cannot unmarshal {} into Go value of type common.Hash", go_kind(v))))?;
-    let h = s.strip_prefix("0x").ok_or_else(|| invalid("bad tx hash: hex string without 0x prefix"))?;
-    if h.len() != 64 {
-        return Err(invalid(format!("bad tx hash: hex string has length {}, want 64 for common.Hash", h.len())));
-    }
-    s.parse().map_err(|_| invalid("bad tx hash: invalid hex string"))
+    let b = crate::tokens::unmarshal_fixed(v, 32).map_err(|e| invalid(format!("bad tx hash: {}", fixed_err(e, "common.Hash"))))?;
+    Ok(B256::from_slice(&b))
 }
 
 // --- address history ----------------------------------------------------------
@@ -402,8 +403,8 @@ impl Server {
         let page_number = uint_param(params, 1, "pageNumber")?;
         let page_size = page_size(params, 2)? as u64;
         let n = b.txs.len() as u64;
-        let lo = page_number.saturating_mul(page_size).min(n);
-        let hi = lo.saturating_add(page_size).min(n);
+        let lo = page_number.wrapping_mul(page_size).min(n);
+        let hi = lo.wrapping_add(page_size).min(n);
 
         let mut fields = block_json(&b, false)?;
         fields["transactionCount"] = json!(b.txs.len());
@@ -445,6 +446,3 @@ fn flatten(f: &Value, out: &mut Vec<Frame>) {
         flatten(c, out);
     }
 }
-
-#[allow(dead_code)]
-fn unused(_: &Map<String, Value>) {}

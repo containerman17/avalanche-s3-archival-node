@@ -14,7 +14,7 @@
 use alloy_primitives::{Address, B256};
 use serde_json::Value;
 
-use crate::{invalid, RpcError, RpcResult, Server};
+use crate::{invalid, RpcResult, Server};
 
 pub fn dispatch(s: &Server, method: &str, params: &[Value]) -> Option<RpcResult> {
     if !matches!(
@@ -72,42 +72,44 @@ fn kind(v: &Value) -> &'static str {
     }
 }
 
-fn fixed<const N: usize>(v: Option<&Value>, ty: &str) -> Result<Option<[u8; N]>, String> {
+/// One fixed-size hex field, with encoding/json's struct-field decoration on
+/// the errors it re-renders as an UnmarshalTypeError.
+fn fixed<const N: usize>(v: Option<&Value>, field: &str, ty: &str) -> Result<Option<[u8; N]>, String> {
     let Some(v) = v else { return Ok(None) };
-    let s = v.as_str().ok_or_else(|| format!("json: cannot unmarshal {} into Go value of type {ty}", kind(v)))?;
-    let h = s.strip_prefix("0x").ok_or_else(|| format!("json: cannot unmarshal hex string without 0x prefix into Go value of type {ty}"))?;
-    if h.len() != 2 * N {
-        return Err(format!("json: cannot unmarshal hex string of length {} into Go value of type {ty}, want {}", h.len(), 2 * N));
+    match crate::tokens::unmarshal_fixed(v, N) {
+        Ok(b) => Ok(Some(<[u8; N]>::try_from(&b[..]).unwrap())),
+        Err((msg, true)) => Err(format!("json: cannot unmarshal {msg} into Go struct field edbParams.{field} of type {ty}")),
+        Err((msg, false)) => Err(msg.replace("TYPE", ty)),
     }
-    let mut out = [0u8; N];
-    alloy_primitives::hex::decode_to_slice(h, &mut out).map_err(|e| format!("json: cannot unmarshal hex string into Go value of type {ty}: {e}"))?;
-    Ok(Some(out))
 }
 
 impl Params {
     fn parse(v: &Value) -> Result<Params, String> {
         let o = v.as_object().ok_or_else(|| format!("json: cannot unmarshal {} into Go value of type rpc.edbParams", kind(v)))?;
-        let num = |k: &str| -> Result<u64, String> {
+        let num = |k: &str, ty: &str, max: u64| -> Result<u64, String> {
             match o.get(k) {
                 None | Some(Value::Null) => Ok(0),
-                Some(x) => x.as_u64().ok_or_else(|| format!("json: cannot unmarshal {} into Go struct field edbParams.{k} of type uint64", kind(x))),
+                Some(x) => match x.as_u64() {
+                    Some(n) if n <= max => Ok(n),
+                    _ => Err(format!("json: cannot unmarshal {} {} into Go struct field edbParams.{k} of type {ty}", kind(x), x)),
+                },
             }
         };
         Ok(Params {
-            emitter: fixed::<20>(o.get("emitter"), "common.Address")?.map(Address::from).unwrap_or_default(),
-            token: fixed::<20>(o.get("token"), "common.Address")?.map(Address::from).unwrap_or_default(),
-            address: fixed::<20>(o.get("address"), "common.Address")?.map(Address::from).unwrap_or_default(),
-            value: fixed::<32>(o.get("value"), "common.Hash")?.map(B256::from).unwrap_or_default(),
-            topic0: fixed::<32>(o.get("topic0").filter(|v| !v.is_null()), "common.Hash")?.map(B256::from),
-            positions: num("positions")? as u8,
+            emitter: fixed::<20>(o.get("emitter"), "emitter", "common.Address")?.map(Address::from).unwrap_or_default(),
+            token: fixed::<20>(o.get("token"), "token", "common.Address")?.map(Address::from).unwrap_or_default(),
+            address: fixed::<20>(o.get("address"), "address", "common.Address")?.map(Address::from).unwrap_or_default(),
+            value: fixed::<32>(o.get("value"), "value", "common.Hash")?.map(B256::from).unwrap_or_default(),
+            topic0: fixed::<32>(o.get("topic0").filter(|v| !v.is_null()), "topic0", "common.Hash")?.map(B256::from),
+            positions: num("positions", "uint8", u8::MAX as u64)? as u8,
             standard: match o.get("standard") {
                 None | Some(Value::Null) => String::new(),
                 Some(x) => x.as_str().ok_or_else(|| format!("json: cannot unmarshal {} into Go struct field edbParams.standard of type string", kind(x)))?.to_string(),
             },
-            cursor: num("cursor")?,
+            cursor: num("cursor", "uint64", u64::MAX)?,
             limit: match o.get("limit") {
                 None | Some(Value::Null) => 0,
-                Some(x) => x.as_i64().ok_or_else(|| format!("json: cannot unmarshal {} into Go struct field edbParams.limit of type int", kind(x)))?,
+                Some(x) => x.as_i64().ok_or_else(|| format!("json: cannot unmarshal {} {x} into Go struct field edbParams.limit of type int", kind(x)))?,
             },
             ascending: match o.get("ascending") {
                 None | Some(Value::Null) => false,
@@ -117,7 +119,3 @@ impl Params {
         })
     }
 }
-
-/// Not a parse error: the error the Go node answers a bad standard with.
-#[allow(dead_code)]
-fn unused(_: RpcError) {}

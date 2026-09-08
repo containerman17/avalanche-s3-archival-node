@@ -15,6 +15,32 @@ use store::format::*;
 use crate::json::*;
 use crate::{Log, Receipt, RpcError, RpcResult, Server};
 
+
+/// hexutil.UnmarshalFixedJSON, error for error. `Err.0` is the message and
+/// `Err.1` says whether it is a decError, which encoding/json re-renders as an
+/// UnmarshalTypeError (the caller supplies the "into Go value of type ..." or
+/// the struct-field half); a plain error is passed through verbatim.
+pub fn unmarshal_fixed(v: &Value, n: usize) -> Result<Vec<u8>, (String, bool)> {
+    let Some(s) = v.as_str() else { return Err(("non-string".into(), true)) };
+    // hexutil.checkText: an empty string is accepted here and fails the length
+    // check below, exactly as it does in Go.
+    let raw = if s.is_empty() {
+        ""
+    } else {
+        match s.strip_prefix("0x") {
+            None => return Err(("hex string without 0x prefix".into(), true)),
+            Some(h) => h,
+        }
+    };
+    if raw.len() % 2 != 0 {
+        return Err(("hex string of odd length".into(), true));
+    }
+    if raw.len() / 2 != n {
+        return Err((format!("hex string has length {}, want {} for TYPE", raw.len(), 2 * n), false));
+    }
+    alloy_primitives::hex::decode(raw).map_err(|_| ("invalid hex string".to_string(), true))
+}
+
 /// One page's cap in transactions, as ots_ has one in rows.
 pub const MAX_PAGE: usize = 1000;
 
@@ -240,7 +266,7 @@ impl Server {
         }
         let next = if more {
             if desc {
-                cut - 1
+                cut.wrapping_sub(1)
             } else {
                 cut + 1
             }

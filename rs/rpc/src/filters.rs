@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
+#[allow(unused_imports)]
+use crate::json::parse_hash;
 use serde_json::{json, Value};
 
 use crate::eth::parse_log_matchers;
-use crate::json::*;
 use crate::{invalid, RpcResult, Server};
 
 const DEADLINE: Duration = Duration::from_secs(5 * 60);
@@ -28,18 +29,19 @@ pub struct Filter {
 
 #[derive(Default)]
 pub struct Registry {
-    pub filters: HashMap<B256, Filter>,
+    pub filters: HashMap<String, Filter>,
     seq: u64,
 }
 
 impl Registry {
-    fn new_id(&mut self) -> B256 {
+    /// rpc.NewID: 16 random bytes as hex.
+    fn new_id(&mut self) -> String {
         self.seq += 1;
         let mut b = [0u8; 32];
-        b[..16].copy_from_slice(&(std::process::id() as u128 ^ (Instant::now().elapsed().as_nanos())).to_be_bytes());
-        b[16..24].copy_from_slice(&self.seq.to_be_bytes());
-        b[24..].copy_from_slice(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0).to_be_bytes());
-        alloy_primitives::keccak256(b)
+        b[..8].copy_from_slice(&(std::process::id() as u64).to_be_bytes());
+        b[8..16].copy_from_slice(&self.seq.to_be_bytes());
+        b[16..24].copy_from_slice(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0).to_be_bytes());
+        format!("0x{}", alloy_primitives::hex::encode(&alloy_primitives::keccak256(b)[..16]))
     }
     fn sweep(&mut self) {
         self.filters.retain(|_, f| f.last_poll.elapsed() < DEADLINE);
@@ -71,7 +73,7 @@ impl Server {
         let mut g = self.filters.lock().unwrap();
         g.sweep();
         let id = g.new_id();
-        g.filters.insert(id, Filter { kind, next: self.head() + 1, last_poll: Instant::now() });
+        g.filters.insert(id.clone(), Filter { kind, next: self.head() + 1, last_poll: Instant::now() });
         Ok(json!(id))
     }
 
@@ -86,8 +88,8 @@ impl Server {
         self.install(Kind::Logs { from: f.get("fromBlock").cloned(), to: f.get("toBlock").cloned(), addrs, topics })
     }
 
-    fn filter_id(params: &[Value]) -> Result<B256, crate::RpcError> {
-        parse_hash(params.first()).map_err(|e| invalid(format!("bad filter id: {}", e.message)))
+    fn filter_id(params: &[Value]) -> Result<String, crate::RpcError> {
+        Ok(params.first().and_then(Value::as_str).ok_or_else(|| crate::missing_arg(0))?.to_string())
     }
 
     fn get_filter_changes(&self, params: &[Value]) -> RpcResult {

@@ -26,7 +26,8 @@ fn main() -> Result<()> {
     let db = store::db::DB::open_read_only(std::path::Path::new(&dir), store::casfs::Store::open(std::path::Path::new(&dir))?, root)?;
     let chain_config = serde_json::from_slice::<serde_json::Value>(&g)?.get("config").cloned().unwrap_or_default();
     let cfg = Arc::new(cfg);
-    let server = Arc::new(rpc::Server::new(Arc::new(rpc::storedb::StoreDb::new(db, cfg.clone())), cfg, genesis, chain_config));
+    let upgrades = serde_json::from_slice::<serde_json::Value>(&upgrade).ok();
+    let server = Arc::new(rpc::Server::new(Arc::new(rpc::storedb::StoreDb::new(db, cfg.clone())), cfg, genesis, chain_config, upgrades));
     eprintln!("epochdb-rpc-serve: head {} at http://{http}", server.head());
     let l = TcpListener::bind(&http)?;
     for conn in l.incoming() {

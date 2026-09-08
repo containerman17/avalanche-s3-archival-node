@@ -28,9 +28,16 @@ impl Server {
         Ok(FeeConfig::from_words(&w))
     }
 
-    /// EstimateNextBaseFee(parent, parent's time): None before SubnetEVM.
+    /// EstimateNextBaseFee at the parent's own timestamp.
     pub fn next_base_fee_of(&self, parent: &Header) -> Result<Option<U256>, RpcError> {
+        self.next_base_fee_at(parent, parent.time)
+    }
+
+    /// EstimateNextBaseFee(parent, timestamp): the window shifted by the
+    /// elapsed seconds; None before SubnetEVM.
+    pub fn next_base_fee_at(&self, parent: &Header, timestamp: u64) -> Result<Option<U256>, RpcError> {
         let cfg = &self.cfg;
+        let timestamp = timestamp.max(parent.time);
         if parent.time < cfg.subnet_evm {
             return Ok(None);
         }
@@ -48,13 +55,27 @@ impl Server {
             *w = u64::from_be_bytes(parent.extra[i * 8..i * 8 + 8].try_into().unwrap());
         }
         window[WINDOW_LEN - 1] = add(window[WINDOW_LEN - 1], parent.gas_used);
-        // time elapsed = 0 (the parent's own timestamp): no shift.
+        let elapsed = timestamp - parent.time;
+        if elapsed as usize >= WINDOW_LEN {
+            window = [0; WINDOW_LEN];
+        } else {
+            window.rotate_left(elapsed as usize);
+            for w in window[WINDOW_LEN - elapsed as usize..].iter_mut() {
+                *w = 0;
+            }
+        }
         let total: u64 = window.iter().fold(0, |s, v| add(s, *v));
         let target = fc.target_gas.to::<u64>();
         let mut base = parent_base;
         if total != target {
             let (diff, up) = if total > target { (total - target, true) } else { (target - total, false) };
-            let delta = (U256::from(diff) * parent_base / U256::from(target) / fc.base_fee_change_denominator).max(U256::from(1));
+            let mut delta = (U256::from(diff) * parent_base / U256::from(target) / fc.base_fee_change_denominator).max(U256::from(1));
+            if !up {
+                let windows = elapsed / WINDOW_LEN as u64;
+                if windows > 1 {
+                    delta *= U256::from(windows);
+                }
+            }
             base = if up { base.saturating_add(delta) } else { base.saturating_sub(delta) };
         }
         Ok(Some(base.max(fc.min_base_fee)))

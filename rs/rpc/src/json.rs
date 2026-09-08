@@ -27,14 +27,17 @@ pub fn parse_qty(v: &Value) -> Result<u64, RpcError> {
     match v {
         Value::Number(n) => n.as_u64().ok_or_else(|| invalid("expected a hex quantity")),
         Value::String(s) => {
-            let h = s.strip_prefix("0x").ok_or_else(|| invalid(format!("hex string without 0x prefix: {s:?}")))?;
+            let h = s.strip_prefix("0x").ok_or_else(|| invalid("hex string without 0x prefix"))?;
             if h.is_empty() {
                 return Err(invalid("hex string \"0x\""));
             }
             if h.len() > 1 && h.starts_with('0') {
                 return Err(invalid("hex number with leading zero digits"));
             }
-            u64::from_str_radix(h, 16).map_err(|e| invalid(e.to_string()))
+            if h.len() > 16 {
+                return Err(invalid("hex number > 64 bits"));
+            }
+            u64::from_str_radix(h, 16).map_err(|_| invalid("invalid hex string"))
         }
         _ => Err(invalid("expected a hex quantity")),
     }
@@ -42,26 +45,41 @@ pub fn parse_qty(v: &Value) -> Result<u64, RpcError> {
 
 pub fn parse_u256(v: &Value) -> Result<U256, RpcError> {
     let s = v.as_str().ok_or_else(|| invalid("expected a hex quantity"))?;
-    let h = s.strip_prefix("0x").ok_or_else(|| invalid(format!("hex string without 0x prefix: {s:?}")))?;
+    let h = s.strip_prefix("0x").ok_or_else(|| invalid("hex string without 0x prefix"))?;
     if h.is_empty() {
         return Err(invalid("hex string \"0x\""));
     }
     if h.len() > 1 && h.starts_with('0') {
         return Err(invalid("hex number with leading zero digits"));
     }
-    U256::from_str_radix(h, 16).map_err(|e| invalid(e.to_string()))
+    if h.len() > 64 {
+        return Err(invalid("hex number > 256 bits"));
+    }
+    U256::from_str_radix(h, 16).map_err(|_| invalid("invalid hex string"))
 }
 
 pub fn parse_bytes(v: &Value) -> Result<Bytes, RpcError> {
     v.as_str().ok_or_else(|| invalid("expected hex bytes"))?.parse().map_err(|e| invalid(format!("{e}")))
 }
 
+/// common.Address UnmarshalJSON: exactly 40 hex digits behind 0x.
 pub fn parse_addr(v: Option<&Value>) -> Result<Address, RpcError> {
-    v.and_then(Value::as_str).ok_or_else(|| invalid("missing address"))?.parse().map_err(|_| invalid("invalid address"))
+    let s = v.and_then(Value::as_str).ok_or_else(|| invalid("json: cannot unmarshal non-string into Go value of type common.Address"))?;
+    let h = s.strip_prefix("0x").ok_or_else(|| invalid("hex string without 0x prefix"))?;
+    if h.len() != 40 {
+        return Err(invalid(format!("hex string has length {}, want 40 for common.Address", h.len())));
+    }
+    s.parse().map_err(|_| invalid("invalid hex string"))
 }
 
+/// common.Hash UnmarshalJSON: exactly 64 hex digits behind 0x.
 pub fn parse_hash(v: Option<&Value>) -> Result<B256, RpcError> {
-    v.and_then(Value::as_str).ok_or_else(|| invalid("missing hash"))?.parse().map_err(|_| invalid("invalid hash"))
+    let s = v.and_then(Value::as_str).ok_or_else(|| invalid("json: cannot unmarshal non-string into Go value of type common.Hash"))?;
+    let h = s.strip_prefix("0x").ok_or_else(|| invalid("hex string without 0x prefix"))?;
+    if h.len() != 64 {
+        return Err(invalid(format!("hex string has length {}, want 64 for common.Hash", h.len())));
+    }
+    s.parse().map_err(|_| invalid("invalid hex string"))
 }
 
 /// A hash param from a 32-byte hex, geth's common.Hash UnmarshalJSON (exact length).
@@ -142,6 +160,24 @@ fn tx_element_len(t: &Tx) -> usize {
     } else {
         alloy_rlp::Header { list: false, payload_length: t.raw.len() }.length() + t.raw.len()
     }
+}
+
+/// The eth block RLP [header, txs, uncles] (what debug_getRawBlock hands out).
+pub fn block_rlp(b: &Block) -> Vec<u8> {
+    let txs: usize = b.txs.iter().map(tx_element_len).sum();
+    let body = b.header_rlp.len() + alloy_rlp::Header { list: true, payload_length: txs }.length() + txs + 1;
+    let mut out = Vec::with_capacity(body + 4);
+    alloy_rlp::Header { list: true, payload_length: body }.encode(&mut out);
+    out.extend_from_slice(&b.header_rlp);
+    alloy_rlp::Header { list: true, payload_length: txs }.encode(&mut out);
+    for t in &b.txs {
+        if t.tx_type != 0 {
+            alloy_rlp::Header { list: false, payload_length: t.raw.len() }.encode(&mut out);
+        }
+        out.extend_from_slice(&t.raw);
+    }
+    out.push(0xc0);
+    out
 }
 
 /// types.Block.Size(): the RLP size of [header, txs, uncles].
