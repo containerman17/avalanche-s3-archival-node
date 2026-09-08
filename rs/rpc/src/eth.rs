@@ -36,6 +36,7 @@ pub fn dispatch(s: &Server, method: &str, params: &[Value]) -> Option<RpcResult>
         "eth_maxPriorityFeePerGas" => s.suggest_tip().map(|v| json!(qty128(v))),
         "eth_baseFee" => s.base_fee_at(s.head()).map(|v| json!(qty128(v.unwrap_or(0)))),
         "eth_feeHistory" => s.fee_history(params),
+        "eth_feeConfig" => s.fee_config(params),
         "eth_suggestPriceOptions" => s.suggest_price_options(),
         "eth_getChainConfig" | "debug_chainConfig" => Ok(s.chain_config.clone()),
         _ => {
@@ -289,7 +290,12 @@ impl Server {
         Ok(self.block_at(n)?.header.base_fee.map(|f| f.to::<u128>()))
     }
 
+    /// The oracle's clock (stock: mockable.Clock, the wall clock in a node);
+    /// EPOCHDB_RPC_NOW=<unix seconds> pins it for a deterministic comparison.
     fn now() -> u64 {
+        if let Some(t) = std::env::var("EPOCHDB_RPC_NOW").ok().and_then(|s| s.parse().ok()) {
+            return t;
+        }
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
     }
 
