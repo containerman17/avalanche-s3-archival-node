@@ -262,6 +262,13 @@ type parsed struct {
 // height order, unwrapped), parse (ring -> batches of VM-parsed blocks, up to
 // 2 waiting) and drive (Verify + Accept, strictly sequential per block). The
 // first error stops the host; each stage closes its output so drive sees it.
+//
+// vmMu: the VM sees ONE call at a time, the way avalanchego's engine calls
+// it (under ctx.Lock). A parse batch lands between two of drive's calls,
+// never during one: the rpcchainvm client's block cache (chain.State) is not
+// goroutine-safe and a concurrent parse died on its map. The overlap a VM
+// gets is its own parse-time work (a sender recovery pool) running while
+// the host verifies the previous batch.
 type pipe struct {
 	q        *fetch.Queue
 	f        *fetch.Fetcher
@@ -274,6 +281,7 @@ type pipe struct {
 	batches  chan []parsed
 
 	pulledTxs atomic.Uint64
+	vmMu      sync.Mutex // one call into the VM at a time, as under avalanchego
 	stop      context.CancelFunc
 	once      sync.Once
 	err       error
@@ -412,6 +420,7 @@ func (p *pipe) parse(ctx context.Context, vm block.ChainVM) {
 			blks []snowman.Block
 			err  error
 		)
+		p.vmMu.Lock()
 		if bvm != nil {
 			blks, err = bvm.BatchedParseBlock(ctx, raws)
 			if errors.Is(err, block.ErrRemoteVMNotImplemented) {
@@ -430,6 +439,7 @@ func (p *pipe) parse(ctx context.Context, vm block.ChainVM) {
 				}
 			}
 		}
+		p.vmMu.Unlock()
 		if err != nil {
 			p.fail(err)
 			return
@@ -483,48 +493,58 @@ func (p *pipe) drive(ctx context.Context, vm block.ChainVM, b *bench) error {
 			return ctx.Err()
 		}
 		for _, x := range batch {
-			h, blk := x.h, x.blk
-			verified := false
-			if wc, ok := blk.(block.WithVerifyContext); ok {
-				should, err := wc.ShouldVerifyWithContext(ctx)
-				if err != nil {
-					return fmt.Errorf("height %d: ShouldVerifyWithContext: %w", h, err)
-				}
-				if should {
-					if err := wc.VerifyWithContext(ctx, &block.Context{PChainHeight: x.pch}); err != nil {
-						return fmt.Errorf("height %d: VerifyWithContext(pChainHeight=%d): %w", h, x.pch, err)
-					}
-					verified = true
-				}
-			}
-			if !verified {
-				if err := blk.Verify(ctx); err != nil {
-					return fmt.Errorf("height %d: Verify: %w", h, err)
-				}
-			}
-			if err := blk.Accept(ctx); err != nil {
-				return fmt.Errorf("height %d: Accept: %w", h, err)
-			}
-			b.accepted(x.item)
-			// The tip is where the follower says it is. At it, the plugin
-			// goes to normal operation and the preference follows every
-			// block, as under avalanchego; during catch-up it is refreshed
-			// now and then.
-			tip := p.f.AcceptedHead()
-			if !normal && tip > 0 && h >= tip {
-				if err := vm.SetState(ctx, snow.NormalOp); err != nil {
-					return fmt.Errorf("SetState(NormalOp): %w", err)
-				}
-				normal = true
-				log.Printf("epochdb-host: caught up at height=%d, plugin in NormalOp", h)
-			}
-			if normal || h%1000 == 0 {
-				if err := vm.SetPreference(ctx, blk.ID()); err != nil {
-					return fmt.Errorf("height %d: SetPreference: %w", h, err)
-				}
+			if err := p.step(ctx, vm, x, b, &normal); err != nil {
+				return err
 			}
 		}
 	}
+}
+
+// step is one block under vmMu: Verify, Accept, and the tip bookkeeping.
+func (p *pipe) step(ctx context.Context, vm block.ChainVM, x parsed, b *bench, normal *bool) error {
+	p.vmMu.Lock()
+	defer p.vmMu.Unlock()
+	h, blk := x.h, x.blk
+	verified := false
+	if wc, ok := blk.(block.WithVerifyContext); ok {
+		should, err := wc.ShouldVerifyWithContext(ctx)
+		if err != nil {
+			return fmt.Errorf("height %d: ShouldVerifyWithContext: %w", h, err)
+		}
+		if should {
+			if err := wc.VerifyWithContext(ctx, &block.Context{PChainHeight: x.pch}); err != nil {
+				return fmt.Errorf("height %d: VerifyWithContext(pChainHeight=%d): %w", h, x.pch, err)
+			}
+			verified = true
+		}
+	}
+	if !verified {
+		if err := blk.Verify(ctx); err != nil {
+			return fmt.Errorf("height %d: Verify: %w", h, err)
+		}
+	}
+	if err := blk.Accept(ctx); err != nil {
+		return fmt.Errorf("height %d: Accept: %w", h, err)
+	}
+	b.accepted(x.item)
+	// The tip is where the follower says it is. At it, the plugin
+	// goes to normal operation and the preference follows every
+	// block, as under avalanchego; during catch-up it is refreshed
+	// now and then.
+	tip := p.f.AcceptedHead()
+	if !*normal && tip > 0 && h >= tip {
+		if err := vm.SetState(ctx, snow.NormalOp); err != nil {
+			return fmt.Errorf("SetState(NormalOp): %w", err)
+		}
+		*normal = true
+		log.Printf("epochdb-host: caught up at height=%d, plugin in NormalOp", h)
+	}
+	if *normal || h%1000 == 0 {
+		if err := vm.SetPreference(ctx, blk.ID()); err != nil {
+			return fmt.Errorf("height %d: SetPreference: %w", h, err)
+		}
+	}
+	return nil
 }
 
 // unwrap returns the inner VM bytes of a container and the P-chain height for
