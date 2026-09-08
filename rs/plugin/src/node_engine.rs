@@ -96,6 +96,9 @@ pub struct NodeEngine {
     pub genesis: Arc<Block>,
     pub inner: Mutex<Inner>,
     pub store: Arc<Mutex<Box<dyn BlockStore>>>,
+    /// The store's read API, shared with the RPC threads and the block
+    /// lookups below: reads never take the writer's mutex.
+    pub db: Arc<store::db::DB>,
     pub head: Mutex<Arc<Block>>,
     /// Accepted, not yet in the store (the checker is behind by at most CHECK_DEPTH).
     pub recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>,
@@ -282,6 +285,7 @@ impl NodeEngine {
         let dirty = Arc::new(Mutex::new(dirty));
         let roller = Roller::new(dir, gen, dirty.clone(), cpus);
         let ex = Executor::open(cfg.clone(), Layered::new(be));
+        let db_reads = db.clone();
         let store: Arc<Mutex<Box<dyn BlockStore>>> = Arc::new(Mutex::new(Box::new(store)));
         let recent = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
@@ -313,6 +317,7 @@ impl NodeEngine {
             genesis,
             inner: Mutex::new(Inner { ex, roller, roll_budget: sync_roll }),
             store,
+            db: db_reads,
             head: Mutex::new(head),
             recent,
             parsed: Mutex::new(HashMap::new()),
@@ -401,11 +406,9 @@ impl Engine for NodeEngine {
         if let Some(b) = self.recent.lock().unwrap().get(id) {
             return Some(b.clone());
         }
-        let store = self.store.lock().unwrap();
-        let h = store.height_of(id)?;
-        let c = store.container(h).ok()??;
-        drop(store);
-        block::decode_container(c).ok().map(Arc::new)
+        let h = self.db.height_by_hash(id).ok()??;
+        let c = self.db.container_at(h).ok()??;
+        block::decode_container(Bytes::from(c)).ok().map(Arc::new)
     }
 
     fn block_id_at_height(&self, height: u64) -> Option<Id> {
@@ -419,8 +422,8 @@ impl Engine for NodeEngine {
         if height == head.height {
             return Some(head.hash.0);
         }
-        if let Some(id) = self.store.lock().unwrap().id_at(height) {
-            return Some(id);
+        if let Some(hdr) = self.db.header_rlp(height).ok().flatten() {
+            return Some(state::keccak::keccak256(&hdr));
         }
         self.recent.lock().unwrap().values().find(|b| b.height == height).map(|b| b.hash.0)
     }
