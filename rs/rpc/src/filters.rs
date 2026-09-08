@@ -2,6 +2,7 @@
 //! Filters live in memory, keyed by a random id, and expire after 5 minutes
 //! without a poll (geth's deadline).
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
@@ -30,19 +31,23 @@ pub struct Filter {
 #[derive(Default)]
 pub struct Registry {
     pub filters: HashMap<String, Filter>,
-    seq: u64,
+}
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// rpc.NewID: 16 pseudo-random bytes as a hex quantity (leading zeros
+/// trimmed, `0x0` for all zeros); filters and subscriptions share it.
+pub fn new_id() -> String {
+    let mut b = [0u8; 32];
+    b[..8].copy_from_slice(&(std::process::id() as u64).to_be_bytes());
+    b[8..16].copy_from_slice(&SEQ.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    b[16..24].copy_from_slice(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0).to_be_bytes());
+    let h = alloy_primitives::hex::encode(&alloy_primitives::keccak256(b)[..16]);
+    let h = h.trim_start_matches('0');
+    format!("0x{}", if h.is_empty() { "0" } else { h })
 }
 
 impl Registry {
-    /// rpc.NewID: 16 random bytes as hex.
-    fn new_id(&mut self) -> String {
-        self.seq += 1;
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&(std::process::id() as u64).to_be_bytes());
-        b[8..16].copy_from_slice(&self.seq.to_be_bytes());
-        b[16..24].copy_from_slice(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0).to_be_bytes());
-        format!("0x{}", alloy_primitives::hex::encode(&alloy_primitives::keccak256(b)[..16]))
-    }
     fn sweep(&mut self) {
         self.filters.retain(|_, f| f.last_poll.elapsed() < DEADLINE);
     }
@@ -72,7 +77,7 @@ impl Server {
     fn install(&self, kind: Kind) -> RpcResult {
         let mut g = self.filters.lock().unwrap();
         g.sweep();
-        let id = g.new_id();
+        let id = new_id();
         g.filters.insert(id.clone(), Filter { kind, next: self.head() + 1, last_poll: Instant::now() });
         Ok(json!(id))
     }

@@ -78,6 +78,7 @@ func main() {
 	batch := fs.Int("batch", 256, "blocks per BatchedParseBlock (1 = ParseBlock one at a time); up to 2 parsed batches wait ahead of Verify")
 	configJSON := fs.String("config", `{"state-sync-enabled":false}`, "the VM's config bytes (JSON)")
 	serve := fs.Bool("serve", false, "after the dump, keep serving HTTP until SIGINT instead of shutting down")
+	feedDelay := fs.Duration("feed-delay", 0, "pace: wait this long before every block (lets a websocket client subscribe and watch heads arrive live)")
 	fs.Parse(os.Args[1:])
 	if *dumpPath == "" || *vmPath == "" {
 		log.Fatal("epochdb-host-bench: --dump and --vm are required")
@@ -218,6 +219,7 @@ func main() {
 		ring:    make(chan item, 4096),
 		batches: make(chan []parsed, 2),
 		stop:    stop,
+		delay:   *feedDelay,
 	}
 	b := &bench{tracker: tracker, ring: p.ring}
 	b.height.Store(last.Height())
@@ -384,6 +386,7 @@ type pipe struct {
 	batch   int
 	ring    chan item
 	batches chan []parsed
+	delay   time.Duration // --feed-delay: the pace between blocks
 
 	vmMu sync.Mutex
 	stop context.CancelFunc
@@ -530,6 +533,9 @@ func (p *pipe) drive(ctx context.Context, vm block.ChainVM, b *bench) error {
 			return ctx.Err()
 		}
 		for _, x := range batch {
+			if p.delay > 0 {
+				time.Sleep(p.delay)
+			}
 			if err := p.step(ctx, vm, x, b, &normal); err != nil {
 				return err
 			}
@@ -560,8 +566,13 @@ func (p *pipe) step(ctx context.Context, vm block.ChainVM, x parsed, b *bench, n
 			return fmt.Errorf("height %d: Verify: %w", h, err)
 		}
 	}
+	tAccept := time.Now()
 	if err := blk.Accept(ctx); err != nil {
 		return fmt.Errorf("height %d: Accept: %w", h, err)
+	}
+	if p.delay > 0 {
+		// Paced runs are subscription tests: the client diffs its receive time against these.
+		log.Printf("epochdb-host-bench: accepted height=%d start_ns=%d end_ns=%d", h, tAccept.UnixNano(), time.Now().UnixNano())
 	}
 	b.accepted(x.item)
 	tip := p.d.Last()

@@ -445,6 +445,9 @@ impl Engine for NodeEngine {
     fn rpc(&self, body: &[u8]) -> Vec<u8> {
         crate::rpc::handle(self, body)
     }
+    fn ws_server(&self) -> Option<&rpc::Server> {
+        Some(&self.rpc)
+    }
 
     fn health(&self) -> Result<serde_json::Value, Error> {
         let h = self.head.lock().unwrap().height;
@@ -577,6 +580,14 @@ impl NodeEngine {
         self.stats.executed.fetch_add(1, Ordering::Relaxed);
         self.stats.txs.fetch_add(payload.result.txs.len() as u64, Ordering::Relaxed);
         self.stats.gas.fetch_add(payload.result.gas_used, Ordering::Relaxed);
+        if self.rpc.heads.receiver_count() > 0 {
+            // /ws subscribers: the head goes out before the checker stores it.
+            let mut receipts = Vec::new();
+            for t in &payload.result.txs {
+                t.receipt.encode_2718(&mut receipts);
+            }
+            self.rpc.publish(b.clone(), &receipts);
+        }
         let tx = self.check_tx.lock().unwrap().clone().ok_or("checker stopped")?;
         tx.send(Msg::Block(Box::new(CheckItem { block: b.clone(), payload }))).map_err(|_| "checker stopped")?;
         if b.height % 256 == 0 {

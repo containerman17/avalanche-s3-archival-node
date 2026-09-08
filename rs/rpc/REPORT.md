@@ -59,7 +59,7 @@ Status: `=` byte-equal with stock subnet-evm v1.14.2 on every probe of the diffe
 | edb_getLogsByEmitter, getLogsByTopicValue, getTopicGroups, getTokenTransfersByHolder / ByContract, getTokenContracts | Go | same run; the ERC-721 `supportsInterface` probe only ever hit its false branch on Step (no 4-topic Transfer logs in 1..50k), the erc1155 paths saw no row |
 | epochdb_head | Go | |
 | batch requests (1000 max, 10 MB body, notifications, per-element errors) | = | shapes equal; the text of the -32700 / -32600 errors carries the parser detail, stock's does not |
-| WebSocket `/ws`, eth_subscribe | not done | see open items |
+| WebSocket `/ws`, eth_subscribe / eth_unsubscribe (newHeads, logs, newPendingTransactions, newAcceptedTransactions) | = | rs-ws below: notifications byte-equal with stock on the live beam feed |
 
 ## Oracle results
 
@@ -113,7 +113,6 @@ The store path is 2.6x stock and 5x the Go node on receipts, 3.3x stock and 7.8x
 
 ## Open items
 
-- WebSocket `/ws` and eth_subscribe (newHeads, logs, newPendingTransactions): the plugin's ghttp `Handle` (upgrade requests over the reader / writer streams, the `responsewriter` / `reader` / `writer` / `conn` protos not yet copied) is still Unimplemented, and the standalone bin is plain HTTP. filters.rs already has the polling half.
 - The interim plugin Store (state at head only, no postings): replaced by rs-storewire's DbStore behind `Store`.
 - flatCallTracer (revm-inspectors' parity builder is available, not wired) and JS tracers.
 - eth_createAccessList is derived from the prestate, not from an access-list inspector; equal on the probes.
@@ -155,6 +154,44 @@ python3 $S/rpc/rpccmp2.py http://127.0.0.1:19941/ext/bc/2tmrrBo1.../rpc http://1
 go run ./exp/feecheck synth                     # the Go vectors behind fee::tests::next_base_fee_matches_go
 ```
 Kill servers by the pid `ss -ltnp` reports for the port; a `pgrep -f` pattern that also appears later in the same command line (a nohup launch) kills the calling shell.
+- `cargo test --workspace`: 33 tests pass (state 14, exec 2, block 1, plugin 3, store 6 + 8) and the rpc doctests (a text block in edb.rs was parsed as Rust and fenced). rs/rpc's own unit tests are the three in ws.rs (rs-ws); the differential is the check for the rest.
+
+## rs-ws: WebSocket `/ws` and eth_subscribe
+
+Branch `rs-ws` on top of rs-rpc, 2026-09-09 02:00 to 04:00 JST, local box. Spec: stock subnet-evm v1.14.2's `/ws` (libevm `rpc/websocket.go`, `rpc/subscription.go`, `rpc/handler.go`; subnet-evm `eth/filters/api.go`), measured against the stock plugin under `cmd/epochdb-host-bench`.
+
+### Design
+
+- `rs/rpc/src/ws.rs` (new): one transport-agnostic `serve(&Server, stream)` over any `AsyncRead + AsyncWrite` stream, framing by `tokio-tungstenite` (server role, `from_raw_socket`; 32 MiB read limit = `wsDefaultReadLimit`). Requests go through the same `Server::handle_with` as HTTP (single and batch, same envelope, same errors) with a per-connection hook that intercepts `eth_subscribe` / `eth_unsubscribe`; everything else on the socket is the HTTP dispatch. Accepted heads reach every connection through a `tokio::sync::broadcast` channel on `Server` (`Server::publish(block, receipts_rlp)`, queue 20,000 = `maxClientSubscriptionBuffer`; a client that lags is disconnected). Idle ping every 30 s with a 30 s pong deadline, 10 s per write, `writeJSON`'s ping reset on every write. `handshake()` is gorilla's `Upgrader.Upgrade` check order (Connection, Upgrade, method, version, key) with its status codes and `Sec-Websocket-Version: 13` on refusal, so both transports (the plugin's ghttp and the plain TCP server) answer the same.
+- Subscriptions: `newHeads`, `logs` (FilterCriteria: address list up to 1000, topics, from/to as `rpc.BlockNumber` with `SubscribeAcceptedLogs`' accepted combinations, `blockHash` exclusive with the range), `newPendingTransactions` (accepted, never fires: a follower has no mempool, and stock under the harness has an empty pool so it never fires there either), `newAcceptedTransactions` (hashes or full txs). A subscription records the head at creation and delivers heights above it only. Per head the notifications go out in subscription-id order, logs in receipt / log order with the block-wide `logIndex`. Ids come from `filters::new_id` (rpc.NewID's shape: 16 bytes hex, leading zeros trimmed), shared with the polling filters.
+- Accept hook: `NodeEngine::accept` calls `rpc.publish(block, receipts)` right after the block is executed and its stats counted, before the record is handed to the checker / store writer; `publish` is a no-op with no subscribers. The store-path oracle (`epochdb-rpc-serve`) has no accept path, so its subscriptions answer but never fire.
+- Plugin (`rs/plugin/src/ghttp.rs`, `vm.rs`): `Handle` implements avalanchego's hijack path (see rs/plugin/REPORT.md); `CreateHandlers` mounts `/rpc` and `/ws`. `Engine::ws_server()` (default None) is how an engine offers the `rpc::Server` for `/ws`.
+- `epochdb-rpc-serve`: an `Upgrade` request on any path is handed to `ws::serve` on a tokio runtime; the HTTP/1.1 loop is unchanged otherwise.
+- Harness: `--feed-delay <dur>` paces the feed (a sleep before every block) and logs `accepted height=N start_ns end_ns` per block, so a client can subscribe first and time its notifications against Accept.
+- Tests: `ws::tests` (3): gorilla handshake (RFC 6455 key -> accept, the refusals), subscription bookkeeping (fan-out, since-gating, logs filter hit and miss, pending silent, unsubscribe and its errors), and `serve` end to end over a `tokio::io::duplex` with a tungstenite client (call, batch, subscribe, a published head arrives, unsubscribe stops it, clean close). `rs/rpc/scripts/ws_e2e.py` + `wsc.py` (stdlib only, no `websockets` module or `websocat` on this box): `capture URL N OUT` subscribes newHeads + logs + newPendingTransactions and collects N heads, then eth_getBlockByNumber, a batch (eth_chainId, eth_blockNumber, eth_getLogs) with notifications interleaving, eth_unsubscribe x3 plus the two error cases, and a clean close (expects the server's 1000 close frame); `diff A B` compares height by height with subscription ids masked; `latency CAP LOG` joins receive times with the harness lines; `static URL` is the no-live-heads set (subscribe answers and error texts, call, batch with an unknown method, notification without id, parse error).
+
+### Results
+
+Runs: beam chain, both plugins under the harness from the same 50k data dirs, `--feed-delay 500ms`, 50,401..51,200 (stock `$S/ws/beam-stock-data`, epochdb-rs `$S/rpc/beam-rs`; `$S/ws/beam-*.log`), and Step 50,081..50,500 at 1 s. Captures and outputs in `$S/ws/`.
+
+- Through the host mount (`/ext/bc/<chain>/ws` -> ghttp `Handle` -> hijack -> `Conn` streams): 150 heads captured from each node in the same window, 149 common heights, **201 of 201 notifications byte-equal** with stock (149 `newHeads`, 52 `logs`) after masking the subscription id: same field set and order (`HeaderSerializable`: parentHash ... nonce, baseFeePerGas, blockGasCost, blobGasUsed, excessBlobGas, parentBeaconBlockRoot, timestampMilliseconds, minDelayExcess, hash; nulls present), same `eth_subscription` envelope, and the trailing newline `json.Encoder` writes. The Step run before the field-order fix had the same field set (0 byte-equal, order only).
+- `static` passes on stock, on epochdb-rs through the host mount and on `epochdb-rpc-serve /ws`: identical subscription-error texts (`no "bogus" subscription in eth namespace`, `invalid argument 1: json: cannot unmarshal number into Go value of type filters.input`, `invalid from and to block combination: from > to`, `subscription not found`, `invalid argument 0: ... rpc.ID`, `missing value for required argument 1`, `too many arguments, want at most 1`); plain call, batch, unsubscribe, clean close with a 1000 close frame from the server. A non-upgrade GET on `/ws` through the host answers gorilla's 400 with `Sec-Websocket-Version: 13`, as stock.
+- Latency, harness Accept to client receive (`newHeads`, 150 each, same box, 500 ms pace): epochdb-rs median 0.55 ms from Accept start / 0.16 ms from Accept return (p90 0.77 / 0.25, max 3.0 / 2.5); stock 1.81 / 1.25 ms (p90 3.38 / 2.41, max 11.4 / 7.0). Ours fires inside Accept (before the store write), stock's fires from the chain event after Accept.
+- `cargo test --workspace` green (36 tests, rs/rpc 4 of them); `go vet ./cmd/epochdb-host-bench/` clean.
+
+### Deviations from stock
+
+- After a message that is not JSON, stock writes the -32700 error and drops the TCP connection (the client sees a reset); we write the same error and then a proper close frame.
+- `newPendingTransactions` never fires (no mempool); stock's subscription exists and is fed by its txpool. Same observable behaviour under the harness.
+- `eth_subscribe` over plain HTTP keeps rs-rpc's refusal (the Go node's code and text), unchanged.
+- Origins are not checked (stock's `WebsocketHandler` is built with `[]string{"*"}` for the VM's handlers), compression is not negotiated (stock's `wsDefaultReadLimit` server does not enable it either), and there is no per-connection request concurrency: replies leave in request order, which is also how one client observes stock over a single connection.
+- The 30 s ping / pong deadline is enforced from our side only; stock's client-side pings are answered by tungstenite automatically.
+
+### Open items
+
+- `newHeads` under reorgs: the follower never reorgs, so removed heads and `removed: true` logs never arise; nothing is implemented for them.
+- The subscription id generator seeds from pid, a counter and the clock (rs-rpc's filters), not from `crypto/rand`; the shape is stock's.
+- `epochdb-rpc-serve` runs one tokio runtime for ws sessions next to its thread-per-connection HTTP loop; a plain-HTTP session that upgrades late is not handled (the harness and clients upgrade on the first request).
 
 ## Rerun
 

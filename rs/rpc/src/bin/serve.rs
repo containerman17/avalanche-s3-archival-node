@@ -1,5 +1,7 @@
 //! epochdb-rpc-serve: the RPC surface over a store dir, plain HTTP (JSON-RPC
-//! POST, keep-alive), for the differential and throughput runs.
+//! POST, keep-alive) plus WebSocket upgrades on any path (/ws), for the
+//! differential and throughput runs. A store dir never moves, so
+//! subscriptions here answer but never fire.
 //!   epochdb-rpc-serve --data DIR --genesis chain.json --upgrade upgrade.json --http 127.0.0.1:19905
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -29,10 +31,12 @@ fn main() -> Result<()> {
     let upgrades = serde_json::from_slice::<serde_json::Value>(&upgrade).ok();
     let server = Arc::new(rpc::Server::new(Arc::new(rpc::storedb::StoreDb::new(Arc::new(db), cfg.clone())), cfg, genesis, chain_config, upgrades));
     eprintln!("epochdb-rpc-serve: head {} at http://{http}", server.head());
+    let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build()?);
     let l = TcpListener::bind(&http)?;
     for conn in l.incoming() {
         let Ok(conn) = conn else { continue };
         let server = server.clone();
+        let rt = rt.clone();
         std::thread::spawn(move || {
             let _ = conn.set_nodelay(true);
             let mut r = BufReader::new(conn.try_clone().unwrap());
@@ -44,6 +48,7 @@ fn main() -> Result<()> {
                 }
                 let mut len = 0usize;
                 let mut close = false;
+                let mut headers: Vec<(String, String)> = Vec::new();
                 loop {
                     let mut h = String::new();
                     if r.read_line(&mut h).unwrap_or(0) == 0 {
@@ -58,6 +63,29 @@ fn main() -> Result<()> {
                         "content-length" => len = v.trim().parse().unwrap_or(0),
                         "connection" if v.trim().eq_ignore_ascii_case("close") => close = true,
                         _ => {}
+                    }
+                    headers.push((k.to_string(), v.trim().to_string()));
+                }
+                if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Upgrade")) {
+                    let method = line.split_whitespace().next().unwrap_or("");
+                    let lookup = |k: &str| headers.iter().find(|(hk, _)| hk.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone());
+                    match rpc::ws::handshake(method, &lookup) {
+                        Ok(resp) => {
+                            if w.write_all(resp.as_bytes()).is_err() || w.set_nonblocking(true).is_err() {
+                                return;
+                            }
+                            drop(r);
+                            rt.spawn(async move {
+                                let Ok(s) = tokio::net::TcpStream::from_std(w) else { return };
+                                rpc::ws::serve(&server, s).await;
+                            });
+                            return;
+                        }
+                        Err((code, _)) => {
+                            let text = rpc::ws::status_text(code);
+                            let _ = w.write_all(format!("HTTP/1.1 {code} {text}\r\nSec-Websocket-Version: 13\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\n\r\n{text}\n", text.len() + 1).as_bytes());
+                            return;
+                        }
                     }
                 }
                 let mut body = vec![0u8; len];

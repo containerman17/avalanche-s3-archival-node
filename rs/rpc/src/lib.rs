@@ -16,6 +16,7 @@ pub mod ots;
 pub mod storedb;
 pub mod tokens;
 pub mod genesis;
+pub mod ws;
 
 use std::sync::{Arc, Mutex};
 
@@ -92,6 +93,7 @@ pub trait Store: Send + Sync {
     fn set_scan(&self, prefix: &[u8], f: &mut dyn FnMut(&[u8]) -> bool) -> Result<()>;
 }
 
+#[derive(Debug)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
@@ -149,12 +151,28 @@ pub struct Server {
     pub chain_config: Value,
     pub(crate) filters: Mutex<filters::Registry>,
     pub(crate) iface721: Mutex<alloy_primitives::map::HashMap<Address, String>>,
+    /// Accepted heads for eth_subscribe (ws.rs); `publish` feeds it.
+    pub heads: tokio::sync::broadcast::Sender<Arc<ws::Head>>,
 }
 
 impl Server {
     pub fn new(store: Arc<dyn Store>, cfg: Arc<exec::Config>, genesis: Arc<Block>, chain_config: Value, upgrades: Option<Value>) -> Server {
         let chain_config = stock_chain_config(&cfg, chain_config, upgrades);
-        Server { store, cfg, genesis, chain_config, filters: Mutex::new(Default::default()), iface721: Mutex::new(Default::default()) }
+        Server { store, cfg, genesis, chain_config, filters: Mutex::new(Default::default()), iface721: Mutex::new(Default::default()), heads: tokio::sync::broadcast::channel(ws::QUEUE).0 }
+    }
+
+    /// The accept path's hook: one accepted block with its receipts (the
+    /// 2718 envelopes, concatenated) for every live subscription.
+    pub fn publish(&self, block: Arc<Block>, receipts_rlp: &[u8]) {
+        if self.heads.receiver_count() == 0 {
+            return;
+        }
+        match ws::decode_receipts(receipts_rlp) {
+            Ok(receipts) => {
+                let _ = self.heads.send(Arc::new(ws::Head { block, receipts }));
+            }
+            Err(e) => eprintln!("rpc: head {} not published: {e:#}", block.height),
+        }
     }
 
     pub fn head(&self) -> u64 {
@@ -276,7 +294,9 @@ impl Server {
     }
 
     /// One request object -> one response object (None for a notification).
-    fn one(&self, r: &Value) -> Option<Value> {
+    /// `hook` sees the call first (the transport's own methods: eth_subscribe
+    /// over a WebSocket connection).
+    fn one(&self, r: &Value, hook: &mut dyn FnMut(&str, &[Value]) -> Option<RpcResult>) -> Option<Value> {
         let id = r.get("id").cloned();
         let method = r.get("method").and_then(Value::as_str).unwrap_or("");
         if method.is_empty() {
@@ -287,12 +307,17 @@ impl Server {
             Some(Value::Array(a)) => a.clone(),
             Some(_) => return Some(reply(id, Err(RpcError { code: -32600, message: "invalid request: params must be an array".into(), data: None }))),
         };
-        let res = self.dispatch(method, &params);
+        let res = hook(method, &params).unwrap_or_else(|| self.dispatch(method, &params));
         id.map(|id| reply(Some(id), res))
     }
 
     /// One HTTP body in, one body out (single or batch).
     pub fn handle(&self, body: &[u8]) -> Vec<u8> {
+        self.handle_with(body, &mut |_, _| None)
+    }
+
+    /// `handle` with a per-connection hook ahead of the dispatch.
+    pub fn handle_with(&self, body: &[u8], hook: &mut dyn FnMut(&str, &[Value]) -> Option<RpcResult>) -> Vec<u8> {
         if body.len() > MAX_REQUEST_BYTES {
             return reply(None, Err(RpcError { code: -32600, message: format!("request body exceeds the {MAX_REQUEST_BYTES}-byte limit"), data: None })).to_string().into_bytes();
         }
@@ -311,7 +336,7 @@ impl Server {
                 let replies: Vec<Value> = rs
                     .iter()
                     .filter_map(|r| match r {
-                        Value::Object(_) => self.one(r),
+                        Value::Object(_) => self.one(r, hook),
                         _ => Some(reply(None, Err(RpcError { code: -32600, message: "invalid request: not an object".into(), data: None }))),
                     })
                     .collect();
@@ -320,7 +345,7 @@ impl Server {
                 }
                 Value::Array(replies)
             }
-            Value::Object(_) => match self.one(&req) {
+            Value::Object(_) => match self.one(&req, hook) {
                 Some(v) => v,
                 None => return Vec::new(),
             },
