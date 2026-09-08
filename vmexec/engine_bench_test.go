@@ -18,7 +18,13 @@ import (
 // BenchmarkBlockRoot is one beam-sized block (a transfer plus two slot writes
 // on a contract) applied and rooted over a 100k-account state: the per-block
 // fixed cost of Dirty.Root.
-func BenchmarkBlockRoot(b *testing.B) {
+func BenchmarkBlockRoot(b *testing.B) { benchBlockRoot(b, 3, 1, 2) }
+
+// BenchmarkBlockRootStep is a Step-sized block: 8 accounts (7 senders + the
+// fee recipient) and 3 contracts with 4 slot writes each.
+func BenchmarkBlockRootStep(b *testing.B) { benchBlockRoot(b, 8, 3, 4) }
+
+func benchBlockRoot(b *testing.B, accounts, contracts, slots int) {
 	rng := rand.New(rand.NewSource(1))
 	alloc := make(types.GenesisAlloc, 100_000)
 	addrs := make([]common.Address, 0, 100_000)
@@ -53,14 +59,16 @@ func BenchmarkBlockRoot(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ws := newWriteSet()
-		for _, a := range []common.Address{addrs[rng.Intn(len(addrs))], addrs[rng.Intn(len(addrs))], addrs[rng.Intn(len(addrs))]} {
+		for k := 0; k < accounts; k++ {
+			a := addrs[rng.Intn(len(addrs))]
 			row, _ := rlp.EncodeToBytes(&accountRow{Nonce: uint64(i), Balance: uint256.NewInt(uint64(i + 1)), CodeHash: types.EmptyCodeHash[:]})
 			ws.put(accountKey(crypto.Keccak256Hash(a[:])), row)
 		}
-		c := addrs[rng.Intn(2000)*50]
-		ch := crypto.Keccak256Hash(c[:])
-		for j := 0; j < 2; j++ {
-			ws.put(slotKey(ch, crypto.Keccak256Hash(common.Hash{byte(rng.Intn(40)), 1}.Bytes())), []byte{byte(i), byte(j + 1)})
+		for c := 0; c < contracts; c++ {
+			ch := crypto.Keccak256Hash(addrs[rng.Intn(2000)*50][:])
+			for j := 0; j < slots; j++ {
+				ws.put(slotKey(ch, crypto.Keccak256Hash(common.Hash{byte(rng.Intn(40)), 1}.Bytes())), []byte{byte(i), byte(j + 1)})
+			}
 		}
 		eng.applyOverlay(ws)
 		if err := eng.applyDirty(ws); err != nil {
