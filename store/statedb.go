@@ -37,19 +37,26 @@ var errOverlayReadOnly = errors.New("epochdb overlay: read-only historical view"
 // forever. Every account and slot read of one call resolves the same height, so
 // a single slot turns the whole tip workload into one atomic load, which is
 // what keeps this off the descent (and out of the memtable's lock) entirely.
-func (d *DB) txCeiling(height uint64) (at uint64, err error) {
+//
+// floor=true is height 0 when genesis is no stored container: the state at
+// its end is the genesis floor alone, no row is at or below it, and there is
+// no TxNum that names "before block 1" (block 1 may start at 0).
+func (d *DB) txCeiling(height uint64) (at uint64, floor bool, err error) {
 	if c := d.ceil.Load(); c != nil && c.height == height {
-		return c.at, nil
+		return c.at, false, nil
 	}
 	at, ok, err := d.TxNumAtEndOf(height)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if !ok {
-		return 0, fmt.Errorf("store: block %d is not stored, so it has no state to read", height)
+		if height == 0 {
+			return 0, true, nil
+		}
+		return 0, false, fmt.Errorf("store: block %d is not stored, so it has no state to read", height)
 	}
 	d.ceil.Store(&txCeil{height: height, at: at})
-	return at, nil
+	return at, false, nil
 }
 
 // txCeil is one memoized txCeiling answer.
@@ -82,13 +89,18 @@ func (d *DB) stateRow(prefix []byte, height, at uint64) ([]byte, bool, error) {
 // Handing the alloc literal here answers a read of such an address with "does
 // not exist".
 func (d *DB) Account(genesis types.GenesisAlloc, addr common.Address, height uint64) (*types.StateAccount, error) {
-	at, err := d.txCeiling(height)
+	at, floor, err := d.txCeiling(height)
 	if err != nil {
 		return nil, err
 	}
-	val, ok, err := d.stateRow(AccountPrefix(addr[:]), height, at)
-	if err != nil {
-		return nil, err
+	var (
+		val []byte
+		ok  bool
+	)
+	if !floor {
+		if val, ok, err = d.stateRow(AccountPrefix(addr[:]), height, at); err != nil {
+			return nil, err
+		}
 	}
 	if ok {
 		return decodeAccount(val, addr) // empty value = explicit delete, account gone
@@ -117,13 +129,18 @@ func (d *DB) Account(genesis types.GenesisAlloc, addr common.Address, height uin
 // (addr, slot) as of the end of block height; nil = zero. A stored empty value
 // is a cleared slot, which the EVM defines as zero.
 func (d *DB) Storage(genesis types.GenesisAlloc, addr common.Address, slot []byte, height uint64) ([]byte, error) {
-	at, err := d.txCeiling(height)
+	at, floor, err := d.txCeiling(height)
 	if err != nil {
 		return nil, err
 	}
-	val, ok, err := d.stateRow(SlotPrefix(addr[:], slot), height, at)
-	if err != nil {
-		return nil, err
+	var (
+		val []byte
+		ok  bool
+	)
+	if !floor {
+		if val, ok, err = d.stateRow(SlotPrefix(addr[:], slot), height, at); err != nil {
+			return nil, err
+		}
 	}
 	if ok {
 		return val, nil

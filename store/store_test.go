@@ -537,7 +537,7 @@ func TestFlatCacheNeverStale(t *testing.T) {
 		if !ok || head != h {
 			t.Fatalf("head %d %v after block %d", head, ok, h)
 		}
-		at, err := db.txCeiling(head)
+		at, _, err := db.txCeiling(head)
 		if err != nil {
 			t.Fatalf("ceiling at %d: %d %v", head, at, err)
 		}
@@ -562,7 +562,7 @@ func TestFlatCacheNeverStale(t *testing.T) {
 		}
 		// A historical read must never be served (or polluted) by the cache.
 		if h > 0 {
-			hAt, err := db.txCeiling(h - 1)
+			hAt, _, err := db.txCeiling(h - 1)
 			if err != nil {
 				t.Fatal(err)
 			}
