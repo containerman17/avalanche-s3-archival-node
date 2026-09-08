@@ -182,14 +182,39 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for SevmPrecompiles {
 
 // ---------------------------------------------------------------------------
 
+/// The state behind the executor: revm's read and commit traits plus what
+/// the node's own backend needs to provide. The in-memory `Db` is the oracle
+/// runner's; rs-node's flat state implements it over latest + commit.
+pub trait StateDb: Database<Error = std::convert::Infallible> + DatabaseCommit {
+    /// BLOCKHASH source: the hash of an executed block.
+    fn set_block_hash(&mut self, number: u64, hash: B256);
+    /// An account that a tx left self-destructed or EIP-158 empty: whatever
+    /// the backend cached for it (storage included) must go.
+    fn forget(&mut self, addr: Address) {
+        let _ = addr;
+    }
+}
+
 pub type Db = CacheDB<EmptyDB>;
-type Ctx = Context<BlockEnv, TxEnv, CfgEnv, Db, Journal<Db>, (), LocalContext>;
-type SevmEvm = Evm<Ctx, TracingInspector, EthInstructions<EthInterpreter, Ctx>, SevmPrecompiles, EthFrame<EthInterpreter>>;
+
+impl StateDb for Db {
+    fn set_block_hash(&mut self, number: u64, hash: B256) {
+        self.cache.block_hashes.insert(U256::from(number), hash);
+    }
+    /// CacheDB keeps an EIP-158-deleted account as an empty touched entry;
+    /// drop it (with its storage) so the state is the trie's.
+    fn forget(&mut self, addr: Address) {
+        self.cache.accounts.insert(addr, revm::database::DbAccount::new_not_existing());
+    }
+}
+
+type Ctx<D> = Context<BlockEnv, TxEnv, CfgEnv, D, Journal<D>, (), LocalContext>;
+type SevmEvm<D> = Evm<Ctx<D>, TracingInspector, EthInstructions<EthInterpreter, Ctx<D>>, SevmPrecompiles, EthFrame<EthInterpreter>>;
 type Err = EVMError<std::convert::Infallible>;
 
-pub struct Executor {
+pub struct Executor<D: StateDb = Db> {
     pub cfg: Config,
-    evm: SevmEvm,
+    evm: SevmEvm<D>,
     /// Time split of execute_block: EVM run (incl. sender-side validation), trace
     /// JSON, journal finalize + rows + DB commit.
     pub t_evm: std::time::Duration,
@@ -197,13 +222,20 @@ pub struct Executor {
     pub t_commit: std::time::Duration,
 }
 
-impl Executor {
-    /// A fresh state holding what the genesis materialises: the alloc and every
+impl Executor<Db> {
+    /// The in-memory state (the oracle runner's).
+    pub fn new(cfg: Config) -> Result<Executor<Db>> {
+        Executor::with_db(cfg, CacheDB::new(EmptyDB::default()))
+    }
+}
+
+impl<D: StateDb> Executor<D> {
+    /// Seeds db with what the genesis materialises: the alloc and every
     /// precompile enabled at genesis (trieAlloc in vmexec/genesis.go).
-    pub fn new(cfg: Config) -> Result<Executor> {
+    pub fn with_db(cfg: Config, db: D) -> Result<Executor<D>> {
         let spec = cfg.spec(cfg.genesis_timestamp);
         let ctx = Context::mainnet()
-            .with_db(CacheDB::new(EmptyDB::default()))
+            .with_db(db)
             .with_cfg(CfgEnv::new_with_spec(spec))
             .modify_cfg_chained(|c| c.chain_id = cfg.chain_id);
         let trace_cfg = TracingInspectorConfig::from_geth_call_config(&CallConfig::default());
@@ -218,33 +250,37 @@ impl Executor {
         let alloc = ex.cfg.alloc.clone();
         let db = ex.db_mut();
         for (addr, ga) in alloc {
-            let mut info = db.basic(addr).unwrap().unwrap_or_default();
-            info.balance = ga.balance;
-            info.nonce = ga.nonce;
+            let mut acct = Account::default();
+            acct.mark_touch();
+            acct.mark_created();
+            acct.info = db.basic(addr).unwrap().unwrap_or_default();
+            acct.info.balance = ga.balance;
+            acct.info.nonce = ga.nonce;
             if !ga.code.is_empty() {
                 let code = Bytecode::new_raw(ga.code.clone());
-                info.code_hash = code.hash_slow();
-                info.code = Some(code);
+                acct.info.code_hash = code.hash_slow();
+                acct.info.code = Some(code);
             }
-            db.insert_account_info(addr, info);
             for (k, v) in ga.storage {
-                db.insert_account_storage(addr, U256::from_be_bytes(k.0), U256::from_be_bytes(v.0)).unwrap();
+                let (k, v) = (U256::from_be_bytes(k.0), U256::from_be_bytes(v.0));
+                acct.storage.insert(k, EvmStorageSlot::new_changed(U256::ZERO, v, Default::default()));
             }
+            db.commit([(addr, acct)].into_iter().collect());
         }
         Ok(ex)
     }
 
-    pub fn db(&self) -> &Db {
+    pub fn db(&self) -> &D {
         self.evm.ctx.db()
     }
 
-    pub fn db_mut(&mut self) -> &mut Db {
+    pub fn db_mut(&mut self) -> &mut D {
         self.evm.ctx.db_mut()
     }
 
     /// BLOCKHASH source: hashes of executed blocks, keyed by number.
     pub fn set_block_hash(&mut self, number: u64, hash: B256) {
-        self.db_mut().cache.block_hashes.insert(U256::from(number), hash);
+        self.db_mut().set_block_hash(number, hash);
     }
 
     /// ApplyPrecompileActivations for one config: disable = SelfDestruct, else
@@ -348,7 +384,7 @@ impl Executor {
             let t0 = std::time::Instant::now();
             self.evm.ctx.set_tx(tx_env);
             self.evm.inspector.fuse();
-            let res: ExecutionResult = SevmHandler::<SevmEvm, Err, EthFrame<EthInterpreter>>::default()
+            let res: ExecutionResult = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default()
                 .inspect_run(&mut self.evm)
                 .map_err(|e| anyhow!("block {} tx {i} ({}): {e:?}", h.number, t.hash))?;
             let t1 = std::time::Instant::now();
@@ -385,8 +421,8 @@ impl Executor {
         Ok(out)
     }
 
-    /// Commit a tx's journal state. CacheDB keeps an EIP-158-deleted account as an
-    /// empty touched entry; drop it (with its storage) so the state is the trie's.
+    /// Commit a tx's journal state; the backend forgets the accounts it left
+    /// self-destructed or EIP-158 empty (see StateDb::forget).
     fn commit(&mut self, state: EvmState) {
         let dead: Vec<Address> = state
             .iter()
@@ -396,7 +432,7 @@ impl Executor {
         let db = self.db_mut();
         db.commit(state);
         for addr in dead {
-            db.cache.accounts.insert(addr, revm::database::DbAccount::new_not_existing());
+            db.forget(addr);
         }
     }
 }

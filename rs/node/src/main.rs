@@ -1,0 +1,563 @@
+//! epochdb-rs: the benchmark-grade Rust node. Blocks from a container dump
+//! (rs/block, senders recovered on a pool ahead), revm execution (rs/exec)
+//! over the flat state (rs/state: overlay + rolled run), the state root
+//! checked against every header on a checker thread one block behind, the
+//! overlay merged and the trie rolled in the background when it is over
+//! budget, receipts + callTracer JSON + state rows appended to a history
+//! file. One executor thread, like vmexec.
+//!
+//!   epochdb-rs --dump FILE --genesis chain.json --upgrade upgrade.json --data DIR
+//!       [--from 1] [--to N] [--stop-at N] [--duration S] [--workers 14]
+//!       [--roll-budget MB] [--history FILE] [--network 1]
+
+mod engine;
+
+use alloy_eips::eip2718::Encodable2718;
+use alloy_primitives::{Bytes, B256};
+use anyhow::{anyhow, bail, Context, Result};
+use engine::{run_path, seek_fn, spawn_roll, trie_path, user_data, write_manifest, Backend, RollResult};
+use exec::{oracle, Config, Executor};
+use state::commit::dirty::Dirty;
+use state::commit::file::File;
+use state::commit::roll::roll;
+use state::view::{merge, View};
+use state::KvIter;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How many executed blocks may wait for their root check (vmexec checkDepth).
+const CHECK_DEPTH: usize = 4;
+/// The history file's group-fsync cadence in blocks (vmexec flushEvery).
+const FLUSH_EVERY: u64 = 256;
+
+/// The bench snapshot, published per block by the checker (vmexec.Stats)
+/// plus the time split of both threads.
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    height: u64,
+    blocks: u64,
+    txs: u64,
+    gas: u64,
+    overlay: usize,
+    dirty: usize,
+    /// Blocks whose root was hashed and compared (non-empty write set).
+    checked: u64,
+    rolls: u64,
+    rolling: bool,
+    t_read: Duration,
+    t_evm: Duration,
+    t_trace: Duration,
+    t_commit: Duration,
+    t_apply: Duration,
+    t_root: Duration,
+    t_write: Duration,
+}
+
+struct CheckItem {
+    height: u64,
+    want: B256,
+    ws: Vec<(Vec<u8>, Vec<u8>)>,
+    header_rlp: Bytes,
+    receipts: Vec<u8>,
+    traces: Vec<String>,
+    code: Vec<(B256, Bytes)>,
+    stats: Stats,
+}
+
+enum Msg {
+    Block(Box<CheckItem>),
+    /// A sync item: the checker reports parked, then waits to be resumed.
+    Park(SyncSender<()>, Receiver<()>),
+}
+
+/// The flat history file: per block the header RLP, the receipts RLP, every
+/// tx's callTracer JSON, the state rows and the deployed code, each
+/// length-prefixed; fsync every FLUSH_EVERY blocks on a flusher thread.
+struct History {
+    w: std::io::BufWriter<std::fs::File>,
+    flush: SyncSender<()>,
+}
+
+impl History {
+    fn open(path: &str) -> Result<History> {
+        let f = std::fs::File::create(path).with_context(|| format!("history {path}"))?;
+        let f2 = f.try_clone()?;
+        let (tx, rx) = sync_channel::<()>(1);
+        std::thread::spawn(move || {
+            for _ in rx {
+                if let Err(e) = f2.sync_data() {
+                    eprintln!("epochdb-rs: history fsync: {e}");
+                    std::process::exit(1);
+                }
+            }
+        });
+        Ok(History { w: std::io::BufWriter::with_capacity(1 << 20, f), flush: tx })
+    }
+
+    fn put(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.w.write_all(&(b.len() as u32).to_le_bytes())?;
+        self.w.write_all(b)
+    }
+
+    fn write(&mut self, it: &CheckItem) -> std::io::Result<()> {
+        self.put(&it.header_rlp)?;
+        self.put(&it.receipts)?;
+        for t in &it.traces {
+            self.put(t.as_bytes())?;
+        }
+        for (k, v) in &it.ws {
+            self.put(k)?;
+            self.put(v)?;
+        }
+        for (h, c) in &it.code {
+            self.put(h.as_slice())?;
+            self.put(c)?;
+        }
+        if it.height % FLUSH_EVERY == 0 {
+            self.w.flush()?;
+            let _ = self.flush.try_send(()); // flusher busy: coalesce into the next multiple
+        }
+        Ok(())
+    }
+}
+
+/// The checker thread: applies each block's write set to Dirty, checks the
+/// root against the header (a mismatch kills the process), writes the block
+/// to the history file and publishes the stats.
+fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, mut hist: Option<History>, stats: Arc<Mutex<Stats>>) -> Result<()> {
+    let (mut t_apply, mut t_root, mut t_write) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut checked = 0u64;
+    for msg in rx {
+        let it = match msg {
+            Msg::Park(parked, resume) => {
+                let _ = parked.send(());
+                let _ = resume.recv();
+                continue;
+            }
+            Msg::Block(it) => it,
+        };
+        let dirty_bytes;
+        {
+            let mut d = dirty.lock().unwrap();
+            let root = if it.ws.is_empty() {
+                d.current_root()
+            } else {
+                let t0 = Instant::now();
+                for (k, v) in &it.ws {
+                    d.apply(k, v).with_context(|| format!("block {}: apply write set", it.height))?;
+                }
+                let t1 = Instant::now();
+                t_apply += t1 - t0;
+                let r = d.root().with_context(|| format!("block {}: state root", it.height))?;
+                t_root += t1.elapsed();
+                checked += 1;
+                r
+            };
+            if root != it.want.0 {
+                eprintln!("epochdb-rs: block {}: state root mismatch: computed {}, header {}", it.height, B256::from(root), it.want);
+                std::process::exit(1);
+            }
+            dirty_bytes = d.bytes();
+        }
+        if let Some(h) = hist.as_mut() {
+            let t0 = Instant::now();
+            h.write(&it).with_context(|| format!("block {}: history write", it.height))?;
+            t_write += t0.elapsed();
+        }
+        let mut s = it.stats;
+        s.dirty = dirty_bytes;
+        s.checked = checked;
+        s.t_apply = t_apply;
+        s.t_root = t_root;
+        s.t_write = t_write;
+        *stats.lock().unwrap() = s;
+    }
+    Ok(())
+}
+
+fn rss_mb() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let pages: u64 = s.split_whitespace().nth(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+    pages * 4096 >> 20
+}
+
+/// The bench thread: one line every 10 s and one at exit (epochdb-vm's line
+/// verbatim, full= always 0), the time split beside it; sets `stop` once
+/// --duration seconds passed since the first executed block.
+struct Bench {
+    stats: Arc<Mutex<Stats>>,
+    wait_ns: Arc<AtomicU64>,
+    t0: Instant,
+    first: Option<Instant>,
+    last: Stats,
+    last_t: Instant,
+}
+
+impl Bench {
+    fn line(&mut self, tag: &str) {
+        let s = *self.stats.lock().unwrap();
+        let now = Instant::now();
+        let dt = (now - self.last_t).as_secs_f64();
+        let window = if dt > 0.0 { (s.gas - self.last.gas) as f64 / dt / 1e6 } else { 0.0 };
+        let cum = match self.first {
+            Some(f) if (now - f).as_secs_f64() > 0.0 => s.gas as f64 / (now - f).as_secs_f64() / 1e6,
+            _ => 0.0,
+        };
+        eprintln!(
+            "{tag} t={:.0} h={} blk={} tx={} mgas/s={window:.2} cum={cum:.2} wait={:.1} full=0 rss={} overlay={} dirty={} rolls={} rolling={}",
+            (now - self.t0).as_secs_f64(),
+            s.height,
+            s.blocks,
+            s.txs,
+            self.wait_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            rss_mb(),
+            s.overlay >> 20,
+            s.dirty >> 20,
+            s.rolls,
+            s.rolling
+        );
+        let d = |a: Duration, b: Duration| a.saturating_sub(b).as_secs_f64();
+        let l = self.last;
+        eprintln!(
+            "split read={:.2}s evm={:.2}s trace={:.2}s commit={:.2}s | checker apply={:.2}s root={:.2}s write={:.2}s of {dt:.1}s",
+            d(s.t_read, l.t_read),
+            d(s.t_evm, l.t_evm),
+            d(s.t_trace, l.t_trace),
+            d(s.t_commit, l.t_commit),
+            d(s.t_apply, l.t_apply),
+            d(s.t_root, l.t_root),
+            d(s.t_write, l.t_write)
+        );
+        self.last = s;
+        self.last_t = now;
+    }
+
+    fn run(mut self, exit: Receiver<()>, duration: Option<f64>, stop: Arc<AtomicBool>) {
+        let mut n = 0;
+        loop {
+            match exit.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if self.first.is_none() && self.stats.lock().unwrap().blocks > 0 {
+                self.first = Some(Instant::now());
+            }
+            if let (Some(f), Some(d)) = (self.first, duration) {
+                if f.elapsed().as_secs_f64() >= d && !stop.swap(true, Ordering::Relaxed) {
+                    eprintln!("epochdb-rs: --duration {d} s reached");
+                }
+            }
+            n += 1;
+            if n % 10 == 0 {
+                self.line("bench");
+            }
+        }
+        self.line("bench exit");
+        let s = *self.stats.lock().unwrap();
+        let ex = s.t_evm + s.t_trace + s.t_commit;
+        eprintln!(
+            "split total read={:.2}s evm={:.2}s trace={:.2}s commit={:.2}s | checker apply={:.2}s root={:.2}s write={:.2}s | exec-thread {:.1} mgas/s | blocks={} root-checked={} rolls={}",
+            s.t_read.as_secs_f64(),
+            s.t_evm.as_secs_f64(),
+            s.t_trace.as_secs_f64(),
+            s.t_commit.as_secs_f64(),
+            s.t_apply.as_secs_f64(),
+            s.t_root.as_secs_f64(),
+            s.t_write.as_secs_f64(),
+            if ex.is_zero() { 0.0 } else { s.gas as f64 / ex.as_secs_f64() / 1e6 },
+            s.blocks,
+            s.checked,
+            s.rolls
+        );
+    }
+}
+
+fn arg(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+fn num<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    match arg(args, name) {
+        Some(s) => s.parse().map_err(|e| anyhow!("{name} {s}: {e}")),
+        None => Ok(default),
+    }
+}
+
+struct Node {
+    ex: Executor<Backend>,
+    dir: PathBuf,
+    gen: u64,
+    rolls: u64,
+    rolling: Option<Receiver<Result<RollResult, String>>>,
+    roll_h: u64,
+    roll_root: B256,
+    roll_t0: Instant,
+    dirty: Arc<Mutex<Dirty>>,
+    workers: usize,
+}
+
+impl Node {
+    /// maybeRoll: freezes the overlay once it is over budget and merges +
+    /// rolls it in the background; h and root are what the overlay's state
+    /// is at, the oracle for the rolled file.
+    fn maybe_roll(&mut self, budget: usize, h: u64, root: B256) {
+        if self.rolling.is_some() || self.ex.db().overlay.bytes() < budget {
+            return;
+        }
+        let be = self.ex.db_mut();
+        let frozen = be.freeze();
+        let base = be.run.clone().expect("run");
+        let gen = self.gen + 1;
+        eprintln!(
+            "epochdb-rs: roll {gen} start: height={h} overlay={} keys/{:.0}MB dirty={:.0}MB",
+            frozen.len(),
+            frozen.bytes() as f64 / 1e6,
+            self.dirty.lock().unwrap().bytes() as f64 / 1e6
+        );
+        self.roll_h = h;
+        self.roll_root = root;
+        self.roll_t0 = Instant::now();
+        self.rolling = Some(spawn_roll(self.dir.clone(), gen, frozen, base, user_data(h, &root)));
+    }
+
+    /// swapRoll + finishRoll: with the checker parked (it has then verified
+    /// every block handed to it), the new pair replaces the old, Dirty is
+    /// rebased on the new file and the fresh overlay's writes re-applied.
+    fn swap_roll(&mut self, check_tx: &SyncSender<Msg>) -> Result<()> {
+        let Some(rx) = &self.rolling else { return Ok(()) };
+        let Ok(r) = rx.try_recv() else { return Ok(()) };
+        self.rolling = None;
+        let r = r.map_err(|e| anyhow!("roll {}: {e}", self.gen + 1))?;
+        let (ptx, prx) = sync_channel(0);
+        let (rtx, rrx) = sync_channel(0);
+        check_tx.send(Msg::Park(ptx, rrx)).map_err(|_| anyhow!("checker gone"))?;
+        prx.recv().map_err(|_| anyhow!("checker gone"))?;
+        if r.root != self.roll_root.0 {
+            eprintln!("epochdb-rs: roll root mismatch at height {}: rolled {}, verified {}", self.roll_h, B256::from(r.root), self.roll_root);
+            std::process::exit(1);
+        }
+        let gen = self.gen + 1;
+        write_manifest(&self.dir, gen, self.roll_h, &self.roll_root)?;
+        let run = Arc::new(r.run);
+        let file = Arc::new(r.file);
+        let (before, after, replayed) = {
+            let mut d = self.dirty.lock().unwrap();
+            let before = d.bytes();
+            *d = Dirty::new(file, seek_fn(run.clone()));
+            d.workers = self.workers;
+            let be = self.ex.db_mut();
+            let mut it = be.overlay.iter(None, None);
+            let mut n = 0;
+            while it.next() {
+                d.apply(it.key(), it.value())?;
+                n += 1;
+            }
+            (before, d.bytes(), n)
+        };
+        self.ex.db_mut().swap(run.clone());
+        let _ = std::fs::remove_file(run_path(&self.dir, self.gen));
+        let _ = std::fs::remove_file(trie_path(&self.dir, self.gen));
+        self.gen = gen;
+        self.rolls += 1;
+        rtx.send(()).map_err(|_| anyhow!("checker gone"))?;
+        eprintln!(
+            "epochdb-rs: roll {gen} done: height={} keys={} nodes={} run={:.0}MB trie={:.0}MB merge={:.0}ms roll={:.0}ms total={:.0}ms replayed={replayed} overlay={:.0}MB dirty={:.0}MB->{:.0}MB",
+            self.roll_h,
+            r.stats.keys,
+            r.stats.nodes,
+            run.bytes() as f64 / 1e6,
+            r.stats.bytes as f64 / 1e6,
+            r.merge.as_secs_f64() * 1e3,
+            r.roll.as_secs_f64() * 1e3,
+            self.roll_t0.elapsed().as_secs_f64() * 1e3,
+            self.ex.db().overlay.bytes() as f64 / 1e6,
+            before as f64 / 1e6,
+            after as f64 / 1e6
+        );
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let dump = arg(&args, "--dump").ok_or_else(|| anyhow!("--dump FILE"))?;
+    let mut genesis = std::fs::read(arg(&args, "--genesis").ok_or_else(|| anyhow!("--genesis chain.json"))?)?;
+    let upgrade = match arg(&args, "--upgrade") {
+        Some(p) => std::fs::read(p)?,
+        None => Vec::new(),
+    };
+    let data = PathBuf::from(arg(&args, "--data").ok_or_else(|| anyhow!("--data DIR"))?);
+    let mut network: u32 = num(&args, "--network", 1)?;
+    if let Ok(desc) = serde_json::from_slice::<serde_json::Value>(&genesis) {
+        if let Some(gd) = desc.get("genesisData").and_then(|v| v.as_str()) {
+            use base64::Engine;
+            genesis = base64::engine::general_purpose::STANDARD.decode(gd).context("genesisData base64")?;
+            if let Some(n) = desc.get("networkID").and_then(|v| v.as_u64()) {
+                network = n as u32;
+            }
+        }
+    }
+    let from: u64 = num(&args, "--from", 1)?;
+    let to: u64 = num(&args, "--to", u64::MAX)?;
+    let stop_at: u64 = num(&args, "--stop-at", u64::MAX)?.min(to);
+    let workers: usize = num(&args, "--workers", 4)?;
+    let roll_budget: usize = num::<usize>(&args, "--roll-budget", 2048)? << 20;
+    let duration: Option<f64> = arg(&args, "--duration").map(|s| s.parse()).transpose()?;
+    let history = arg(&args, "--history").map(|p| History::open(&p)).transpose()?;
+    if from != 1 {
+        bail!("--from must be 1: the state starts at genesis (recovery is out of scope)");
+    }
+    let t0 = Instant::now();
+
+    let cfg = Config::from_genesis(&genesis, &upgrade, network).context("config")?;
+    let dirty_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+
+    // Genesis: the alloc into the first run, the first trie rolled from it,
+    // its root checked against a full alloy-trie recompute (newEngine).
+    let dir = data.join("vmstate");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let mut ex = Executor::with_db(cfg.clone(), Backend::new())?;
+    let want = oracle::state_root(Executor::new(cfg.clone())?.db());
+    let (run0, file0) = {
+        let be = ex.db_mut();
+        be.take_ws();
+        let frozen = be.freeze();
+        let user = user_data(0, &want);
+        let run0 = merge(&run_path(&dir, 0), &View::new(Some(&frozen), &[]), user).context("genesis merge")?;
+        let (root, st) = roll(&mut run0.iter(None, None), &trie_path(&dir, 0), user).context("genesis roll")?;
+        if root != want.0 {
+            bail!("genesis root mismatch: rolled {}, alloc {want}", B256::from(root));
+        }
+        let file0 = File::open(&trie_path(&dir, 0))?;
+        write_manifest(&dir, 0, 0, &want)?;
+        eprintln!("epochdb-rs: genesis state ok: root={want} accounts={} keys={} nodes={} run={}B trie={}B", cfg.alloc.len(), st.keys, st.nodes, run0.bytes(), st.bytes);
+        let run0 = Arc::new(run0);
+        be.swap(run0.clone());
+        (run0, Arc::new(file0))
+    };
+    let mut dirty = Dirty::new(file0, seek_fn(run0));
+    dirty.workers = dirty_workers;
+    let dirty = Arc::new(Mutex::new(dirty));
+
+    let stats = Arc::new(Mutex::new(Stats::default()));
+    let wait_ns = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (check_tx, check_rx) = sync_channel::<Msg>(CHECK_DEPTH);
+    let checker = {
+        let (dirty, stats) = (dirty.clone(), stats.clone());
+        std::thread::spawn(move || checker(check_rx, dirty, history, stats))
+    };
+    let (bench_exit_tx, bench_exit_rx) = sync_channel::<()>(1);
+    let bench = {
+        let b = Bench { stats: stats.clone(), wait_ns: wait_ns.clone(), t0, first: None, last: Stats::default(), last_t: t0 };
+        let stop = stop.clone();
+        std::thread::spawn(move || b.run(bench_exit_rx, duration, stop))
+    };
+    eprintln!(
+        "epochdb-rs: chainId={} dump={dump} heights={from}..{} roll-budget={}MB workers={workers} dirty-workers={dirty_workers} history={}",
+        cfg.chain_id,
+        if stop_at == u64::MAX { "end".to_string() } else { stop_at.to_string() },
+        roll_budget >> 20,
+        arg(&args, "--history").unwrap_or_default()
+    );
+
+    let mut node = Node {
+        ex,
+        dir,
+        gen: 0,
+        rolls: 0,
+        rolling: None,
+        roll_h: 0,
+        roll_root: want,
+        roll_t0: t0,
+        dirty,
+        workers: dirty_workers,
+    };
+    let blocks = block::Blocks::open(&dump, from, to)?;
+    let mut it = block::recovered(blocks, workers);
+    let mut parent_time = cfg.genesis_timestamp;
+    let (mut nblk, mut ntx, mut gas) = (0u64, 0u64, 0u64);
+    let mut t_read = Duration::ZERO;
+    let mut first = true;
+    let res = (|| -> Result<()> {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            node.swap_roll(&check_tx)?;
+            let tw = Instant::now();
+            let Some(b) = it.next() else { return Ok(()) };
+            let w = tw.elapsed();
+            t_read += w;
+            wait_ns.fetch_add(w.as_nanos() as u64, Ordering::Relaxed);
+            let b = b.map_err(|e| anyhow!("block decode: {e}"))?;
+            let h = &b.header;
+            if h.number > stop_at {
+                eprintln!("epochdb-rs: reached --stop-at {stop_at}");
+                return Ok(());
+            }
+            if first {
+                node.ex.set_block_hash(h.number - 1, h.parent_hash);
+                first = false;
+            }
+            let r = node.ex.execute_block(&b, parent_time).with_context(|| format!("block {}", h.number))?;
+            if r.gas_used != h.gas_used {
+                bail!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used);
+            }
+            if r.receipts_root != h.receipt_hash {
+                bail!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash);
+            }
+            if r.bloom != h.bloom {
+                bail!("block {}: logsBloom differs from the header", h.number);
+            }
+            node.ex.set_block_hash(h.number, b.hash);
+            nblk += 1;
+            ntx += r.txs.len() as u64;
+            gas += r.gas_used;
+            parent_time = h.time;
+            // From here the block's root is the header's or the checker dies.
+            node.maybe_roll(roll_budget, h.number, h.root);
+            let (ws, code) = node.ex.db_mut().take_ws();
+            let mut receipts = Vec::new();
+            let mut traces = Vec::with_capacity(r.txs.len());
+            for t in r.txs {
+                t.receipt.encode_2718(&mut receipts);
+                traces.push(t.trace_json);
+            }
+            let stats = Stats {
+                height: h.number,
+                blocks: nblk,
+                txs: ntx,
+                gas,
+                overlay: node.ex.db().overlay.bytes(),
+                rolls: node.rolls,
+                rolling: node.rolling.is_some(),
+                t_read,
+                t_evm: node.ex.t_evm,
+                t_trace: node.ex.t_trace,
+                t_commit: node.ex.t_commit,
+                ..Default::default()
+            };
+            let item = CheckItem { height: h.number, want: h.root, ws, header_rlp: Bytes::from(b.header_rlp.clone()), receipts, traces, code, stats };
+            if check_tx.send(Msg::Block(Box::new(item))).is_err() {
+                bail!("checker stopped");
+            }
+        }
+    })();
+    drop(check_tx);
+    let cres = checker.join().map_err(|_| anyhow!("checker panicked"))?;
+    let _ = bench_exit_tx.send(());
+    let _ = bench.join();
+    res?;
+    cres?;
+    let _ = Path::new(&dump);
+    Ok(())
+}
