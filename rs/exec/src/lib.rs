@@ -7,4 +7,4 @@ pub mod feemanager;
 pub mod oracle;
 
 pub use config::Config;
-pub use exec::{BlockResult, Executor, StateDb, StateRow, TxResult};
+pub use exec::{BlockResult, CallMsg, CallOut, Executor, StateDb, StateRow, TxResult};

@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 # rs-block's crate (branch rs-block, rs/block): dump reader, proposervm unwrap, block/tx decode, sender pool.
 block = { package = "epochdb-block", path = "../block" }
-revm = { version = "43", features = ["std", "serde"] }
+revm = { version = "43", features = ["std", "serde", "optional_balance_check", "optional_block_gas_limit", "optional_eip3607", "optional_no_base_fee"] }
 revm-inspectors = { version = "0.43", features = ["std", "serde"] }
 alloy-primitives = { version = "1", features = ["std", "map", "serde", "rlp", "asm-keccak"] }
 alloy-rlp = "0.3"

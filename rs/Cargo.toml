@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["state", "block", "exec", "node", "store"]
+members = ["state", "block", "exec", "node", "plugin", "store"]
 
 [profile.release]
 debug = 1

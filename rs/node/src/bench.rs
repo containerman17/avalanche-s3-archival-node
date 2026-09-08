@@ -10,18 +10,16 @@
 //!       [--from 1] [--to N] [--stop-at N] [--duration S] [--workers 14]
 //!       [--roll-budget MB] [--history FILE] [--network 1]
 
-mod engine;
-
+use crate::engine;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Bytes, B256};
 use anyhow::{anyhow, bail, Context, Result};
-use engine::{run_path, seek_fn, spawn_roll, trie_path, user_data, write_manifest, Backend, RollResult};
+use engine::{run_path, seek_fn, trie_path, user_data, write_manifest, Backend, Roller};
 use exec::{oracle, Config, Executor};
 use state::commit::dirty::Dirty;
 use state::commit::file::File;
 use state::commit::roll::roll;
 use state::view::{merge, View};
-use state::KvIter;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -290,103 +288,8 @@ where
     }
 }
 
-struct Node {
-    ex: Executor<Backend>,
-    dir: PathBuf,
-    gen: u64,
-    rolls: u64,
-    rolling: Option<Receiver<Result<RollResult, String>>>,
-    roll_h: u64,
-    roll_root: B256,
-    roll_t0: Instant,
-    dirty: Arc<Mutex<Dirty>>,
-    workers: usize,
-}
-
-impl Node {
-    /// maybeRoll: freezes the overlay once it is over budget and merges +
-    /// rolls it in the background; h and root are what the overlay's state
-    /// is at, the oracle for the rolled file.
-    fn maybe_roll(&mut self, budget: usize, h: u64, root: B256) {
-        if self.rolling.is_some() || self.ex.db().overlay.bytes() < budget {
-            return;
-        }
-        let be = self.ex.db_mut();
-        let frozen = be.freeze();
-        let base = be.run.clone().expect("run");
-        let gen = self.gen + 1;
-        eprintln!(
-            "epochdb-rs: roll {gen} start: height={h} overlay={} keys/{:.0}MB dirty={:.0}MB",
-            frozen.len(),
-            frozen.bytes() as f64 / 1e6,
-            self.dirty.lock().unwrap().bytes() as f64 / 1e6
-        );
-        self.roll_h = h;
-        self.roll_root = root;
-        self.roll_t0 = Instant::now();
-        self.rolling = Some(spawn_roll(self.dir.clone(), gen, frozen, base, user_data(h, &root)));
-    }
-
-    /// swapRoll + finishRoll: with the checker parked (it has then verified
-    /// every block handed to it), the new pair replaces the old, Dirty is
-    /// rebased on the new file and the fresh overlay's writes re-applied.
-    fn swap_roll(&mut self, check_tx: &SyncSender<Msg>) -> Result<()> {
-        let Some(rx) = &self.rolling else { return Ok(()) };
-        let Ok(r) = rx.try_recv() else { return Ok(()) };
-        self.rolling = None;
-        let r = r.map_err(|e| anyhow!("roll {}: {e}", self.gen + 1))?;
-        let (ptx, prx) = sync_channel(0);
-        let (rtx, rrx) = sync_channel(0);
-        check_tx.send(Msg::Park(ptx, rrx)).map_err(|_| anyhow!("checker gone"))?;
-        prx.recv().map_err(|_| anyhow!("checker gone"))?;
-        if r.root != self.roll_root.0 {
-            eprintln!("epochdb-rs: roll root mismatch at height {}: rolled {}, verified {}", self.roll_h, B256::from(r.root), self.roll_root);
-            std::process::exit(1);
-        }
-        let gen = self.gen + 1;
-        write_manifest(&self.dir, gen, self.roll_h, &self.roll_root)?;
-        let run = Arc::new(r.run);
-        let file = Arc::new(r.file);
-        let (before, after, replayed) = {
-            let mut d = self.dirty.lock().unwrap();
-            let before = d.bytes();
-            *d = Dirty::new(file, seek_fn(run.clone()));
-            d.workers = self.workers;
-            let be = self.ex.db_mut();
-            let mut it = be.overlay.iter(None, None);
-            let mut n = 0;
-            while it.next() {
-                d.apply(it.key(), it.value())?;
-                n += 1;
-            }
-            (before, d.bytes(), n)
-        };
-        self.ex.db_mut().swap(run.clone());
-        let _ = std::fs::remove_file(run_path(&self.dir, self.gen));
-        let _ = std::fs::remove_file(trie_path(&self.dir, self.gen));
-        self.gen = gen;
-        self.rolls += 1;
-        rtx.send(()).map_err(|_| anyhow!("checker gone"))?;
-        eprintln!(
-            "epochdb-rs: roll {gen} done: height={} keys={} nodes={} run={:.0}MB trie={:.0}MB merge={:.0}ms roll={:.0}ms total={:.0}ms replayed={replayed} overlay={:.0}MB dirty={:.0}MB->{:.0}MB",
-            self.roll_h,
-            r.stats.keys,
-            r.stats.nodes,
-            run.bytes() as f64 / 1e6,
-            r.stats.bytes as f64 / 1e6,
-            r.merge.as_secs_f64() * 1e3,
-            r.roll.as_secs_f64() * 1e3,
-            self.roll_t0.elapsed().as_secs_f64() * 1e3,
-            self.ex.db().overlay.bytes() as f64 / 1e6,
-            before as f64 / 1e6,
-            after as f64 / 1e6
-        );
-        Ok(())
-    }
-}
-
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+/// The bench mode: `args` is the whole argv.
+pub fn main(args: Vec<String>) -> Result<()> {
     let dump = arg(&args, "--dump").ok_or_else(|| anyhow!("--dump FILE"))?;
     let mut genesis = std::fs::read(arg(&args, "--genesis").ok_or_else(|| anyhow!("--genesis chain.json"))?)?;
     let upgrade = match arg(&args, "--upgrade") {
@@ -469,18 +372,8 @@ fn main() -> Result<()> {
         arg(&args, "--history").unwrap_or_default()
     );
 
-    let mut node = Node {
-        ex,
-        dir,
-        gen: 0,
-        rolls: 0,
-        rolling: None,
-        roll_h: 0,
-        roll_root: want,
-        roll_t0: t0,
-        dirty,
-        workers: dirty_workers,
-    };
+    let mut ex = ex;
+    let mut roller = Roller::new(dir, 0, dirty, dirty_workers);
     let blocks = block::Blocks::open(&dump, from, to)?;
     let mut it = block::recovered(blocks, workers);
     let mut parent_time = cfg.genesis_timestamp;
@@ -492,7 +385,14 @@ fn main() -> Result<()> {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            node.swap_roll(&check_tx)?;
+            if let Some(r) = roller.poll_roll(false)? {
+                let (ptx, prx) = sync_channel(0);
+                let (rtx, rrx) = sync_channel(0);
+                check_tx.send(Msg::Park(ptx, rrx)).map_err(|_| anyhow!("checker gone"))?;
+                prx.recv().map_err(|_| anyhow!("checker gone"))?;
+                roller.finish_roll(ex.db_mut(), r, || Ok(()))?;
+                rtx.send(()).map_err(|_| anyhow!("checker gone"))?;
+            }
             let tw = Instant::now();
             let Some(b) = it.next() else { return Ok(()) };
             let w = tw.elapsed();
@@ -505,10 +405,10 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             if first {
-                node.ex.set_block_hash(h.number - 1, h.parent_hash);
+                ex.set_block_hash(h.number - 1, h.parent_hash);
                 first = false;
             }
-            let r = node.ex.execute_block(&b, parent_time).with_context(|| format!("block {}", h.number))?;
+            let r = ex.execute_block(&b, parent_time).with_context(|| format!("block {}", h.number))?;
             if r.gas_used != h.gas_used {
                 bail!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used);
             }
@@ -518,14 +418,14 @@ fn main() -> Result<()> {
             if r.bloom != h.bloom {
                 bail!("block {}: logsBloom differs from the header", h.number);
             }
-            node.ex.set_block_hash(h.number, b.hash);
+            ex.set_block_hash(h.number, b.hash);
             nblk += 1;
             ntx += r.txs.len() as u64;
             gas += r.gas_used;
             parent_time = h.time;
             // From here the block's root is the header's or the checker dies.
-            node.maybe_roll(roll_budget, h.number, h.root);
-            let (ws, code) = node.ex.db_mut().take_ws();
+            roller.maybe_roll(ex.db_mut(), roll_budget, h.number, h.root);
+            let (ws, code) = ex.db_mut().take_ws();
             let mut receipts = Vec::new();
             let mut traces = Vec::with_capacity(r.txs.len());
             for t in r.txs {
@@ -537,13 +437,13 @@ fn main() -> Result<()> {
                 blocks: nblk,
                 txs: ntx,
                 gas,
-                overlay: node.ex.db().overlay.bytes(),
-                rolls: node.rolls,
-                rolling: node.rolling.is_some(),
+                overlay: ex.db().overlay.bytes(),
+                rolls: roller.rolls,
+                rolling: roller.rolling(),
                 t_read,
-                t_evm: node.ex.t_evm,
-                t_trace: node.ex.t_trace,
-                t_commit: node.ex.t_commit,
+                t_evm: ex.t_evm,
+                t_trace: ex.t_trace,
+                t_commit: ex.t_commit,
                 ..Default::default()
             };
             let item = CheckItem { height: h.number, want: h.root, ws, header_rlp: Bytes::from(b.header_rlp.clone()), receipts, traces, code, stats };
