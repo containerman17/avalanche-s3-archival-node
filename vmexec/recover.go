@@ -173,6 +173,7 @@ func (e *Executor) recover(m manifest, genesisRoot common.Hash, head uint64) err
 		e.headNum, e.headRoot, e.headTime = head, hdr.Root, hdr.Time
 	}
 	e.live.Store(e.headNum)
+	e.statsMu.Store(&Stats{Height: e.headNum})
 	log.Printf("vmexec: recovered: rolled at %d (gen %d), head %d, rows scanned %d, keys applied %d, root ok, in %s",
 		m.Height, m.Gen, head, rows, keys, time.Since(t0).Round(time.Millisecond))
 	return nil
