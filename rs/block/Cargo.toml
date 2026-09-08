@@ -12,7 +12,7 @@ name = "blockcheck"
 path = "src/main.rs"
 
 [dependencies]
-alloy-primitives = { version = "1.6", features = ["rlp"] }
+alloy-primitives = { version = "1.6", features = ["rlp", "asm-keccak"] }
 alloy-rlp = "0.3"
 bytes = "1"
 memmap2 = "0.9"
