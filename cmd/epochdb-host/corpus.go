@@ -186,6 +186,7 @@ func runCorpus(ctx context.Context, c *chain.Chain, sources []string, vmPath, da
 		return errors.New("plugin has no /rpc handler")
 	}
 	mux := http.NewServeMux()
+	mux.Handle("/debug/pprof/", http.DefaultServeMux)
 	for ext, handler := range handlers {
 		mux.Handle("/ext/bc/"+c.BlockchainID.String()+ext, handler)
 	}
@@ -212,6 +213,7 @@ func runCorpus(ctx context.Context, c *chain.Chain, sources []string, vmPath, da
 	log.Printf("epochdb-host: corpus=%s accepted=%d stop=%d batch=%d ring=%d vm_pid=%d", corpusPath, last.Height(), stopHeight, batchSize, queueAhead, tracker.pid.Load())
 	p := &pipe{from: last.Height() + 1, batch: batchSize, ring: make(chan item, queueAhead), batches: make(chan []parsed, 2), stop: cancel}
 	b := &bench{tracker: tracker, ring: p.ring}
+	p.b = b
 	b.height.Store(last.Height())
 	benchCtx, stopBench := context.WithCancel(ctx)
 	defer stopBench()

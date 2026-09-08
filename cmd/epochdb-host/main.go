@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -199,6 +200,7 @@ func main() {
 		log.Fatalf("epochdb-host: CreateHandlers: %v", err)
 	}
 	mux := http.NewServeMux()
+	mux.Handle("/debug/pprof/", http.DefaultServeMux)
 	for ext, h := range handlers {
 		mux.Handle("/ext/bc/"+c.BlockchainID.String()+ext, h)
 		log.Printf("epochdb-host: mounted /ext/bc/%s%s", c.BlockchainID, ext)
@@ -239,6 +241,7 @@ func main() {
 		stop:    stop,
 	}
 	b := &bench{tracker: tracker, ring: p.ring}
+	p.b = b
 	b.height.Store(last.Height())
 	go b.loop(ctx)
 	go p.pull(ctx, &snowCtx.NetworkUpgrades)
@@ -296,6 +299,7 @@ type pipe struct {
 	holdTx   bool
 	ring     chan item
 	batches  chan []parsed
+	b        *bench
 
 	pulledTxs atomic.Uint64
 	vmMu      sync.Mutex // one call into the VM at a time, as under avalanchego
@@ -437,7 +441,10 @@ func (p *pipe) parse(ctx context.Context, vm block.ChainVM) {
 			blks []snowman.Block
 			err  error
 		)
+		tLock := time.Now()
 		p.vmMu.Lock()
+		tParse := time.Now()
+		p.b.lockNs.Add(int64(tParse.Sub(tLock)))
 		if bvm != nil {
 			blks, err = bvm.BatchedParseBlock(ctx, raws)
 			if errors.Is(err, block.ErrRemoteVMNotImplemented) {
@@ -456,6 +463,7 @@ func (p *pipe) parse(ctx context.Context, vm block.ChainVM) {
 				}
 			}
 		}
+		p.b.parseNs.Add(int64(time.Since(tParse)))
 		p.vmMu.Unlock()
 		if err != nil {
 			p.fail(err)
@@ -519,8 +527,11 @@ func (p *pipe) drive(ctx context.Context, vm block.ChainVM, b *bench) error {
 
 // step is one block under vmMu: Verify, Accept, and the tip bookkeeping.
 func (p *pipe) step(ctx context.Context, vm block.ChainVM, x parsed, b *bench, normal *bool) error {
+	t0 := time.Now()
 	p.vmMu.Lock()
 	defer p.vmMu.Unlock()
+	t1 := time.Now()
+	b.lockNs.Add(int64(t1.Sub(t0)))
 	h, blk := x.h, x.blk
 	verified := false
 	if wc, ok := blk.(block.WithVerifyContext); ok {
@@ -540,9 +551,14 @@ func (p *pipe) step(ctx context.Context, vm block.ChainVM, x parsed, b *bench, n
 			return fmt.Errorf("height %d: Verify: %w", h, err)
 		}
 	}
+	t2 := time.Now()
+	b.verifyNs.Add(int64(t2.Sub(t1)))
 	if err := blk.Accept(ctx); err != nil {
 		return fmt.Errorf("height %d: Accept: %w", h, err)
 	}
+	t3 := time.Now()
+	b.acceptNs.Add(int64(t3.Sub(t2)))
+	defer func() { b.tailNs.Add(int64(time.Since(t3))) }()
 	b.accepted(x.item)
 	// The tip is where the follower says it is. At it, the plugin
 	// goes to normal operation and the preference follows every
@@ -616,6 +632,10 @@ type bench struct {
 	waitSince atomic.Int64 // unix nanos since the VM loop began its current wait, 0 while it runs
 	fullNs    atomic.Int64
 	firstAt   atomic.Int64 // unix nanos of the first accepted block, 0 before
+
+	// stage wall totals under vmMu: parse batches, waiting for vmMu (both
+	// goroutines), Verify, Accept, and the SetPreference/SetState tail.
+	parseNs, lockNs, verifyNs, acceptNs, tailNs atomic.Int64
 }
 
 // waited is the blocked time so far, the wait in progress included, so a
@@ -668,6 +688,9 @@ func (b *bench) loop(ctx context.Context) {
 // exit prints the whole run as one window.
 func (b *bench) exit() {
 	log.Print(b.line("exit ", b.blocks.Load(), b.txs.Load(), b.gas.Load(), b.waited(), b.fullNs.Load(), b.elapsed()))
+	log.Printf("bench stages elapsed=%.3fs parse=%.3fs lockwait=%.3fs verify=%.3fs accept=%.3fs tail=%.3fs",
+		b.elapsed().Seconds(), float64(b.parseNs.Load())/1e9, float64(b.lockNs.Load())/1e9,
+		float64(b.verifyNs.Load())/1e9, float64(b.acceptNs.Load())/1e9, float64(b.tailNs.Load())/1e9)
 }
 
 func (b *bench) elapsed() time.Duration {

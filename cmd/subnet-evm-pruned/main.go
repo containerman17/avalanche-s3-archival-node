@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 
@@ -30,7 +32,10 @@ import (
 	"github.com/containerman17/avalanche-s3-archival-node/pruned"
 )
 
-const backendField = "benchmark-state-backend"
+const (
+	backendField = "benchmark-state-backend"
+	pprofField   = "benchmark-pprof-addr" // optional: serve net/http/pprof on this address
+)
 
 var (
 	_ core.RevisionTrieDB = (*pruned.DB)(nil)
@@ -65,6 +70,16 @@ func backendConfig(data []byte, networkID uint32) (string, []byte, error) {
 		if err := json.Unmarshal(data, &fields); err != nil {
 			return "", nil, fmt.Errorf("decode VM config: %w", err)
 		}
+		changed := false
+		if value, ok := fields[pprofField]; ok {
+			var addr string
+			if err := json.Unmarshal(value, &addr); err != nil {
+				return "", nil, fmt.Errorf("decode %s: %w", pprofField, err)
+			}
+			delete(fields, pprofField)
+			changed = true
+			go func() { _ = http.ListenAndServe(addr, nil) }()
+		}
 		if value, ok := fields[backendField]; ok {
 			var selected string
 			if err := json.Unmarshal(value, &selected); err != nil {
@@ -72,6 +87,9 @@ func backendConfig(data []byte, networkID uint32) (string, []byte, error) {
 			}
 			backend = selected
 			delete(fields, backendField)
+			changed = true
+		}
+		if changed {
 			var err error
 			data, err = json.Marshal(fields)
 			if err != nil {
