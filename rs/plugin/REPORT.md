@@ -104,3 +104,94 @@ Not done in the time box: wiring rs/node's executor behind the trait (the mappin
 - Plain errors are `Unknown` with the message (what a Go handler returning `error` produces); the enum-coded errors (`NOT_FOUND`, `STATE_SYNC_NOT_IMPLEMENTED`) follow `errorToErrEnum` with a nil gRPC error.
 - BlockVerify re-parses the bytes (as the Go server does); the parsed-block cache of `chain.State` lives on the host side, not here.
 - Logging is `eprintln!` lines, not the zap logger the Go server builds; avalanchego relays the plugin's stderr.
+
+# PHASE 2: the real executor behind the plugin (branch rs-vm)
+
+Branch `rs-vm` on top of rs-plugin (edafa2c), 2026-09-09 00:00-01:00 JST, local i7-10700K, nothing on the Tokyo box. One binary `epochdb-rs` (crate `rs/plugin`): no arguments = rpcchainvm plugin over rs/node's executor; `--dump ...` = rs/node's in-process bench (unchanged flags, rs/node is a library now); `--version`. No Go file edited except the new harness `cmd/epochdb-host-bench` (it is rs-plugin's own code). The TrivialEngine is gone (its numbers are above; git has it).
+
+## Engine mapping (rs/plugin/src/node_engine.rs, layered.rs)
+
+| trait | NodeEngine |
+|---|---|
+| `Block` | `Arc<block::Block>` with senders recovered. `parse` = `block::decode_container` (inner bytes or a whole container) + libsecp256k1 recovery per tx; the parsed blocks are kept by id (8,192 max, swept below the accepted head every 256 accepts) so the host's re-parse in BlockVerify is a lookup. `parse_batch` (new trait default = map parse) runs the batch on a rayon pool of NumCPU-2 threads: BatchedParseBlock is where the recovery happens, like vmchain/recover.go's pool but synchronous inside the call (the host parses the next batch while it verifies the current one, so the executor never recovers). |
+| `Pending` | `{ number, hash, time, parent: Option<Arc<Pending>>, map (reads, slot tombstones included), owners, code, payload: Mutex<Option<{ws, code, receipts, traces, gas_used, txs}>> }`. The payload is taken once, at accept. |
+| `verify` | `Layered::begin(parent)`, `Executor<Layered>::execute_block(b, parent_time)`, gasUsed / receiptsRoot / logsBloom against the header (a mismatch is the Verify error), `Layered::finish` -> Pending. `Layered: StateDb` reads cur -> pending chain -> `Backend` (fresh overlay -> frozen -> run), commits into cur's map + ordered write set (Backend::commit's rows, tombstones in the read map only, as engine.tombstoneSlots regenerates them at overlay apply). Code by hash: cur -> chain -> Backend's table. BLOCKHASH: the chain's hashes, then the accepted ones. |
+| `accept` | swap a finished roll first (checker parked, store fsync, MANIFEST, Dirty rebased: rs/node's `Roller::finish_roll`), `Backend::apply_ws(ws)` (Go's applyOverlay: puts + slot tombstones + owners), code table, block hash, head = b, `Roller::maybe_roll(budget, h, root)`, then the CheckItem to the checker thread (depth 4). |
+| checker thread | Dirty apply + root one block behind, compared with the header root: a mismatch prints `block N: state root mismatch: computed X, header Y` and exits 1 (the Go follower's log.Fatal); then the interim store append (blocks.log + code.log), fsync every 256 blocks on a flusher thread through its own file handles, `root-checked` counter. |
+| `last_accepted` / `get_block` / `block_id_at_height` | the head (in memory), the genesis, the accepted-not-yet-logged window (at most 4), then the store's id index. |
+| `set_state` (new trait default) | Bootstrapping = catch-up profile, NormalOp = tip profile (below). |
+| `shutdown` | a roll in flight is waited for and swapped in (so a restart replays from the newest roll), the checker drains, the store is synced, the counters and time split go to stderr. |
+
+The engine's executor sits behind one mutex (`Inner { Executor<Layered>, Roller, roll_budget }`); verify and accept are serialized by the tree's lock anyway, RPC state reads and eth_call take the same mutex.
+
+Genesis (rs/plugin/src/genesis.rs): the header as subnet-evm's `core.Genesis.toBlock` builds it (fields with their defaults, baseFee = genesis baseFeePerGas or feeConfig.minBaseFee under SubnetEVM, blockGasCost 0 under Etna, the EIP-4844/4788 zeros under Cancun, Granite refused) over the root of the alloc plus the precompiles active at 0 (rs/exec's seeded state, alloy-trie recompute); `block::eth::encode_header` (new, the inverse of the decoder). Step: `0x628a4aba...5cb1b0c1` = block 1's parentHash (unit test `genesis::tests::step_genesis_hash` and the harness's `check genesis` line). The `genesis-id` config hack is gone from the harness.
+
+Budgets (vmexec/budget.go): `SyncRoll` 2 GiB while Bootstrapping, `TipRoll` 128 MiB on SetState(NormalOp) plus one roll of whatever the overlay holds at the switch (tickBudget); no GOGC equivalent. Config bytes `{"roll-budget-mb": N}` override the catch-up budget (tip = min(N, 128)), the harness's way to force rolls.
+
+Call mode (rs/exec): `Executor::call(head_header, CallMsg)` = subnet-evm DoCall (base fee, balance, nonce and EIP-3607 checks off, block gas limit off, journal cleared, nothing committed) and `Executor::open(cfg, db)` (no genesis seeding) for a db that already holds a state. revm's `optional_*` features enabled in rs/exec.
+
+## The interim store (rs/plugin/src/log.rs)
+
+```rust
+pub trait BlockStore: Send {
+    fn head(&self) -> u64;                                   // last logged height, 0 when empty
+    fn height_of(&self, id: &Id) -> Option<u64>;
+    fn id_at(&self, height: u64) -> Option<Id>;
+    fn container(&self, height: u64) -> io::Result<Option<Bytes>>;  // the bytes the plugin was handed
+    fn read(&self, height: u64) -> io::Result<Option<Record>>;      // + receipts, traces, write set, code (recovery)
+    fn append(&mut self, r: &Record) -> io::Result<()>;             // height == head + 1
+    fn sync(&self) -> io::Result<()>;
+}
+```
+`BlockLog` = `<chainData>/blocks.log`, records `[u32 len][u64 height][32 id][u32 crc32][payload]`, payload = container, receipts RLP, callTracer JSONs, the block's ordered write set (contract keys), deployed code, each u32-length-prefixed; one write per record; the height/id index is rebuilt on open from the record heads (one pread each: 50k blocks 3.7 s cold, 30-40 ms warm; 1M would be around a minute cold, rs/store's job). `CodeLog` = `code.log` (`[32 hash][u32][code]`), read whole on open into the Backend's code table (the run holds no code). Torn tail rule (the wiki note): a record whose bytes are not all there, or whose crc fails as the LAST record, is truncated away; anything short or bad elsewhere, and any read error, is an error. Test `log::tests::roundtrip_and_torn_tail`. 50k Step: blocks.log 319 MB (the traces are most of it, uncompressed as rs/node's history file was), code.log 168 KB, vmstate 21 MB.
+
+## Recovery (NodeEngine::open, from vmexec/recover.go)
+
+1. Config from the genesis + upgrade bytes, the genesis block, config bytes.
+2. `vmstate/MANIFEST` present: `open_rolled` opens `run.<gen>` / `trie.<gen>`, checks their user data and the trie root against the manifest, sweeps every other file in vmstate (a torn roll is anything unnamed). Absent: vmstate is wiped, the genesis state goes through the executor into `run.0` / `trie.0`, root-checked, `MANIFEST {0, 0, root}`.
+3. Open blocks.log and code.log (torn tails dropped, logged), code into the Backend. `head < manifest.height` is an error. The rolled root must equal the chain's root at the manifest height (genesis root at 0, else the stored header's). Block 1's parentHash must be the genesis hash.
+4. Replay heights manifest.height+1..=head: `Backend::apply_ws` + `Dirty::apply` per row (code came from code.log). If anything was replayed, `Dirty::root` must equal the head header's root, else exit 1 with both roots. The last 256 block hashes are loaded for BLOCKHASH. Head = the stored block (or the genesis).
+5. Log line `recovered: rolled at H (gen G), head N <hash>, rows replayed R, root ok, in T ms`; the executor opens over the Backend; the checker thread starts.
+
+MANIFEST is written by `Roller::finish_roll` after the rolled root matched the verified root at the roll height and after the store was fsynced (Go's syncStore), temp + fsync + rename + dir fsync, then the old pair is unlinked.
+
+## Results
+
+Harness runs: `go run ./cmd/epochdb-host-bench --dump $S/rs/step/step-containers-1-50000.bin --vm rs/target/release/epochdb-rs --data $S/vm-50k/data --http 127.0.0.1:19902 --batch 256 --config '{"state-sync-enabled":false,"roll-budget-mb":8}'` (`$S` = the session scratchpad; logs under `$S/vm-50k`, `$S/vm-crash`, `$S/vm-1m`).
+
+1. Step 50k, 8 MB roll budget, fresh dir (`$S/vm-50k/run3.log`): every block parsed, verified, accepted and root-checked (`exit: blocks=50000 txs=343731 gas=21828575876 root-checked=50000 rolls=4 head=50000`), rolls at 17,546 / 31,462 / 45,339 by budget and one at 50,000 on SetState(NormalOp), every rolled root equal to the verified root (a mismatch exits), `check eth_blockNumber=50000 ... match=true` and `check genesis eth_getBlockByNumber(0x0).hash=0x628a4aba... block1.parentHash=0x628a4aba... match=true`. 46 s, 1,078 blk/s, vm_rss 133 MB. Time split from the exit line: `evm=4.40s trace=0.37s commit=0.55s | parse-batch=2.72s parse=0.55s verify=6.21s accept=3.60s checker=6.48s`: the engine spends 12.5 s inside VM calls (0.25 ms per block: 0.05 parse batch on 14 threads, 0.12 verify, 0.07 accept, the checker off the critical path) and the other 33 s are the gRPC round trips plus the host's bookkeeping, the same ~28 s the trivial engine measured for 50k blocks (Verify + Accept = 2 round trips of 0.28 ms plus the batched parse). So under rpcchainvm the plugin is round-trip bound at about 1,100 blk/s on these blocks, the executor is busy 10 percent of the time, and BatchedParseBlock + parse-time recovery keeps it fed: `wait=0.0s` on the host side and no recovery inside verify.
+   RPC oracle: the public door answered 502 for the whole session (`error code: 502`), so the oracle is stock subnet-evm v1.14.2 under the same harness on its 50k data dir (`--serve`, the RPC ORACLE RULE's tiebreaker), both plugins at head 50,000 (`$S/vm-50k/rpccmp.py`, output `rpccmp.out`): 30 of 30 answers byte-equal: eth_chainId, eth_blockNumber, eth_getBalance of the alloc address `0x7212Ac7f...` at `latest` and at `0xc350` (`0x10263f6f007f8154972fb800`), of `0x337858b9...` (`0xe851ff19c196e00`) and of the contract, eth_getTransactionCount (`0x7c25`, `0x6`), eth_getCode of the Step contract `0x48f7f068...` (607 bytes) and of an EOA, eth_getStorageAt slots 0..2, eth_call of the contract's `spam(uint256)` (`0x5858d161`, the only function on Step 1..50k; it writes n hashed slots) with n=3 from `0x337858b9...` and with n=1 from the zero address (`0x` on both, the state is not committed), the four reverting calls (`-32000 execution reverted` with no data, geth's shape for an empty revert), the intrinsic-gas error text, eth_estimateGas of a plain transfer (`0x5208`, the 21000 shortcut), of spam(3) / spam(40) / spam(1) at a gas price (`0x866f`, `0xdec3c`, `0x65fd`: the gasestimator port with `lo = gasUsed - 1`, the optimistic 64/63 probe, the 1.5 percent error ratio and the `mid <= 2 lo` skew, exactly), eth_getBlockByHash of block 50,000 and eth_getBlockByNumber(0x1, full) with the tx objects (senders recovered on read).
+2. Crash test (`$S/vm-crash/run2.sh`, kill -9 on the plugin pid when a log pattern appears, `--from 0` resumes from the plugin's LastAccepted as the host does):
+   - outside a roll: killed at height 31,700 right after roll 2 had swapped in (`kill1.log`; the host saw `Verify: rpc error: code = Unavailable`). MANIFEST `{gen 2, 31462}`. Restart (`resume1.log`): `recovered: rolled at 31462 (gen 2), head 31700, rows replayed 3549, root ok, in 29 ms`, `plugin last accepted height=31700`, the run continued from 31,701 (roll 3 at 45,339 equal to the verified root).
+   - inside a roll: killed on `roll 4 start` at 50,000 (`resume2.log`), leaving `run.4` without `trie.4` and MANIFEST at gen 3 / 45,339. Restart (`resume3.log`): `swept run.4: not named by the manifest`, `recovered: rolled at 45339 (gen 3), head 50000 0xa9a6c28a..., rows replayed 64431, root ok, in 134 ms`, both check lines `match=true`, head hash equal to the fresh run's (`0xa9a6c28a4081e99a5a91b0864c18d97f6a08505d3c0f0b92410d45ede5a7b3f6`, the same root at 50,000 the checker verified in the fresh run).
+   (Kills on `roll N start` with the default `tail -F` landed after the 170-270 ms rolls had finished; `-s 0.005` lands inside.)
+3. 1M dump, 180 s, 256 MB roll budget: see the table below.
+4. `cd rs && cargo test --workspace`: 20 tests pass (state 14, exec 2, block 1, plugin 3: the sibling tree test, the Step genesis hash, the log round trip + torn tail). `cargo build --release --target x86_64-unknown-linux-musl -p epochdb-plugin`: static-pie 40.9 MB, `epochdb-rs/0.1.0 [rpcchainvm=45]`.
+
+1M dump under the harness (`$S/vm-1m/run.log`, `roll-budget-mb: 256`, `--batch 256`, fresh dir; the harness was SIGINTed 10 s after its t=17x line, so the exit line is at t=190 s; the t=179 line is the 180 s figure):
+
+| | epochdb-rs under rpcchainvm (this) | rs/node in-process (rs-node report) | TrivialEngine ceiling (above) |
+|---|---|---|---|
+| blocks at 180 s | 220,450 (t=179), 234,307 at t=190 | 895,592 | (50k in 28 s) |
+| blk/s | 1,225 (window), 1,232 cum at exit | 4,976 | 1,769 |
+| tx/s | 5,240 (window), 5,665 cum | 19,182 | |
+| mgas/s cum | 305 (302.9 at exit) | 1,348 | |
+| plugin RSS | 395 MB at t=179, 424 MB at exit (host 661 MB) | 1,338 MB peak | 141 MB |
+| rolls | 0 (overlay under 256 MB at 234k) | 1 | |
+| root-checked | 234,307 of 234,307 | 896,445 | none |
+
+Where the time goes (the plugin's exit line, 191 s): `evm=12.35s trace=1.43s commit=1.96s` (the executor busy 16 s, 3,660 mgas/s while it runs), `parse-batch=8.36s parse=2.00s verify=18.85s accept=10.21s`: 37 s inside VM calls, `checker=24.20s` off the critical path. The other ~150 s are gRPC round trips and the host's per-block bookkeeping: 2 round trips per block (Verify, Accept) at the 0.28 ms the trivial engine measured plus the host's chain.State work, about 0.65 ms per block, against 0.16 ms of engine work per block. `wait=0.0s full=184.6s` on the host: the dump was always ahead, the VM path was the wall the whole run. BatchedParseBlock + parse-time recovery keeps the executor fed (no recovery inside verify; parse-batch is 36 us per block on the pool, serialized with verify by the host's VM mutex). So under rpcchainvm this engine runs at 1.2k blk/s, a quarter of its in-process 5k: the protocol, not the executor, is the ceiling, and the way past it is fewer or cheaper round trips (a fused Verify+Accept is not in the protocol; the Go plugin path measured ~880 blk/s on the same blocks). The 50k window here (t=49: h=56,592) is close to the 50k run's 1,078 blk/s.
+
+## Deviations
+
+- Recovery replays the store's write sets block by block in order (rs/node's contract-key rows) instead of Go's address-form rows with per-key latest-wins; same result, simpler.
+- The parse cache replaces Go's sender cache on the tx object; a block parsed but never verified is swept at 8,192 entries.
+- Empty write sets are still root-compared (current root vs header), as rs/node does.
+- `totalDifficulty` in block JSON is the height (difficulty 1 per block over a genesis of 0 on every subnet-evm chain we run).
+- eth_getBlockByNumber / ByHash for a stored block decodes the container on every call, no cache; state RPCs only at `latest` (the interim store has no history).
+- Shutdown waits for a roll in flight instead of abandoning it (Go abandons; the sweep covers both).
+- The `Inner` (revm Evm) is `unsafe impl Send` behind the mutex: revm's LocalContext holds an Rc the Evm alone touches.
+
+## What rs/store and rs/rpc must provide to replace the interim pieces
+
+rs/store: an implementation of `BlockStore` (head, height by id, id by height, container by height, the per-block record for recovery replay: write set + code; append; sync), the code table by hash for the Backend (today code.log read whole), and the recovery contract: rows since the manifest height must be readable after a crash through the store's own head (the WAL semantics of Go's runs). The engine calls `sync()` before writing MANIFEST and every 256 blocks. Receipts and traces are handed over in the same record; the store decides their format. rs/rpc: takes `NodeEngine`'s `head`, `store`, `inner` (executor + backend for state reads and `Executor::call`) and the `rpc::handle` envelope; historical state and the debug_/ots_/edb_ namespaces are its own.
