@@ -22,9 +22,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -62,6 +64,7 @@ func main() {
 	nodeURI := flag.String("node", "", "comma-separated bootstrap RPC node URIs")
 	p2pPort := flag.Int("p2p-port", 0, "listen for avalanchego peers on this port")
 	index := flag.String("index", "", "container id -> height index file, built on first start")
+	identities := flag.Int("identities", 1, "listeners to open, on consecutive ports from --p2p-port, one NodeID each: avalanchego's inbound bandwidth throttler caps every peer at 512 KiB/s, so a syncing node fetches from N of us at N times that")
 	flag.Parse()
 	if *dir == "" || *manifest == "" || *chainSpec == "" || *p2pPort == 0 || *index == "" {
 		log.Fatal("archive-serve: need --dir, --manifest, --chain, --p2p-port, --index")
@@ -101,10 +104,19 @@ func main() {
 	c, err := chain.Resolve(rctx, *chainSpec, netID, *dir, dist.Sources(*nodeURI)...)
 	cancel()
 	check(err)
-	net, err := listen(*p2pPort, *dir, c, a)
-	check(err)
-	defer net.StartClose()
-	log.Printf("archive-serve: serving %s on :%d", c.BlockchainID, *p2pPort)
+	var peers []string
+	for i := 0; i < *identities; i++ {
+		idDir := *dir
+		if i > 0 {
+			idDir = filepath.Join(*dir, fmt.Sprintf("id%d", i))
+			check(os.MkdirAll(idDir, 0o755))
+		}
+		net, nodeID, err := listen(*p2pPort+i, idDir, c, a)
+		check(err)
+		defer net.StartClose()
+		peers = append(peers, fmt.Sprintf("%s@198.18.0.1:%d", nodeID, *p2pPort+i))
+	}
+	log.Printf("archive-serve: serving %s on :%d..%d; --peers %s", c.BlockchainID, *p2pPort, *p2pPort+*identities-1, strings.Join(peers, ","))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -121,9 +133,10 @@ func main() {
 		served := a.served.Load()
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
-		log.Printf("archive-serve: served=%d (%.0f/s over 30s, %.0f/s avg) bytes=%dMB lookups=%d misses=%d polls=%d windows=%d heap=%dMB",
+		cs, _ := cas.CacheStats()
+		log.Printf("archive-serve: served=%d (%.0f/s over 30s, %.0f/s avg) bytes=%dMB lookups=%d misses=%d polls=%d windows=%d build=%s heap=%dMB cache=%+v",
 			served, float64(served-last)/30, float64(served)/time.Since(t0).Seconds(), a.bytes.Load()>>20,
-			a.lookups.Load(), a.lookupMiss.Load(), a.polls.Load(), a.windows.Load(), ms.HeapAlloc>>20)
+			a.lookups.Load(), a.lookupMiss.Load(), a.polls.Load(), a.windows.Load(), time.Duration(a.buildNanos.Load()).Round(time.Millisecond), ms.HeapAlloc>>20, cs)
 		last = served
 	}
 }
@@ -142,7 +155,7 @@ type archive struct {
 	win   map[uint64]*window // key = height / winBlocks
 	order []uint64           // insertion order, for eviction
 
-	served, bytes, lookups, lookupMiss, polls, windows atomic.Uint64
+	served, bytes, lookups, lookupMiss, polls, windows, buildNanos atomic.Uint64
 }
 
 // top is the highest height the runs hold.
@@ -156,7 +169,7 @@ type window struct {
 }
 
 func (a *archive) ContainerAt(h uint64) ([]byte, error) {
-	w, err := a.windowFor(h)
+	w, err := a.windowFor(h, false)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +184,7 @@ func (a *archive) ContainerAt(h uint64) ([]byte, error) {
 
 // idAt is the container id at height h, what a PullQuery for h is answered with.
 func (a *archive) idAt(h uint64) (ids.ID, error) {
-	w, err := a.windowFor(h)
+	w, err := a.windowFor(h, false)
 	if err != nil {
 		return ids.Empty, err
 	}
@@ -183,7 +196,7 @@ func (a *archive) idAt(h uint64) (ids.ID, error) {
 
 // windowFor is the window holding h, built once and shared by every caller
 // that asks while it builds.
-func (a *archive) windowFor(h uint64) (*window, error) {
+func (a *archive) windowFor(h uint64, prefetch bool) (*window, error) {
 	k := h / winBlocks
 	a.mu.Lock()
 	w := a.win[k]
@@ -196,9 +209,16 @@ func (a *archive) windowFor(h uint64) (*window, error) {
 			a.order = a.order[1:]
 		}
 		a.mu.Unlock()
+		t0 := time.Now()
 		w.c, w.id, w.err = a.buildWindow(k*winBlocks, k*winBlocks+winBlocks-1)
 		a.windows.Add(1)
+		a.buildNanos.Add(uint64(time.Since(t0)))
 		close(w.ready)
+		// A GetAncestors walk descends, so the window below is the next one
+		// asked for: build it now, off the request's path.
+		if k > 0 && !prefetch {
+			go a.windowFor(k*winBlocks-1, true)
+		}
 	} else {
 		a.mu.Unlock()
 		<-w.ready

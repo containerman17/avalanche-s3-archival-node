@@ -40,42 +40,42 @@ import (
 // epochdb needs and nobody else on the chain has. The network setup is
 // fetch.dial's (NewTestNetworkConfig, persisted staking cert, MyIPPort
 // 127.0.0.1), minus the validator dial: peers dial us.
-func listen(port int, dir string, c *chain.Chain, src *archive) (network.Network, error) {
+func listen(port int, dir string, c *chain.Chain, src *archive) (network.Network, ids.NodeID, error) {
 	vdrs := &permissiveValidators{Manager: validators.NewManager()}
 	netCfg, err := network.NewTestNetworkConfig(prometheus.NewRegistry(), c.NetworkID, vdrs, set.Of(c.SubnetID))
 	if err != nil {
-		return nil, fmt.Errorf("NewTestNetworkConfig: %w", err)
+		return nil, ids.EmptyNodeID, fmt.Errorf("NewTestNetworkConfig: %w", err)
 	}
 	keyPath, certPath := filepath.Join(dir, "staker.key"), filepath.Join(dir, "staker.crt")
 	if _, serr := os.Stat(keyPath); serr != nil {
 		if err := staking.InitNodeStakingKeyPair(keyPath, certPath); err != nil {
-			return nil, fmt.Errorf("staking key pair: %w", err)
+			return nil, ids.EmptyNodeID, fmt.Errorf("staking key pair: %w", err)
 		}
 	}
 	tlsCert, err := staking.LoadTLSCertFromFiles(keyPath, certPath)
 	if err != nil {
-		return nil, fmt.Errorf("staking cert: %w", err)
+		return nil, ids.EmptyNodeID, fmt.Errorf("staking cert: %w", err)
 	}
 	netCfg.TLSConfig = peer.TLSConfig(*tlsCert, nil)
 	netCfg.TLSKey = tlsCert.PrivateKey.(crypto.Signer)
 	netCfg.MyIPPort.Set(netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(port)))
 	stakingCert, err := staking.ParseCertificate(netCfg.TLSConfig.Certificates[0].Leaf.Raw)
 	if err != nil {
-		return nil, fmt.Errorf("ParseCertificate: %w", err)
+		return nil, ids.EmptyNodeID, fmt.Errorf("ParseCertificate: %w", err)
 	}
 	netCfg.MyNodeID = ids.NodeIDFromCert(stakingCert)
 
 	ln, err := gonet.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		return nil, fmt.Errorf("p2p listen: %w", err)
+		return nil, ids.EmptyNodeID, fmt.Errorf("p2p listen: %w", err)
 	}
 	msgCreator, err := message.NewCreator(prometheus.NewRegistry(), avaconstants.DefaultNetworkCompressionType, avaconstants.DefaultNetworkMaximumInboundTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("message.NewCreator: %w", err)
+		return nil, ids.EmptyNodeID, fmt.Errorf("message.NewCreator: %w", err)
 	}
 	h := &handler{src: src, subnetID: c.SubnetID}
 	if h.creator, err = message.NewCreator(prometheus.NewRegistry(), compression.TypeZstd, avaconstants.DefaultNetworkMaximumInboundTimeout); err != nil {
-		return nil, fmt.Errorf("message.NewCreator: %w", err)
+		return nil, ids.EmptyNodeID, fmt.Errorf("message.NewCreator: %w", err)
 	}
 	net, err := network.NewNetwork(
 		netCfg,
@@ -88,12 +88,12 @@ func listen(port int, dir string, c *chain.Chain, src *archive) (network.Network
 		h,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("NewNetwork: %w", err)
+		return nil, ids.EmptyNodeID, fmt.Errorf("NewNetwork: %w", err)
 	}
 	h.net = net
 	go func() { log.Printf("archive-serve: network stopped: %v", net.Dispatch()) }()
 	log.Printf("archive-serve: serving p2p on :%d as %s", port, netCfg.MyNodeID)
-	return net, nil
+	return net, netCfg.MyNodeID, nil
 }
 
 // permissiveValidators answers "yes" to every membership check so this node
