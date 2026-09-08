@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -173,6 +174,20 @@ func runCorpus(ctx context.Context, c *chain.Chain, sources []string, vmPath, da
 	}()
 	if err := vm.Initialize(ctx, snowCtx, prefixdb.New([]byte("vm"), db), c.GenesisJSON, c.UpgradeJSON, configBytes, nil, noopSender{}); err != nil {
 		return fmt.Errorf("initialize: %w", err)
+	}
+	if n := os.Getenv("EPOCHDB_HOST_RTT"); n != "" {
+		// Round-trip probe: Version is the emptiest rpcchainvm call there is.
+		count, _ := strconv.Atoi(n)
+		lat := make([]time.Duration, 0, count)
+		for i := 0; i < count; i++ {
+			t := time.Now()
+			if _, err := vm.Version(ctx); err != nil {
+				return fmt.Errorf("Version: %w", err)
+			}
+			lat = append(lat, time.Since(t))
+		}
+		sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+		log.Printf("bench rtt n=%d p50=%s p90=%s p99=%s min=%s", len(lat), lat[len(lat)/2], lat[len(lat)*9/10], lat[len(lat)*99/100], lat[0])
 	}
 	if err := vm.SetState(ctx, snow.Bootstrapping); err != nil {
 		return err
