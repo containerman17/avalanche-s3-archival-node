@@ -259,7 +259,13 @@ bench exit t=17 h=50000 blk=50000 tx=343731 mgas/s=900.87 cum=1407.77 wait=0.4 f
 split total read=0.37s evm=7.05s trace=0.59s commit=0.68s | checker apply=0.17s root=4.65s write=0.00s | exec-thread 2624.1 mgas/s | blocks=50000 root-checked=50000 rolls=3
 ```
 The same keys, node counts and roll heights as the v1 run in
-rs/node/REPORT.md; the run files are 4 / 7 / 11 MB against 4 / 7 / 10.
+rs/node/REPORT.md, and `trie.3` is byte-for-byte the same size
+(9,311,675). `run.3` is 10,746,180 bytes against v1's 10,431,068 (+3%):
+that state is 156,141 random 32-byte slot values under 158 accounts (the
+dictionary codes 199 rows, nothing to pack), so the only format effect is
+the 2 KB block padding on 96-byte entries (fill 97.5% against about 99%
+at 4 KB), the "+0.5 to +1 B/key" LAYOUT.md priced for 2 KB blocks, +2
+B/key on this entry size.
 
 The first round (load 10 to 11 from other agents' builds, after run only)
 gave cstate 37.64 B/key, 719 / 72.4 ns, merge 5.0M entries/s and
