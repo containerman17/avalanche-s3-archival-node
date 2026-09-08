@@ -1,0 +1,25 @@
+[package]
+name = "epochdb-state"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "state"
+path = "src/lib.rs"
+
+[dependencies]
+memmap2 = "0.9"
+crc32fast = "1"
+hashbrown = "0.15"
+foldhash = "0.1"
+tiny-keccak = { version = "2", features = ["keccak"] }
+keccak-asm = { version = "0.1", optional = true }
+
+[features]
+default = ["asm"]
+asm = ["keccak-asm"]
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"

@@ -1,0 +1,23 @@
+[package]
+name = "epochdb-exec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# rs-block's crate (branch rs-block, rs/block): dump reader, proposervm unwrap, block/tx decode, sender pool.
+block = { package = "epochdb-block", path = "../block" }
+revm = { version = "43", features = ["std", "serde"] }
+revm-inspectors = { version = "0.43", features = ["std", "serde"] }
+alloy-primitives = { version = "1", features = ["std", "map", "serde", "rlp", "asm-keccak"] }
+alloy-rlp = "0.3"
+alloy-consensus = { version = "2", features = ["std"] }
+alloy-eips = { version = "2", features = ["std"] }
+alloy-trie = "0.9"
+alloy-rpc-types-trace = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+
+[profile.release]
+debug = 1
