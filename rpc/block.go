@@ -15,6 +15,13 @@ import (
 // which is what makes this an assembly and not a container decode. Nothing is
 // cached: the rows are the cache.
 func (s *Server) blockByNumber(n uint64) (*types.Block, error) {
+	if n == 0 {
+		// Genesis is no stored container: the chain context keeps its
+		// header (StoreChainContext), and its body is empty by definition.
+		if h := s.chainCtx.GetHeader(common.Hash{}, 0); h != nil {
+			return types.NewBlockWithHeader(h), nil
+		}
+	}
 	headerRLP, ok, err := s.db.HeaderRLP(n)
 	if err != nil {
 		return nil, fmt.Errorf("read header %d: %w", n, err)

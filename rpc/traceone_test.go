@@ -21,3 +21,21 @@ func TestTraceBlockOneHasGenesisParent(t *testing.T) {
 		t.Fatalf("trace block 1: %v", rerr.Message)
 	}
 }
+
+// eth_getBlockByNumber(0) answers from the same genesis header: indexers
+// walk from 0 and stock subnet-evm serves it.
+func TestGetBlockZeroIsGenesis(t *testing.T) {
+	s, _, _, _ := testServer(t)
+	res, rerr := call(t, s, "eth_getBlockByNumber", "0x0", false)
+	if rerr != nil {
+		t.Fatalf("block 0: %v", rerr.Message)
+	}
+	m := res.(map[string]any)
+	want := s.chainCtx.GetHeader(common.Hash{}, 0).Hash()
+	if got := m["hash"].(common.Hash); got != want {
+		t.Fatalf("block 0 hash %s, genesis header hash %s", got, want)
+	}
+	if txs := m["transactions"].([]any); len(txs) != 0 {
+		t.Fatalf("block 0 has %d txs", len(txs))
+	}
+}
