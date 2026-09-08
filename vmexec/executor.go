@@ -86,11 +86,48 @@ type Executor struct {
 	curStatedb *ethstate.StateDB
 	signer     types.Signer
 
-	spl struct{ read, evm, hash, write time.Duration }
+	spl             struct{ read, evm time.Duration }
+	hashNs, writeNs goatomic.Int64 // the checker's split
+	dirtyBytes      goatomic.Int64
+
+	// The root check runs one block behind on its own goroutine: the
+	// executor applies a block's write set to the overlay, hands the block
+	// to checkQ and executes the next one. The checker applies the write
+	// set to Dirty, checks the root, writes the block to the store and
+	// publishes it. Dirty (and the store's WriteBlock) belong to the
+	// checker; the executor touches Dirty only while the checker is parked
+	// at a sync item (the roll swap).
+	checkQ    chan *checkItem
+	checkDone chan struct{}
+	checkDead chan struct{} // closed when the checker stopped on an error
+	checkErr  error
+	// unpublished is what block N+1 needs from block N before the checker
+	// has written N to the store: its header (BLOCKHASH) and the hashes of
+	// the code it deployed (served from wrapDB.recent until then).
+	unpublished []unpublishedBlock
+	recentHdr   map[uint64]*types.Header
 
 	flushReq  chan uint64
 	flushErr  chan error
 	flushDone chan struct{}
+}
+
+// checkDepth is how many executed blocks may wait for their root check.
+const checkDepth = 4
+
+type checkItem struct {
+	blk      *types.Block
+	bw       *store.BlockWrite
+	ws       *writeSet // nil for an empty block: nothing to hash
+	receipts types.Receipts
+	statedb  *ethstate.StateDB
+	stats    Stats         // the executor's side of the snapshot; Dirty is filled in by the checker
+	sync     chan struct{} // a sync item: the checker parks on it until told to go on
+}
+
+type unpublishedBlock struct {
+	n    uint64
+	code []string
 }
 
 // FetchStart: a fresh dir starts at block 1, anchored on the genesis hash.
@@ -130,7 +167,7 @@ func New(cfg Config) (*Executor, error) {
 	e := &Executor{
 		cfg:         cfg,
 		chainCfg:    g.Config,
-		chainCtx:    chainContext{store: cfg.Store},
+		chainCtx:    chainContext{store: cfg.Store, recent: map[uint64]*types.Header{}},
 		wrapDB:      wrapDatabase(flat),
 		flat:        flat,
 		eng:         eng,
@@ -139,6 +176,7 @@ func New(cfg Config) (*Executor, error) {
 		headTime:    g.Timestamp,
 	}
 	e.live.Store(0)
+	e.recentHdr = e.chainCtx.recent
 	return e, nil
 }
 
@@ -160,13 +198,105 @@ func (e *Executor) Stats() Stats {
 	return Stats{}
 }
 
-func (e *Executor) publish() {
-	e.live.Store(e.headNum)
-	e.statsMu.Store(&Stats{
-		Height: e.headNum, Blocks: e.blocksDone, Txs: e.totalTxs, Gas: e.totalGas,
-		Wait: time.Duration(e.waitNs.Load()), Overlay: e.eng.overlay.Bytes(), Dirty: e.eng.dirty.Bytes(),
-		Rolls: e.eng.rolls, Rolling: e.eng.frozen != nil,
-	})
+// publish is the checker's: a block is visible only after its root matched.
+func (e *Executor) publish(st Stats) {
+	st.Wait = time.Duration(e.waitNs.Load())
+	st.Dirty = int(e.dirtyBytes.Load())
+	e.statsMu.Store(&st)
+	e.live.Store(st.Height)
+}
+
+// checker is the root-check goroutine: see checkQ.
+func (e *Executor) checker() {
+	defer close(e.checkDone)
+	for it := range e.checkQ {
+		if it.sync != nil {
+			it.sync <- struct{}{}
+			<-it.sync
+			continue
+		}
+		if err := e.check(it); err != nil {
+			e.checkErr = err
+			close(e.checkDead)
+			for range e.checkQ { // let the executor's sends through
+			}
+			return
+		}
+	}
+}
+
+func (e *Executor) check(it *checkItem) error {
+	blockNum := it.blk.NumberU64()
+	if it.ws != nil {
+		t0 := time.Now()
+		if err := e.eng.applyDirty(it.ws); err != nil {
+			return fmt.Errorf("block %d: apply write set: %w", blockNum, err)
+		}
+		root, err := e.eng.root()
+		if err != nil {
+			return fmt.Errorf("block %d: state root: %w", blockNum, err)
+		}
+		e.hashNs.Add(int64(time.Since(t0)))
+		if want := it.blk.Root(); root != want {
+			dumpMismatch(it.blk, it.bw.Tail, it.receipts, it.statedb, root, want)
+			log.Fatalf("vmexec: block %d: state root mismatch: computed %x, header %x", blockNum, root, want)
+		}
+	}
+	e.dirtyBytes.Store(int64(e.eng.dirty.Bytes()))
+	t0 := time.Now()
+	if err := e.cfg.Store.WriteBlock(it.bw); err != nil {
+		return err
+	}
+	e.writeNs.Add(int64(time.Since(t0)))
+	if err := e.maybeFlush(blockNum); err != nil {
+		return err
+	}
+	e.publish(it.stats)
+	if e.cfg.OnBlock != nil {
+		e.cfg.OnBlock(blockNum, it.blk.Hash())
+	}
+	return nil
+}
+
+// enqueue hands a checked-later block to the checker; it blocks while
+// checkDepth blocks are waiting.
+func (e *Executor) enqueue(it *checkItem) error {
+	select {
+	case e.checkQ <- it:
+		return nil
+	case <-e.checkDead:
+		return e.checkErr
+	}
+}
+
+// parkChecker waits until the checker has processed every block handed to
+// it and parks it; the returned func resumes it. Between the two the caller
+// owns Dirty and the store.
+func (e *Executor) parkChecker() (resume func(), err error) {
+	ch := make(chan struct{})
+	if err := e.enqueue(&checkItem{sync: ch}); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ch:
+		return func() { ch <- struct{}{} }, nil
+	case <-e.checkDead:
+		return nil, e.checkErr
+	}
+}
+
+// forgetPublished drops what block N+1 no longer needs to see from blocks
+// the checker has published.
+func (e *Executor) forgetPublished() {
+	live := e.live.Load()
+	for len(e.unpublished) > 0 && e.unpublished[0].n <= live {
+		u := e.unpublished[0]
+		e.unpublished = e.unpublished[1:]
+		delete(e.recentHdr, u.n)
+		for _, h := range u.code {
+			delete(e.wrapDB.recent, h)
+		}
+	}
 }
 
 // Run executes blocks ascending from headNum+1. Returns on ctx cancel or on
@@ -190,7 +320,16 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			}
 		}
 	}()
+	e.checkQ = make(chan *checkItem, checkDepth)
+	e.checkDone = make(chan struct{})
+	e.checkDead = make(chan struct{})
+	go e.checker()
 	defer func() {
+		close(e.checkQ)
+		<-e.checkDone
+		if e.checkErr != nil && err == nil {
+			err = fmt.Errorf("checker: %w", e.checkErr)
+		}
 		close(e.flushReq)
 		<-e.flushDone
 		e.flushReq = nil
@@ -313,11 +452,11 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				float64(sz[store.SecState])/1e6,
 				float64(sz[store.SecLookup])/1e6,
 				len(e.cfg.Store.Manifest().Runs),
-				float64(e.eng.overlay.Bytes())/1e6, float64(e.eng.dirty.Bytes())/1e6, e.eng.rolls,
+				float64(e.eng.overlay.Bytes())/1e6, float64(e.dirtyBytes.Load())/1e6, e.eng.rolls,
 			)
-			log.Printf("vmexec: split read=%.2fs evm=%.2fs hash=%.2fs write=%.2fs of %.1fs",
-				e.spl.read.Seconds(), e.spl.evm.Seconds(), e.spl.hash.Seconds(), e.spl.write.Seconds(), dt)
-			e.spl = struct{ read, evm, hash, write time.Duration }{}
+			log.Printf("vmexec: split read=%.2fs evm=%.2fs | checker hash=%.2fs write=%.2fs of %.1fs",
+				e.spl.read.Seconds(), e.spl.evm.Seconds(), float64(e.hashNs.Swap(0))/1e9, float64(e.writeNs.Swap(0))/1e9, dt)
+			e.spl = struct{ read, evm time.Duration }{}
 			lastLog = time.Now()
 			lastGas, lastBlocks, lastTxs = e.totalGas, e.blocksDone, e.totalTxs
 		}
@@ -328,24 +467,36 @@ func (e *Executor) executeDecoded(blockNum uint64, pvm []byte, blk *types.Block)
 	if got := blk.NumberU64(); got != blockNum {
 		return fmt.Errorf("block %d has internal number %d", blockNum, got)
 	}
-	if err := e.eng.finishRoll(); err != nil {
-		log.Fatalf("vmexec: %v", err)
+	if e.eng.rollReady() {
+		// The swap rebases Dirty and reads the store: park the checker,
+		// which has then verified every block up to this one.
+		resume, err := e.parkChecker()
+		if err != nil {
+			return err
+		}
+		err = e.eng.finishRoll()
+		resume()
+		if err != nil {
+			log.Fatalf("vmexec: %v", err)
+		}
 	}
-	newRoot, err := e.executeBlock(blk, pvm)
+	e.forgetPublished()
+	it, err := e.executeBlock(blk, pvm)
 	if err != nil {
 		return fmt.Errorf("block %d: %w", blockNum, err)
 	}
-	e.headRoot = newRoot
+	// From here the block's root is the header's or the checker dies.
+	e.headRoot = blk.Root()
 	e.headNum = blockNum
 	e.headTime = blk.Time()
 	e.totalGas += blk.GasUsed()
 	e.totalTxs += uint64(len(blk.Transactions()))
-	e.eng.maybeRoll(e.cfg.RollBudget, blockNum, newRoot)
-	e.publish()
-	if e.cfg.OnBlock != nil {
-		e.cfg.OnBlock(e.headNum, blk.Hash())
+	e.eng.maybeRoll(e.cfg.RollBudget, blockNum, e.headRoot)
+	it.stats = Stats{
+		Height: blockNum, Blocks: e.blocksDone + 1, Txs: e.totalTxs, Gas: e.totalGas,
+		Overlay: e.eng.overlay.Bytes(), Rolls: e.eng.rolls, Rolling: e.eng.frozen != nil,
 	}
-	return nil
+	return e.enqueue(it)
 }
 
 // maybeFlush advances the durable watermark every flushEvery blocks.
@@ -365,28 +516,27 @@ func (e *Executor) maybeFlush(blockNum uint64) error {
 	return nil
 }
 
-// executeBlock runs the EVM for blk, applies its write set to the engine,
-// verifies the computed root against header.Root (a mismatch is death), then
-// hands the block's rows to the store. Publish happens after the root matched.
-func (e *Executor) executeBlock(blk *types.Block, pvm []byte) (common.Hash, error) {
+// executeBlock runs the EVM for blk and applies its write set to the
+// overlay, so the next block reads it; the root check and the store write
+// are the checker's (see checkQ), which is where the block is published.
+func (e *Executor) executeBlock(blk *types.Block, pvm []byte) (*checkItem, error) {
 	header := blk.Header()
 	parentRoot := e.headRoot
 	blockNum := blk.NumberU64()
 
 	headerRLP, err := rlp.EncodeToBytes(header)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("encode header: %w", err)
+		return nil, fmt.Errorf("encode header: %w", err)
 	}
 	bw := &store.BlockWrite{Height: blockNum, HeaderRLP: headerRLP, Pvm: pvm, Code: map[string][]byte{}}
+	it := &checkItem{blk: blk, bw: bw}
+	e.recentHdr[blockNum] = header
+	u := unpublishedBlock{n: blockNum}
 
 	// Empty-block fast path: no state change claimed and no transactions.
 	if header.Root == parentRoot && len(blk.Transactions()) == 0 {
-		tW := time.Now()
-		if err := e.cfg.Store.WriteBlock(bw); err != nil {
-			return common.Hash{}, err
-		}
-		e.spl.write += time.Since(tW)
-		return parentRoot, e.maybeFlush(blockNum)
+		e.unpublished = append(e.unpublished, u)
+		return it, nil
 	}
 
 	tEVM := time.Now()
@@ -396,46 +546,31 @@ func (e *Executor) executeBlock(blk *types.Block, pvm []byte) (common.Hash, erro
 
 	statedb, err := ethstate.New(parentRoot, e.wrapDB, nil)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("open statedb: %w", err)
+		return nil, fmt.Errorf("open statedb: %w", err)
 	}
 	e.curStatedb = statedb
 	receipts, err := runEVM(e.chainCtx, e.chainCfg, blk, e.headTime, statedb, e.captureTx)
 	if err != nil {
-		return common.Hash{}, err
+		return nil, err
 	}
 	// Commit drains whatever the last tx boundary did not (block-final
 	// writes) through the interceptor into the write set. The account trie
 	// answers the parent root, so statedb skips its triedb update.
 	if _, err := statedb.Commit(blockNum, e.chainCfg.IsEIP158(header.Number)); err != nil {
-		return common.Hash{}, fmt.Errorf("statedb commit: %w", err)
+		return nil, fmt.Errorf("statedb commit: %w", err)
 	}
+	ws := e.flat.take()
+	e.eng.applyOverlay(ws)
 	e.spl.evm += time.Since(tEVM)
 
-	tHash := time.Now()
-	ws := e.flat.take()
-	if err := e.eng.apply(ws); err != nil {
-		return common.Hash{}, fmt.Errorf("apply write set: %w", err)
-	}
-	newRoot, err := e.eng.root()
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("state root: %w", err)
-	}
-	e.spl.hash += time.Since(tHash)
-
-	if newRoot != header.Root {
-		dumpMismatch(blk, cap.rows, receipts, statedb, newRoot, header.Root)
-		log.Fatalf("vmexec: block %d: state root mismatch: computed %x, header %x", blockNum, newRoot, header.Root)
-	}
-
-	tW := time.Now()
 	bw.Tail = cap.take()
 	bw.Code = cap.code
-	if err := e.cfg.Store.WriteBlock(bw); err != nil {
-		return common.Hash{}, err
+	for h := range cap.code {
+		u.code = append(u.code, h)
 	}
-	e.wrapDB.forgetRecentCode()
-	e.spl.write += time.Since(tW)
-	return newRoot, e.maybeFlush(blockNum)
+	e.unpublished = append(e.unpublished, u)
+	it.ws, it.receipts, it.statedb = ws, receipts, statedb
+	return it, nil
 }
 
 func (e *Executor) beginCapture(c *capture, bw *store.BlockWrite, header *types.Header, parentRoot common.Hash) {

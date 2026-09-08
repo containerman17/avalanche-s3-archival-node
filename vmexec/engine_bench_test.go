@@ -62,7 +62,8 @@ func BenchmarkBlockRoot(b *testing.B) {
 		for j := 0; j < 2; j++ {
 			ws.put(slotKey(ch, crypto.Keccak256Hash(common.Hash{byte(rng.Intn(40)), 1}.Bytes())), []byte{byte(i), byte(j + 1)})
 		}
-		if err := eng.apply(ws); err != nil {
+		eng.applyOverlay(ws)
+		if err := eng.applyDirty(ws); err != nil {
 			b.Fatal(err)
 		}
 		if _, err := eng.root(); err != nil {

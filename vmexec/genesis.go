@@ -174,12 +174,20 @@ func trieAlloc(g *sevmcore.Genesis) (types.GenesisAlloc, error) {
 // chainContext is subnet-evm's ChainContext over the store's headers, so
 // BLOCKHASH resolves real hashes across its 256-block window. A read or
 // decode failure panics: nil is libevm's "no such header" and would become a
-// silent zero hash inside a running contract.
-type chainContext struct{ store *store.DB }
+// silent zero hash inside a running contract. recent holds the headers of
+// executed blocks the checker has not written to the store yet (executor
+// goroutine only).
+type chainContext struct {
+	store  *store.DB
+	recent map[uint64]*types.Header
+}
 
 func (chainContext) Engine() sevmconsensus.Engine { return sevmdummy.NewFullFaker() }
 
 func (c chainContext) GetHeader(_ common.Hash, num uint64) *types.Header {
+	if h := c.recent[num]; h != nil {
+		return h
+	}
 	raw, ok, err := c.store.HeaderRLP(num)
 	if err != nil {
 		panic(fmt.Sprintf("vmexec: read header %d for BLOCKHASH: %v", num, err))

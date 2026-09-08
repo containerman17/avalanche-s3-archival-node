@@ -164,10 +164,10 @@ func (s *engine) seek(prefix []byte) (key, value []byte) {
 
 func (s *engine) get(key []byte) ([]byte, bool) { return s.view.Get(key) }
 
-// apply folds one block's ordered write set into the overlay and the dirty
-// trie. An account delete tombstones every live slot under it in the overlay
-// (Dirty wipes the storage itself).
-func (s *engine) apply(ws *writeSet) error {
+// applyOverlay folds one block's ordered write set into the overlay
+// (executor goroutine). An account delete tombstones every live slot under
+// it (Dirty wipes the storage itself).
+func (s *engine) applyOverlay(ws *writeSet) {
 	for _, op := range ws.ops {
 		switch {
 		case len(op.k) == 33 && len(op.v) == 0:
@@ -176,6 +176,13 @@ func (s *engine) apply(ws *writeSet) error {
 			s.owners[common.BytesToHash(op.k[:32])] = struct{}{}
 		}
 		s.overlay.Put(op.k, op.v)
+	}
+}
+
+// applyDirty queues the same write set into the dirty trie (checker
+// goroutine).
+func (s *engine) applyDirty(ws *writeSet) error {
+	for _, op := range ws.ops {
 		if err := s.dirty.Apply(op.k, op.v); err != nil {
 			return err
 		}
@@ -237,9 +244,14 @@ func (s *engine) maybeRoll(budget int, h uint64, root common.Hash) {
 	}()
 }
 
+// rollReady says a roll finished and finishRoll would swap it in.
+func (s *engine) rollReady() bool { return s.frozen != nil && len(s.rollDone) > 0 }
+
 // finishRoll swaps a finished roll in: runs = [new], Dirty rebased on the new
 // file, and every write of the fresh overlay re-applied so Dirty's base is
-// the new file. Called between blocks on the executor goroutine.
+// the new file. Called between blocks on the executor goroutine with the
+// checker parked, so the fresh overlay holds exactly the checked blocks'
+// writes after the frozen one.
 func (s *engine) finishRoll() error {
 	select {
 	case r := <-s.rollDone:

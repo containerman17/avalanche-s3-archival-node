@@ -115,7 +115,8 @@ func TestEngineAgainstGethTrie(t *testing.T) {
 			t.Fatal(err)
 		}
 		ws := flat.take()
-		if err := eng.apply(ws); err != nil {
+		eng.applyOverlay(ws)
+		if err := eng.applyDirty(ws); err != nil {
 			t.Fatal(err)
 		}
 		got, err := eng.root()
