@@ -201,9 +201,15 @@ impl ReadAt for RemoteBlob {
             let cur = off + n as u64;
             let idx = cur / CHUNK_SIZE;
             let in_chunk = (cur % CHUNK_SIZE) as usize;
-            let chunk = self.cache.chunk(&self.s3, &self.hash, self.size, &self.list, idx)?;
-            let take = (buf.len() - n).min(chunk.len() - in_chunk);
-            buf[n..n + take].copy_from_slice(&chunk[in_chunk..in_chunk + take]);
+            let clen = (self.size - idx * CHUNK_SIZE).min(CHUNK_SIZE) as usize;
+            let take = (buf.len() - n).min(clen - in_chunk);
+            // A chunk already on disk is pread for the bytes asked (it was
+            // verified when admitted); a whole 4 MB read per point read made
+            // the 1M verify over a joined dir run for hours.
+            if !self.cache.pread(&format!("{}.{idx}", self.hash), clen, in_chunk as u64, &mut buf[n..n + take]) {
+                let chunk = self.cache.chunk(&self.s3, &self.hash, self.size, &self.list, idx)?;
+                buf[n..n + take].copy_from_slice(&chunk[in_chunk..in_chunk + take]);
+            }
             n += take;
         }
         Ok(())
@@ -458,6 +464,14 @@ impl ChunkCache {
             }
         });
     }
+    /// The bytes at off of a chunk file already in the cache dir, when it is
+    /// there whole; false = not cached (or a lost promotion race), fetch it.
+    fn pread(&self, name: &str, clen: usize, off: u64, buf: &mut [u8]) -> bool {
+        use std::os::unix::fs::FileExt;
+        let Some(p) = self.find(name) else { return false };
+        let Ok(f) = fs::File::open(&p) else { return false };
+        f.metadata().map(|m| m.len() as usize == clen).unwrap_or(false) && f.read_exact_at(buf, off).is_ok()
+    }
     /// One verified chunk, from RAM, the cache directory, or a ranged GET.
     fn chunk(&self, s3: &S3, hash: &str, size: u64, list: &[u8], idx: u64) -> Result<Arc<Vec<u8>>> {
         let name = format!("{hash}.{idx}");
@@ -470,7 +484,9 @@ impl ChunkCache {
         let clen = (size - idx * CHUNK_SIZE).min(CHUNK_SIZE);
         let b = match self.find(&name) {
             Some(p) => {
-                let b = fs::read(p)?;
+                // A read error is a miss: another process on the same cache
+                // dir may have promoted (renamed) the file between find and read.
+                let b = fs::read(p).unwrap_or_default();
                 if b.len() as u64 != clen || verify_chunk(hash, list, idx, &b).is_err() {
                     let b = s3.get_range(hash, idx * CHUNK_SIZE, clen)?;
                     verify_chunk(hash, list, idx, &b)?;
