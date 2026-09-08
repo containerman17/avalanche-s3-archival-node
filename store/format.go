@@ -14,8 +14,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
+	"os"
 	"strconv"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	sstblock "github.com/cockroachdb/pebble/v2/sstable/block"
@@ -485,12 +488,43 @@ func writerOptions(s Section, level int) sstable.WriterOptions {
 // the filter block is and the bloom gate silently degrades to "may have
 // everything". The merger needs no name here: pebble accepts "nullptr" as "no
 // merge operator" without a registration.
-func readerOptions() sstable.ReaderOptions {
-	return sstable.ReaderOptions{
+func readerOptions() (sstable.ReaderOptions, interface{ Close() }) {
+	o := sstable.ReaderOptions{
 		Comparer: Comparer,
 		Filters:  map[string]sstable.FilterPolicy{filterPolicy.Name(): filterPolicy},
 	}
+	if blockCache == nil {
+		return o, nil
+	}
+	// One handle per reader: the handle id namespaces the cache key, so
+	// FileNum can stay 0 and no two readers ever share a key.
+	h := blockCache.NewHandle()
+	o.CacheOpts.CacheHandle = h
+	return o, h
 }
+
+// blockCache is THE DECOMPRESSED-BLOCK CACHE in front of every section reader.
+// pebble attaches its block cache only to readers it opens inside a DB; a
+// standalone sstable.Reader gets none, so every point read of a run paid a
+// full zstd-9 data-block decompression (82% of fifa's CPU under an indexer
+// asking eth_getTransactionReceipt 24 times per block, 2026-09-09). The types
+// behind CacheOpts are pebble-internal and cannot be named here, but the
+// fields are exported and (*pebble.Cache).NewHandle is public, so assigning
+// works. EPOCHDB_BLOCK_CACHE, plain bytes, overrides; 0 turns it off.
+var blockCache = func() *pebble.Cache {
+	n := uint64(256 << 20) // ponytail: flat 256MB, size against the container ceiling if a chain outgrows it
+	if v := os.Getenv("EPOCHDB_BLOCK_CACHE"); v != "" {
+		m, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			log.Fatalf("store: EPOCHDB_BLOCK_CACHE=%q is not a byte count", v)
+		}
+		n = m
+	}
+	if n == 0 {
+		return nil
+	}
+	return pebble.NewCache(int64(n))
+}()
 
 // filterPolicy is the one used by the sections that have a filter; it is also
 // what probes the filter block on the read side (pebble's sstable.Reader has no

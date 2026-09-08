@@ -277,6 +277,7 @@ type Run struct {
 	refs   atomic.Int64
 	blob   *dist.Blob
 	rd     [numSections]*sstable.Reader
+	ch     [numSections]interface{ Close() } // block cache handles, one per reader
 	sec    [numSections]*sectionReadable
 	filter [numSections][]byte
 }
@@ -402,7 +403,9 @@ func openRunAttempt(cas *dist.Store, name RunName, seed *Run, version uint32) (_
 			r.Close()
 			return nil, false, err
 		}
-		rd, err := sstable.NewReader(context.Background(), readable, readerOptions())
+		ro, ch := readerOptions()
+		r.ch[s] = ch
+		rd, err := sstable.NewReader(context.Background(), readable, ro)
 		if err != nil {
 			r.Close()
 			return nil, false, fmt.Errorf("store: run %s section %v: %w", name, s, err)
@@ -568,6 +571,10 @@ func (r *Run) Close() error {
 		if rd != nil {
 			rd.Close()
 			r.rd[i] = nil
+		}
+		if r.ch[i] != nil {
+			r.ch[i].Close()
+			r.ch[i] = nil
 		}
 	}
 	for _, sc := range r.sec {

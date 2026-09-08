@@ -167,7 +167,8 @@ func openSST(path string) (*sstable.Reader, error) {
 		f.Close()
 		return nil, err
 	}
-	return sstable.NewReader(context.Background(), readable, readerOptions())
+	ro, _ := readerOptions()
+	return sstable.NewReader(context.Background(), readable, ro)
 }
 
 // pointReadMedian is the measured cost of serving ONE row: seek, read the data
