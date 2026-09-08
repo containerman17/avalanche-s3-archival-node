@@ -261,6 +261,32 @@ func TestDuplicateRootBlockIdentities(t *testing.T) {
 	acceptBlock(t, d, d.blocks[testHash(103)])
 }
 
+func TestSecondAliasAfterCheckpointRestart(t *testing.T) {
+	d := testDB(t, Config{})
+	g := proposeBlock(t, d, d.current, 100, 0, accountOp(t, 1, 10))
+	acceptBlock(t, d, g)
+	first := proposeBlock(t, d, g, 101, 1, accountOp(t, 1, 20))
+	second := proposeBlock(t, d, g, 102, 1, accountOp(t, 1, 20))
+	acceptBlock(t, d, second)
+	if err := d.checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	cfg, root := d.cfg, first.root
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := testDB(t, cfg)
+	if reopened.current.root != root {
+		t.Fatal("checkpoint changed aliased state")
+	}
+	// subnet-evm supplies the accepted block's identity after locating its
+	// persisted root. The second block hash must then work as a parent.
+	reopened.SetHashAndHeight(testHash(102), 1)
+	r := proposeBlock(t, reopened, reopened.current, 103, 2, accountOp(t, 1, 30))
+	acceptBlock(t, reopened, r)
+	checkValue(t, reopened, reopened.current, accountOp(t, 1, 30))
+}
+
 func TestKillRecovery(t *testing.T) {
 	if dir := os.Getenv("PRUNED_CRASH_CHILD"); dir != "" {
 		d := testDB(t, Config{Dir: dir, JournalLimit: 5000})

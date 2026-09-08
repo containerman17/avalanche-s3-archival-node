@@ -57,6 +57,10 @@ Firewood retains its original constructor and proof handler. The replacement
 backend skips Firewood's proof handler only when state sync is disabled.
 Historical Firewood reconstruction and state sync are outside this integration.
 
+The timed RPC set is `eth_getBalance`, `eth_getStorageAt`, and `eth_call`, all
+at `latest`. Proof and debug APIs are excluded. In particular, the replacement
+and Firewood currently return different unsupported errors for `eth_getProof`.
+
 The `database-config` value is base64 for `{"sync":true}`. Both variants use
 synced Pebble writes for block data and acceptance metadata. This adds write
 latency to both measurements compared with subnet-evm's default standalone
