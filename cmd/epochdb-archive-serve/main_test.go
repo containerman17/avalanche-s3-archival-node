@@ -1,11 +1,11 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"path/filepath"
 	"testing"
 
+	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/libevm/crypto"
 
 	"github.com/containerman17/avalanche-s3-archival-node/dist"
@@ -104,12 +104,14 @@ func TestArchiveServesRun(t *testing.T) {
 		if err != nil || string(got) != string(want) {
 			t.Fatalf("ContainerAt(%d) = %x, %v; want %x", h, got, err, want)
 		}
-		id := sha256.Sum256(want)
-		if len(b.pvm) == 0 {
-			copy(id[:], crypto.Keccak256(b.hdr))
-		}
+		// None of these fake containers parses as a proposervm block, so the
+		// id is the eth block hash: keccak of the header row.
+		id := ids.ID(crypto.Keccak256(b.hdr))
 		if hh, ok, err := a.HeightByContainerID(id[:]); !ok || hh != h || err != nil {
 			t.Fatalf("HeightByContainerID(block %d) = %d, %v, %v", h, hh, ok, err)
+		}
+		if got, err := a.idAt(h); err != nil || got != id {
+			t.Fatalf("idAt(%d) = %s, %v; want %x", h, got, err, id)
 		}
 	}
 	if _, ok, _ := a.HeightByContainerID(make([]byte, 32)); ok {

@@ -15,7 +15,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -31,12 +30,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
+	proposerblock "github.com/ava-labs/avalanchego/vms/proposervm/block"
 	"github.com/ava-labs/libevm/crypto"
 
 	"github.com/containerman17/avalanche-s3-archival-node/chain"
 	"github.com/containerman17/avalanche-s3-archival-node/dist"
-	"github.com/containerman17/avalanche-s3-archival-node/fetch"
 	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
@@ -101,10 +101,9 @@ func main() {
 	c, err := chain.Resolve(rctx, *chainSpec, netID, *dir, dist.Sources(*nodeURI)...)
 	cancel()
 	check(err)
-	f, err := fetch.New(fetch.Config{NodeURI: *nodeURI, Chain: c, ListenPort: *p2pPort, DataDir: *dir})
+	net, err := listen(*p2pPort, *dir, c, a)
 	check(err)
-	defer f.Close()
-	f.Serve(a)
+	defer net.StartClose()
 	log.Printf("archive-serve: serving %s on :%d", c.BlockchainID, *p2pPort)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -122,9 +121,9 @@ func main() {
 		served := a.served.Load()
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
-		log.Printf("archive-serve: served=%d (%.0f/s over 30s, %.0f/s avg) bytes=%dMB lookups=%d misses=%d windows=%d heap=%dMB",
+		log.Printf("archive-serve: served=%d (%.0f/s over 30s, %.0f/s avg) bytes=%dMB lookups=%d misses=%d polls=%d windows=%d heap=%dMB",
 			served, float64(served-last)/30, float64(served)/time.Since(t0).Seconds(), a.bytes.Load()>>20,
-			a.lookups.Load(), a.lookupMiss.Load(), a.windows.Load(), ms.HeapAlloc>>20)
+			a.lookups.Load(), a.lookupMiss.Load(), a.polls.Load(), a.windows.Load(), ms.HeapAlloc>>20)
 		last = served
 	}
 }
@@ -143,16 +142,48 @@ type archive struct {
 	win   map[uint64]*window // key = height / winBlocks
 	order []uint64           // insertion order, for eviction
 
-	served, bytes, lookups, lookupMiss, windows atomic.Uint64
+	served, bytes, lookups, lookupMiss, polls, windows atomic.Uint64
 }
+
+// top is the highest height the runs hold.
+func (a *archive) top() uint64 { return a.runs[len(a.runs)-1].ToHeight }
 
 type window struct {
 	ready chan struct{}
-	c     [][]byte // container bytes by height - lo, nil where the runs have no such height
+	c     [][]byte   // container bytes by height - lo, nil where the runs have no such height
+	id    [][32]byte // their container ids
 	err   error
 }
 
 func (a *archive) ContainerAt(h uint64) ([]byte, error) {
+	w, err := a.windowFor(h)
+	if err != nil {
+		return nil, err
+	}
+	c := w.c[h%winBlocks]
+	if c == nil {
+		return nil, fmt.Errorf("archive-serve: height %d is not in the runs", h)
+	}
+	a.served.Add(1)
+	a.bytes.Add(uint64(len(c)))
+	return c, nil
+}
+
+// idAt is the container id at height h, what a PullQuery for h is answered with.
+func (a *archive) idAt(h uint64) (ids.ID, error) {
+	w, err := a.windowFor(h)
+	if err != nil {
+		return ids.Empty, err
+	}
+	if w.c[h%winBlocks] == nil {
+		return ids.Empty, fmt.Errorf("archive-serve: height %d is not in the runs", h)
+	}
+	return w.id[h%winBlocks], nil
+}
+
+// windowFor is the window holding h, built once and shared by every caller
+// that asks while it builds.
+func (a *archive) windowFor(h uint64) (*window, error) {
 	k := h / winBlocks
 	a.mu.Lock()
 	w := a.win[k]
@@ -165,7 +196,7 @@ func (a *archive) ContainerAt(h uint64) ([]byte, error) {
 			a.order = a.order[1:]
 		}
 		a.mu.Unlock()
-		w.c, w.err = a.buildWindow(k*winBlocks, k*winBlocks+winBlocks-1)
+		w.c, w.id, w.err = a.buildWindow(k*winBlocks, k*winBlocks+winBlocks-1)
 		a.windows.Add(1)
 		close(w.ready)
 	} else {
@@ -175,13 +206,7 @@ func (a *archive) ContainerAt(h uint64) ([]byte, error) {
 	if w.err != nil {
 		return nil, w.err
 	}
-	c := w.c[h-k*winBlocks]
-	if c == nil {
-		return nil, fmt.Errorf("archive-serve: height %d is not in the runs", h)
-	}
-	a.served.Add(1)
-	a.bytes.Add(uint64(len(c)))
-	return c, nil
+	return w, nil
 }
 
 func (a *archive) HeightByContainerID(id []byte) (uint64, bool, error) {
@@ -189,65 +214,112 @@ func (a *archive) HeightByContainerID(id []byte) (uint64, bool, error) {
 	n := len(a.idx) / recSize
 	i := sort.Search(n, func(i int) bool { return bytes.Compare(a.idx[i*recSize:i*recSize+32], id) >= 0 })
 	if i == n || !bytes.Equal(a.idx[i*recSize:i*recSize+32], id) {
-		a.lookupMiss.Add(1)
+		if a.lookupMiss.Add(1) <= 20 {
+			log.Printf("archive-serve: lookup miss %x", id)
+		}
 		return 0, false, nil
 	}
-	return binary.BigEndian.Uint64(a.idx[i*recSize+32 : (i+1)*recSize]), true, nil
+	h := binary.BigEndian.Uint64(a.idx[i*recSize+32 : (i+1)*recSize])
+	if a.lookups.Load()-a.lookupMiss.Load() <= 20 {
+		log.Printf("archive-serve: lookup %x = height %d", id, h)
+	}
+	return h, true, nil
 }
 
 // buildWindow reassembles every container in [lo, hi] the runs hold.
-func (a *archive) buildWindow(lo, hi uint64) ([][]byte, error) {
-	out := make([][]byte, hi-lo+1)
+func (a *archive) buildWindow(lo, hi uint64) ([][]byte, [][32]byte, error) {
+	out, id := make([][]byte, hi-lo+1), make([][32]byte, hi-lo+1)
 	for _, r := range a.runs {
 		if r.ToHeight < lo || r.FromHeight > hi {
 			continue
 		}
 		err := scanBlocks(r.run, max(lo, r.FromHeight), min(hi, r.ToHeight), func(h uint64, hdr, pvm []byte, txs [][]byte) error {
 			c, err := store.Reassemble(pvm, hdr, txs)
+			if err != nil {
+				return err
+			}
 			out[h-lo] = c
-			return err
+			id[h-lo] = containerID(hdr, c)
+			return nil
 		})
 		if err != nil {
-			return nil, fmt.Errorf("archive-serve: window [%d,%d] run %s: %w", lo, hi, r.Name[:8], err)
+			return nil, nil, fmt.Errorf("archive-serve: window [%d,%d] run %s: %w", lo, hi, r.Name[:8], err)
 		}
 	}
-	return out, nil
+	return out, id, nil
 }
 
-// containerID is what a peer names the container by: sha256 of the wrapped
-// bytes for a proposervm block, the eth block hash for a bare pre-fork one.
-func containerID(pvm, hdr, container []byte) []byte {
-	if len(pvm) == 0 {
-		return crypto.Keccak256(hdr)
+// containerID is what a peer names the container by, fetch.parseContainer's
+// rule: a proposervm block's id is sha256 of its UNSIGNED bytes (the
+// trailing signature stripped, what proposerblock.Parse computes; NOT sha256
+// of the whole container, which is what store v4's cid/ row holds), and a
+// bare pre-fork block's id is its eth block hash.
+func containerID(hdr, container []byte) ids.ID {
+	if blk, err := proposerblock.ParseWithoutVerification(container); err == nil {
+		return blk.ID()
 	}
-	s := sha256.Sum256(container)
-	return s[:]
+	return ids.ID(crypto.Keccak256(hdr))
 }
 
 // buildIndex streams every block of every run once, ids it, sorts the records
 // by id and writes them to path (tmp + rename).
 func (a *archive) buildIndex(path string, total uint64) error {
 	t0 := time.Now()
-	recs := make([][recSize]byte, 0, total)
+	recs := make([][recSize]byte, total)
+	// The scan is one goroutine (IO and decompression); the ids are a codec
+	// parse and a hash each, so batches of blocks go to a worker pool and
+	// land in their own slots of recs.
+	type block struct {
+		h      uint64
+		hdr, c []byte
+	}
+	var (
+		wg    sync.WaitGroup
+		sem   = make(chan struct{}, runtime.NumCPU())
+		n     uint64
+		batch []block
+	)
+	flush := func(at uint64, bs []block) {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			for k, b := range bs {
+				id := containerID(b.hdr, b.c)
+				copy(recs[at+uint64(k)][:32], id[:])
+				binary.BigEndian.PutUint64(recs[at+uint64(k)][32:], b.h)
+			}
+		}()
+	}
 	for _, r := range a.runs {
 		err := scanBlocks(r.run, r.FromHeight, r.ToHeight, func(h uint64, hdr, pvm []byte, txs [][]byte) error {
 			c, err := store.Reassemble(pvm, hdr, txs)
 			if err != nil {
 				return err
 			}
-			var rec [recSize]byte
-			copy(rec[:32], containerID(pvm, hdr, c))
-			binary.BigEndian.PutUint64(rec[32:], h)
-			recs = append(recs, rec)
-			if len(recs)%1_000_000 == 0 {
-				log.Printf("archive-serve: index %d/%d blocks, height %d, %.0f blk/s, %s", len(recs), total, h,
-					float64(len(recs))/time.Since(t0).Seconds(), time.Since(t0).Round(time.Second))
+			if n >= total {
+				return fmt.Errorf("more blocks than the manifest's %d", total)
+			}
+			batch = append(batch, block{h, hdr, c})
+			if len(batch) == 4096 {
+				flush(n+1-uint64(len(batch)), batch)
+				batch = nil
+			}
+			if n++; n%1_000_000 == 0 {
+				log.Printf("archive-serve: index %d/%d blocks, height %d, %.0f blk/s, %s", n, total, h,
+					float64(n)/time.Since(t0).Seconds(), time.Since(t0).Round(time.Second))
 			}
 			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("archive-serve: index run %s: %w", r.Name[:8], err)
 		}
+	}
+	flush(n-uint64(len(batch)), batch)
+	wg.Wait()
+	if n != total {
+		return fmt.Errorf("archive-serve: index: %d blocks scanned, manifest says %d", n, total)
 	}
 	scanned := time.Since(t0)
 	slices.SortFunc(recs, func(x, y [recSize]byte) int { return bytes.Compare(x[:32], y[:32]) })
