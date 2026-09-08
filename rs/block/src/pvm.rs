@@ -12,6 +12,9 @@ pub struct Pvm {
     pub parent_id: [u8; 32],
     pub timestamp: i64,
     pub pchain_height: u64,
+    /// statelessGraniteBlock's Epoch.PChainHeight (the predicate context
+    /// height under Granite); None before Granite.
+    pub epoch_pchain_height: Option<u64>,
 }
 
 pub struct Unwrapped {
@@ -75,8 +78,9 @@ fn parse_pvm(c: &Bytes) -> Option<Unwrapped> {
             let pchain_height = r.u64()?;
             let _cert = r.bytes()?;
             let block = r.bytes()?;
+            let mut epoch_pchain_height = None;
             if ty == 2 {
-                r.u64()?;
+                epoch_pchain_height = Some(r.u64()?);
                 r.u64()?;
                 r.u64()?;
             }
@@ -89,7 +93,7 @@ fn parse_pvm(c: &Bytes) -> Option<Unwrapped> {
             Some(Unwrapped {
                 inner: c.slice_ref(block),
                 id: Some(Sha256::digest(&c[..unsigned]).into()),
-                pvm: Some(Pvm { parent_id, timestamp, pchain_height }),
+                pvm: Some(Pvm { parent_id, timestamp, pchain_height, epoch_pchain_height }),
             })
         }
         1 => {
@@ -101,7 +105,7 @@ fn parse_pvm(c: &Bytes) -> Option<Unwrapped> {
             Some(Unwrapped {
                 inner: c.slice_ref(block),
                 id: Some(Sha256::digest(&c[..]).into()),
-                pvm: Some(Pvm { parent_id, timestamp: 0, pchain_height: 0 }),
+                pvm: Some(Pvm { parent_id, timestamp: 0, pchain_height: 0, epoch_pchain_height: None }),
             })
         }
         _ => None,
