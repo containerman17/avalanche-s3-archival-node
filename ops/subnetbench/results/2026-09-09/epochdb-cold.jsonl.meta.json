@@ -1,0 +1,22 @@
+{
+  "after": {
+    "chain_id": "0x10f1",
+    "head_hash": "0xd53a08bdc947113309bfd066a9f76faccfa5764109518bf247be8cc7c95bf7a5",
+    "height": 1000000
+  },
+  "before": {
+    "chain_id": "0x10f1",
+    "head_hash": "0xd53a08bdc947113309bfd066a9f76faccfa5764109518bf247be8cc7c95bf7a5",
+    "height": 1000000
+  },
+  "chain_id": "0x10f1",
+  "created_jst": "2026-09-09T06:10:43.461675+09:00",
+  "format": 1,
+  "head_hash": "0xd53a08bdc947113309bfd066a9f76faccfa5764109518bf247be8cc7c95bf7a5",
+  "head_valid": true,
+  "height": 1000000,
+  "label": "epochdb-cold",
+  "request_count": 3000,
+  "requests_sha256": "87c5254739ece169c25071956a32d99f0d9cf0176312cec39bee8eedd7e43a56",
+  "responses_sha256": "7dd8a85cf8411e1f6a024fee629f71eba214593376038fc4b74aacfa8478c525"
+}

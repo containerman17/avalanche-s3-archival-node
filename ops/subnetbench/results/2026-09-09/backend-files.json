@@ -1,0 +1,41 @@
+{
+  "firewood": {
+    "files": [
+      {
+        "name": "firewood.db",
+        "bytes": 239230430
+      }
+    ]
+  },
+  "epochdb": {
+    "files": [
+      {
+        "name": "JOURNAL",
+        "bytes": 36785711
+      },
+      {
+        "name": "LOCK",
+        "bytes": 0
+      },
+      {
+        "name": "MANIFEST",
+        "bytes": 203
+      },
+      {
+        "name": "run.9",
+        "bytes": 52928468
+      },
+      {
+        "name": "trie.9",
+        "bytes": 51673927
+      }
+    ],
+    "manifest": {
+      "generation": 9,
+      "sequence": 939827,
+      "height": 939826,
+      "root": "0x1e489d216636fe9ac8f959deb037a8e7c2b50e112e99698f3e49ab4137b4fdd2",
+      "block": "0x8ce7fd3020e935c72883b462c613b684764a5bc14e56657be7560d3b10627e88"
+    }
+  }
+}

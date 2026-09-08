@@ -1,0 +1,14 @@
+{
+  "storage_version": 4,
+  "chain_root": "7755687f349c08f9eb589b38bb877ae112630ec4b5f2e78281ff89db5a77dcac",
+  "runs": [
+    {
+      "from_tx": 0,
+      "to_tx": 8038087,
+      "from_height": 1,
+      "to_height": 1000000,
+      "name": "792551e355d282b7ee26200ee2f2816463ade8ab4fd487a8e4607552847c3593",
+      "level": 1
+    }
+  ]
+}

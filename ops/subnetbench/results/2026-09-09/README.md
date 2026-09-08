@@ -1,8 +1,62 @@
 # Pruned Firewood replacement inside subnet-evm
 
-Run in progress. Results will be filled after both backends pass the full replay,
-restart, and current-state RPC comparisons. This run supersedes the discarded
-archival-node comparison; none of those old measurements are used here.
+Both pruned backends passed the fixed million-block replay, recovered the exact
+head after SIGKILL, and returned matching answers for all current-state requests.
+The Go replacement used **27.0% less peak host + VM RSS** and **40.9% less backend
+apparent disk**, with **2.2% longer replay time** in this run. Restart took
+**10.985 s versus 1.285 s** for Firewood.
+
+This is one sequential full run per backend. The small throughput difference is
+an observation from this run, not a demonstrated repeatable performance gap.
+The cache policies differ as documented below. These measurements do not isolate
+a programming-language effect. The decision on Rust is deferred for discussion.
+
+## Measured results
+
+| Metric | Firewood | Epoch (Go) |
+| --- | ---: | ---: |
+| Time to RPC-ready, s | 1104.328 | 1128.666 |
+| Wall throughput, Mgas/s | 63.013 | 61.654 |
+| Median complete-window throughput, Mgas/s | 56.7 | 54.4 |
+| Peak sampled host + VM RSS, GiB | 2.110 | 1.540 |
+| Host + VM RSS at N + 10 s, GiB | 2.109 | 1.429 |
+| Backend apparent disk, MiB | 228.15 | 134.84 |
+| Common block DB apparent disk, MiB | 1748.26 | 1746.44 |
+| Total apparent disk, GiB | 1.930 | 1.837 |
+| Total allocated disk, GiB | 2.253 | 2.161 |
+| SIGKILL restart to RPC-ready, s | 1.285 | 10.985 |
+
+The median uses 109 complete windows for Firewood and 111 for Epoch. Both report
+0.0 seconds of input wait at the display precision. Their input rings were full
+98.80% and 99.04% of the complete-window sampling time, respectively. No source
+shortage was observed. Every submitted block passed the VM's validation, including
+its state-root check. The terminal hash and root match the corpus on both sides.
+
+Disk values in the table are from the full replay, 10 seconds after readiness.
+Post-restart block-database sizes are retained in the raw restart measurements,
+but are not used for the size comparison: Pebble WAL and compaction behavior
+changed that common database substantially on restart.
+
+The replacement's 134.84 MiB backend contains one 50.48 MiB flat run, one 49.28 MiB
+commitment file, and a 35.08 MiB recovery journal, plus small metadata files.
+Its latest checkpoint is height 939,826. Restart replays 60,174 accepted-state
+journal records and validates their roots. The host submits zero extra blocks;
+this recovery work does not re-execute their EVM transactions.
+
+## Current-state RPC results
+
+Every cell is p50 / p95 latency in milliseconds, 1,000 requests per method per
+pass. All 12,000 requests succeeded. All normalized answers match across backends
+and across passes. First pass means after process restart, with OS cache retained.
+
+| Method | Firewood first | Epoch first | Firewood warm | Epoch warm |
+| --- | ---: | ---: | ---: | ---: |
+| eth_getBalance | 0.283 / 0.452 | 0.263 / 0.386 | 0.286 / 0.444 | 0.264 / 0.382 |
+| eth_getStorageAt | 0.294 / 0.446 | 0.272 / 0.428 | 0.287 / 0.433 | 0.267 / 0.389 |
+| eth_call | 0.392 / 0.587 | 0.366 / 0.526 | 0.390 / 0.569 | 0.361 / 0.500 |
+
+These repeated requests exercise a small working set. See the workload section
+for unique inputs and successful calls with empty results.
 
 ## Scope and fixed inputs
 
@@ -138,6 +192,21 @@ the replacement, reusing the same request file and metadata. Compare answers
 across both backends and across both passes, ignoring only the JSON-RPC response
 ID and object key order. The RPC tool refuses errors or any changed head.
 
+## Engine memory policies
+
+The VM config is identical, but the engines manage memory differently. Firewood
+receives a 512 MiB clean-node cache with `CacheAllReads`, from the pinned VM's
+`TrieCleanCache` default. The new backend has no equivalent clean-node cache. It
+checkpoints when its accounted overlay plus dirty-node bytes exceed 256 MiB or
+its accepted journal reaches 64 MiB. Both retain 32 runtime revisions. Both host
+and plugin use the same default Pebble settings: 512 MiB block cache, 128 MiB
+memtables, stop threshold eight, and synced writes.
+
+These are engine-policy differences, not a comparison at matched cache sizes.
+Lower RSS in this run cannot be attributed to Go versus Rust. Nor does accounted
+buffer size equal actual resident memory. The measured unit has a common 48 GiB
+cgroup limit; neither engine is constrained to a small matched memory budget.
+
 ## Selected current-state workload
 
 The frozen request SHA-256 is
@@ -183,3 +252,22 @@ warm, and repeated requests warm process caches within that pass.
 The host's public validator API returns an unsupported-height warning during
 background validator-set refresh. Both backends share this path. Those warnings
 do not interrupt block replay or current-state RPC, and are retained in raw logs.
+
+## Preservation and cleanup
+
+The dedicated runner was terminated after both contenders stopped and the final
+state directories were copied to the local worktree. `runner-final-status.json`
+records AWS confirmation. The existing fleet was not changed by this benchmark.
+
+The local state backup is `.audit/final-state.tar.zst` in the worktree, alongside
+the corpus and measured binaries described above. It is 1,189,842,161 bytes; its
+SHA-256 is `8db2815dd787bb5e3d728f7d76f45bca54f4f128693eb3be1e4e9459bac4862e`.
+The downloaded backup hash matches the source. Large local artifacts are omitted
+from git. Raw measurement logs, RPC responses, reports, configs, and source
+fingerprints are committed in this directory.
+
+The append-only audit trail remains local at `.audit/decisions.tsv`. Paths
+beginning with `.audit/` refer to this worktree; `/data/bench/` paths describe the
+former runner. Final measurement artifacts from those runner paths are retained
+in this result directory. Each block's root was checked by stock VM validation;
+the logs do not contain a separate root list for every height.
