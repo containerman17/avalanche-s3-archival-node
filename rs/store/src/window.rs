@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 pub const FROZEN_LOG: &str = "window.frozen.log";
 const REC_HEADER: usize = 1 + 8 + 4;
-const FAM_REC: [u8; 6] = [b'B', b'H', b'I', b'P', b'R', b'T'];
+const FAM_REC: [u8; NUM_FAMS] = [b'B', b'H', b'I', b'P', b'Q', b'R', b'T', b'W'];
 
 // ---------------------------------------------------------------------------
 // what a block writes
@@ -77,6 +77,55 @@ pub struct BlockWrite {
     pub code: Vec<([u8; 32], Vec<u8>)>,
     /// State written outside any tx; lands at the block's boundary slot.
     pub tail: Vec<StateRow>,
+    /// The receipts blob as the plugin was handed it (rcb/ row); empty when
+    /// the producer has none.
+    pub receipts_blob: Vec<u8>,
+    /// The state engine's write set + code hashes, framed by `frame_ws`
+    /// (ws/ row); empty when the producer has none.
+    pub ws: Vec<u8>,
+}
+
+/// ws/ row framing: [n u32][klen u32][key][vlen u32][val]... [m u32][hash 32]...
+pub fn frame_ws(ws: &[(Vec<u8>, Vec<u8>)], code_hashes: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(ws.len() as u32).to_le_bytes());
+    for (k, v) in ws {
+        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        out.extend_from_slice(k);
+        out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        out.extend_from_slice(v);
+    }
+    out.extend_from_slice(&(code_hashes.len() as u32).to_le_bytes());
+    for h in code_hashes {
+        out.extend_from_slice(h);
+    }
+    out
+}
+
+pub fn unframe_ws(b: &[u8]) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<[u8; 32]>)> {
+    let mut p = 0usize;
+    let mut take = |n: usize| -> Result<&[u8]> {
+        if b.len() < p + n {
+            bail!("ws row: truncated");
+        }
+        p += n;
+        Ok(&b[p - n..p])
+    };
+    let n = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+    let mut ws = Vec::with_capacity(n);
+    for _ in 0..n {
+        let kl = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let k = take(kl)?.to_vec();
+        let vl = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let v = take(vl)?.to_vec();
+        ws.push((k, v));
+    }
+    let m = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+    let mut hashes = Vec::with_capacity(m);
+    for _ in 0..m {
+        hashes.push(take(32)?.try_into().unwrap());
+    }
+    Ok((ws, hashes))
 }
 
 fn hex20(v: &serde_json::Value) -> Option<[u8; 20]> {
@@ -173,7 +222,7 @@ impl BlockWrite {
                 code.push((h.0, c.to_vec()));
             }
         }
-        Ok(BlockWrite { height: b.height, container_id: b.container_id.0, header_rlp: b.header_rlp.to_vec(), pvm, txs, code, tail: r.tail.iter().map(exec_row).collect() })
+        Ok(BlockWrite { height: b.height, container_id: b.container_id.0, header_rlp: b.header_rlp.to_vec(), pvm, txs, code, tail: r.tail.iter().map(exec_row).collect(), receipts_blob: Vec::new(), ws: Vec::new() })
     }
 }
 
@@ -239,7 +288,7 @@ pub struct Memtable {
     pub base_height: u64,
     pub next_height: u64,
     pub started: bool,
-    chain: [ChainIndex; 6],
+    chain: [ChainIndex; NUM_FAMS],
     pub state: HashMap<Vec<u8>, Vec<(u64, Vec<u8>)>>,
     pub code: HashMap<[u8; 32], Vec<u8>>,
     pub nums: HashMap<Vec<u8>, u64>,
@@ -347,7 +396,7 @@ impl Memtable {
             let body = off + REC_HEADER as u64;
             off = body + n as u64;
             match kind {
-                b'B' | b'H' | b'I' | b'P' | b'R' | b'T' => {
+                b'B' | b'H' | b'I' | b'P' | b'Q' | b'R' | b'T' | b'W' => {
                     let fam = FAM_REC.iter().position(|&k| k == kind).unwrap();
                     pend.push(Pend::Chain(fam, num, body, n as usize));
                 }
@@ -522,6 +571,8 @@ impl Memtable {
         self.chain_row(FAM_BLK, b.height, &blk)?;
         self.chain_row(FAM_HDR, b.height, &b.header_rlp)?;
         self.chain_row(FAM_PVM, b.height, &b.pvm)?;
+        self.chain_row(FAM_RCB, b.height, &b.receipts_blob)?;
+        self.chain_row(FAM_WS, b.height, &b.ws)?;
         self.num_row(blkh_key(&state::keccak::keccak256(&b.header_rlp)), b.height)?;
         self.num_row(cid_key(&b.container_id), b.height)?;
         for (h, blob) in &b.code {
