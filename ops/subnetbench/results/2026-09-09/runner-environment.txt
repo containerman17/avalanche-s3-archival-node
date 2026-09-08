@@ -1,0 +1,86 @@
+Linux ip-172-31-39-22.ap-northeast-1.compute.internal 6.1.176-223.369.amzn2023.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Jul 24 13:34:27 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           46 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  8
+On-line CPU(s) list:                     0-7
+Vendor ID:                               GenuineIntel
+Model name:                              Intel(R) Xeon(R) Platinum 8559C
+CPU family:                              6
+Model:                                   207
+Thread(s) per core:                      2
+Core(s) per socket:                      4
+Socket(s):                               1
+Stepping:                                2
+BogoMIPS:                                4800.00
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch invpcid_single ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd ida arat avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq rdpid cldemote movdiri movdir64b md_clear serialize amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               192 KiB (4 instances)
+L1i cache:                               128 KiB (4 instances)
+L2 cache:                                8 MiB (4 instances)
+L3 cache:                                320 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-7
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+               total        used        free      shared  buff/cache   available
+Mem:     66337267712   363196416 56311934976      737280  9662136320 65317900288
+Swap:              0           0           0
+NAME          FSTYPE FSVER LABEL      UUID                                 FSAVAIL FSUSE% MOUNTPOINTS
+nvme0n1                                                                                   
+├─nvme0n1p1   xfs          /          10a0540c-af75-45be-a928-be91e70def88   27.8G     7% /
+├─nvme0n1p127                                                                             
+└─nvme0n1p128 vfat   FAT16            6133-BB87                               8.7M    13% /boot/efi
+nvme1n1       xfs          epochbench 89e918aa-298e-48db-a76e-949195b2b47a    1.7T     1% /data
+30a2e438a3b185df70ba1003c481db6ce4883a1527cb4c3e6937e663ceb0b2c9  /data/bench/bin/epochdb-host
+b4244115d55ff757feafc078c29d60c2225ad4449e39e78ebfc19026e6fe9aea  /data/bench/bin/subnet-evm-pruned
+743402123f753c3b0cd3b065d9d41f9080dbf86c7eb785e99661e42c1c00f416  /data/bench/bin/subnetbench-corpus
+c4a8a2c23d4430ddaa4c3bc3412eb22e4a2f65654b989122e7aea2d5d4976d4c  /data/bench/seed/chain.json
+2ea96edd753dc948804156dbad3661a308b67f9d3082260b315238b5e759d7dc  /data/bench/seed/upgrade.json
+c4e97df6f62d6f5e83398ec2f3edf56a868ae9c2d635ca21a8603c9731ac181e  /data/bench/firewood.json
+839d425b47c6622344ffdc41ed48c1c23ac78aa31abeb1799c8cb3889e18e869  /data/bench/epochdb.json
+  UNIT                       LOAD   ACTIVE SUB     DESCRIPTION
+  acpid.service              loaded active running ACPI Event Daemon
+  amazon-ssm-agent.service   loaded active running amazon-ssm-agent
+  atd.service                loaded active running Deferred execution scheduler
+  auditd.service             loaded active running Security Auditing Service
+  chronyd.service            loaded active running NTP client/server
+  containerd.service         loaded active running containerd container runtime
+  dbus-broker.service        loaded active running D-Bus System Message Bus
+  docker.service             loaded active running Docker Application Container Engine
+  getty@tty1.service         loaded active running Getty on tty1
+  gssproxy.service           loaded active running GSSAPI Proxy Daemon
+  irqbalance.service         loaded active running irqbalance daemon
+  libstoragemgmt.service     loaded active running libstoragemgmt plug-in server daemon
+  serial-getty@ttyS0.service loaded active running Serial Getty on ttyS0
+  sshd.service               loaded active running OpenSSH server daemon
+  systemd-homed.service      loaded active running Home Area Manager
+  systemd-journald.service   loaded active running Journal Service
+  systemd-logind.service     loaded active running User Login Management
+  systemd-networkd.service   loaded active running Network Configuration
+  systemd-resolved.service   loaded active running Network Name Resolution
+  systemd-udevd.service      loaded active running Rule-based Manager for Device Events and Files
+  systemd-userdbd.service    loaded active running User Database Manager
+  user@1000.service          loaded active running User Manager for UID 1000
+
+LOAD   = Reflects whether the unit definition was properly loaded.
+ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+SUB    = The low-level unit activation state, values depend on unit type.
+22 loaded units listed.

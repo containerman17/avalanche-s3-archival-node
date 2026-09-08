@@ -1,0 +1,1148 @@
+{
+  "bench_exit": {
+    "elapsed_seconds": 1103,
+    "queue_wait_fraction": 0.0,
+    "queue_wait_seconds": 0.0,
+    "ring_full_fraction": 0.985312783318223,
+    "ring_full_seconds": 1086.8
+  },
+  "complete_10_second_samples": {
+    "count": 109,
+    "excluded": {
+      "after_exit": 0,
+      "duplicate_duration": 0,
+      "first_partial": 1,
+      "non_10_second_gap": 0
+    },
+    "p50_mgas_per_second": 56.7,
+    "queue_wait_fraction": 0.0,
+    "queue_wait_seconds": 0.0,
+    "ring_full_fraction": 0.9879816513761469,
+    "ring_full_seconds": 1076.9,
+    "rows": [
+      {
+        "cumulative_mgas_per_second": 45.5,
+        "elapsed_seconds": 19,
+        "height": 18775,
+        "mgas_per_second": 40.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9388,
+        "window_transactions": 9671
+      },
+      {
+        "cumulative_mgas_per_second": 48.9,
+        "elapsed_seconds": 29,
+        "height": 27493,
+        "mgas_per_second": 55.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 8718,
+        "window_transactions": 8886
+      },
+      {
+        "cumulative_mgas_per_second": 59.7,
+        "elapsed_seconds": 39,
+        "height": 35705,
+        "mgas_per_second": 92.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8212,
+        "window_transactions": 8733
+      },
+      {
+        "cumulative_mgas_per_second": 64.0,
+        "elapsed_seconds": 49,
+        "height": 43535,
+        "mgas_per_second": 81.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 7830,
+        "window_transactions": 8129
+      },
+      {
+        "cumulative_mgas_per_second": 59.9,
+        "elapsed_seconds": 59,
+        "height": 52895,
+        "mgas_per_second": 39.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9360,
+        "window_transactions": 9576
+      },
+      {
+        "cumulative_mgas_per_second": 55.0,
+        "elapsed_seconds": 69,
+        "height": 62606,
+        "mgas_per_second": 26.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9711,
+        "window_transactions": 9983
+      },
+      {
+        "cumulative_mgas_per_second": 51.6,
+        "elapsed_seconds": 79,
+        "height": 72374,
+        "mgas_per_second": 27.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9768,
+        "window_transactions": 9940
+      },
+      {
+        "cumulative_mgas_per_second": 54.5,
+        "elapsed_seconds": 89,
+        "height": 81138,
+        "mgas_per_second": 78.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8764,
+        "window_transactions": 8955
+      },
+      {
+        "cumulative_mgas_per_second": 92.0,
+        "elapsed_seconds": 99,
+        "height": 83017,
+        "mgas_per_second": 428.8,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 1879,
+        "window_transactions": 1894
+      },
+      {
+        "cumulative_mgas_per_second": 105.1,
+        "elapsed_seconds": 109,
+        "height": 88360,
+        "mgas_per_second": 235.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 5343,
+        "window_transactions": 5443
+      },
+      {
+        "cumulative_mgas_per_second": 99.6,
+        "elapsed_seconds": 119,
+        "height": 97554,
+        "mgas_per_second": 39.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9194,
+        "window_transactions": 9404
+      },
+      {
+        "cumulative_mgas_per_second": 115.2,
+        "elapsed_seconds": 129,
+        "height": 102121,
+        "mgas_per_second": 302.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 4567,
+        "window_transactions": 4671
+      },
+      {
+        "cumulative_mgas_per_second": 111.9,
+        "elapsed_seconds": 139,
+        "height": 110426,
+        "mgas_per_second": 68.8,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 8305,
+        "window_transactions": 8462
+      },
+      {
+        "cumulative_mgas_per_second": 108.5,
+        "elapsed_seconds": 149,
+        "height": 118502,
+        "mgas_per_second": 61.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8076,
+        "window_transactions": 8340
+      },
+      {
+        "cumulative_mgas_per_second": 104.5,
+        "elapsed_seconds": 159,
+        "height": 127189,
+        "mgas_per_second": 44.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8687,
+        "window_transactions": 8852
+      },
+      {
+        "cumulative_mgas_per_second": 101.2,
+        "elapsed_seconds": 169,
+        "height": 135865,
+        "mgas_per_second": 49.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8676,
+        "window_transactions": 8714
+      },
+      {
+        "cumulative_mgas_per_second": 98.5,
+        "elapsed_seconds": 179,
+        "height": 144519,
+        "mgas_per_second": 51.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8654,
+        "window_transactions": 8675
+      },
+      {
+        "cumulative_mgas_per_second": 95.7,
+        "elapsed_seconds": 189,
+        "height": 153259,
+        "mgas_per_second": 45.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8740,
+        "window_transactions": 8767
+      },
+      {
+        "cumulative_mgas_per_second": 93.2,
+        "elapsed_seconds": 199,
+        "height": 162036,
+        "mgas_per_second": 45.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 8777,
+        "window_transactions": 8826
+      },
+      {
+        "cumulative_mgas_per_second": 91.0,
+        "elapsed_seconds": 209,
+        "height": 170574,
+        "mgas_per_second": 48.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8538,
+        "window_transactions": 8743
+      },
+      {
+        "cumulative_mgas_per_second": 88.5,
+        "elapsed_seconds": 219,
+        "height": 179683,
+        "mgas_per_second": 35.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9109,
+        "window_transactions": 9375
+      },
+      {
+        "cumulative_mgas_per_second": 85.8,
+        "elapsed_seconds": 229,
+        "height": 189161,
+        "mgas_per_second": 27.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9478,
+        "window_transactions": 10394
+      },
+      {
+        "cumulative_mgas_per_second": 83.5,
+        "elapsed_seconds": 239,
+        "height": 198701,
+        "mgas_per_second": 29.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 9540,
+        "window_transactions": 10276
+      },
+      {
+        "cumulative_mgas_per_second": 81.6,
+        "elapsed_seconds": 249,
+        "height": 207899,
+        "mgas_per_second": 36.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9198,
+        "window_transactions": 10096
+      },
+      {
+        "cumulative_mgas_per_second": 79.7,
+        "elapsed_seconds": 259,
+        "height": 217172,
+        "mgas_per_second": 31.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9273,
+        "window_transactions": 9808
+      },
+      {
+        "cumulative_mgas_per_second": 77.8,
+        "elapsed_seconds": 269,
+        "height": 226508,
+        "mgas_per_second": 28.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9336,
+        "window_transactions": 9504
+      },
+      {
+        "cumulative_mgas_per_second": 76.6,
+        "elapsed_seconds": 279,
+        "height": 235030,
+        "mgas_per_second": 44.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8522,
+        "window_transactions": 8722
+      },
+      {
+        "cumulative_mgas_per_second": 75.1,
+        "elapsed_seconds": 289,
+        "height": 244261,
+        "mgas_per_second": 32.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9231,
+        "window_transactions": 9654
+      },
+      {
+        "cumulative_mgas_per_second": 73.7,
+        "elapsed_seconds": 299,
+        "height": 253731,
+        "mgas_per_second": 31.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9470,
+        "window_transactions": 10121
+      },
+      {
+        "cumulative_mgas_per_second": 72.7,
+        "elapsed_seconds": 309,
+        "height": 262415,
+        "mgas_per_second": 45.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 8684,
+        "window_transactions": 9231
+      },
+      {
+        "cumulative_mgas_per_second": 71.6,
+        "elapsed_seconds": 319,
+        "height": 271461,
+        "mgas_per_second": 36.8,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9046,
+        "window_transactions": 9546
+      },
+      {
+        "cumulative_mgas_per_second": 70.5,
+        "elapsed_seconds": 329,
+        "height": 280480,
+        "mgas_per_second": 34.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9019,
+        "window_transactions": 9608
+      },
+      {
+        "cumulative_mgas_per_second": 69.3,
+        "elapsed_seconds": 339,
+        "height": 289704,
+        "mgas_per_second": 30.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9224,
+        "window_transactions": 9505
+      },
+      {
+        "cumulative_mgas_per_second": 68.2,
+        "elapsed_seconds": 349,
+        "height": 298814,
+        "mgas_per_second": 32.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9110,
+        "window_transactions": 9443
+      },
+      {
+        "cumulative_mgas_per_second": 67.4,
+        "elapsed_seconds": 359,
+        "height": 308068,
+        "mgas_per_second": 37.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9254,
+        "window_transactions": 9703
+      },
+      {
+        "cumulative_mgas_per_second": 66.5,
+        "elapsed_seconds": 369,
+        "height": 317163,
+        "mgas_per_second": 34.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9095,
+        "window_transactions": 10349
+      },
+      {
+        "cumulative_mgas_per_second": 65.7,
+        "elapsed_seconds": 379,
+        "height": 326283,
+        "mgas_per_second": 34.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9120,
+        "window_transactions": 13797
+      },
+      {
+        "cumulative_mgas_per_second": 64.8,
+        "elapsed_seconds": 389,
+        "height": 335591,
+        "mgas_per_second": 31.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9308,
+        "window_transactions": 12332
+      },
+      {
+        "cumulative_mgas_per_second": 64.0,
+        "elapsed_seconds": 399,
+        "height": 344678,
+        "mgas_per_second": 34.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9087,
+        "window_transactions": 13080
+      },
+      {
+        "cumulative_mgas_per_second": 63.2,
+        "elapsed_seconds": 409,
+        "height": 353829,
+        "mgas_per_second": 32.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9151,
+        "window_transactions": 13230
+      },
+      {
+        "cumulative_mgas_per_second": 62.6,
+        "elapsed_seconds": 419,
+        "height": 362831,
+        "mgas_per_second": 35.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 9002,
+        "window_transactions": 13358
+      },
+      {
+        "cumulative_mgas_per_second": 62.1,
+        "elapsed_seconds": 429,
+        "height": 372499,
+        "mgas_per_second": 40.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9668,
+        "window_transactions": 12064
+      },
+      {
+        "cumulative_mgas_per_second": 61.7,
+        "elapsed_seconds": 439,
+        "height": 381029,
+        "mgas_per_second": 44.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8530,
+        "window_transactions": 11287
+      },
+      {
+        "cumulative_mgas_per_second": 61.0,
+        "elapsed_seconds": 449,
+        "height": 390231,
+        "mgas_per_second": 31.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9202,
+        "window_transactions": 11572
+      },
+      {
+        "cumulative_mgas_per_second": 60.3,
+        "elapsed_seconds": 459,
+        "height": 399466,
+        "mgas_per_second": 30.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9235,
+        "window_transactions": 11336
+      },
+      {
+        "cumulative_mgas_per_second": 59.7,
+        "elapsed_seconds": 469,
+        "height": 408699,
+        "mgas_per_second": 31.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9233,
+        "window_transactions": 11641
+      },
+      {
+        "cumulative_mgas_per_second": 59.2,
+        "elapsed_seconds": 479,
+        "height": 417796,
+        "mgas_per_second": 34.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9097,
+        "window_transactions": 13600
+      },
+      {
+        "cumulative_mgas_per_second": 58.9,
+        "elapsed_seconds": 489,
+        "height": 427484,
+        "mgas_per_second": 47.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 9688,
+        "window_transactions": 10859
+      },
+      {
+        "cumulative_mgas_per_second": 58.9,
+        "elapsed_seconds": 499,
+        "height": 435915,
+        "mgas_per_second": 59.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8431,
+        "window_transactions": 9341
+      },
+      {
+        "cumulative_mgas_per_second": 58.4,
+        "elapsed_seconds": 509,
+        "height": 445270,
+        "mgas_per_second": 31.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9355,
+        "window_transactions": 11226
+      },
+      {
+        "cumulative_mgas_per_second": 58.0,
+        "elapsed_seconds": 519,
+        "height": 454231,
+        "mgas_per_second": 38.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8961,
+        "window_transactions": 11702
+      },
+      {
+        "cumulative_mgas_per_second": 57.8,
+        "elapsed_seconds": 529,
+        "height": 462674,
+        "mgas_per_second": 50.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.6,
+        "window_blocks": 8443,
+        "window_transactions": 19667
+      },
+      {
+        "cumulative_mgas_per_second": 57.8,
+        "elapsed_seconds": 539,
+        "height": 470868,
+        "mgas_per_second": 56.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8194,
+        "window_transactions": 18532
+      },
+      {
+        "cumulative_mgas_per_second": 57.8,
+        "elapsed_seconds": 549,
+        "height": 480068,
+        "mgas_per_second": 56.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9200,
+        "window_transactions": 17346
+      },
+      {
+        "cumulative_mgas_per_second": 57.6,
+        "elapsed_seconds": 559,
+        "height": 490853,
+        "mgas_per_second": 47.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 10785,
+        "window_transactions": 12951
+      },
+      {
+        "cumulative_mgas_per_second": 57.3,
+        "elapsed_seconds": 569,
+        "height": 499727,
+        "mgas_per_second": 38.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8874,
+        "window_transactions": 10432
+      },
+      {
+        "cumulative_mgas_per_second": 57.2,
+        "elapsed_seconds": 579,
+        "height": 507946,
+        "mgas_per_second": 53.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8219,
+        "window_transactions": 10564
+      },
+      {
+        "cumulative_mgas_per_second": 57.2,
+        "elapsed_seconds": 589,
+        "height": 515852,
+        "mgas_per_second": 58.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 7906,
+        "window_transactions": 10906
+      },
+      {
+        "cumulative_mgas_per_second": 57.2,
+        "elapsed_seconds": 599,
+        "height": 524087,
+        "mgas_per_second": 53.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8235,
+        "window_transactions": 10875
+      },
+      {
+        "cumulative_mgas_per_second": 57.2,
+        "elapsed_seconds": 609,
+        "height": 532837,
+        "mgas_per_second": 59.8,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 8750,
+        "window_transactions": 19965
+      },
+      {
+        "cumulative_mgas_per_second": 57.5,
+        "elapsed_seconds": 619,
+        "height": 542411,
+        "mgas_per_second": 77.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9574,
+        "window_transactions": 25335
+      },
+      {
+        "cumulative_mgas_per_second": 57.8,
+        "elapsed_seconds": 629,
+        "height": 552148,
+        "mgas_per_second": 74.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9737,
+        "window_transactions": 20460
+      },
+      {
+        "cumulative_mgas_per_second": 57.7,
+        "elapsed_seconds": 639,
+        "height": 560920,
+        "mgas_per_second": 51.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 8772,
+        "window_transactions": 11825
+      },
+      {
+        "cumulative_mgas_per_second": 57.3,
+        "elapsed_seconds": 649,
+        "height": 569951,
+        "mgas_per_second": 34.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9031,
+        "window_transactions": 10450
+      },
+      {
+        "cumulative_mgas_per_second": 57.1,
+        "elapsed_seconds": 659,
+        "height": 578660,
+        "mgas_per_second": 42.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8709,
+        "window_transactions": 10550
+      },
+      {
+        "cumulative_mgas_per_second": 57.0,
+        "elapsed_seconds": 669,
+        "height": 588776,
+        "mgas_per_second": 47.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 10116,
+        "window_transactions": 12374
+      },
+      {
+        "cumulative_mgas_per_second": 56.8,
+        "elapsed_seconds": 679,
+        "height": 599806,
+        "mgas_per_second": 47.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 11030,
+        "window_transactions": 15659
+      },
+      {
+        "cumulative_mgas_per_second": 57.0,
+        "elapsed_seconds": 689,
+        "height": 609857,
+        "mgas_per_second": 65.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 10051,
+        "window_transactions": 24695
+      },
+      {
+        "cumulative_mgas_per_second": 57.2,
+        "elapsed_seconds": 699,
+        "height": 619429,
+        "mgas_per_second": 72.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9572,
+        "window_transactions": 23567
+      },
+      {
+        "cumulative_mgas_per_second": 57.4,
+        "elapsed_seconds": 709,
+        "height": 629129,
+        "mgas_per_second": 70.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9700,
+        "window_transactions": 24698
+      },
+      {
+        "cumulative_mgas_per_second": 57.5,
+        "elapsed_seconds": 719,
+        "height": 638909,
+        "mgas_per_second": 67.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9780,
+        "window_transactions": 23779
+      },
+      {
+        "cumulative_mgas_per_second": 57.6,
+        "elapsed_seconds": 729,
+        "height": 648956,
+        "mgas_per_second": 62.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 10047,
+        "window_transactions": 11183
+      },
+      {
+        "cumulative_mgas_per_second": 57.7,
+        "elapsed_seconds": 739,
+        "height": 659031,
+        "mgas_per_second": 63.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 10075,
+        "window_transactions": 12821
+      },
+      {
+        "cumulative_mgas_per_second": 57.7,
+        "elapsed_seconds": 749,
+        "height": 669693,
+        "mgas_per_second": 56.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 10662,
+        "window_transactions": 20081
+      },
+      {
+        "cumulative_mgas_per_second": 57.7,
+        "elapsed_seconds": 759,
+        "height": 680191,
+        "mgas_per_second": 61.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 10498,
+        "window_transactions": 19742
+      },
+      {
+        "cumulative_mgas_per_second": 58.3,
+        "elapsed_seconds": 769,
+        "height": 688168,
+        "mgas_per_second": 105.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 7977,
+        "window_transactions": 9743
+      },
+      {
+        "cumulative_mgas_per_second": 58.8,
+        "elapsed_seconds": 779,
+        "height": 696338,
+        "mgas_per_second": 96.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8170,
+        "window_transactions": 8693
+      },
+      {
+        "cumulative_mgas_per_second": 59.0,
+        "elapsed_seconds": 789,
+        "height": 705835,
+        "mgas_per_second": 74.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9497,
+        "window_transactions": 10271
+      },
+      {
+        "cumulative_mgas_per_second": 59.2,
+        "elapsed_seconds": 799,
+        "height": 715169,
+        "mgas_per_second": 75.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9334,
+        "window_transactions": 10065
+      },
+      {
+        "cumulative_mgas_per_second": 59.3,
+        "elapsed_seconds": 809,
+        "height": 725038,
+        "mgas_per_second": 68.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9869,
+        "window_transactions": 14460
+      },
+      {
+        "cumulative_mgas_per_second": 59.6,
+        "elapsed_seconds": 819,
+        "height": 734207,
+        "mgas_per_second": 82.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9169,
+        "window_transactions": 13416
+      },
+      {
+        "cumulative_mgas_per_second": 59.9,
+        "elapsed_seconds": 829,
+        "height": 742807,
+        "mgas_per_second": 83.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8600,
+        "window_transactions": 9395
+      },
+      {
+        "cumulative_mgas_per_second": 60.3,
+        "elapsed_seconds": 839,
+        "height": 751052,
+        "mgas_per_second": 95.5,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8245,
+        "window_transactions": 9331
+      },
+      {
+        "cumulative_mgas_per_second": 60.8,
+        "elapsed_seconds": 849,
+        "height": 759096,
+        "mgas_per_second": 100.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8044,
+        "window_transactions": 9014
+      },
+      {
+        "cumulative_mgas_per_second": 61.2,
+        "elapsed_seconds": 859,
+        "height": 767225,
+        "mgas_per_second": 93.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8129,
+        "window_transactions": 8658
+      },
+      {
+        "cumulative_mgas_per_second": 61.6,
+        "elapsed_seconds": 869,
+        "height": 775222,
+        "mgas_per_second": 98.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 7997,
+        "window_transactions": 8675
+      },
+      {
+        "cumulative_mgas_per_second": 61.7,
+        "elapsed_seconds": 879,
+        "height": 784081,
+        "mgas_per_second": 71.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 8859,
+        "window_transactions": 10031
+      },
+      {
+        "cumulative_mgas_per_second": 61.8,
+        "elapsed_seconds": 889,
+        "height": 793611,
+        "mgas_per_second": 71.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9530,
+        "window_transactions": 11478
+      },
+      {
+        "cumulative_mgas_per_second": 61.9,
+        "elapsed_seconds": 899,
+        "height": 803606,
+        "mgas_per_second": 64.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9995,
+        "window_transactions": 11566
+      },
+      {
+        "cumulative_mgas_per_second": 61.9,
+        "elapsed_seconds": 909,
+        "height": 813353,
+        "mgas_per_second": 68.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9747,
+        "window_transactions": 11515
+      },
+      {
+        "cumulative_mgas_per_second": 62.0,
+        "elapsed_seconds": 919,
+        "height": 822907,
+        "mgas_per_second": 70.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9554,
+        "window_transactions": 11430
+      },
+      {
+        "cumulative_mgas_per_second": 62.0,
+        "elapsed_seconds": 929,
+        "height": 832493,
+        "mgas_per_second": 64.0,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9586,
+        "window_transactions": 11131
+      },
+      {
+        "cumulative_mgas_per_second": 62.1,
+        "elapsed_seconds": 939,
+        "height": 842288,
+        "mgas_per_second": 65.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9795,
+        "window_transactions": 11564
+      },
+      {
+        "cumulative_mgas_per_second": 62.2,
+        "elapsed_seconds": 949,
+        "height": 851424,
+        "mgas_per_second": 76.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 9136,
+        "window_transactions": 11376
+      },
+      {
+        "cumulative_mgas_per_second": 62.3,
+        "elapsed_seconds": 959,
+        "height": 861096,
+        "mgas_per_second": 68.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9672,
+        "window_transactions": 11602
+      },
+      {
+        "cumulative_mgas_per_second": 62.3,
+        "elapsed_seconds": 969,
+        "height": 871115,
+        "mgas_per_second": 62.8,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 10019,
+        "window_transactions": 11290
+      },
+      {
+        "cumulative_mgas_per_second": 62.4,
+        "elapsed_seconds": 979,
+        "height": 880770,
+        "mgas_per_second": 67.8,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9655,
+        "window_transactions": 11237
+      },
+      {
+        "cumulative_mgas_per_second": 62.3,
+        "elapsed_seconds": 989,
+        "height": 890870,
+        "mgas_per_second": 53.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 10100,
+        "window_transactions": 11101
+      },
+      {
+        "cumulative_mgas_per_second": 62.3,
+        "elapsed_seconds": 999,
+        "height": 900480,
+        "mgas_per_second": 68.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 9610,
+        "window_transactions": 11445
+      },
+      {
+        "cumulative_mgas_per_second": 62.3,
+        "elapsed_seconds": 1009,
+        "height": 910675,
+        "mgas_per_second": 57.6,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 10195,
+        "window_transactions": 11374
+      },
+      {
+        "cumulative_mgas_per_second": 62.3,
+        "elapsed_seconds": 1019,
+        "height": 920826,
+        "mgas_per_second": 62.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 10151,
+        "window_transactions": 22690
+      },
+      {
+        "cumulative_mgas_per_second": 62.3,
+        "elapsed_seconds": 1029,
+        "height": 930661,
+        "mgas_per_second": 68.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9835,
+        "window_transactions": 23131
+      },
+      {
+        "cumulative_mgas_per_second": 62.5,
+        "elapsed_seconds": 1039,
+        "height": 939834,
+        "mgas_per_second": 77.3,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9173,
+        "window_transactions": 23197
+      },
+      {
+        "cumulative_mgas_per_second": 62.6,
+        "elapsed_seconds": 1049,
+        "height": 949665,
+        "mgas_per_second": 69.1,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 10.0,
+        "window_blocks": 9831,
+        "window_transactions": 23038
+      },
+      {
+        "cumulative_mgas_per_second": 62.7,
+        "elapsed_seconds": 1059,
+        "height": 958907,
+        "mgas_per_second": 78.4,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.7,
+        "window_blocks": 9242,
+        "window_transactions": 22638
+      },
+      {
+        "cumulative_mgas_per_second": 62.9,
+        "elapsed_seconds": 1069,
+        "height": 968075,
+        "mgas_per_second": 80.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.8,
+        "window_blocks": 9168,
+        "window_transactions": 23027
+      },
+      {
+        "cumulative_mgas_per_second": 63.1,
+        "elapsed_seconds": 1079,
+        "height": 977021,
+        "mgas_per_second": 82.9,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 8946,
+        "window_transactions": 16007
+      },
+      {
+        "cumulative_mgas_per_second": 63.1,
+        "elapsed_seconds": 1089,
+        "height": 986268,
+        "mgas_per_second": 73.2,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 9.9,
+        "window_blocks": 9247,
+        "window_transactions": 11381
+      },
+      {
+        "cumulative_mgas_per_second": 63.1,
+        "elapsed_seconds": 1099,
+        "height": 996662,
+        "mgas_per_second": 56.7,
+        "queue_wait_seconds": 0.0,
+        "ring_full_seconds": 8.1,
+        "window_blocks": 10394,
+        "window_transactions": 11668
+      }
+    ],
+    "samples_with_displayed_wait": 0
+  },
+  "corpus": {
+    "block_hash": "0xd53a08bdc947113309bfd066a9f76faccfa5764109518bf247be8cc7c95bf7a5",
+    "blocks": 1000000,
+    "gas": 69587362119,
+    "sha256": "f0b7add5aab3c819ce54f72d3e13767d276d3c9bc234e78551530fa59eb45d5c",
+    "state_root": "0xc0df2d7718e6047532228276d4f2515fd5310b47a43b6af79b3d88273b80c74e"
+  },
+  "disk": {
+    "block_database": {
+      "allocated_bytes": 2150547456,
+      "apparent_bytes": 1833184414
+    },
+    "firewood": {
+      "allocated_bytes": 268369920,
+      "apparent_bytes": 239230455
+    },
+    "total": {
+      "allocated_bytes": 2418954240,
+      "apparent_bytes": 2072424680
+    }
+  },
+  "last_cumulative_mgas_per_second": 63.0,
+  "main_pid": 36008,
+  "precision": "Bench gas rates are rounded to 0.1 Mgas/s; elapsed seconds are truncated to integers.",
+  "ready_seconds": 1104.327910409,
+  "rss_scope": "All measured host and VM processes; summed process high-water marks need not occur together.",
+  "sampled_peak_rss_bytes": 2265546752,
+  "settled_rss_bytes": 2264322048,
+  "source_starvation_evidence": "Queue wait measures time waiting for the next parsed batch, including input and parsing delays. Ring-full time samples the host input ring at capacity every 100 ms. Wait/full values are rounded to 0.1 seconds; displayed 0.0 is not proof of zero wait. No starvation threshold or bottleneck classification is applied.",
+  "sum_process_hwm_bytes": 2309898240,
+  "unit": "subnetbench-firewood.service",
+  "wall_mgas_per_second": 63.01331467138918
+}

@@ -1,0 +1,12 @@
+{
+  "benchmark-state-backend": "epochdb",
+  "state-scheme": "firewood",
+  "pruning-enabled": true,
+  "state-sync-enabled": false,
+  "snapshot-cache": 0,
+  "use-standalone-database": true,
+  "database-type": "pebbledb",
+  "database-config": "eyJzeW5jIjp0cnVlfQ==",
+  "state-history": 32,
+  "commit-interval": 31
+}

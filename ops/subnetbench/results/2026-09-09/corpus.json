@@ -1,0 +1,11 @@
+{
+  "format": "EPCORP01",
+  "Blocks": 1000000,
+  "Gas": 69587362119,
+  "Transactions": 1358991,
+  "Bytes": 2584588557,
+  "SHA256": "f0b7add5aab3c819ce54f72d3e13767d276d3c9bc234e78551530fa59eb45d5c",
+  "Genesis": "0xbbf116c5c0eb4ef0c0d3c6b062aadb47a1085efbc50d33452808da3608e65f3d",
+  "LastBlock": "0xd53a08bdc947113309bfd066a9f76faccfa5764109518bf247be8cc7c95bf7a5",
+  "LastRoot": "0xc0df2d7718e6047532228276d4f2515fd5310b47a43b6af79b3d88273b80c74e"
+}

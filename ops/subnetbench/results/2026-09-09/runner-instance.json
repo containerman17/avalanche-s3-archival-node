@@ -1,0 +1,34 @@
+{
+  "InstanceId": "i-09b1ba1bd3d047f8f",
+  "Type": "i7i.2xlarge",
+  "State": "running",
+  "AvailabilityZone": "ap-northeast-1a",
+  "LaunchTime": "2026-09-08T19:10:12+00:00",
+  "PublicIp": "175.41.197.249",
+  "Tags": [
+    {
+      "Key": "Name",
+      "Value": "ilya-solohin-epochdb-firewood-bench-20260909"
+    },
+    {
+      "Key": "Project",
+      "Value": "epochdb-firewood-benchmark"
+    },
+    {
+      "Key": "AutoStopDeadlineUTC",
+      "Value": "2026-09-09 03:09:51 UTC"
+    }
+  ],
+  "BlockDevices": [
+    {
+      "DeviceName": "/dev/xvda",
+      "Ebs": {
+        "AttachTime": "2026-09-08T19:10:13+00:00",
+        "DeleteOnTermination": true,
+        "Status": "attached",
+        "VolumeId": "vol-0c1be82260f74b488",
+        "EbsCardIndex": 0
+      }
+    }
+  ]
+}

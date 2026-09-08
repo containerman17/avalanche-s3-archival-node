@@ -1,0 +1,2 @@
+c2eadaeef9ccdd6613ac772b5a59e970f2003b5ad4e7739f11aa0a380b26e63f  ops/subnetbench/subnet-evm.patch
+b8e495e513958ef19254a6a679f311116f08b48f50918482a03c79ac75c1a60f  ops/subnetbench/libevm.patch

@@ -1,0 +1,67 @@
+{
+  "equal": true,
+  "examples": [],
+  "left": {
+    "chain_id": "0x10f1",
+    "file": "/data/bench/results/firewood-cold.jsonl",
+    "head_hash": "0xd53a08bdc947113309bfd066a9f76faccfa5764109518bf247be8cc7c95bf7a5",
+    "height": 1000000,
+    "label": "firewood-cold",
+    "methods": {
+      "eth_call": {
+        "error": 0,
+        "p50_ns": 391709,
+        "p95_ns": 587078,
+        "success": 1000
+      },
+      "eth_getBalance": {
+        "error": 0,
+        "p50_ns": 283416,
+        "p95_ns": 451716,
+        "success": 1000
+      },
+      "eth_getStorageAt": {
+        "error": 0,
+        "p50_ns": 293803,
+        "p95_ns": 445660,
+        "success": 1000
+      }
+    },
+    "requests_sha256": "87c5254739ece169c25071956a32d99f0d9cf0176312cec39bee8eedd7e43a56",
+    "storage_nonzero": 699,
+    "storage_zero": 301,
+    "valid": true
+  },
+  "mismatches": 0,
+  "right": {
+    "chain_id": "0x10f1",
+    "file": "/data/bench/results/firewood-warm.jsonl",
+    "head_hash": "0xd53a08bdc947113309bfd066a9f76faccfa5764109518bf247be8cc7c95bf7a5",
+    "height": 1000000,
+    "label": "firewood-warm",
+    "methods": {
+      "eth_call": {
+        "error": 0,
+        "p50_ns": 389750,
+        "p95_ns": 569185,
+        "success": 1000
+      },
+      "eth_getBalance": {
+        "error": 0,
+        "p50_ns": 286417,
+        "p95_ns": 444023,
+        "success": 1000
+      },
+      "eth_getStorageAt": {
+        "error": 0,
+        "p50_ns": 286649,
+        "p95_ns": 433045,
+        "success": 1000
+      }
+    },
+    "requests_sha256": "87c5254739ece169c25071956a32d99f0d9cf0176312cec39bee8eedd7e43a56",
+    "storage_nonzero": 699,
+    "storage_zero": 301,
+    "valid": true
+  }
+}
