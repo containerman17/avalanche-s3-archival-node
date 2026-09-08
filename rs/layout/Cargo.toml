@@ -1,0 +1,15 @@
+[package]
+name = "epochdb-layout"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "layout"
+path = "src/main.rs"
+
+[dependencies]
+state = { package = "epochdb-state", path = "../state" }
+memmap2 = "0.9"
+zstd = "0.13"
+lz4_flex = "0.11"
+libc = "0.2"
