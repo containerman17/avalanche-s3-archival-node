@@ -35,7 +35,6 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	proposerblock "github.com/ava-labs/avalanchego/vms/proposervm/block"
-	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/rlp"
 
@@ -516,11 +515,11 @@ func (a *archive) sumGas(lo, hi uint64) error {
 			continue
 		}
 		err := scanBlocks(r.run, max(lo, r.FromHeight), min(hi, r.ToHeight), func(h uint64, hdr, pvm []byte, tx [][]byte) error {
-			var head types.Header
-			if err := rlp.DecodeBytes(hdr, &head); err != nil {
+			g, err := headerGasUsed(hdr)
+			if err != nil {
 				return fmt.Errorf("header %d: %w", h, err)
 			}
-			gas += head.GasUsed
+			gas += g
 			txs += uint64(len(tx))
 			if h%50000 == 0 || h == hi {
 				fmt.Printf("upto %d gas %d txs %d\n", h, gas, txs)
@@ -533,4 +532,27 @@ func (a *archive) sumGas(lo, hi uint64) error {
 	}
 	fmt.Printf("TOTAL %d %d gas %d txs %d\n", lo, hi, gas, txs)
 	return nil
+}
+
+// headerGasUsed reads field 10 (gasUsed) of a header RLP by splitting, so a
+// subnet-evm header with its extra fields needs no libevm extras registered.
+func headerGasUsed(hdr []byte) (uint64, error) {
+	content, _, err := rlp.SplitList(hdr)
+	if err != nil {
+		return 0, err
+	}
+	for i := 0; i < 10; i++ {
+		if _, _, content, err = rlp.Split(content); err != nil {
+			return 0, err
+		}
+	}
+	_, v, _, err := rlp.Split(content)
+	if err != nil {
+		return 0, err
+	}
+	var g uint64
+	for _, b := range v {
+		g = g<<8 | uint64(b)
+	}
+	return g, nil
 }
