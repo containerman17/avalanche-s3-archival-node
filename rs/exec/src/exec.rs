@@ -190,6 +190,11 @@ type Err = EVMError<std::convert::Infallible>;
 pub struct Executor {
     pub cfg: Config,
     evm: SevmEvm,
+    /// Time split of execute_block: EVM run (incl. sender-side validation), trace
+    /// JSON, journal finalize + rows + DB commit.
+    pub t_evm: std::time::Duration,
+    pub t_trace: std::time::Duration,
+    pub t_commit: std::time::Duration,
 }
 
 impl Executor {
@@ -203,7 +208,7 @@ impl Executor {
             .modify_cfg_chained(|c| c.chain_id = cfg.chain_id);
         let trace_cfg = TracingInspectorConfig::from_geth_call_config(&CallConfig::default());
         let evm = Evm::new_with_inspector(ctx, TracingInspector::new(trace_cfg), EthInstructions::new_mainnet_with_spec(spec), SevmPrecompiles::new(spec));
-        let mut ex = Executor { cfg, evm };
+        let mut ex = Executor { cfg, evm, t_evm: Default::default(), t_trace: Default::default(), t_commit: Default::default() };
 
         // Genesis.toBlock: ApplyPrecompileActivations with no parent, then the alloc on top.
         let acts: Vec<_> = ex.cfg.activating(None, ex.cfg.genesis_timestamp).into_iter().cloned().collect();
@@ -340,11 +345,14 @@ impl Executor {
             if cumulative + t.gas_limit > h.gas_limit {
                 bail!("block {} tx {i}: gas limit reached (pool {}, tx {})", h.number, h.gas_limit - cumulative, t.gas_limit);
             }
+            let t0 = std::time::Instant::now();
             self.evm.ctx.set_tx(tx_env);
             self.evm.inspector.fuse();
             let res: ExecutionResult = SevmHandler::<SevmEvm, Err, EthFrame<EthInterpreter>>::default()
                 .inspect_run(&mut self.evm)
                 .map_err(|e| anyhow!("block {} tx {i} ({}): {e:?}", h.number, t.hash))?;
+            let t1 = std::time::Instant::now();
+            self.t_evm += t1 - t0;
             let state = self.evm.ctx.journal_mut().finalize();
 
             let gas_used = res.tx_gas_used();
@@ -361,10 +369,13 @@ impl Executor {
             self.evm.inspector.set_transaction_gas_limit(t.gas_limit);
             let frame = self.evm.inspector.geth_builder().geth_call_traces(CallConfig::default(), gas_used);
             let trace_json = serde_json::to_string(&frame).context("trace json")?;
+            let t2 = std::time::Instant::now();
+            self.t_trace += t2 - t1;
 
             let (rows, code) = state_rows(&state);
             out.code.extend(code);
             self.commit(state);
+            self.t_commit += t2.elapsed();
             receipts.push(receipt.clone());
             out.txs.push(TxResult { hash: t.hash, status, gas_used, cumulative_gas_used: cumulative, receipt, trace_json, rows });
         }

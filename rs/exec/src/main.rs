@@ -38,6 +38,7 @@ fn main() -> Result<()> {
     let checkpoint: u64 = arg(&args, "--checkpoint").map(|s| s.parse()).transpose()?.unwrap_or(1000);
     let workers: usize = arg(&args, "--workers").map(|s| s.parse()).transpose()?.unwrap_or(4);
     let traces_to: u64 = arg(&args, "--traces-to").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    let traces_from: u64 = arg(&args, "--traces-from").map(|s| s.parse()).transpose()?.unwrap_or(1);
     let mut traces_out = arg(&args, "--traces-out").map(std::fs::File::create).transpose()?.map(std::io::BufWriter::new);
 
     let cfg = Config::from_genesis(&genesis, &upgrade, network).context("config")?;
@@ -84,7 +85,7 @@ fn main() -> Result<()> {
         }
         ex.set_block_hash(h.number, b.hash);
         if let Some(w) = traces_out.as_mut() {
-            if h.number <= traces_to {
+            if h.number >= traces_from && h.number <= traces_to {
                 for t in &r.txs {
                     writeln!(w, "{{\"height\":{},\"tx\":\"{}\",\"result\":{}}}", h.number, t.hash, t.trace_json)?;
                 }
@@ -108,13 +109,16 @@ fn main() -> Result<()> {
             let (na, ns) = oracle::size(ex.db());
             let dt = last_report.elapsed().as_secs_f64();
             eprintln!(
-                "h={} root ok ({:.0} ms, {na} accts {ns} slots) window {:.0} blk/s {:.0} tx/s {:.1} mgas/s cum {:.1} mgas/s",
+                "h={} root ok ({:.0} ms, {na} accts {ns} slots) window {:.0} blk/s {:.0} tx/s {:.1} mgas/s cum {:.1} mgas/s (evm {:.1}s trace {:.1}s commit {:.1}s)",
                 h.number,
                 t1.elapsed().as_secs_f64() * 1e3,
                 rblk as f64 / dt,
                 rtx as f64 / dt,
                 rgas as f64 / dt / 1e6,
-                gas as f64 / t_exec.as_secs_f64() / 1e6
+                gas as f64 / t_exec.as_secs_f64() / 1e6,
+                ex.t_evm.as_secs_f64(),
+                ex.t_trace.as_secs_f64(),
+                ex.t_commit.as_secs_f64()
             );
             last_report = Instant::now();
             (rblk, rtx, rgas) = (0, 0, 0);
