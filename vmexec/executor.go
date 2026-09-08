@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"runtime"
 	goatomic "sync/atomic"
 	"time"
 
@@ -342,17 +343,23 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 		}
 	}()
 
-	// Prefetcher: container reads, decoding and sender recovery overlap
-	// execution (exec's, minus the warm stage, which is a no-op on subnet-evm).
+	// Prefetcher: container reads and decoding overlap execution (exec's,
+	// minus the warm stage, which is a no-op on subnet-evm). Sender recovery
+	// (secp256k1, the prefetcher's biggest cost) fans out over a pool of
+	// NumCPU-2 goroutines; types.Sender caches the address on the tx object
+	// itself, so the EVM finds it there. The lookahead is bounded by pf's
+	// depth and the pool.
 	type pfItem struct {
-		n   uint64
-		pvm []byte
-		blk *types.Block
-		err error
+		n    uint64
+		pvm  []byte
+		blk  *types.Block
+		err  error
+		done chan struct{} // closed once the block's senders are recovered
 	}
 	pfCtx, pfCancel := context.WithCancel(ctx)
 	defer pfCancel()
 	pf := make(chan pfItem, 512)
+	pool := make(chan struct{}, max(runtime.NumCPU()-2, 1))
 	go func() {
 		defer close(pf)
 		for h := next; ; h++ {
@@ -384,12 +391,22 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 				}
 				return
 			}
-			signer := types.MakeSigner(e.chainCfg, blk.Number(), blk.Time())
-			for _, tx := range blk.Transactions() {
-				types.Sender(signer, tx)
-			}
+			done := make(chan struct{})
 			select {
-			case pf <- pfItem{n: h, pvm: pvm, blk: blk}:
+			case pool <- struct{}{}:
+			case <-pfCtx.Done():
+				return
+			}
+			go func() {
+				defer close(done)
+				defer func() { <-pool }()
+				signer := types.MakeSigner(e.chainCfg, blk.Number(), blk.Time())
+				for _, tx := range blk.Transactions() {
+					types.Sender(signer, tx)
+				}
+			}()
+			select {
+			case pf <- pfItem{n: h, pvm: pvm, blk: blk, done: done}:
 			case <-pfCtx.Done():
 				return
 			}
@@ -415,6 +432,7 @@ func (e *Executor) Run(ctx context.Context) (err error) {
 			} else if it.n != next {
 				return fmt.Errorf("prefetch out of order: got %d want %d", it.n, next)
 			} else {
+				<-it.done
 				pvm, blk, ok = it.pvm, it.blk, true
 			}
 		case <-time.After(200 * time.Millisecond):
