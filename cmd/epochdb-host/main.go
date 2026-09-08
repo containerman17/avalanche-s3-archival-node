@@ -74,7 +74,20 @@ func main() {
 	corpus := fs.String("corpus", "", "local EPCORP01 container file; disables fetching and following")
 	configPath := fs.String("config", "", "VM config JSON file (required with --corpus)")
 	stopHeight := fs.Uint64("stop", 0, "last corpus height to accept; keep RPC open at this height")
+	genPrefill := fs.Duration("gen-prefill", 0, "block generator mode: prefill a private local chain for this long, then time --gen-sizes blocks (needs --config, fresh --data)")
+	genBatch := fs.Int("gen-batch", 2000, "generator: txs submitted per prefill block")
+	genSizes := fs.String("gen-sizes", "100,1000,5000,20000", "generator: tx counts of the timed blocks")
 	fs.Parse(os.Args[1:])
+	if *genPrefill > 0 {
+		if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+			log.Fatal(err)
+		}
+		id, err := genChain(*dataDir)
+		if err != nil {
+			log.Fatalf("epochdb-host: gen chain: %v", err)
+		}
+		*chainSpec, *network = id, "local"
+	}
 	if *chainSpec == "" || *vmPath == "" {
 		log.Fatal("epochdb-host: --chain and --vm are required")
 	}
@@ -91,6 +104,8 @@ func main() {
 		networkID = constants.MainnetID
 	case "fuji":
 		networkID = constants.FujiID
+	case "local":
+		networkID = constants.LocalID
 	default:
 		log.Fatalf("epochdb-host: unknown --network %q", *network)
 	}
@@ -121,6 +136,15 @@ func main() {
 	}
 	if c.SubnetID == constants.PrimaryNetworkID {
 		log.Fatal("epochdb-host: the primary network's C-chain is not an L1 (coreth is not a plugin)")
+	}
+	if *genPrefill > 0 {
+		if *configPath == "" {
+			log.Fatal("epochdb-host: --gen-prefill requires --config")
+		}
+		if err := runGen(ctx, c, *vmPath, *dataDir, *configPath, *genPrefill, *genBatch, *genSizes); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("epochdb-host: gen: %v", err)
+		}
+		return
 	}
 	if *corpus != "" {
 		if err := runCorpus(ctx, c, sources, *vmPath, *dataDir, *httpAddr, *corpus, *configPath, *stopHeight, *queueAhead, *batch); err != nil && !errors.Is(err, context.Canceled) {

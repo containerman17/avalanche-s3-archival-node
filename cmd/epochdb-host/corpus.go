@@ -114,47 +114,48 @@ func readCorpus(ctx context.Context, path string, accepted, stop uint64, anchor 
 	return nil
 }
 
-func runCorpus(ctx context.Context, c *chain.Chain, sources []string, vmPath, dataDir, httpAddr, corpusPath, configPath string, stopHeight uint64, queueAhead, batchSize int) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	if c.VMKind != chain.SubnetEVM {
-		return errors.New("corpus mode requires subnet-evm")
-	}
-	configBytes, err := os.ReadFile(configPath)
-	if err != nil {
-		return err
-	}
+// plugin is a launched rpcchainvm plugin, initialized on this chain.
+type plugin struct {
+	vm      block.ChainVM
+	tracker *pidTracker
+	snowCtx *snow.Context
+	close   func()
+}
+
+// openPlugin launches the plugin binary, opens the host database under dataDir,
+// and initializes the VM on chain c with configBytes.
+func openPlugin(ctx context.Context, c *chain.Chain, sources []string, vmPath, dataDir string, configBytes []byte) (*plugin, error) {
 	fetch.RegisterExtras(c.VMKind)
 	if err := staking.InitNodeStakingKeyPair(filepath.Join(dataDir, "staker.key"), filepath.Join(dataDir, "staker.crt")); err != nil {
-		return err
+		return nil, err
 	}
 	nodeID, err := nodeIDFrom(dataDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	blsKey, err := localsigner.FromFileOrPersistNew(filepath.Join(dataDir, "signer.key"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	xChainID, cChainID, avaxAssetID, err := primaryIDs(c.NetworkID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	logger := logging.NewLogger("host", logging.NewWrappedCore(logging.Info, os.Stderr, logging.Plain.ConsoleEncoder()))
 	tracker := &pidTracker{}
 	v, err := rpcchainvm.NewFactory(vmPath, tracker, runtime.NewManager(), metrics.NewPrefixGatherer()).New(logger)
 	if err != nil {
-		return fmt.Errorf("launch plugin: %w", err)
+		return nil, fmt.Errorf("launch plugin: %w", err)
 	}
 	vm := v.(block.ChainVM)
 	db, err := pebbledb.New(filepath.Join(dataDir, "db"), nil, logger, prometheus.NewRegistry())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer db.Close()
 	chainDataDir := filepath.Join(dataDir, "chainData")
 	if err := os.MkdirAll(chainDataDir, 0o755); err != nil {
-		return err
+		db.Close()
+		return nil, err
 	}
 	snowCtx := &snow.Context{
 		NetworkID: c.NetworkID, SubnetID: c.SubnetID, ChainID: c.BlockchainID,
@@ -165,16 +166,38 @@ func runCorpus(ctx context.Context, c *chain.Chain, sources []string, vmPath, da
 		WarpSigner:     warp.NewSigner(blsKey, c.NetworkID, c.BlockchainID),
 		ValidatorState: newRPCValidatorState(sources, c.BlockchainID, c.SubnetID), ChainDataDir: chainDataDir,
 	}
-	defer func() {
+	pl := &plugin{vm: vm, tracker: tracker, snowCtx: snowCtx}
+	pl.close = func() {
 		shutdownCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
 		defer stop()
 		if err := vm.Shutdown(shutdownCtx); err != nil {
 			log.Printf("epochdb-host: plugin shutdown: %v", err)
 		}
-	}()
-	if err := vm.Initialize(ctx, snowCtx, prefixdb.New([]byte("vm"), db), c.GenesisJSON, c.UpgradeJSON, configBytes, nil, noopSender{}); err != nil {
-		return fmt.Errorf("initialize: %w", err)
+		db.Close()
 	}
+	if err := vm.Initialize(ctx, snowCtx, prefixdb.New([]byte("vm"), db), c.GenesisJSON, c.UpgradeJSON, configBytes, nil, noopSender{}); err != nil {
+		pl.close()
+		return nil, fmt.Errorf("initialize: %w", err)
+	}
+	return pl, nil
+}
+
+func runCorpus(ctx context.Context, c *chain.Chain, sources []string, vmPath, dataDir, httpAddr, corpusPath, configPath string, stopHeight uint64, queueAhead, batchSize int) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if c.VMKind != chain.SubnetEVM {
+		return errors.New("corpus mode requires subnet-evm")
+	}
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	pl, err := openPlugin(ctx, c, sources, vmPath, dataDir, configBytes)
+	if err != nil {
+		return err
+	}
+	defer pl.close()
+	vm, tracker, snowCtx := pl.vm, pl.tracker, pl.snowCtx
 	if n := os.Getenv("EPOCHDB_HOST_RTT"); n != "" {
 		// Round-trip probe: Version is the emptiest rpcchainvm call there is.
 		count, _ := strconv.Atoi(n)
