@@ -263,7 +263,10 @@ fn verify(args: &[String]) -> Result<()> {
             eprintln!("verify: h={h} ok ({:.0}s)", t0.elapsed().as_secs_f64());
         }
     }
-    expect("next_tx", db.next_tx(), next_tx)?;
+    if nblk == head {
+        expect("next_tx", db.next_tx(), next_tx)?;
+    }
+    let head = head.min(nblk);
     // the sequential readers agree with the point reads
     let mut n = 0u64;
     db.chain_rows(FAM_HDR, 1, head, |h, v| {

@@ -6,7 +6,8 @@
 use crate::bloom;
 use anyhow::{anyhow, bail, Result};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 pub const TRAILER_LEN: usize = 5;
 const FOOTER_LEN: usize = 53;
@@ -450,7 +451,12 @@ pub struct Sst {
     pub two_level: bool,
     /// Index partitions of a two-level index, for the layout report.
     pub index_blocks: Vec<Handle>,
+    /// Decoded data blocks by offset. ponytail: cleared whole past CACHE_BLOCKS
+    /// entries; an LRU when a real working set needs one.
+    cache: Mutex<HashMap<u64, Arc<Vec<(Vec<u8>, Vec<u8>)>>>>,
 }
+
+const CACHE_BLOCKS: usize = 256;
 
 fn decode_block_entries(blk: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     if blk.len() < 4 {
@@ -481,7 +487,7 @@ fn strip_trailer(ikey: &[u8]) -> &[u8] {
 
 impl Sst {
     pub fn open(blob: Arc<dyn ReadAt>, off: u64, len: u64) -> Result<Sst> {
-        let mut s = Sst { blob, off, len, index: Vec::new(), filter: None, props: Vec::new(), two_level: false, index_blocks: Vec::new() };
+        let mut s = Sst { blob, off, len, index: Vec::new(), filter: None, props: Vec::new(), two_level: false, index_blocks: Vec::new(), cache: Mutex::new(HashMap::new()) };
         if len < FOOTER_LEN as u64 {
             bail!("sst: section is {len} bytes, too small for a footer");
         }
@@ -595,7 +601,7 @@ impl Sst {
     }
 
     pub fn iter(&self) -> SstIter<'_> {
-        SstIter { sst: self, blk: usize::MAX, entries: Vec::new(), pos: 0 }
+        SstIter { sst: self, blk: usize::MAX, entries: Arc::new(Vec::new()), pos: 0 }
     }
 
     /// Exact-key point read.
@@ -632,7 +638,7 @@ impl Sst {
 pub struct SstIter<'a> {
     sst: &'a Sst,
     blk: usize,
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    entries: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
     pos: usize,
 }
 
@@ -641,11 +647,25 @@ impl<'a> SstIter<'a> {
         if self.blk == blk {
             return Ok(());
         }
-        let raw = self.sst.read_block(self.sst.index[blk].1)?;
+        let h = self.sst.index[blk].1;
+        if let Some(e) = self.sst.cache.lock().unwrap().get(&h.offset) {
+            self.entries = e.clone();
+            self.blk = blk;
+            return Ok(());
+        }
+        let raw = self.sst.read_block(h)?;
         let mut ents = decode_block_entries(&raw)?;
         for e in &mut ents {
             let n = e.0.len() - 8;
             e.0.truncate(n);
+        }
+        let ents = Arc::new(ents);
+        {
+            let mut c = self.sst.cache.lock().unwrap();
+            if c.len() >= CACHE_BLOCKS {
+                c.clear();
+            }
+            c.insert(h.offset, ents.clone());
         }
         self.entries = ents;
         self.blk = blk;

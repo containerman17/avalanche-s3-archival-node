@@ -260,7 +260,7 @@ impl Memtable {
         if let Some(d) = path.parent() {
             fs::create_dir_all(d)?;
         }
-        let f = fs::OpenOptions::new().read(true).write(!read_only).create(!read_only).open(path)?;
+        let f = fs::OpenOptions::new().read(true).write(true).create(true).open(path)?;
         let w = BufWriter::with_capacity(1 << 20, f.try_clone()?);
         let mut m = Memtable {
             path: path.to_path_buf(),
