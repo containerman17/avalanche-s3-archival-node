@@ -45,7 +45,7 @@ const (
 	selMint         = "40c10f19"
 	selMintMany     = "9579f5d1"
 	holdersPerMint  = 1000 // mintMany holders per prefill tx
-	mintsPerBlock   = 12   // mintMany txs per prefill block (state growth)
+	mintsPerBlock   = 20   // mintMany txs per prefill block (state growth)
 )
 
 // genChain writes chain.json for the private chain when it is absent.
@@ -102,6 +102,25 @@ func genKey(i int) *ecdsa.PrivateKey {
 		panic(err)
 	}
 	return k
+}
+
+// genState is what a finished prefill leaves in the data dir, so later runs
+// skip setup and prefill and go straight to timed blocks on the grown state.
+type genState struct {
+	Contract common.Address `json:"contract"`
+	Holders  uint64         `json:"holders"`
+	Nonces   []uint64       `json:"nonces"`
+	Rng      uint64         `json:"rng"`
+}
+
+func genStatePath(dataDir string) string { return filepath.Join(dataDir, "gen-state.json") }
+
+func (g *gen) save(dataDir string) error {
+	raw, err := json.Marshal(genState{Contract: g.contract, Holders: g.holders, Nonces: g.nonces, Rng: g.rng})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(genStatePath(dataDir), raw, 0o644)
 }
 
 // gen is the generator state: signers, nonces, and how much state exists.
@@ -270,45 +289,9 @@ func (g *gen) mine(ctx context.Context) (*ethtypes.Block, [3]time.Duration, erro
 	return &eth, d, nil
 }
 
-// runGen: prefill for prefillFor, then one timed block per entry of sizes.
-func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath string, prefillFor time.Duration, prefillBatch int, sizes string) error {
-	configBytes, err := os.ReadFile(configPath)
-	if err != nil {
-		return err
-	}
-	pl, err := openPlugin(ctx, c, nil, vmPath, dataDir, configBytes)
-	if err != nil {
-		return err
-	}
-	defer pl.close()
-	if err := pl.vm.SetState(ctx, snow.Bootstrapping); err != nil {
-		return err
-	}
-	if err := pl.vm.SetState(ctx, snow.NormalOp); err != nil {
-		return err
-	}
-	handlers, err := pl.vm.CreateHandlers(ctx)
-	if err != nil {
-		return err
-	}
-	if handlers["/rpc"] == nil {
-		return errors.New("plugin has no /rpc handler")
-	}
-	g := &gen{vm: pl, rpc: handlers["/rpc"], signer: ethtypes.LatestSignerForChainID(big.NewInt(genChainID)), nonces: make([]uint64, genSenders)}
-	for i := 0; i < genSenders; i++ {
-		g.keys = append(g.keys, genKey(i))
-	}
-	lastID, err := pl.vm.LastAccepted(ctx)
-	if err != nil {
-		return err
-	}
-	last, err := pl.vm.GetBlock(ctx, lastID)
-	if err != nil {
-		return err
-	}
-	if last.Height() != 0 {
-		return fmt.Errorf("generator wants a fresh data dir, found height %d", last.Height())
-	}
+// setupAndPrefill deploys the token, funds and approves the senders, grows
+// holders for prefillFor, and saves the generator state for later runs.
+func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor time.Duration, prefillBatch int) error {
 	// Deploy the token (treasury = sender 1023, fee 25 bps), fund every sender,
 	// and let every sender approve its successor: setup blocks, not timed.
 	treasury := crypto.PubkeyToAddress(g.keys[genSenders-1].PublicKey)
@@ -324,7 +307,7 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 		return fmt.Errorf("deploy block has %d txs, gas %d", len(blk.Transactions()), blk.GasUsed())
 	}
 	g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), 0)
-	log.Printf("gen deployed token at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.contract, blk.NumberU64(), d[0], d[1], d[2], pl.tracker.pid.Load())
+	log.Printf("gen deployed token at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.contract, blk.NumberU64(), d[0], d[1], d[2], g.vm.tracker.pid.Load())
 	setup := make([][]byte, 0, 2*genSenders)
 	for i := 0; i < genSenders; i++ {
 		to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
@@ -382,6 +365,59 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 	el := time.Since(start)
 	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d senders=%d height=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, genSenders, blk.NumberU64())
 
+	return g.save(dataDir)
+}
+
+// runGen: prefill for prefillFor, then one timed block per entry of sizes.
+func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath string, prefillFor time.Duration, prefillBatch int, sizes string) error {
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	pl, err := openPlugin(ctx, c, nil, vmPath, dataDir, configBytes)
+	if err != nil {
+		return err
+	}
+	defer pl.close()
+	if err := pl.vm.SetState(ctx, snow.Bootstrapping); err != nil {
+		return err
+	}
+	if err := pl.vm.SetState(ctx, snow.NormalOp); err != nil {
+		return err
+	}
+	handlers, err := pl.vm.CreateHandlers(ctx)
+	if err != nil {
+		return err
+	}
+	if handlers["/rpc"] == nil {
+		return errors.New("plugin has no /rpc handler")
+	}
+	g := &gen{vm: pl, rpc: handlers["/rpc"], signer: ethtypes.LatestSignerForChainID(big.NewInt(genChainID)), nonces: make([]uint64, genSenders)}
+	for i := 0; i < genSenders; i++ {
+		g.keys = append(g.keys, genKey(i))
+	}
+	lastID, err := pl.vm.LastAccepted(ctx)
+	if err != nil {
+		return err
+	}
+	last, err := pl.vm.GetBlock(ctx, lastID)
+	if err != nil {
+		return err
+	}
+	if raw, err := os.ReadFile(genStatePath(dataDir)); err == nil {
+		var st genState
+		if err := json.Unmarshal(raw, &st); err != nil {
+			return err
+		}
+		g.contract, g.holders, g.nonces, g.rng = st.Contract, st.Holders, st.Nonces, st.Rng
+		log.Printf("gen resumed: height=%d holders=%d senders=%d vm_pid=%d (prefill skipped)", last.Height(), g.holders, genSenders, pl.tracker.pid.Load())
+	} else if last.Height() != 0 {
+		return fmt.Errorf("data dir at height %d without %s", last.Height(), genStatePath(dataDir))
+	} else {
+		if err := g.setupAndPrefill(ctx, dataDir, prefillFor, prefillBatch); err != nil {
+			return err
+		}
+	}
 	// Measured blocks: existing state, reads and writes.
 	for _, f := range strings.Split(sizes, ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(f))
@@ -406,6 +442,9 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 					return err
 				}
 			}
+		}
+		if err := g.save(dataDir); err != nil {
+			return err
 		}
 	}
 	return nil
