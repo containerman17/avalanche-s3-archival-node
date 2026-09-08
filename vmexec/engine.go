@@ -2,6 +2,8 @@ package vmexec
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -25,7 +27,10 @@ import (
 // roots. Everything here runs on the executor goroutine except the roll
 // goroutine, which reads only the frozen overlay and the runs it was handed.
 //
-// No restart: the engine is rebuilt from genesis on every open (prototype).
+// Durability: the run/trie pair the MANIFEST names is the rolled state, and
+// the store's history rows since that roll are the write-ahead log the
+// overlays are rebuilt from on open (recover.go). Files the manifest does not
+// name are garbage.
 type engine struct {
 	dir     string
 	overlay *latest.Overlay
@@ -48,6 +53,84 @@ type engine struct {
 	rollT0   time.Time
 	rollDone chan rollResult
 	rolls    int
+	// syncStore makes the store durable through the roll height before the
+	// manifest names the roll, so a restart always has rows from that height
+	// on. nil without a store (tests).
+	syncStore func() error
+}
+
+// manifest is vmstate/MANIFEST: the current pair (run.<gen>, trie.<gen>),
+// the height their state was rolled at and the verified root at it. It is
+// replaced atomically (temp, fsync, rename), the pair is complete and fsynced
+// before it is named, and the old pair is unlinked only after. A torn roll,
+// a torn temp or a stale index is therefore any file it does not name.
+type manifest struct {
+	Gen    int         `json:"gen"`
+	Height uint64      `json:"height"`
+	Root   common.Hash `json:"root"`
+}
+
+const manifestName = "MANIFEST"
+
+var errNoManifest = errors.New("vmstate: no manifest")
+
+func readManifest(dir string) (manifest, error) {
+	b, err := os.ReadFile(filepath.Join(dir, manifestName))
+	if errors.Is(err, os.ErrNotExist) {
+		return manifest{}, errNoManifest
+	}
+	if err != nil {
+		return manifest{}, err
+	}
+	var m manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return manifest{}, fmt.Errorf("vmstate manifest: %w", err)
+	}
+	return m, nil
+}
+
+func writeManifest(dir string, m manifest) error {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, manifestName+".tmp")
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(b); err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(dir, manifestName))
+	}
+	if err != nil {
+		return fmt.Errorf("vmstate manifest: %w", err)
+	}
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// userData is the 32-byte user field of the run and the trie file: the roll
+// height and the first 24 bytes of the root at it, the file-level link to
+// the manifest (the full root is the trie footer's and the manifest's).
+func userData(h uint64, root common.Hash) [32]byte {
+	var u [32]byte
+	binary.LittleEndian.PutUint64(u[:8], h)
+	copy(u[8:], root[:24])
+	return u
 }
 
 type rollResult struct {
@@ -74,12 +157,6 @@ func slotKey(ah common.Hash, slotHash common.Hash) []byte {
 	k = append(k, ah[:]...)
 	k = append(k, 1)
 	return append(k, slotHash[:]...)
-}
-
-func heightUser(h uint64) [32]byte {
-	var u [32]byte
-	binary.LittleEndian.PutUint64(u[:], h)
-	return u
 }
 
 func (s *engine) runPath(gen int) string  { return filepath.Join(s.dir, fmt.Sprintf("run.%d", gen)) }
@@ -118,11 +195,11 @@ func newEngine(dir string, alloc types.GenesisAlloc, want common.Hash) (*engine,
 		}
 	}
 	t0 := time.Now()
-	run, err := latest.Merge(s.runPath(0), latest.NewView(s.overlay), heightUser(0))
+	run, err := latest.Merge(s.runPath(0), latest.NewView(s.overlay), userData(0, want))
 	if err != nil {
 		return nil, fmt.Errorf("genesis merge: %w", err)
 	}
-	root, st, err := commit.Roll(run.Iter(nil, nil), s.triePath(0), heightUser(0))
+	root, st, err := commit.Roll(run.Iter(nil, nil), s.triePath(0), userData(0, want))
 	if err != nil {
 		return nil, fmt.Errorf("genesis roll: %w", err)
 	}
@@ -131,6 +208,9 @@ func newEngine(dir string, alloc types.GenesisAlloc, want common.Hash) (*engine,
 	}
 	file, err := commit.Open(s.triePath(0))
 	if err != nil {
+		return nil, err
+	}
+	if err := writeManifest(dir, manifest{Gen: 0, Height: 0, Root: root}); err != nil {
 		return nil, err
 	}
 	log.Printf("vmexec: genesis state ok: root=%x accounts=%d keys=%d nodes=%d run=%dB trie=%dB in %s",
@@ -142,6 +222,49 @@ func newEngine(dir string, alloc types.GenesisAlloc, want common.Hash) (*engine,
 	s.dirty.Workers = runtime.NumCPU()
 	s.rebuildView()
 	return s, nil
+}
+
+// openEngine opens the pair the manifest names and sweeps every other file
+// out of dir. The caller checks the root against the chain and rebuilds the
+// overlays (recover.go).
+func openEngine(dir string) (*engine, manifest, error) {
+	m, err := readManifest(dir)
+	if err != nil {
+		return nil, m, err
+	}
+	s := &engine{dir: dir, overlay: latest.NewOverlay(), rollDone: make(chan rollResult, 1), owners: map[common.Hash]struct{}{}, gen: m.Gen}
+	run, err := latest.Open(s.runPath(m.Gen))
+	if err != nil {
+		return nil, m, fmt.Errorf("vmstate run %d: %w", m.Gen, err)
+	}
+	file, err := commit.Open(s.triePath(m.Gen))
+	if err != nil {
+		run.Close()
+		return nil, m, fmt.Errorf("vmstate trie %d: %w", m.Gen, err)
+	}
+	if want := userData(m.Height, m.Root); run.UserData() != want || file.UserData() != want || file.Root() != m.Root {
+		run.Close()
+		file.Close()
+		return nil, m, fmt.Errorf("vmstate: manifest names gen %d at height %d root %x, but the files carry run=%x trie=%x root=%x",
+			m.Gen, m.Height, m.Root, run.UserData(), file.UserData(), file.Root())
+	}
+	keep := map[string]bool{manifestName: true, filepath.Base(s.runPath(m.Gen)): true, filepath.Base(s.triePath(m.Gen)): true}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, m, err
+	}
+	for _, e := range entries {
+		if !keep[e.Name()] {
+			os.Remove(filepath.Join(dir, e.Name()))
+			log.Printf("vmexec: swept %s: not named by the manifest", e.Name())
+		}
+	}
+	s.runs = []*latest.Run{run}
+	s.file = file
+	s.dirty = commit.NewDirty(file, s.seek)
+	s.dirty.Workers = runtime.NumCPU()
+	s.rebuildView()
+	return s, m, nil
 }
 
 func (s *engine) rebuildView() {
@@ -230,11 +353,11 @@ func (s *engine) maybeRoll(budget int, h uint64, root common.Hash) {
 	go func() {
 		var r rollResult
 		t0 := time.Now()
-		r.run, r.err = latest.Merge(s.runPath(gen), view, heightUser(h))
+		r.run, r.err = latest.Merge(s.runPath(gen), view, userData(h, root))
 		r.merge = time.Since(t0)
 		if r.err == nil {
 			t1 := time.Now()
-			r.root, r.stats, r.err = commit.Roll(r.run.Iter(nil, nil), s.triePath(gen), heightUser(h))
+			r.root, r.stats, r.err = commit.Roll(r.run.Iter(nil, nil), s.triePath(gen), userData(h, root))
 			r.roll = time.Since(t1)
 		}
 		if r.err == nil {
@@ -262,6 +385,19 @@ func (s *engine) finishRoll() error {
 		if r.root != s.rollRoot {
 			s.frozen = nil
 			return fmt.Errorf("roll root mismatch at height %d: rolled %x, verified %x", s.rollH, r.root, s.rollRoot)
+		}
+		// The pair is complete and fsynced; the store must hold rows through
+		// the roll height before the manifest names it, then the old pair
+		// may go.
+		if s.syncStore != nil {
+			if err := s.syncStore(); err != nil {
+				s.frozen = nil
+				return fmt.Errorf("roll: store sync: %w", err)
+			}
+		}
+		if err := writeManifest(s.dir, manifest{Gen: s.gen + 1, Height: s.rollH, Root: s.rollRoot}); err != nil {
+			s.frozen = nil
+			return fmt.Errorf("roll: %w", err)
 		}
 		dirtyBefore := s.dirty.Bytes()
 		old, oldFile, oldGen := s.runs, s.file, s.gen
@@ -298,13 +434,12 @@ func (s *engine) finishRoll() error {
 	return nil
 }
 
+// close releases the mmaps. A roll in flight is abandoned: the manifest never
+// named its files, so the next open sweeps them; its goroutine still reads
+// the runs, which therefore stay mapped (the process is exiting).
 func (s *engine) close() {
 	if s.frozen != nil {
-		r := <-s.rollDone // let the roll finish so its files are not torn
-		if r.err == nil {
-			r.run.Close()
-			r.file.Close()
-		}
+		return
 	}
 	for _, r := range s.runs {
 		r.Close()

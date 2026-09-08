@@ -2,12 +2,13 @@
 // (latest + commit) in place of Firewood: no triedb, no cgo, no walk-back.
 // Everything the store receives (receipts, frames, state rows, headers, code)
 // is produced exactly as exec produces it; only the inner state database and
-// the root check changed. Restart/recovery is out of scope: a start rebuilds
-// the state from genesis and refuses a dir that already holds blocks.
+// the root check changed. A restart reopens the rolled state and rebuilds
+// what came after it from the store's rows (recover.go).
 package vmexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
+	"github.com/ava-labs/libevm/crypto"
 	ethstate "github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/params"
@@ -25,6 +27,7 @@ import (
 	"github.com/ava-labs/libevm/triedb"
 
 	"github.com/containerman17/avalanche-s3-archival-node/chain"
+	"github.com/containerman17/avalanche-s3-archival-node/dist"
 	"github.com/containerman17/avalanche-s3-archival-node/store"
 )
 
@@ -41,6 +44,7 @@ type Config struct {
 	DataDir string
 	Blocks  BlockSource
 	Store   *store.DB
+	CAS     *dist.Store // the store's artifact store: recovery reads the runs
 	Misc    *store.MiscStore
 	Chain   *chain.Chain
 	// RollBudget is the overlay size (accounted bytes) that triggers a
@@ -131,19 +135,29 @@ type unpublishedBlock struct {
 	code []string
 }
 
-// FetchStart: a fresh dir starts at block 1, anchored on the genesis hash.
-func FetchStart(genesisHash common.Hash) (from uint64, anchor ids.ID) {
-	return 1, ids.ID(genesisHash)
+// FetchStart is where the fetch resumes: the block after the store's head,
+// anchored on the head's hash (a fresh dir: block 1 on the genesis hash).
+func FetchStart(db *store.DB, genesisHash common.Hash) (from uint64, anchor ids.ID, err error) {
+	head, ok := db.Head()
+	if !ok || head == 0 {
+		return 1, ids.ID(genesisHash), nil
+	}
+	raw, ok, err := db.HeaderRLP(head)
+	if err != nil {
+		return 0, ids.Empty, fmt.Errorf("fetch anchor: header %d: %w", head, err)
+	}
+	if !ok {
+		return 0, ids.Empty, fmt.Errorf("fetch anchor: the store holds block %d but no header for it", head)
+	}
+	return head + 1, ids.ID(crypto.Keccak256Hash(raw)), nil
 }
 
-// New builds the genesis state, checks its root, and returns an Executor
-// ready to Run. The store must be empty (no restart in this prototype).
+// New opens the state (from genesis into an empty dir, or the rolled state
+// plus a rebuild of everything the store holds after it) and returns an
+// Executor ready to Run from the store's head.
 func New(cfg Config) (*Executor, error) {
-	if cfg.Blocks == nil || cfg.DataDir == "" || cfg.Store == nil || cfg.Misc == nil || cfg.Chain == nil {
-		return nil, fmt.Errorf("config: Blocks, DataDir, Store, Misc and Chain are required")
-	}
-	if head, ok := cfg.Store.Head(); ok && head > 0 {
-		return nil, fmt.Errorf("data dir already holds blocks through %d: epochdb-vm has no restart path yet, start from an empty dir", head)
+	if cfg.Blocks == nil || cfg.DataDir == "" || cfg.Store == nil || cfg.CAS == nil || cfg.Misc == nil || cfg.Chain == nil {
+		return nil, fmt.Errorf("config: Blocks, DataDir, Store, CAS, Misc and Chain are required")
 	}
 	if cfg.RollBudget <= 0 {
 		cfg.RollBudget = 2 << 30
@@ -155,10 +169,20 @@ func New(cfg Config) (*Executor, error) {
 	if err := cfg.Misc.BindVMKind(string(cfg.Chain.VMKind)); err != nil {
 		return nil, err
 	}
-	eng, err := newEngine(filepath.Join(cfg.DataDir, "vmstate"), g.TrieAlloc, g.Root)
-	if err != nil {
+	head, _ := cfg.Store.Head()
+	eng, m, err := openEngine(filepath.Join(cfg.DataDir, "vmstate"))
+	recovered := err == nil
+	switch {
+	case errors.Is(err, errNoManifest) && head > 0:
+		return nil, fmt.Errorf("data dir holds blocks through %d but vmstate has no manifest (an older build wrote it): start from an empty dir", head)
+	case errors.Is(err, errNoManifest):
+		if eng, err = newEngine(filepath.Join(cfg.DataDir, "vmstate"), g.TrieAlloc, g.Root); err != nil {
+			return nil, err
+		}
+	case err != nil:
 		return nil, err
 	}
+	eng.syncStore = cfg.Store.Sync
 	ethdbKV := store.EthDB(cfg.Store, cfg.Misc, g.TrieAlloc)
 	memdb := rawdb.NewDatabase(ethdbKV)
 	// Code reads go through libevm's cachingDB over the store's ethdb, as
@@ -178,6 +202,12 @@ func New(cfg Config) (*Executor, error) {
 	}
 	e.live.Store(0)
 	e.recentHdr = e.chainCtx.recent
+	if recovered {
+		if err := e.recover(m, g.Root, head); err != nil {
+			eng.close()
+			return nil, err
+		}
+	}
 	return e, nil
 }
 

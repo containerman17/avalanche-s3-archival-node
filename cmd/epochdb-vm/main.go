@@ -1,7 +1,7 @@
 // Command epochdb-vm is a subnet-evm archival node on the state engine
 // (latest + commit): epochdb serve's fetch, store and RPC with vmexec in
-// place of exec. No Firewood, no triedb. Prototype: no restart path, every
-// start is from genesis into an empty data dir.
+// place of exec. No Firewood, no triedb. A restart resumes from the store's
+// head: the rolled state is reopened and the rest rebuilt from the rows.
 package main
 
 import (
@@ -36,7 +36,7 @@ import (
 
 func main() {
 	fs := flag.NewFlagSet("epochdb-vm", flag.ExitOnError)
-	dataDir := fs.String("data", "./data", "data directory (must be empty: no restart path yet)")
+	dataDir := fs.String("data", "./data", "data directory")
 	port := fs.Int("port", 9650, "HTTP listen port: JSON-RPC at / and /ext/bc/<blockchainID>/rpc, /status")
 	p2pPort := fs.Int("p2p-port", 0, "listen for avalanchego peers on this port (0 disables)")
 	peers := fs.String("peers", "", "comma-separated extra archival peers, NodeID-...@host:port each (an epochdb --p2p-port or epochdb-archive-serve)")
@@ -121,14 +121,17 @@ func main() {
 	}
 	defer misc.Close()
 
-	from, anchor := vmexec.FetchStart(g.Hash)
+	from, anchor, err := vmexec.FetchStart(db, g.Hash)
+	if err != nil {
+		log.Fatalf("epochdb-vm: %v", err)
+	}
 	blocks := fetcher.StartForward(ctx, from, anchor)
 
 	srv := rpc.NewServer(db, g.TrieAlloc, rpc.StoreChainContext(db), g.Config)
 	fetcher.Serve(srv)
 
 	e, err := vmexec.New(vmexec.Config{
-		DataDir: *dataDir, Blocks: blocks, Store: db, Misc: misc, Chain: c,
+		DataDir: *dataDir, Blocks: blocks, Store: db, CAS: cas, Misc: misc, Chain: c,
 		RollBudget: int(*rollBudget), StopAt: *stopAt,
 	})
 	if err != nil {
