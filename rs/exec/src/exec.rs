@@ -699,7 +699,9 @@ impl<D: StateDb> Executor<D> {
             block_env.set_blob_excess_gas_and_price(h.excess_blob_gas.unwrap_or(0), revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
         }
         self.evm.ctx.set_block(block_env);
-        self.evm.ctx.modify_cfg(|c| c.spec = spec);
+        // The gas params table (EIP-3860 initcode words and the rest) is per spec: a bare
+        // `c.spec = spec` would keep the genesis spec's table across Durango and Etna.
+        self.evm.ctx.modify_cfg(|c| c.set_spec_and_mainnet_gas_params(spec));
         let durango = self.cfg.is_durango(time);
         let granite = self.cfg.is_granite(time);
         let mut enabled = [false; 6];

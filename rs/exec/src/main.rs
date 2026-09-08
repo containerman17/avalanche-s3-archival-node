@@ -137,6 +137,14 @@ fn run<D: StateDb + 'static>(
         let t0 = Instant::now();
         let r = ex.execute_block(&b, parent_time).with_context(|| format!("block {}", h.number))?;
         t_exec += t0.elapsed();
+        if let Some(w) = traces_out.as_mut() {
+            if h.number >= traces_from && h.number <= traces_to {
+                for t in &r.txs {
+                    writeln!(w, "{{\"height\":{},\"tx\":\"{}\",\"result\":{}}}", h.number, t.hash, t.trace_json)?;
+                }
+                w.flush()?;
+            }
+        }
         if r.gas_used != h.gas_used {
             bail!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used);
         }
@@ -148,13 +156,6 @@ fn run<D: StateDb + 'static>(
         }
         precompile_txs += b.txs.iter().filter(|t| t.to.is_some_and(|a| epochdb_exec::precompile::module_index(a).is_some())).count() as u64;
         ex.set_block_hash(h.number, b.hash);
-        if let Some(w) = traces_out.as_mut() {
-            if h.number >= traces_from && h.number <= traces_to {
-                for t in &r.txs {
-                    writeln!(w, "{{\"height\":{},\"tx\":\"{}\",\"result\":{}}}", h.number, t.hash, t.trace_json)?;
-                }
-            }
-        }
         nblk += 1;
         ntx += r.txs.len() as u64;
         gas += r.gas_used;

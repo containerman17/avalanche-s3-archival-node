@@ -207,12 +207,28 @@ falls through to a plain call), so the config path is exercised.
 Later windows (5,000 blocks each, fetched): a window needs the state before it, which only
 the archive RPC has; `--from N --rpc URL` replays over `CacheDB<RpcDb>` (eth_getBalance /
 getTransactionCount / getCode / getStorageAt at N minus 1, cached to disk) with the receipts
-oracle only. Both public beam RPCs answer at 1 to 3 calls per second, so only a few blocks
-per window fit the time box: see the window lines appended below (or "not reached").
+oracle only. Both public beam RPCs answer at 1 to 3 calls per second, so the replays are short.
 `platform.getValidatorsAt` on api.avax.network refuses numeric heights ("Unsupported height
 parameter value"); publicnode's P-chain answers them, so `--pchain
 https://avalanche-p-chain-rpc.publicnode.com/ext/bc/P` is the `ValidatorState` feed
-(`RpcValidatorState`, cached).
+(`RpcValidatorState`, cached). Results (gasUsed, receiptsRoot, logsBloom equal to the
+header on every block, `predicates_verified` = txs whose warp predicates were BLS-verified
+against the validator set at the proposervm context height and matched the header's bits):
+- Durango: 1901030..1901229 (200 blocks, 240 txs, 23.4 Mgas), the first Durango block
+  included (SHANGHAI spec, EIP-3860 charged).
+- warp with requirePrimaryNetworkSigners (post-Etna, context height = the block's own):
+  4029316..4029320 (5 blocks, 5 txs; 2 txs carried a warp predicate each, both verified
+  against the primary network's validator set, ICM messages from the C-Chain).
+- InvalidateDelegateUnix window: 5598098 (8 txs, 1 predicate verified).
+- Granite: 6970756 (the first warp-carrying block after Granite; 1 contract creation tx).
+  This block found a PHASE 1 bug: `modify_cfg(|c| c.spec = spec)` leaves revm 43's
+  per-spec `gas_params` table at the genesis spec (LONDON), so no EIP-3860 initcode word
+  gas was charged after Durango (60 words = the 120 gas the header had more). Fixed with
+  `set_spec_and_mainnet_gas_params(spec)`; Step and Beam 1..1M never change spec, so
+  neither could see it. All replays and the 1..50000 roots were rerun after the fix.
+The warp-carrying blocks of each window were found by scanning the dumps for the warp
+address (`4029316` is the first warp tx after the re-enable, `5598098` after
+InvalidateDelegateUnix, `6970756` after Granite).
 
 Unit tests (`cargo test -p epochdb-exec`, 14 tests): the allow-list role transition matrix
 of `allowlisttest/test_allowlist.go` (admin / manager / enabled / none callers against every
