@@ -1,0 +1,24 @@
+[package]
+name = "epochdb-block"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "block"
+path = "src/lib.rs"
+
+[[bin]]
+name = "blockcheck"
+path = "src/main.rs"
+
+[dependencies]
+alloy-primitives = { version = "1.6", features = ["rlp"] }
+alloy-rlp = "0.3"
+bytes = "1"
+memmap2 = "0.9"
+rayon = "1"
+secp256k1 = { version = "0.31", features = ["recovery"] }
+sha2 = "0.10"
+
+[profile.release]
+debug = 1
