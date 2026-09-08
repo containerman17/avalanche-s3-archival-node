@@ -35,7 +35,9 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	avaconstants "github.com/ava-labs/avalanchego/utils/constants"
 	proposerblock "github.com/ava-labs/avalanchego/vms/proposervm/block"
+	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
+	"github.com/ava-labs/libevm/rlp"
 
 	"github.com/containerman17/avalanche-s3-archival-node/chain"
 	"github.com/containerman17/avalanche-s3-archival-node/dist"
@@ -65,8 +67,9 @@ func main() {
 	p2pPort := flag.Int("p2p-port", 0, "listen for avalanchego peers on this port")
 	index := flag.String("index", "", "container id -> height index file, built on first start")
 	identities := flag.Int("identities", 1, "listeners to open, on consecutive ports from --p2p-port, one NodeID each: avalanchego's inbound bandwidth throttler caps every peer at 512 KiB/s, so a syncing node fetches from N of us at N times that")
+	sumGas := flag.String("sum-gas", "", "benchmark helper: print gas used and tx count of heights lo-hi per 50k blocks, then exit")
 	flag.Parse()
-	if *dir == "" || *manifest == "" || *chainSpec == "" || *p2pPort == 0 || *index == "" {
+	if *dir == "" || *manifest == "" || *index == "" || (*sumGas == "" && (*chainSpec == "" || *p2pPort == 0)) {
 		log.Fatal("archive-serve: need --dir, --manifest, --chain, --p2p-port, --index")
 	}
 
@@ -89,10 +92,26 @@ func main() {
 	}
 	log.Printf("archive-serve: %d runs, heights [%d,%d], %d blocks", len(a.runs), a.runs[0].FromHeight, a.runs[len(a.runs)-1].ToHeight, total)
 
+	if *sumGas != "" {
+		var lo, hi uint64
+		if _, err := fmt.Sscanf(*sumGas, "%d-%d", &lo, &hi); err != nil {
+			log.Fatal(err)
+		}
+		check(a.sumGas(lo, hi))
+		return
+	}
 	a.idx, err = loadIndex(*index, total)
 	if err != nil {
 		log.Printf("archive-serve: index %s: %v; building", *index, err)
 		check(a.buildIndex(*index, total))
+		if *sumGas != "" {
+			var lo, hi uint64
+			if _, err := fmt.Sscanf(*sumGas, "%d-%d", &lo, &hi); err != nil {
+				log.Fatal(err)
+			}
+			check(a.sumGas(lo, hi))
+			return
+		}
 		a.idx, err = loadIndex(*index, total)
 		check(err)
 	}
@@ -486,4 +505,32 @@ func check(err error) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// sumGas prints gas used and tx count over [lo, hi] from the header rows,
+// cumulative per 50k blocks (the benchmark's segments), and the total.
+func (a *archive) sumGas(lo, hi uint64) error {
+	var gas, txs uint64
+	for _, r := range a.runs {
+		if r.ToHeight < lo || r.FromHeight > hi {
+			continue
+		}
+		err := scanBlocks(r.run, max(lo, r.FromHeight), min(hi, r.ToHeight), func(h uint64, hdr, pvm []byte, tx [][]byte) error {
+			var head types.Header
+			if err := rlp.DecodeBytes(hdr, &head); err != nil {
+				return fmt.Errorf("header %d: %w", h, err)
+			}
+			gas += head.GasUsed
+			txs += uint64(len(tx))
+			if h%50000 == 0 || h == hi {
+				fmt.Printf("upto %d gas %d txs %d\n", h, gas, txs)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	fmt.Printf("TOTAL %d %d gas %d txs %d\n", lo, hi, gas, txs)
+	return nil
 }
