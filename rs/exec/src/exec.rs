@@ -32,7 +32,9 @@ use crate::{allowlist, feemanager, nativeminter, rewardmanager};
 use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, TxType};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
-use alloy_rpc_types_trace::geth::{CallConfig, GethDefaultTracingOptions, PreStateConfig};
+use alloy_rpc_types_trace::geth::{CallConfig, CallFrame, GethDefaultTracingOptions, PreStateConfig};
+use revm::bytecode::opcode;
+use revm::interpreter::interpreter_types::{InputsTr, Jumps, LoopControl};
 use revm::context::result::ResultAndState;
 use revm::DatabaseRef;
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -250,13 +252,17 @@ pub struct SevmPrecompiles {
     pub enabled: [bool; 6],
     pub block_time: u64,
     pub env: Env,
+    /// The Go error text of every stateful module call that failed this tx, in
+    /// order: libevm's callTracer renders `err.Error()` where revm-inspectors
+    /// only knows "precompiled failed".
+    pub errors: Vec<String>,
 }
 
 impl SevmPrecompiles {
     fn new(spec: SpecId) -> Self {
         let eth = EthPrecompiles::new(spec);
         let warm = eth.warm_addresses().clone();
-        SevmPrecompiles { eth, warm, enabled: [false; 6], block_time: 0, env: Env::default() }
+        SevmPrecompiles { eth, warm, enabled: [false; 6], block_time: 0, env: Env::default(), errors: Vec::new() }
     }
 
     fn rebuild_warm(&mut self) {
@@ -336,6 +342,9 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for SevmPrecompiles {
             4 => rewardmanager::call(ctx, &self.env, &input, &mut gas, read_only, caller),
             _ => warp::call(ctx, &self.env, &input, &mut gas, read_only, caller),
         };
+        if let Err(precompile::Halt::Err(m)) = &r {
+            self.errors.push(m.clone());
+        }
         Ok(Some(precompile::finish(ctx, gas, r)))
     }
 
@@ -358,6 +367,53 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for SevmPrecompiles {
 pub struct SevmInspector {
     pub tracer: TracingInspector,
     pub deployer_allow_list: bool,
+    /// A create the allow list refused gets no frame in libevm (evm.create
+    /// returns before CaptureStart / CaptureEnter): the tracer is not told,
+    /// and the create_end that follows is swallowed.
+    skip_create_end: bool,
+    /// The top-level create was refused: the tx never entered the EVM.
+    pub not_entered: bool,
+    /// Bookkeeping for the prestate / struct tracers, off for the stored row.
+    pub oog_hook: bool,
+    pending: Option<PendingOp>,
+    /// Slots an errored SLOAD / SSTORE was the first to load (libevm's prestate
+    /// CaptureState returns on err before lookupStorage), in order.
+    pub oog_slots: Vec<(Address, U256)>,
+    /// geth's full gasCost of each errored SLOAD / SSTORE (the interpreter logs
+    /// static + dynamic cost with the error; revm spent what was left), in order.
+    pub oog_costs: Vec<u64>,
+}
+
+struct PendingOp {
+    addr: Address,
+    key: U256,
+    fresh: bool,
+    cost: u64,
+}
+
+impl SevmInspector {
+    fn new(cfg: TracingInspectorConfig) -> SevmInspector {
+        SevmInspector {
+            tracer: TracingInspector::new(cfg),
+            deployer_allow_list: false,
+            skip_create_end: false,
+            not_entered: false,
+            oog_hook: false,
+            pending: None,
+            oog_slots: Vec::new(),
+            oog_costs: Vec::new(),
+        }
+    }
+
+    /// Per-tx reset.
+    fn reset(&mut self) {
+        self.tracer.fuse();
+        self.skip_create_end = false;
+        self.not_entered = false;
+        self.pending = None;
+        self.oog_slots.clear();
+        self.oog_costs.clear();
+    }
 }
 
 impl<CTX: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>> Inspector<CTX, EthInterpreter> for SevmInspector {
@@ -365,10 +421,56 @@ impl<CTX: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>> Inspecto
         self.tracer.initialize_interp(interp, context)
     }
     fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
-        self.tracer.step(interp, context)
+        self.tracer.step(interp, context);
+        if !self.oog_hook {
+            return;
+        }
+        self.pending = None;
+        let op = interp.bytecode.opcode();
+        if !matches!(op, opcode::SLOAD | opcode::SSTORE) {
+            return;
+        }
+        let st = interp.stack.data();
+        let Some(&key) = st.last() else { return };
+        let addr = interp.input.target_address();
+        let slot = context.journal_ref().evm_state().get(&addr).and_then(|a| a.storage.get(&key));
+        let fresh = slot.is_none();
+        let (orig, cur) = match slot {
+            Some(s) => (s.original_value(), s.present_value()),
+            None => {
+                let v = context.db_mut().storage(addr, key).unwrap_or_default();
+                (v, v)
+            }
+        };
+        // geth gasSStoreEIP2929 / SLOAD under EIP-2929: cold surcharge plus the
+        // net-metered write cost; the reentrancy sentry fails before any cost.
+        let cold = if fresh { 2100 } else { 0 };
+        let cost = if op == opcode::SLOAD {
+            if fresh { 2100 } else { 100 }
+        } else if interp.gas.remaining() <= 2300 {
+            0
+        } else {
+            let new = st.get(st.len().wrapping_sub(2)).copied().unwrap_or_default();
+            cold + if cur == new {
+                100
+            } else if orig == cur {
+                if orig.is_zero() { 20000 } else { 2900 }
+            } else {
+                100
+            }
+        };
+        self.pending = Some(PendingOp { addr, key, fresh, cost });
     }
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
-        self.tracer.step_end(interp, context)
+        self.tracer.step_end(interp, context);
+        if let Some(p) = self.pending.take() {
+            if interp.bytecode.instruction_result().is_some_and(|r| r.is_halt()) {
+                if p.fresh {
+                    self.oog_slots.push((p.addr, p.key));
+                }
+                self.oog_costs.push(p.cost);
+            }
+        }
     }
     fn log(&mut self, context: &mut CTX, log: Log) {
         self.tracer.log(context, log)
@@ -380,14 +482,17 @@ impl<CTX: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>> Inspecto
         self.tracer.call_end(context, inputs, outcome)
     }
     fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
-        let r = self.tracer.create(context, inputs);
-        if r.is_some() || !self.deployer_allow_list {
-            return r;
+        if !self.deployer_allow_list {
+            return self.tracer.create(context, inputs);
         }
         let origin = context.tx().caller();
         let role = read_state_no_warm(context, DEPLOYER_ALLOW_LIST, allowlist::role_slot(origin));
         if allowlist::is_enabled(role) {
-            return None;
+            return self.tracer.create(context, inputs);
+        }
+        self.skip_create_end = true;
+        if context.journal().depth() == 0 {
+            self.not_entered = true;
         }
         // libevm evm.create: the caller's nonce is bumped and the created address
         // warmed before the hook refuses with gas 0.
@@ -415,10 +520,37 @@ impl<CTX: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>> Inspecto
         Some(CreateOutcome::new(InterpreterResult::new(InstructionResult::PrecompileError, Bytes::new(), gas), None))
     }
     fn create_end(&mut self, context: &mut CTX, inputs: &CreateInputs, outcome: &mut CreateOutcome) {
+        if std::mem::take(&mut self.skip_create_end) {
+            return;
+        }
         self.tracer.create_end(context, inputs, outcome)
     }
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         <TracingInspector as Inspector<CTX, EthInterpreter>>::selfdestruct(&mut self.tracer, contract, target, value)
+    }
+}
+
+/// libevm's Call / Create return before CaptureEnter on a depth, balance,
+/// nonce or address-collision failure, so no frame exists for it; revm's
+/// inspector hooks run before those checks. Only those checks end a frame with
+/// these statuses (revm-inspectors' geth texts).
+fn prune_unentered(f: &mut CallFrame) {
+    f.calls.retain(|c| !matches!(c.error.as_deref(), Some("CallTooDeep" | "insufficient balance for transfer" | "CreateCollision" | "NonceOverflow")));
+    for c in &mut f.calls {
+        prune_unentered(c);
+    }
+}
+
+/// Stateful module frames end in call_end order, which is the tree's post-order:
+/// each "precompiled failed" on a module address takes the next recorded Go text.
+fn name_precompile_errors<'a>(f: &mut CallFrame, errs: &mut impl Iterator<Item = &'a String>) {
+    for c in &mut f.calls {
+        name_precompile_errors(c, errs);
+    }
+    if f.error.as_deref() == Some("precompiled failed") && f.to.is_some_and(|t| module_index(t).is_some()) {
+        if let Some(m) = errs.next() {
+            f.error = Some(m.clone());
+        }
     }
 }
 
@@ -511,7 +643,7 @@ impl<D: StateDb> Executor<D> {
             .with_cfg(CfgEnv::new_with_spec(spec))
             .modify_cfg_chained(|c| c.chain_id = cfg.chain_id);
         let trace_cfg = TracingInspectorConfig::from_geth_call_config(&CallConfig::default());
-        let inspector = SevmInspector { tracer: TracingInspector::new(trace_cfg), deployer_allow_list: false };
+        let inspector = SevmInspector::new(trace_cfg);
         let mut precompiles = SevmPrecompiles::new(spec);
         precompiles.env.network_id = cfg.network_id;
         precompiles.env.blockchain_id = cfg.blockchain_id;
@@ -539,6 +671,7 @@ impl<D: StateDb> Executor<D> {
             Trace::Noop | Trace::Off => TracingInspectorConfig::none(),
         };
         self.evm.inspector.tracer = TracingInspector::new(cfg);
+        self.evm.inspector.oog_hook = matches!(t, Trace::PreState(_) | Trace::Struct(_));
         self.trace = t;
     }
 
@@ -548,16 +681,46 @@ impl<D: StateDb> Executor<D> {
         // callTracer's root frame reports the tx gas limit as `gas` (CaptureTxStart), not the
         // post-intrinsic gas the top call started with.
         self.evm.inspector.tracer.set_transaction_gas_limit(gas_limit);
+        // libevm never enters the EVM for a top-level create the deployer allow
+        // list refuses or that collides (evm.create returns before CaptureStart):
+        // the callTracer's zero frame with CaptureTxEnd's gasUsed, an empty struct
+        // log that did not fail, no prestate.
+        let not_entered = self.evm.inspector.not_entered
+            || self.evm.inspector.tracer.traces().nodes().first().is_some_and(|n| n.trace.status == Some(InstructionResult::CreateCollision));
         Ok(match self.trace.clone() {
             Trace::Off => String::new(),
             Trace::Noop => "{}".to_string(),
-            Trace::Call(c) => serde_json::to_string(&self.evm.inspector.tracer.geth_builder().geth_call_traces(c, gas_used)).context("trace json")?,
+            Trace::Call(_) if not_entered => {
+                let f = CallFrame { typ: "STOP".to_string(), gas_used: U256::from(gas_used), ..Default::default() };
+                serde_json::to_string(&f).context("trace json")?
+            }
+            Trace::Struct(_) if not_entered => format!(r#"{{"failed":false,"gas":{gas_used},"returnValue":"0x","structLogs":[]}}"#),
+            Trace::PreState(c) if not_entered => if c.is_diff_mode() { r#"{"post":{},"pre":{}}"# } else { "{}" }.to_string(),
+            Trace::Call(c) => {
+                let mut f = self.evm.inspector.tracer.geth_builder().geth_call_traces(c, gas_used);
+                prune_unentered(&mut f);
+                name_precompile_errors(&mut f, &mut self.evm.precompiles.errors.iter());
+                serde_json::to_string(&f).context("trace json")?
+            }
             Trace::Struct(o) => {
                 let ret = res.output().cloned().unwrap_or_default();
-                serde_json::to_string(&self.evm.inspector.tracer.geth_builder().geth_traces(gas_used, ret, o)).context("trace json")?
+                let mut f = self.evm.inspector.tracer.geth_builder().geth_traces(gas_used, ret, o);
+                let mut costs = self.evm.inspector.oog_costs.iter();
+                for l in f.struct_logs.iter_mut().filter(|l| l.error.is_some() && matches!(&*l.op, "SLOAD" | "SSTORE")) {
+                    if let Some(c) = costs.next() {
+                        l.gas_cost = *c;
+                    }
+                }
+                serde_json::to_string(&f).context("trace json")?
             }
             Trace::PreState(c) => {
-                let ras = ResultAndState { result: res.clone(), state: state.clone() };
+                let mut state = state.clone();
+                for (a, k) in &self.evm.inspector.oog_slots {
+                    if let Some(acc) = state.get_mut(a) {
+                        acc.storage.remove(k);
+                    }
+                }
+                let ras = ResultAndState { result: res.clone(), state };
                 let (ctx, insp) = (&mut self.evm.ctx, &self.evm.inspector);
                 let db = RefDb(std::cell::RefCell::new(ctx.db_mut()));
                 let f = insp.tracer.geth_builder().geth_prestate_traces(&ras, &c, &db).map_err(|e| anyhow!("prestate: {e:?}"))?;
@@ -854,7 +1017,8 @@ impl<D: StateDb> Executor<D> {
             self.evm.precompiles.env.failed = failed;
             let t0 = std::time::Instant::now();
             self.evm.ctx.set_tx(tx_env);
-            self.evm.inspector.tracer.fuse();
+            self.evm.inspector.reset();
+            self.evm.precompiles.errors.clear();
             let res: ExecutionResult = handler
                 .inspect_run(&mut self.evm)
                 .map_err(|e| anyhow!("block {} tx {i} ({}): {e:?}", h.number, t.hash))?;
@@ -956,7 +1120,8 @@ impl<D: StateDb> Executor<D> {
             c.disable_block_gas_limit = true;
         });
         self.evm.ctx.set_tx(tx_env);
-        self.evm.inspector.tracer.fuse();
+        self.evm.inspector.reset();
+        self.evm.precompiles.errors.clear();
         let res = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default().inspect_run(&mut self.evm);
         let state = self.evm.ctx.journal_mut().finalize();
         self.evm.ctx.journal_mut().clear();

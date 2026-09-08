@@ -762,3 +762,61 @@ fn config_state_upgrades_and_forks() {
     assert_eq!(crate::rpc::cb58_encode(crate::config::cb58("2tmrrBo1Lgt1mzzvPSFt73kkQKFas5d1AP88tv9cicwoFp8BSn").unwrap()), "2tmrrBo1Lgt1mzzvPSFt73kkQKFas5d1AP88tv9cicwoFp8BSn");
     assert_eq!(crate::rpc::cb58_encode(B256::ZERO), "11111111111111111111111111111111LpoYY");
 }
+
+/// libevm never enters the EVM for a create the deployer allow list refuses
+/// (evm.create returns before CaptureStart / CaptureEnter): the callTracer
+/// keeps its zero frame, the struct logger an empty log that did not fail, the
+/// prestate nothing; a refused CREATE at depth leaves no child frame. Module
+/// failures carry the Go error text. Beam blocks 0x86 / 0x88 and 0x7f27.
+#[test]
+fn refused_create_and_module_error_frames() {
+    use crate::exec::{CallMsg, Executor, Trace};
+    use alloy_rpc_types_trace::geth::{CallConfig, GethDefaultTracingOptions, PreStateConfig};
+    // FACTORY: PUSH1 0 PUSH1 0 PUSH1 0 CREATE STOP
+    const FACTORY: Address = address!("00000000000000000000000000000000000000fa");
+    let genesis = format!(
+        r#"{{"config":{{"chainId":1,"feeConfig":{{"gasLimit":8000000,"minBaseFee":25000000000,"targetGas":15000000,"baseFeeChangeDenominator":36,"minBlockGasCost":0,"maxBlockGasCost":1000000,"targetBlockRate":2,"blockGasCostStep":200000}},
+        "contractDeployerAllowListConfig":{{"blockTimestamp":0,"adminAddresses":["{ADMIN}"]}}}},
+        "alloc":{{"{ADMIN}":{{"balance":"0x1000000000000000000"}},"{NOBODY}":{{"balance":"0x1000000000000000000"}},"{FACTORY}":{{"code":"0x6000600060006000f000"}}}},"timestamp":"0x0"}}"#
+    );
+    let cfg = Config::from_genesis(genesis.as_bytes(), b"{}", 1).unwrap();
+    let mut ex = Executor::new(cfg).unwrap();
+    let head = block::Header {
+        parent_hash: B256::ZERO, uncle_hash: B256::ZERO, coinbase: Address::ZERO, root: B256::ZERO, tx_hash: B256::ZERO, receipt_hash: B256::ZERO,
+        bloom: Default::default(), difficulty: U256::from(1), number: 1, gas_limit: 8_000_000, gas_used: 0, time: 1, extra: Bytes::new(),
+        mix_digest: B256::ZERO, nonce: Default::default(), base_fee: Some(U256::from(25_000_000_000u64)), block_gas_cost: None, blob_gas_used: None,
+        excess_blob_gas: None, parent_beacon_root: None, time_milliseconds: None, min_delay_excess: None,
+    };
+    let msg = |from: Address, to: Option<Address>, data: &str| CallMsg { from, to, gas: 100_000, gas_price: 0, value: U256::ZERO, data: data.parse().unwrap() };
+    let create = msg(NOBODY, None, "0x60006000f3");
+
+    ex.set_trace(Trace::Call(CallConfig::default()));
+    let out = ex.call(&head, &create).unwrap();
+    assert_eq!(out.gas_used, 100_000, "all gas consumed");
+    assert_eq!(out.trace_json, r#"{"from":"0x0000000000000000000000000000000000000000","gas":"0x0","gasUsed":"0x186a0","input":"0x","type":"STOP"}"#);
+    ex.set_trace(Trace::Struct(GethDefaultTracingOptions::default()));
+    assert_eq!(ex.call(&head, &create).unwrap().trace_json, r#"{"failed":false,"gas":100000,"returnValue":"0x","structLogs":[]}"#);
+    ex.set_trace(Trace::PreState(PreStateConfig::default()));
+    assert_eq!(ex.call(&head, &create).unwrap().trace_json, "{}");
+    ex.set_trace(Trace::PreState(PreStateConfig { diff_mode: Some(true), ..Default::default() }));
+    assert_eq!(ex.call(&head, &create).unwrap().trace_json, r#"{"post":{},"pre":{}}"#);
+
+    // The admin's create runs: a real CREATE frame.
+    ex.set_trace(Trace::Call(CallConfig::default()));
+    let ok = ex.call(&head, &msg(ADMIN, None, "0x60006000f3")).unwrap();
+    assert!(ok.trace_json.contains(r#""type":"CREATE""#) && ok.halt.is_none(), "{}", ok.trace_json);
+
+    // A refused CREATE at depth: the factory's frame has no child and no error.
+    let nested = ex.call(&head, &msg(NOBODY, Some(FACTORY), "0x")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&nested.trace_json).unwrap();
+    assert!(v.get("calls").is_none() && v.get("error").is_none(), "{}", nested.trace_json);
+    assert_eq!(v["type"], "CALL");
+    let nested_ok = ex.call(&head, &msg(ADMIN, Some(FACTORY), "0x")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&nested_ok.trace_json).unwrap();
+    assert_eq!(v["calls"][0]["type"], "CREATE", "{}", nested_ok.trace_json);
+
+    // setEnabled(NOBODY) by NOBODY on the allow list: libevm's err.Error() in the frame.
+    let denied = ex.call(&head, &msg(NOBODY, Some(precompile::DEPLOYER_ALLOW_LIST), &format!("0x0aaf7043000000000000000000000000{}", precompile::hex(NOBODY.as_slice())))).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&denied.trace_json).unwrap();
+    assert_eq!(v["error"], format!("cannot modify allow list: modify address: {NOBODY}, from role: NoRole, to role: EnabledRole"), "{}", denied.trace_json);
+}

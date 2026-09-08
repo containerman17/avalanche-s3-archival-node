@@ -129,8 +129,8 @@ Sender recovery is the wall-time bottleneck with one worker (same finding as the
 - Durango and later: spec mapping and EIP-3860 wired; FeeManager Durango events and
   `setManager`, Granite/P256Verify, beacon root: not (hard errors). Step never reaches them
   in 1..1M; Beam and other chains will.
-- Trace `error` strings for stateful precompile failures come from revm
-  (`PrecompileError`) rather than the Go error text; no such tx exists in the range checked.
+- Trace `error` strings for stateful precompile failures: fixed in rs-tracefix (the module's
+  Go text is carried into the frame, see PHASE 3 below).
 - Throughput on the contract-heavy tail (600 to 750 mgas/s local) is unprofiled: the
   candidates are the TracingInspector hooks (always on), CacheDB HashMap misses at 3.3M
   slots, and revm's per-frame cost on 64 STATICCALLs per tx. perf is not installed here or
@@ -287,8 +287,7 @@ refuses it the same way. Every module any chain references (the six) exists in R
   hook here runs before revm's own, so a refused create at depth 1024 or with an
   insufficient value consumes all gas instead of returning it (never seen; needs a
   frame_init override to match).
-- Trace `error` strings for refused creates and precompile failures are revm's, not Go's
-  (trace JSON only).
+- Trace shapes for refused creates and module failures: fixed in rs-tracefix (PHASE 3 below).
 - The predicate results of a block are taken from `header.Extra` when no `ValidatorState`
   is given (counted as `predicates_trusted`); with one, ours must equal the header's or the
   block fails. The pre-Etna context height needs the previous block's proposervm height,
@@ -297,3 +296,20 @@ refuses it the same way. Every module any chain references (the six) exists in R
   unchanged (`with_db`).
 - `WarpSet::flatten` uncompresses each key (blst); a 1,000-validator primary set costs about
   a second, cached per (height, subnet).
+
+# PHASE 3: libevm's tracer shapes for what the EVM never enters (rs-tracefix)
+
+Found by the rs/rpc differential on beam (`rs/rpc/REPORT.md`, "rs-tracefix"); these change
+the STORED callTracer row, so the beam store was rebuilt and beam 1..1,000,000 re-executed
+(receipts / gas / bloom equal on every block, 108 roots ok, 101.6 s wall).
+
+| rule | Go source | revm side |
+|---|---|---|
+| a create the deployer allow list refuses, or that collides, is refused in `evm.create` BEFORE `CaptureStart` / `CaptureEnter`: at depth 0 the callTracer's root frame stays the zero `callstack[0]` (`from 0x0, gas 0x0, input 0x, type STOP`) with `CaptureTxEnd`'s gasUsed, the struct logger has an empty log and `failed: false`, the prestate is `{}`; at depth > 0 no child frame exists and the parent continues | libevm `core/vm/evm.go create` (depth, balance, nonce bump, access list, collision, `canCreateContract`, then the capture), `native/call.go CaptureTxEnd`, `logger.go GetResult` | `SevmInspector::create` skips the tracer and swallows `create_end` (`skip_create_end`, `not_entered`); `render_trace` emits the fixed shapes; `prune_unentered` drops nested frames that end in CallTooDeep / OutOfFunds / CreateCollision / NonceOverflow (libevm returns before CaptureEnter for all four) |
+| a failed stateful module's frame `error` is `err.Error()` of the module (e.g. `cannot modify allow list: modify address: 0x…, from role: NoRole, to role: EnabledRole`) | libevm `evm.call` -> `RunPrecompiledContract` error -> `CaptureExit(err)`; `allowlist.go`, `feemanager/contract.go` texts | `SevmPrecompiles::errors` records each `Halt::Err` text per tx; `name_precompile_errors` assigns them in post-order to "precompiled failed" frames on module addresses |
+| the struct logger records an errored SLOAD / SSTORE with the FULL static + dynamic cost (the interpreter's deferred `CaptureState`), 0 when the 2300 reentrancy sentry fails; the prestate tracer ignores the errored op (no `lookupStorage`) | geth `interpreter.go Run` defer, `gas_table.go gasSStoreEIP2929`, `native/prestate.go CaptureState` | `SevmInspector::step` computes the cost from the journal (cold = slot not yet in the journal), `step_end` keeps it when the op halted; `render_trace` patches `gasCost` and removes the first-loaded slots of errored ops from the prestate. `oog_hook` on for prestate / struct only |
+| tx allow list refusal is a `preCheck` error: the block is invalid, nothing is stored | subnet-evm `core/state_transition.go:255` | unchanged: `execute_block` bails per tx |
+
+Unit test: `refused_create_and_module_error_frames` (`src/tests.rs`) runs the three tracers on a
+refused top-level create, a refused nested CREATE, the admin's normal create and a denied
+`setEnabled` through `Executor::call` (the same inspector and render path as the stored row).
