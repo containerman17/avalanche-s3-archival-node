@@ -219,16 +219,22 @@ func runEVM(cc chainContext, chainCfg *params.ChainConfig, blk *types.Block, par
 	}
 	blockCtx := sevmcore.NewEVMBlockContext(header, cc, nil)
 	gp := new(sevmcore.GasPool).AddGas(header.GasLimit)
+	// One EVM and one signer per block, the block hash from the block's
+	// cache: what subnet-evm's own Process does (see applyTx).
+	signer := types.MakeSigner(chainCfg, header.Number, header.Time)
+	vmenv := vm.NewEVM(blockCtx, vm.TxContext{}, statedb, chainCfg, vm.Config{Tracer: frameTracer()})
+	blockHash := blk.Hash()
 	var (
 		usedGas  uint64
 		receipts types.Receipts
 	)
 	for txIndex, tx := range blk.Transactions() {
+		msg, err := sevmcore.TransactionToMessage(tx, signer, header.BaseFee)
+		if err != nil {
+			return nil, fmt.Errorf("tx %d: %w", txIndex, err)
+		}
 		statedb.SetTxContext(tx.Hash(), txIndex)
-		receipt, err := sevmcore.ApplyTransaction(
-			chainCfg, cc, blockCtx, gp, statedb,
-			header, tx, &usedGas, vm.Config{Tracer: frameTracer()},
-		)
+		receipt, err := applyTx(msg, chainCfg, gp, statedb, header.Number, blockHash, tx, &usedGas, vmenv)
 		if err != nil {
 			return nil, fmt.Errorf("tx %d: %w", txIndex, err)
 		}

@@ -25,6 +25,46 @@ type flatDB struct {
 	eng  *engine
 	ws   *writeSet   // the open block's writes; nil outside a block
 	root common.Hash // the parent root: what the account trie's Hash reports
+	hc   hashCache
+}
+
+// hashCache memoises keccak(addr) and keccak(slot) for the flat keys: the
+// fee recipient, the hot contracts and their slots are hashed on every
+// read and again on every per-tx drain otherwise (378 ns a hash, 12 ns a
+// hit). Pointer-free maps, cleared once they reach hashCacheMax entries.
+type hashCache struct {
+	addr map[common.Address]common.Hash
+	slot map[common.Hash]common.Hash
+}
+
+const hashCacheMax = 1 << 16
+
+func (c *hashCache) addrHash(a common.Address) common.Hash {
+	if h, ok := c.addr[a]; ok {
+		return h
+	}
+	if len(c.addr) >= hashCacheMax || c.addr == nil {
+		c.addr = make(map[common.Address]common.Hash, 1024)
+	}
+	h := crypto.Keccak256Hash(a[:])
+	c.addr[a] = h
+	return h
+}
+
+func (c *hashCache) slotHash(key []byte) common.Hash {
+	if len(key) != 32 {
+		return crypto.Keccak256Hash(key)
+	}
+	k := common.BytesToHash(key)
+	if h, ok := c.slot[k]; ok {
+		return h
+	}
+	if len(c.slot) >= hashCacheMax || c.slot == nil {
+		c.slot = make(map[common.Hash]common.Hash, 4096)
+	}
+	h := crypto.Keccak256Hash(key)
+	c.slot[k] = h
+	return h
 }
 
 // writeSet is one block's contract writes in order (order matters: a delete
@@ -66,7 +106,7 @@ func (d *flatDB) lookup(key []byte) ([]byte, bool) {
 func (d *flatDB) OpenTrie(common.Hash) (state.Trie, error) { return &flatTrie{db: d}, nil }
 
 func (d *flatDB) OpenStorageTrie(_ common.Hash, addr common.Address, _ common.Hash, _ state.Trie) (state.Trie, error) {
-	return &flatTrie{db: d, storage: true, ah: crypto.Keccak256Hash(addr[:])}, nil
+	return &flatTrie{db: d, storage: true, ah: d.hc.addrHash(addr)}, nil
 }
 
 func (d *flatDB) CopyTrie(t state.Trie) state.Trie {
@@ -98,7 +138,7 @@ type flatTrie struct {
 func (t *flatTrie) GetKey([]byte) []byte { return nil }
 
 func (t *flatTrie) GetAccount(addr common.Address) (*types.StateAccount, error) {
-	val, ok := t.db.lookup(accountKey(crypto.Keccak256Hash(addr[:])))
+	val, ok := t.db.lookup(accountKey(t.db.hc.addrHash(addr)))
 	if !ok {
 		return nil, nil
 	}
@@ -112,7 +152,7 @@ func (t *flatTrie) GetAccount(addr common.Address) (*types.StateAccount, error) 
 }
 
 func (t *flatTrie) GetStorage(_ common.Address, key []byte) ([]byte, error) {
-	val, _ := t.db.lookup(slotKey(t.ah, crypto.Keccak256Hash(key)))
+	val, _ := t.db.lookup(slotKey(t.ah, t.db.hc.slotHash(key)))
 	return val, nil
 }
 
@@ -125,22 +165,22 @@ func (t *flatTrie) UpdateAccount(addr common.Address, acc *types.StateAccount) e
 	if err != nil {
 		return err
 	}
-	t.db.ws.put(accountKey(crypto.Keccak256Hash(addr[:])), val)
+	t.db.ws.put(accountKey(t.db.hc.addrHash(addr)), val)
 	return nil
 }
 
 func (t *flatTrie) DeleteAccount(addr common.Address) error {
-	t.db.ws.put(accountKey(crypto.Keccak256Hash(addr[:])), nil)
+	t.db.ws.put(accountKey(t.db.hc.addrHash(addr)), nil)
 	return nil
 }
 
 func (t *flatTrie) UpdateStorage(_ common.Address, key, value []byte) error {
-	t.db.ws.put(slotKey(t.ah, crypto.Keccak256Hash(key)), append([]byte(nil), value...))
+	t.db.ws.put(slotKey(t.ah, t.db.hc.slotHash(key)), append([]byte(nil), value...))
 	return nil
 }
 
 func (t *flatTrie) DeleteStorage(_ common.Address, key []byte) error {
-	t.db.ws.put(slotKey(t.ah, crypto.Keccak256Hash(key)), nil)
+	t.db.ws.put(slotKey(t.ah, t.db.hc.slotHash(key)), nil)
 	return nil
 }
 

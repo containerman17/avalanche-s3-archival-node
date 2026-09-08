@@ -54,6 +54,9 @@ pub struct Dirty {
 }
 
 const ZERO: Hash = [0u8; 32];
+/// Slot updates below which `root` hashes the storage tries on the calling
+/// thread instead of a scoped pool.
+const PAR_MIN_SLOTS: usize = 256;
 
 impl Dirty {
     /// Starts an empty overlay over f.
@@ -254,19 +257,31 @@ impl Dirty {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let me: &Dirty = self;
         let nworkers = self.workers.max(1).min(work.len().max(1));
-        std::thread::scope(|s| {
-            for _ in 0..nworkers {
-                s.spawn(|| loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= work.len() {
-                        break;
-                    }
-                    let j = &jobs[work[i]];
-                    let r = me.storage(j.hash, j.root, &j.p.slots);
-                    results.lock().unwrap().push((work[i], r));
-                });
+        let slots: usize = work.iter().map(|&i| jobs[i].p.slots.len()).sum();
+        if nworkers <= 1 || slots < PAR_MIN_SLOTS {
+            // ponytail: a scoped thread costs tens of microseconds to spawn and
+            // a per-block root has a handful of slots; hash them inline, and
+            // fan out only when there is enough work to pay for the threads.
+            for &i in &work {
+                let j = &jobs[i];
+                let r = me.storage(j.hash, j.root, &j.p.slots);
+                results.lock().unwrap().push((i, r));
             }
-        });
+        } else {
+            std::thread::scope(|s| {
+                for _ in 0..nworkers {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= work.len() {
+                            break;
+                        }
+                        let j = &jobs[work[i]];
+                        let r = me.storage(j.hash, j.root, &j.p.slots);
+                        results.lock().unwrap().push((work[i], r));
+                    });
+                }
+            });
+        }
         let mut results = results.into_inner().unwrap();
         results.sort_by_key(|(i, _)| *i);
         let mut sets = Vec::with_capacity(results.len() + 1);

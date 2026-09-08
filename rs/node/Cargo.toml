@@ -1,0 +1,20 @@
+[package]
+name = "epochdb-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "epochdb-rs"
+path = "src/main.rs"
+
+[dependencies]
+block = { package = "epochdb-block", path = "../block" }
+exec = { package = "epochdb-exec", path = "../exec" }
+state = { package = "epochdb-state", path = "../state" }
+revm = { version = "43", features = ["std", "serde"] }
+alloy-primitives = { version = "1", features = ["std", "map", "rlp", "asm-keccak"] }
+alloy-rlp = "0.3"
+alloy-eips = { version = "2", features = ["std"] }
+anyhow = "1"
+base64 = "0.22"
+serde_json = "1"
