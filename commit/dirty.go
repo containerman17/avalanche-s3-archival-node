@@ -1,6 +1,7 @@
 package commit
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
@@ -26,13 +27,20 @@ type SeekFunc func(prefix []byte) (key, value []byte)
 // Dirty is the in-memory overlay of trie nodes changed since the last roll.
 // Apply queues contract writes; Root recomputes the state root touching only
 // the dirty paths and retains the produced nodes for the next round.
+//
+// The retained nodes live in one byte slab behind a pointer-free index, so
+// the GC has nothing to scan there: a node is [cap u16][len u16][blob] at a
+// slab offset, rewritten in place when the new blob fits, else appended
+// (the old slot is dead; Root compacts when dead space passes live).
 type Dirty struct {
-	f     *File
-	seek  SeekFunc
-	root  common.Hash
-	nodes map[common.Hash]map[string][]byte // owner -> path -> blob; nil = deleted
-	bytes int
-	acct  map[common.Hash]*pending
+	f    *File
+	seek SeekFunc
+	root common.Hash
+	idx  map[nodeKey]uint64 // owner + path -> slab offset
+	long map[string]uint64  // paths over 15 nibbles: owner + path -> slab offset
+	slab []byte
+	dead int // slab bytes no index entry points at
+	acct map[common.Hash]*pending
 
 	// Workers bounds the storage-trie hashing pool (default GOMAXPROCS).
 	Workers int
@@ -57,13 +65,108 @@ func NewDirty(f *File, seek SeekFunc) *Dirty {
 func (d *Dirty) Reset(f *File) {
 	d.f = f
 	d.root = f.Root()
-	d.nodes = map[common.Hash]map[string][]byte{}
-	d.bytes = 0
+	d.idx = map[nodeKey]uint64{}
+	d.long = map[string]uint64{}
+	d.slab = nil
+	d.dead = 0
 	d.acct = map[common.Hash]*pending{}
 }
 
-// Bytes is the approximate size of the retained dirty nodes.
-func (d *Dirty) Bytes() int { return d.bytes }
+// Bytes is the size of the retained node slab (dead space included).
+func (d *Dirty) Bytes() int { return len(d.slab) }
+
+// nodeKey is a pointer-free index key: the owner and a trie path of up to
+// 15 nibbles packed as len<<(4*len) | nibbles, which is injective (the
+// ranges [len*16^len, (len+1)*16^len) are disjoint).
+type nodeKey struct {
+	owner common.Hash
+	path  uint64
+}
+
+func packPath(path []byte) (uint64, bool) {
+	if len(path) > 15 {
+		return 0, false
+	}
+	k := uint64(len(path))
+	for _, n := range path {
+		if n > 15 {
+			return 0, false
+		}
+		k = k<<4 | uint64(n)
+	}
+	return k, true
+}
+
+func (d *Dirty) offset(owner common.Hash, path []byte) (uint64, bool) {
+	if k, short := packPath(path); short {
+		off, ok := d.idx[nodeKey{owner, k}]
+		return off, ok
+	}
+	off, ok := d.long[string(owner[:])+string(path)]
+	return off, ok
+}
+
+func (d *Dirty) setOffset(owner common.Hash, path []byte, off uint64) {
+	if k, short := packPath(path); short {
+		d.idx[nodeKey{owner, k}] = off
+	} else {
+		d.long[string(owner[:])+string(path)] = off
+	}
+}
+
+// lookup returns the retained blob at owner/path; ok with an empty blob
+// means the node was deleted (it shadows the file).
+func (d *Dirty) lookup(owner common.Hash, path []byte) ([]byte, bool) {
+	off, ok := d.offset(owner, path)
+	if !ok {
+		return nil, false
+	}
+	n := uint64(binary.LittleEndian.Uint16(d.slab[off+2:]))
+	return d.slab[off+4 : off+4+n], true
+}
+
+// put stores blob at owner/path: in place when it fits the slot, else in a
+// new slot with the length rounded up to 64 so a growing node relocates
+// rarely.
+func (d *Dirty) put(owner common.Hash, path []byte, blob []byte) {
+	if off, ok := d.offset(owner, path); ok {
+		c := int(binary.LittleEndian.Uint16(d.slab[off:]))
+		if len(blob) <= c {
+			binary.LittleEndian.PutUint16(d.slab[off+2:], uint16(len(blob)))
+			copy(d.slab[off+4:], blob)
+			return
+		}
+		d.dead += c + 4
+	}
+	c := (len(blob) + 63) &^ 63
+	off := uint64(len(d.slab))
+	d.slab = append(d.slab, byte(c), byte(c>>8), byte(len(blob)), byte(len(blob)>>8))
+	d.slab = append(d.slab, blob...)
+	d.slab = append(d.slab, make([]byte, c-len(blob))...)
+	d.setOffset(owner, path, off)
+}
+
+// compact rewrites the slab without its dead slots once they outweigh the
+// live ones (and are worth the copy).
+func (d *Dirty) compact() {
+	if d.dead < 32<<20 || d.dead < len(d.slab)/2 {
+		return
+	}
+	slab := make([]byte, 0, len(d.slab)-d.dead)
+	move := func(off uint64) uint64 {
+		c := uint64(binary.LittleEndian.Uint16(d.slab[off:]))
+		at := uint64(len(slab))
+		slab = append(slab, d.slab[off:off+4+c]...)
+		return at
+	}
+	for k, off := range d.idx {
+		d.idx[k] = move(off)
+	}
+	for k, off := range d.long {
+		d.long[k] = move(off)
+	}
+	d.slab, d.dead = slab, 0
+}
 
 // Apply queues one contract write. Keys may come in any order; an empty
 // value deletes, and deleting an account drops its slots.
@@ -162,13 +265,13 @@ func (d *Dirty) Root() (common.Hash, error) {
 	}
 	for _, j := range jobs {
 		if j.p.del {
+			// The account's retained storage nodes go stale here. Nothing
+			// can reach them (a recreated account starts from the empty
+			// root and rewrites every node it touches), so they are left
+			// for the roll to drop.
 			if err := acc.Delete(j.hash[:]); err != nil {
 				return common.Hash{}, err
 			}
-			for _, b := range d.nodes[j.hash] {
-				d.bytes -= len(b)
-			}
-			delete(d.nodes, j.hash)
 			continue
 		}
 		leaf := accountLeaf{Root: j.root}
@@ -194,6 +297,7 @@ func (d *Dirty) Root() (common.Hash, error) {
 		return common.Hash{}, err
 	}
 	d.merge(set)
+	d.compact()
 	d.root = root
 	d.acct = map[common.Hash]*pending{}
 	return root, nil
@@ -225,14 +329,8 @@ func (d *Dirty) merge(set *trienode.NodeSet) {
 	if set == nil {
 		return
 	}
-	m := d.nodes[set.Owner]
-	if m == nil {
-		m = map[string][]byte{}
-		d.nodes[set.Owner] = m
-	}
 	for path, n := range set.Nodes {
-		d.bytes += len(n.Blob) - len(m[path])
-		m[path] = n.Blob
+		d.put(set.Owner, []byte(path), n.Blob)
 	}
 }
 
@@ -243,10 +341,8 @@ func (d *Dirty) Preimage(common.Hash) []byte                 { return nil }
 func (d *Dirty) InsertPreimage(map[common.Hash][]byte)       {}
 
 func (d *Dirty) Node(owner common.Hash, path []byte, _ common.Hash) ([]byte, error) {
-	if m := d.nodes[owner]; m != nil {
-		if blob, ok := m[string(path)]; ok {
-			return blob, nil
-		}
+	if blob, ok := d.lookup(owner, path); ok {
+		return blob, nil
 	}
 	if blob, ok := d.f.Node(owner, path); ok {
 		return blob, nil

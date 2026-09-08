@@ -47,13 +47,14 @@ func main() {
 	rollBudget := fs.Int64("roll-budget", 2<<30, "overlay bytes that trigger a background merge + trie roll")
 	stopAt := fs.Uint64("stop", 0, "stop after executing this height (0 = follow)")
 	pprofAddr := fs.String("pprof", "", "serve net/http/pprof on this address")
+	gogc := fs.Int("gogc", 50, "GC target percent (GOGC); the memory limit still caps the heap")
 	fs.Parse(os.Args[1:])
 	if *chainSpec == "" || *chainSpec == "C" {
 		log.Fatalf("epochdb-vm: --chain must be an L1's blockchainID (subnet-evm only)")
 	}
 	setGoMemLimit()
 	if os.Getenv("GOGC") == "" {
-		debug.SetGCPercent(50)
+		debug.SetGCPercent(*gogc)
 	}
 	release, err := lockDataDir(*dataDir)
 	if err != nil {
