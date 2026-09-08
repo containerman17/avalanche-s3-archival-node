@@ -54,11 +54,11 @@ func main() {
 		block = hexutil.EncodeUint64(n)
 	}
 	var head struct {
-		Number    hexutil.Uint64 `json:"number"`
-		Time      hexutil.Uint64 `json:"timestamp"`
-		GasUsed   hexutil.Uint64 `json:"gasUsed"`
-		BaseFee   *hexutil.Big   `json:"baseFeePerGas"`
-		Extra     hexutil.Bytes  `json:"extraData"`
+		Number    hexutil.Uint64  `json:"number"`
+		Time      hexutil.Uint64  `json:"timestamp"`
+		GasUsed   hexutil.Uint64  `json:"gasUsed"`
+		BaseFee   *hexutil.Big    `json:"baseFeePerGas"`
+		Extra     hexutil.Bytes   `json:"extraData"`
 		TimeMilli *hexutil.Uint64 `json:"timestampMilliseconds"`
 	}
 	must(json.Unmarshal(rpc(url, "eth_getBlockByNumber", block, false), &head))
