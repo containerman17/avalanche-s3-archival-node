@@ -462,13 +462,20 @@ func (p *pipe) parse(ctx context.Context, vm block.ChainVM) {
 // checks are NOT redone here: the follower took the container from the
 // validators' accepted chain.
 func (p *pipe) drive(ctx context.Context, vm block.ChainVM, b *bench) error {
-	var normal bool
+	var normal, fed bool
 	for {
+		// The wait for the FIRST batch is the --hold-until gate plus the
+		// fetcher's seeding, not starvation: it stays off the books.
 		t0 := time.Now()
-		b.waitSince.Store(t0.UnixNano())
+		if fed {
+			b.waitSince.Store(t0.UnixNano())
+		}
 		batch, ok := <-p.batches
-		b.waitSince.Store(0)
-		b.waitNs.Add(int64(time.Since(t0)))
+		if fed {
+			b.waitSince.Store(0)
+			b.waitNs.Add(int64(time.Since(t0)))
+		}
+		fed = true
 		if !ok {
 			if p.err != nil {
 				return p.err
@@ -554,8 +561,8 @@ func unwrap(raw []byte, upgrades *upgrade.Config, parentPCH *uint64) ([]byte, ui
 // bench is the grep-friendly 10s sample line the A/B against `epochdb serve`
 // reads: height, blocks, txs and gas in the window, cumulative mgas/s since
 // the first accepted block, and who starved whom. wait is the time the
-// verify loop spent blocked for its next parsed batch, the --hold-until gate
-// excluded (fetch or parse is the limiter); full is the time the host ring
+// verify loop spent blocked for its next parsed batch, counted from the
+// first batch on (fetch or parse is the limiter); full is the time the host ring
 // was at capacity, sampled at 100ms (the VM is the limiter).
 type bench struct {
 	tracker *pidTracker
