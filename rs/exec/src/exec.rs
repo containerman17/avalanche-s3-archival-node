@@ -190,7 +190,6 @@ type Err = EVMError<std::convert::Infallible>;
 pub struct Executor {
     pub cfg: Config,
     evm: SevmEvm,
-    trace_cfg: TracingInspectorConfig,
 }
 
 impl Executor {
@@ -204,7 +203,7 @@ impl Executor {
             .modify_cfg_chained(|c| c.chain_id = cfg.chain_id);
         let trace_cfg = TracingInspectorConfig::from_geth_call_config(&CallConfig::default());
         let evm = Evm::new_with_inspector(ctx, TracingInspector::new(trace_cfg), EthInstructions::new_mainnet_with_spec(spec), SevmPrecompiles::new(spec));
-        let mut ex = Executor { cfg, evm, trace_cfg };
+        let mut ex = Executor { cfg, evm };
 
         // Genesis.toBlock: ApplyPrecompileActivations with no parent, then the alloc on top.
         let acts: Vec<_> = ex.cfg.activating(None, ex.cfg.genesis_timestamp).into_iter().cloned().collect();
@@ -357,6 +356,9 @@ impl Executor {
             let tx_type = TxType::try_from(t.tx_type).map_err(|e| anyhow!("tx type {}: {e}", t.tx_type))?;
             let receipt = ReceiptEnvelope::from_typed(tx_type, receipt);
 
+            // callTracer's root frame reports the tx gas limit as `gas` (CaptureTxStart), not the
+            // post-intrinsic gas the top call started with.
+            self.evm.inspector.set_transaction_gas_limit(t.gas_limit);
             let frame = self.evm.inspector.geth_builder().geth_call_traces(CallConfig::default(), gas_used);
             let trace_json = serde_json::to_string(&frame).context("trace json")?;
 

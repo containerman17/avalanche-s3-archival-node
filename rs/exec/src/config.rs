@@ -373,3 +373,37 @@ fn json_u256(v: &Value) -> Result<U256> {
 pub fn precompile_code_hash() -> B256 {
     keccak256([1u8])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STEP: &str = r#"{"config":{"chainId":1234,"homesteadBlock":0,"subnetEVMTimestamp":0,
+        "feeConfig":{"gasLimit":20000000,"minBaseFee":1000000000,"targetGas":100000000,"baseFeeChangeDenominator":48,
+        "minBlockGasCost":0,"maxBlockGasCost":10000000,"targetBlockRate":2,"blockGasCostStep":500000},"allowFeeRecipients":true},
+        "alloc":{"0x7212Ac7f1146e5e59a6d58B0de00E73CA7ea57C9":{"balance":"0x1027e72f1f12813088000000"}},"timestamp":"0x0"}"#;
+    const UPGRADE: &str = r#"{"precompileUpgrades":[{"feeManagerConfig":{"adminAddresses":["0xf15a56af154fb241db6167758c14e3970de018bf"],
+        "blockTimestamp":1675252800,"initialFeeConfig":{"gasLimit":20000000,"targetBlockRate":2,"minBaseFee":1000000000,
+        "targetGas":37500000,"baseFeeChangeDenominator":48,"minBlockGasCost":0,"maxBlockGasCost":10000000,"blockGasCostStep":500000}}}]}"#;
+
+    #[test]
+    fn step_config() {
+        let c = Config::from_genesis(STEP.as_bytes(), UPGRADE.as_bytes(), 1).unwrap();
+        assert_eq!(c.chain_id, 1234);
+        assert!(c.allow_fee_recipients);
+        assert_eq!(c.fee_config.target_gas, U256::from(100_000_000u64));
+        assert_eq!(c.spec(1661675311), SpecId::LONDON);
+        assert_eq!(c.spec(1709740800), SpecId::SHANGHAI);
+        assert_eq!(c.spec(1734368400), SpecId::CANCUN);
+        assert!(c.activating(Some(1675252799), 1675252800).len() == 1);
+        assert!(c.activating(Some(1675252800), 1675252802).is_empty());
+        assert!(!c.precompile_enabled(FEE_MANAGER, 1675252799));
+        assert!(c.precompile_enabled(FEE_MANAGER, 1675252800));
+        let w = crate::feemanager::configure(&c.precompile_upgrades[0], &c.fee_config, 7).unwrap();
+        assert_eq!(w[3], (U256::from(4u8) << 248, U256::from(37_500_000u64)));
+        assert_eq!(w[8].0, U256::from_str_radix("6c63610000000000000000000000000000000000000000000000000000000000", 16).unwrap());
+        assert_eq!(w[8].1, U256::from(7u64));
+        assert_eq!(w[9], (U256::from_be_slice(c.precompile_upgrades[0].admins[0].as_slice()), crate::feemanager::ROLE_ADMIN));
+        assert_eq!(precompile_code_hash().to_string(), "0x5fe7f977e71dba2ea1a68e21057beebb9be2ac30c6410aa38d4f3fbe41dcffd2");
+    }
+}
