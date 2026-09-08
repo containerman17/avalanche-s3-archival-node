@@ -175,6 +175,11 @@ impl NodeEngine {
         let cfg = Config::from_genesis(&init.genesis_bytes, &init.upgrade_bytes, init.network_id).context("config")?;
         let genesis = Arc::new(genesis::block(&cfg, &init.genesis_bytes).map_err(|e| anyhow!("genesis: {e}"))?);
         let conf: serde_json::Value = serde_json::from_slice(&init.config_bytes).unwrap_or(serde_json::Value::Null);
+        // Store settings ride in the config bytes (the env filter, see config.rs); into the env before DbStore::open.
+        let applied = crate::config::apply(&init.config_bytes);
+        if !applied.is_empty() {
+            eprintln!("epochdb-rs: config keys applied: {}", applied.join(" "));
+        }
         let sync_roll = conf.get("roll-budget-mb").and_then(|v| v.as_u64()).map(|m| (m as usize) << 20).unwrap_or(SYNC_ROLL);
         let tip_roll = TIP_ROLL.min(sync_roll);
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);

@@ -22,7 +22,7 @@ Dependency order: `state` <- `node`; `block` <- `exec` <- `node`, `store`, `rpc`
 ```
 cd rs
 cargo build --release                       # every bin into rs/target/release/
-cargo test --workspace --release            # 44 tests
+cargo test --workspace --release            # 45 tests
 cargo clippy --workspace                    # warnings only
 ```
 
@@ -70,30 +70,40 @@ and avalanchego launches it for every chain of that VM it tracks (`--track-subne
 
 ### Configuration
 
-Config bytes (the chain config JSON):
+Config bytes (the chain config JSON: `~/.avalanchego/configs/chains/<blockchainID>/config.json` under a stock avalanchego, `--config` under the hosts). One table, defined once in `rs/plugin/src/config.rs`:
 
-| key | meaning |
-|---|---|
-| `state-sync-enabled` | ignored by the plugin (it never state-syncs); the harness passes `false` so stock subnet-evm executes every block under the same config |
-| `roll-budget-mb` | overlay bytes before a roll while bootstrapping (default 2048 = `SyncRoll`); the tip budget after SetState(NormalOp) is `min(roll-budget-mb, 128)` |
+| key | environment fallback | meaning |
+|---|---|---|
+| `state-sync-enabled` | | ignored by the plugin (it never state-syncs); the harness passes `false` so stock subnet-evm executes every block under the same config |
+| `roll-budget-mb` | | overlay bytes before a roll while bootstrapping (default 2048 = `SyncRoll`); the tip budget after SetState(NormalOp) is `min(roll-budget-mb, 128)` |
+| `s3-endpoint`, `s3-bucket`, `s3-access-key`, `s3-secret-key` | `EPOCHDB_S3_ENDPOINT`, `EPOCHDB_S3_BUCKET`, `EPOCHDB_S3_ACCESS_KEY`, `EPOCHDB_S3_SECRET_KEY` | the casfs remote (SigV4 path style); all four required together, static keys only, no default credential chain. No endpoint = local only |
+| `s3-prefix`, `s3-region` | `EPOCHDB_S3_PREFIX`, `EPOCHDB_S3_REGION` | key prefix (default none) and region (default `auto`) |
+| `cache-dir` | `EPOCHDB_CACHE_DIR` | chunk cache root (default `<store>/cache`) |
+| `cache-min-free` | `EPOCHDB_CACHE_MIN_FREE` | admission floor in bytes of free space on the cache filesystem (default 5 percent of it); the eviction target is twice it |
+| `cache-max-age` | `EPOCHDB_CACHE_MAX_AGE` | cache window age limit, seconds or `Nh`/`Nm`/`Ns` (default 30 days) |
+| `terminal-txs` | `EPOCHDB_TERMINAL_TXS` | TxNum slots per terminal run (default 8,000,000); lowered for the merge oracle |
+| `new-chain` | `EPOCHDB_NEW_CHAIN=1` | let `join` start a chain that has no `latest-<chainroot>` pointer on the remote |
 
-Unknown keys are ignored, so a stock subnet-evm config works as is.
+The rule is mechanical: strip `EPOCHDB_`, lower case, `_` -> `-`. Values may be JSON strings, numbers or booleans (`true` = `1`). Unknown keys are ignored, so a stock subnet-evm config works as is. The plugin sets the listed variables into its own environment from the config bytes before it opens the store, so `rs/store` keeps one env-reading code path; a key in the JSON wins over an inherited variable, an absent key leaves the variable alone. The bytes are never logged whole: the startup line prints them with `s3-access-key` / `s3-secret-key` redacted.
 
-Environment variables (read by `rs/store`, `casfs.rs` and `db.rs`):
+Why: avalanchego's subprocess runtime (and therefore both hosts, which use it) forwards only `GRPC_*` and `GODEBUG*` variables to the plugin, plus `AVALANCHE_VM_RUNTIME_ENGINE_ADDR`. The environment column is what `storecheck`, `epochdb-rpc-serve` and the bench read directly.
 
-| variable | meaning |
-|---|---|
-| `EPOCHDB_S3_ENDPOINT`, `EPOCHDB_S3_BUCKET`, `EPOCHDB_S3_ACCESS_KEY`, `EPOCHDB_S3_SECRET_KEY` | the casfs remote (SigV4 path style); all four required together, static keys only, no default credential chain. Unset = local only |
-| `EPOCHDB_S3_PREFIX`, `EPOCHDB_S3_REGION` | key prefix (default none) and region (default `auto`) |
-| `EPOCHDB_CACHE_DIR` | chunk cache root (default `<store>/cache`) |
-| `EPOCHDB_CACHE_MIN_FREE` | admission floor in bytes of free space on the cache filesystem (default 5 percent of it); the eviction target is twice it |
-| `EPOCHDB_CACHE_MAX_AGE` | cache window age limit, seconds or `Nh`/`Nm`/`Ns` (default 30 days) |
-| `EPOCHDB_TERMINAL_TXS` | TxNum slots per terminal run (default 8,000,000); lowered for the merge oracle |
-| `EPOCHDB_NEW_CHAIN=1` | let `join` start a chain that has no `latest-<chainroot>` pointer on the remote |
-| `EPOCHDB_RPC_NOW=<unix s>` | pin the RPC's wall clock (eth_gasPrice / maxPriorityFeePerGas) for a deterministic differential |
-| `EPOCHDB_V1_CONFIGS` | dir of fleet v1 chain configs for `exec`'s `fleet_configs_parse` test (skipped when unset) |
+`cmd/epochdb-host` closes the loop for a container: `--config` (inline JSON or `@file`, default `{"state-sync-enabled":false}`) plus every `EPOCHDB_*` variable of its own environment merged in under the same rule, so a compose file keeps `EPOCHDB_*` on the container and the host hands them to the plugin (`ops/compose.rust.example.yml`). The Go plugin under the same host is unaffected: it ignores the extra keys.
 
-Gotcha: avalanchego's subprocess runtime (and therefore the harness, which uses it) forwards only `GRPC_*` and `GODEBUG*` variables to the plugin, plus `AVALANCHE_VM_RUNTIME_ENGINE_ADDR`. So under a host the `EPOCHDB_*` variables are NOT seen by the plugin; they work for `storecheck`, `epochdb-rpc-serve` and the bench. Carrying S3 / cache settings through the config bytes is open (below).
+Not configurable yet (no knob in rs): block cache size (the store has no decoded-block cache, see Open items), trace mode (traces are always rendered and stored).
+
+Other environment variables (tools and tests only): `EPOCHDB_RPC_NOW=<unix s>` pins the RPC's wall clock (eth_gasPrice / maxPriorityFeePerGas) for a deterministic differential; `EPOCHDB_V1_CONFIGS` is the dir of fleet v1 chain configs for `exec`'s `fleet_configs_parse` test (skipped when unset).
+
+### The image
+
+The repo `Dockerfile` has a `rust` stage (`rust:1.97-trixie`, `musl-tools` + `protobuf-compiler`, target `x86_64-unknown-linux-musl`, cargo registry and target dir as BuildKit cache mounts like the Go stage) that builds `epochdb-rs` static and copies it into the runtime image twice: `/usr/local/bin/epochdb-rs` beside the Go binaries (what `epochdb-host --vm` points at) and `/plugins/srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy` (the stock subnet-evm VM id, for `docker cp` into a stock avalanchego's plugin dir or a bind mount of `/plugins`; a chain created under a vanity VM id wants the same file under that id, `platform.getBlockchains` says which). The entrypoint is still the Go `epochdb`. `.github/workflows/build.yml` builds the same Dockerfile on every push to `main` (unchanged: the new stage rides in the same `docker/build-push-action` step; its GHA layer cache does not hold BuildKit cache mounts, so the Rust stage is cold there unless `rs/` is untouched: 2m43s cold on a 16-thread i7-10700K, so expect 6-10 min of the docker job on a 4 vCPU runner, in parallel with the Go stage); `rs/target` is in `.dockerignore` so a local build tree never enters the context. Image 612 MB, of which `epochdb-rs` is one 78 MB layer (both paths are hard links of one file; debug info kept for backtrace line numbers).
+
+```
+docker build -t epochdb:rust-ops .
+docker run --rm --entrypoint epochdb-rs epochdb:rust-ops --version    # epochdb-rs/0.1.0 [rpcchainvm=45]
+```
+
+`ops/compose.rust.example.yml` is one chain as `epochdb-host` + `epochdb-rs` with `EPOCHDB_*` on the container, and the equivalent stock-avalanchego layout (plugin dir + chain config file) in its comments.
 
 ## Oracles
 
@@ -138,7 +148,6 @@ From avalanchego's `vm_server.go`:
 ## Open items (deduplicated)
 
 - Run under a real avalanchego (consensus Reject, siblings, a validator set) and on the Tokyo box; metrics in `Gather`.
-- `EPOCHDB_*` settings do not reach the plugin under a host (env filter above): carry S3 / cache / terminal settings in the config bytes.
 - Throughput under rpcchainvm is round-trip bound (~1,100-1,280 blk/s on Step: Verify + Accept per block); the executor is busy 10-15 percent of the time.
 - Executor: the contract-heavy tail (600-750 mgas/s single-threaded) is unprofiled; trace JSON rendering could move to the checker; Dirty root at 100k-400k is 60 percent of the checker.
 - Store: zero-copy reads (decoded-block LRU, restart-point cursor), the read-only cohabitation lock, index artifacts beside runs, `MergeIter` heap for a fan-in above 16, RAM ring of 16 chunks in front of the chunk cache.

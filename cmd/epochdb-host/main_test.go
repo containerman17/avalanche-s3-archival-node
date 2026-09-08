@@ -74,3 +74,20 @@ func TestTakeBatches(t *testing.T) {
 		t.Fatal("parseHold accepted garbage")
 	}
 }
+
+func TestPluginConfig(t *testing.T) {
+	got, err := pluginConfig(`{"state-sync-enabled":false}`, []string{"HOME=/x", "EPOCHDB_S3_ENDPOINT=http://minio:9000", "EPOCHDB_S3_SECRET_KEY=a=b", "GODEBUG=x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"s3-endpoint":"http://minio:9000","s3-secret-key":"a=b","state-sync-enabled":false}`
+	if string(got) != want {
+		t.Fatalf("got %s want %s", got, want)
+	}
+	if _, err := pluginConfig(`[]`, nil); err == nil {
+		t.Fatal("array accepted")
+	}
+	if _, err := pluginConfig(`@/nonexistent`, nil); err == nil {
+		t.Fatal("missing file accepted")
+	}
+}

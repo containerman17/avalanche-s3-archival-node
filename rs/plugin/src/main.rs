@@ -25,7 +25,7 @@ fn main() {
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
     let factory = Box::new(|init: &Init| {
-        eprintln!("epochdb-rs: chain {} data {} config {}", plugin::tree::hex(&init.chain_id), init.chain_data_dir, String::from_utf8_lossy(&init.config_bytes));
+        eprintln!("epochdb-rs: chain {} data {} config {}", plugin::tree::hex(&init.chain_id), init.chain_data_dir, plugin::config::redacted(&init.config_bytes));
         NodeEngine::open(init)
     });
     if let Err(e) = rt.block_on(serve(factory)) {

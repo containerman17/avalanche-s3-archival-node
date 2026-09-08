@@ -23,11 +23,38 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 # this binary shells out to anything any more; block compression is the pebble
 # library's, pinned by module version.
 
+# THE RUST NODE. epochdb-rs (rs/plugin) is one static musl binary: it is the
+# rpcchainvm plugin epochdb-host drives, and it is what a stock avalanchego
+# launches from its plugin dir, so it must not depend on the image's libc.
+# musl-tools gives cc-rs the musl-gcc the C crates (zstd-sys, ring) build
+# with; protoc compiles rs/plugin/proto at build time (plugin/build.rs) and
+# libprotobuf-dev holds the google/protobuf/*.proto those import.
+# The registry and target caches are BuildKit cache mounts like the Go
+# stage's: a local rebuild recompiles the changed crates only; CI is cold.
+FROM rust:1.97-trixie AS rust
+ARG SUBNET_EVM_VMID=srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools protobuf-compiler libprotobuf-dev && \
+    rm -rf /var/lib/apt/lists/* && rustup target add x86_64-unknown-linux-musl
+WORKDIR /src/rs
+COPY rs/ .
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/rs/target \
+    cargo build --release --target x86_64-unknown-linux-musl -p epochdb-plugin && \
+    mkdir -p /out/usr/local/bin /out/plugins && cp target/x86_64-unknown-linux-musl/release/epochdb-rs /out/usr/local/bin/ && \
+    ln /out/usr/local/bin/epochdb-rs /out/plugins/${SUBNET_EVM_VMID}
+
 FROM gcr.io/distroless/cc-debian13
 LABEL org.opencontainers.image.source=https://github.com/containerman17/avalanche-s3-archival-node
 COPY --from=build /epochdb /usr/local/bin/epochdb
 # The rework's binaries ride beside the old one; `epochdb` stays the entrypoint.
 COPY --from=build /out/ /usr/local/bin/
+# The plugin-dir copy for a stock avalanchego (`--plugin-dir /plugins`, or mount
+# /plugins over its ~/.avalanchego/plugins). A chain's plugin is the file named
+# by its VM id; this is the stock subnet-evm id, which is what almost every L1
+# runs under. A chain created with a vanity VM id (FIFA does this with a stock
+# binary) needs the same file under that id: copy or hard-link
+# /usr/local/bin/epochdb-rs to /plugins/<that id> in the operator's setup.
+# One COPY of both paths keeps the hard link, so the 78 MB binary is one layer.
+COPY --from=rust /out/ /
 # GO RETURNS FREED HEAP PAGES LAZILY BY DEFAULT (MADV_FREE): they stay RESIDENT
 # until the kernel reclaims them, so the arena ratchets to its high-water mark
 # and never gives the ground back. This node's speed comes from the page cache,

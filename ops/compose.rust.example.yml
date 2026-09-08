@@ -1,0 +1,76 @@
+# One L1 on the Rust node: `epochdb-host` (Go: fetches accepted containers
+# from the L1's validators over p2p, drives the plugin over rpcchainvm 45,
+# mounts its HTTP) + `epochdb-rs` (Rust: executor, state, store, JSON-RPC).
+# Both binaries are in the image; the entrypoint stays the Go `epochdb`, so
+# the service names the host as its command.
+#
+# CONFIG CHANNEL. avalanchego's subprocess runtime (which the host uses)
+# forwards only GRPC_* / GODEBUG* to the plugin, so EPOCHDB_* set here never
+# reach epochdb-rs directly. The host translates every EPOCHDB_* variable of
+# its environment into the plugin's config JSON (EPOCHDB_S3_ENDPOINT ->
+# "s3-endpoint"; the full table is in rs/README.md, "Configuration"), merged
+# over --config. Secrets travel in the Initialize call, never in a log line.
+#
+# GODEBUG: the image bakes GODEBUG=madvdontneed=1 for the Go processes. A
+# compose `environment: GODEBUG=...` REPLACES it, so repeat madvdontneed=1 if
+# you add to it. Not set here on purpose.
+services:
+  some-l1:
+    image: ghcr.io/containerman17/avalanche-s3-archival-node
+    command: >
+      epochdb-host --vm /usr/local/bin/epochdb-rs --network mainnet
+      --chain <blockchainID> --data /data --http 0.0.0.0:9650 --p2p-port 9651
+      --config '{"state-sync-enabled":false,"roll-budget-mb":2048}'
+    environment:
+      EPOCHDB_S3_ENDPOINT: https://s3.ap-northeast-1.amazonaws.com
+      EPOCHDB_S3_REGION: ap-northeast-1
+      EPOCHDB_S3_BUCKET: my-epochdb
+      EPOCHDB_S3_PREFIX: some-l1/
+      EPOCHDB_S3_ACCESS_KEY: ${S3_ACCESS_KEY}     # from .env, never in this file
+      EPOCHDB_S3_SECRET_KEY: ${S3_SECRET_KEY}
+      EPOCHDB_CACHE_DIR: /cache                   # shared across chains: same uid in every container
+      EPOCHDB_CACHE_MIN_FREE: "20000000000"       # bytes of free space kept on /cache; eviction to twice it
+      EPOCHDB_CACHE_MAX_AGE: 720h
+      # EPOCHDB_NEW_CHAIN: "1"                    # only when starting a NEW chain in a shared prefix
+    volumes:
+      - l1-data:/data      # host db + staking identity, chainData/{vmstate,store} of the plugin
+      - cache:/cache
+    ports:
+      - "9650:9650"        # JSON-RPC: http://host:9650/ext/bc/<blockchainID>/rpc and /ws
+      - "9651:9651"        # p2p: a stable NodeID needs the same --p2p-port and the persisted staker.key
+    cgroup_parent: epochdb.slice   # see ops/epochdb.slice; drop with mem_limit on a dedicated box
+    mem_limit: 6g
+    restart: unless-stopped
+volumes: {l1-data: {}, cache: {}}
+
+# THE SAME NODE UNDER A STOCK AVALANCHEGO (non-validating tracker of the L1),
+# no epochdb-host involved. The image's /plugins holds epochdb-rs under the
+# stock subnet-evm VM id; the chain config file carries the same keys.
+#
+#   # plugin dir: take it out of the image once (or bind-mount /plugins)
+#   docker create --name edb ghcr.io/containerman17/avalanche-s3-archival-node
+#   docker cp edb:/plugins/. ~/.avalanchego/plugins/    # srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy
+#   docker rm edb
+#   # a chain created under a vanity VM id (platform.getBlockchains -> vmID) wants the same file under that id:
+#   # ln ~/.avalanchego/plugins/srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy ~/.avalanchego/plugins/<vmID>
+#
+#   # chain config: ~/.avalanchego/configs/chains/<blockchainID>/config.json (mode 0600, it holds the keys)
+#   {
+#     "state-sync-enabled": false,
+#     "roll-budget-mb": 2048,
+#     "s3-endpoint": "https://s3.ap-northeast-1.amazonaws.com",
+#     "s3-region": "ap-northeast-1",
+#     "s3-bucket": "my-epochdb",
+#     "s3-prefix": "some-l1/",
+#     "s3-access-key": "...",
+#     "s3-secret-key": "...",
+#     "cache-dir": "/var/lib/epochdb/cache",
+#     "cache-min-free": 20000000000,
+#     "cache-max-age": "720h"
+#   }
+#
+#   avalanchego --network-id=mainnet --track-subnets=<subnetID> --plugin-dir ~/.avalanchego/plugins \
+#     --http-host 0.0.0.0 --http-port 9650
+#
+# The plugin's data lands under avalanchego's <data-dir>/chainData/<blockchainID>/{vmstate,store};
+# the RPC is at http://host:9650/ext/bc/<blockchainID>/rpc and /ws.

@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -70,6 +71,7 @@ func main() {
 	holdSpec := fs.String("hold-until", "", "hand the VM its first block only once this much is fetched ahead of it: N blocks, or N txs as Ntx (100000, 250000tx)")
 	queueAhead := fs.Int("queue-ahead", 100_000, "blocks the host keeps fetched ahead of the VM in its own ring, in front of the fetch package's fixed window")
 	batch := fs.Int("batch", 256, "blocks per BatchedParseBlock; up to 2 parsed batches wait ahead of verification")
+	configSpec := fs.String("config", `{"state-sync-enabled":false}`, "the plugin's config bytes: JSON, or @path of a JSON file; every EPOCHDB_* variable in the environment is merged in as a key (EPOCHDB_S3_ENDPOINT -> s3-endpoint), see rs/README.md")
 	fs.Parse(os.Args[1:])
 	if *chainSpec == "" || *vmPath == "" {
 		log.Fatal("epochdb-host: --chain and --vm are required")
@@ -92,6 +94,10 @@ func main() {
 	}
 	if *nodeURI == "" {
 		*nodeURI = map[uint32]string{constants.MainnetID: "https://api.avax.network", constants.FujiID: "https://api.avax-test.network"}[networkID]
+	}
+	configBytes, err := pluginConfig(*configSpec, os.Environ())
+	if err != nil {
+		log.Fatalf("epochdb-host: --config: %v", err)
 	}
 	sources := dist.Sources(*nodeURI)
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -166,10 +172,11 @@ func main() {
 		ValidatorState:  newRPCValidatorState(sources, c.BlockchainID, c.SubnetID),
 		ChainDataDir:    chainDataDir,
 	}
-	// state-sync off: the plugin must execute every block, that is the point.
-	// Pruning stays at the plugin's default.
+	// state-sync off by default: the plugin must execute every block, that is
+	// the point. Pruning stays at the plugin's default. The bytes are never
+	// logged: they carry the S3 keys.
 	if err := vm.Initialize(ctx, snowCtx, prefixdb.New([]byte("vm"), db), c.GenesisJSON, c.UpgradeJSON,
-		[]byte(`{"state-sync-enabled":false}`), nil, noopSender{}); err != nil {
+		configBytes, nil, noopSender{}); err != nil {
 		log.Fatalf("epochdb-host: Initialize: %v", err)
 	}
 	if err := vm.SetState(ctx, snow.Bootstrapping); err != nil {
@@ -292,6 +299,35 @@ func (p *pipe) fail(err error) {
 		p.err = err
 		p.stop()
 	})
+}
+
+// pluginConfig builds the plugin's config bytes: --config (inline JSON or
+// @file), then every EPOCHDB_* variable of environ merged in under the
+// rs/plugin/src/config.rs rule (EPOCHDB_S3_ENDPOINT -> "s3-endpoint"; the
+// variable wins over the file). avalanchego's subprocess runtime forwards
+// only GRPC_* / GODEBUG* to the plugin, so this is how the container's
+// environment reaches epochdb-rs. Values stay strings; the plugin parses
+// them. Plugins ignore unknown keys, so a stock subnet-evm is unaffected.
+func pluginConfig(spec string, environ []string) ([]byte, error) {
+	raw := []byte(spec)
+	if strings.HasPrefix(spec, "@") {
+		var err error
+		if raw, err = os.ReadFile(spec[1:]); err != nil {
+			return nil, err
+		}
+	}
+	conf := map[string]any{}
+	if err := json.Unmarshal(raw, &conf); err != nil {
+		return nil, fmt.Errorf("config is not a JSON object: %w", err)
+	}
+	for _, kv := range environ {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasPrefix(k, "EPOCHDB_") {
+			continue
+		}
+		conf[strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(k, "EPOCHDB_")), "_", "-")] = v
+	}
+	return json.Marshal(conf)
 }
 
 // parseHold reads --hold-until: "N" blocks or "Ntx" transactions.
