@@ -10,7 +10,7 @@ use block::{Block, Header};
 use exec::{oracle, Config, Executor};
 use serde_json::Value;
 
-use crate::tree::Error;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const EMPTY_ROOT: B256 = alloy_trie::EMPTY_ROOT_HASH;
 const EMPTY_UNCLES: B256 = alloy_primitives::b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347");

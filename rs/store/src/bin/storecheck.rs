@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use store::db::DB;
 use store::format::*;
@@ -341,6 +342,14 @@ fn readall(args: &[String]) -> Result<()> {
         }
     }
     eprintln!("readall OK: {to} blocks, {ntx} txs, {nlog} logs, {nbytes} container bytes, {} runs, {:.1}s", db.manifest().runs.len(), t0.elapsed().as_secs_f64());
+    let st = &db.cas().cache().stats;
+    eprintln!(
+        "chunk cache: {} fills, {} refusals, {} evictions, {} bytes freed",
+        st.fills.load(Ordering::Relaxed),
+        st.refusals.load(Ordering::Relaxed),
+        st.evictions.load(Ordering::Relaxed),
+        st.freed.load(Ordering::Relaxed)
+    );
     Ok(())
 }
 

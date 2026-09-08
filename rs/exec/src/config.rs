@@ -90,8 +90,9 @@ impl FeeConfig {
     }
 }
 
-/// One precompile config (genesis or upgrade.json entry). Only feeManagerConfig
-/// is modelled; every other module key is a hard error at parse time.
+/// One precompile config (genesis or upgrade.json entry) of any of the six
+/// registered modules (precompile/registry): the shared Upgrade fields, the
+/// allow list, and the module's own initial state.
 #[derive(Debug, Clone)]
 pub struct PrecompileConfig {
     pub key: &'static str,
@@ -101,21 +102,32 @@ pub struct PrecompileConfig {
     pub admins: Vec<Address>,
     pub enabled: Vec<Address>,
     pub managers: Vec<Address>,
+    /// feeManagerConfig.initialFeeConfig.
     pub initial_fee_config: Option<FeeConfig>,
+    /// contractNativeMinterConfig.initialMint, in address order.
+    pub initial_mint: Vec<(Address, U256)>,
+    /// rewardManagerConfig.initialRewardConfig: (allowFeeRecipients, rewardAddress).
+    pub initial_reward: Option<(bool, Address)>,
+    /// warpConfig.quorumNumerator (0 = the default 67).
+    pub quorum_numerator: u64,
+    pub require_primary_network_signers: bool,
 }
 
-pub const FEE_MANAGER: Address = Address::new([
-    0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03,
-]);
+pub use crate::precompile::{DEPLOYER_ALLOW_LIST, FEE_MANAGER, MODULES, NATIVE_MINTER, REWARD_MANAGER, TX_ALLOW_LIST, WARP};
 
-const MODULE_KEYS: &[(&str, [u8; 20])] = &[
-    ("contractDeployerAllowListConfig", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00]),
-    ("contractNativeMinterConfig", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]),
-    ("txAllowListConfig", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]),
-    ("feeManagerConfig", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03]),
-    ("rewardManagerConfig", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04]),
-    ("warpConfig", [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05]),
-];
+/// One upgrade.json stateUpgrades entry (params/extras/state_upgrade.go).
+#[derive(Debug, Clone)]
+pub struct StateUpgrade {
+    pub timestamp: u64,
+    pub accounts: BTreeMap<Address, StateUpgradeAccount>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StateUpgradeAccount {
+    pub code: Bytes,
+    pub storage: BTreeMap<B256, B256>,
+    pub balance_change: Option<U256>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct GenesisAccount {
@@ -134,22 +146,31 @@ pub struct Config {
     pub subnet_evm: u64,
     pub durango: Option<u64>,
     pub etna: Option<u64>,
+    /// Fortuna has no effect on subnet-evm (params/extras/network_upgrades.go).
+    pub fortuna: Option<u64>,
     pub granite: Option<u64>,
     /// Genesis precompile configs, in module address order.
     pub genesis_precompiles: Vec<PrecompileConfig>,
     /// upgrade.json precompileUpgrades, in file order.
     pub precompile_upgrades: Vec<PrecompileConfig>,
+    /// upgrade.json stateUpgrades, in file order (timestamps ascending).
+    pub state_upgrades: Vec<StateUpgrade>,
     pub alloc: BTreeMap<Address, GenesisAccount>,
     pub genesis_timestamp: u64,
+    /// The snow context the warp precompile reads (SnowCtx.NetworkID, ChainID,
+    /// SubnetID); zero until the chain descriptor sets them.
+    pub network_id: u32,
+    pub blockchain_id: B256,
+    pub subnet_id: B256,
 }
 
 /// avalanchego upgrade/upgrade.go: Mainnet and Fuji schedules (Unix seconds).
 /// Any other network id is the Default config: everything initially active.
-fn network_upgrades(network_id: u32) -> (Option<u64>, Option<u64>, Option<u64>) {
+fn network_upgrades(network_id: u32) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
     match network_id {
-        1 => (Some(1709740800), Some(1734368400), Some(1763568000)),
-        5 => (Some(1707840000), Some(1732550400), Some(1761750000)),
-        _ => (Some(1607144400), Some(1607144400), Some(1607144400)),
+        1 => (Some(1709740800), Some(1734368400), Some(1746057600), Some(1763568000)),
+        5 => (Some(1707840000), Some(1732550400), Some(1744648800), Some(1761750000)),
+        _ => (Some(1607144400), Some(1607144400), Some(1607144400), Some(1607144400)),
     }
 }
 
@@ -187,7 +208,7 @@ impl Config {
         let allow_fee_recipients = cfg.get("allowFeeRecipients").and_then(Value::as_bool).unwrap_or(false);
 
         // NetworkUpgrades.SetDefaults: nil or 0 in the genesis means the network default.
-        let (d_durango, d_etna, d_granite) = network_upgrades(network_id);
+        let (d_durango, d_etna, d_fortuna, d_granite) = network_upgrades(network_id);
         let pick = |key: &str, default: Option<u64>| -> Option<u64> {
             match cfg.get(key).and_then(Value::as_u64) {
                 None | Some(0) => default,
@@ -197,26 +218,63 @@ impl Config {
         let subnet_evm = cfg.get("subnetEVMTimestamp").and_then(Value::as_u64).unwrap_or(0);
         let mut durango = pick("durangoTimestamp", d_durango);
         let mut etna = pick("etnaTimestamp", d_etna);
+        let mut fortuna = pick("fortunaTimestamp", d_fortuna);
         let mut granite = pick("graniteTimestamp", d_granite);
+        // gasPriceManagerConfig is registered in this subnet-evm but no fleet chain uses it.
+        if cfg.get("gasPriceManagerConfig").is_some() {
+            bail!("precompile gasPriceManagerConfig is not implemented");
+        }
 
         let mut genesis_precompiles = Vec::new();
-        for (key, addr) in MODULE_KEYS {
-            if let Some(v) = cfg.get(*key) {
-                genesis_precompiles.push(parse_precompile(key, Address::new(*addr), v)?);
+        for (key, addr) in MODULES {
+            if let Some(v) = cfg.get(key) {
+                genesis_precompiles.push(parse_precompile(key, addr, v)?);
             }
         }
 
         let mut precompile_upgrades = Vec::new();
+        let mut state_upgrades = Vec::new();
         if !upgrade_json.is_empty() {
             let u: Value = serde_json::from_slice(upgrade_json).context("upgrade json")?;
             if let Some(o) = u.get("networkUpgradeOverrides") {
                 // NetworkUpgrades.Override: set fields present (non-null).
                 if let Some(t) = o.get("durangoTimestamp").and_then(Value::as_u64) { durango = Some(t); }
                 if let Some(t) = o.get("etnaTimestamp").and_then(Value::as_u64) { etna = Some(t); }
+                if let Some(t) = o.get("fortunaTimestamp").and_then(Value::as_u64) { fortuna = Some(t); }
                 if let Some(t) = o.get("graniteTimestamp").and_then(Value::as_u64) { granite = Some(t); }
             }
-            if u.get("stateUpgrades").map(|s| !s.as_array().map_or(true, Vec::is_empty)).unwrap_or(false) {
-                bail!("upgrade.json stateUpgrades are not implemented");
+            if let Some(arr) = u.get("stateUpgrades").and_then(Value::as_array) {
+                let mut prev = None;
+                for (i, e) in arr.iter().enumerate() {
+                    let timestamp = e.get("blockTimestamp").and_then(Value::as_u64).ok_or_else(|| anyhow!("StateUpgrade[{i}]: blockTimestamp missing"))?;
+                    if timestamp == 0 {
+                        bail!("state upgrade config block timestamp must be greater than 0: StateUpgrade[{i}]");
+                    }
+                    if prev.is_some_and(|p| timestamp <= p) {
+                        bail!("state upgrade config block timestamp must be greater than previous timestamp: StateUpgrade[{i}]");
+                    }
+                    prev = Some(timestamp);
+                    let mut accounts = BTreeMap::new();
+                    if let Some(acc) = e.get("accounts").and_then(Value::as_object) {
+                        for (addr, a) in acc {
+                            let address: Address = addr.parse().with_context(|| format!("StateUpgrade[{i}] account {addr}"))?;
+                            let mut sa = StateUpgradeAccount::default();
+                            if let Some(c) = a.get("code").and_then(Value::as_str) {
+                                sa.code = c.parse::<Bytes>().with_context(|| format!("StateUpgrade[{i}] {addr} code"))?;
+                            }
+                            if let Some(st) = a.get("storage").and_then(Value::as_object) {
+                                for (k, v) in st {
+                                    sa.storage.insert(k.parse()?, v.as_str().ok_or_else(|| anyhow!("storage value"))?.parse()?);
+                                }
+                            }
+                            if let Some(b) = a.get("balanceChange") {
+                                sa.balance_change = Some(json_u256(b).with_context(|| format!("StateUpgrade[{i}] {addr} balanceChange"))?);
+                            }
+                            accounts.insert(address, sa);
+                        }
+                    }
+                    state_upgrades.push(StateUpgrade { timestamp, accounts });
+                }
             }
             if let Some(arr) = u.get("precompileUpgrades").and_then(Value::as_array) {
                 for entry in arr {
@@ -225,11 +283,11 @@ impl Config {
                         bail!("PrecompileUpgrade must have exactly one key, got {}", obj.len());
                     }
                     let (k, v) = obj.iter().next().unwrap();
-                    let (key, addr) = MODULE_KEYS
+                    let (key, addr) = MODULES
                         .iter()
                         .find(|(mk, _)| mk == k)
                         .ok_or_else(|| anyhow!("unknown precompile config: {k}"))?;
-                    precompile_upgrades.push(parse_precompile(key, Address::new(*addr), v)?);
+                    precompile_upgrades.push(parse_precompile(key, *addr, v)?);
                 }
             }
         }
@@ -265,12 +323,24 @@ impl Config {
             subnet_evm,
             durango,
             etna,
+            fortuna,
             granite,
             genesis_precompiles,
             precompile_upgrades,
+            state_upgrades,
             alloc,
             genesis_timestamp,
+            network_id,
+            blockchain_id: B256::ZERO,
+            subnet_id: B256::ZERO,
         })
+    }
+
+    /// The snow context from the chain descriptor (chain.json: cb58 ids).
+    pub fn with_chain(mut self, blockchain_id: B256, subnet_id: B256) -> Config {
+        self.blockchain_id = blockchain_id;
+        self.subnet_id = subnet_id;
+        self
     }
 
     pub fn is_durango(&self, time: u64) -> bool {
@@ -279,8 +349,21 @@ impl Config {
     pub fn is_etna(&self, time: u64) -> bool {
         self.etna.is_some_and(|t| t <= time)
     }
+    pub fn is_fortuna(&self, time: u64) -> bool {
+        self.fortuna.is_some_and(|t| t <= time)
+    }
     pub fn is_granite(&self, time: u64) -> bool {
         self.granite.is_some_and(|t| t <= time)
+    }
+
+    /// GetActivatingStateUpgrades: entries with timestamp in (parent, block].
+    pub fn activating_state_upgrades(&self, parent_time: Option<u64>, time: u64) -> Vec<&StateUpgrade> {
+        self.state_upgrades.iter().filter(|u| parent_time.map_or(true, |p| u.timestamp > p) && u.timestamp <= time).collect()
+    }
+
+    /// The warp config active at `time` (quorum numerator, requirePrimaryNetworkSigners).
+    pub fn warp_config(&self, time: u64) -> Option<&PrecompileConfig> {
+        self.activating(None, time).into_iter().filter(|c| c.address == WARP).last().filter(|c| !c.disable)
     }
 
     /// The revm spec for a block time. params.SetEthUpgrades: Shanghai = Durango,
@@ -302,8 +385,7 @@ impl Config {
     pub fn activating(&self, parent_time: Option<u64>, time: u64) -> Vec<&PrecompileConfig> {
         let transition = |t: u64| parent_time.map_or(true, |p| t > p) && t <= time;
         let mut out = Vec::new();
-        for (_, addr) in MODULE_KEYS {
-            let addr = Address::new(*addr);
+        for (_, addr) in MODULES {
             for c in self.genesis_precompiles.iter().filter(|c| c.address == addr) {
                 if transition(c.timestamp) {
                     out.push(c);
@@ -329,9 +411,6 @@ impl Config {
 }
 
 fn parse_precompile(key: &'static str, address: Address, v: &Value) -> Result<PrecompileConfig> {
-    if key != "feeManagerConfig" {
-        bail!("precompile {key} is not implemented (only feeManagerConfig)");
-    }
     let timestamp = v.get("blockTimestamp").and_then(Value::as_u64).ok_or_else(|| anyhow!("{key}: blockTimestamp missing"))?;
     let addrs = |k: &str| -> Result<Vec<Address>> {
         v.get(k)
@@ -339,6 +418,40 @@ fn parse_precompile(key: &'static str, address: Address, v: &Value) -> Result<Pr
             .map(|a| a.iter().map(|x| Ok(x.as_str().ok_or_else(|| anyhow!("{k}"))?.parse::<Address>()?)).collect())
             .unwrap_or(Ok(Vec::new()))
     };
+    let mut initial_mint = Vec::new();
+    if let Some(m) = v.get("initialMint").and_then(Value::as_object) {
+        for (a, amt) in m {
+            let amount = json_u256(amt).with_context(|| format!("{key}: initialMint {a}"))?;
+            if amount.is_zero() {
+                bail!("initial mint cannot contain invalid amount: amount 0 for address {a}");
+            }
+            initial_mint.push((a.parse::<Address>().with_context(|| format!("{key}: initialMint {a}"))?, amount));
+        }
+        initial_mint.sort_by_key(|(a, _)| *a);
+    }
+    let initial_reward = match v.get("initialRewardConfig") {
+        Some(r) => {
+            let allow = r.get("allowFeeRecipients").and_then(Value::as_bool).unwrap_or(false);
+            let addr = match r.get("rewardAddress").and_then(Value::as_str) {
+                Some(s) => s.parse::<Address>().with_context(|| format!("{key}: rewardAddress"))?,
+                None => Address::ZERO,
+            };
+            if allow && addr != Address::ZERO {
+                bail!("cannot enable both fee recipients and reward address at the same time");
+            }
+            Some((allow, addr))
+        }
+        None => None,
+    };
+    let quorum_numerator = v.get("quorumNumerator").and_then(Value::as_u64).unwrap_or(0);
+    if key == "warpConfig" {
+        if quorum_numerator > 100 {
+            bail!("invalid warp quorum ratio: cannot specify numerator ({quorum_numerator}) > denominator (100)");
+        }
+        if quorum_numerator != 0 && quorum_numerator < 33 {
+            bail!("invalid warp quorum ratio: cannot specify numerator ({quorum_numerator}) < min numerator (33)");
+        }
+    }
     Ok(PrecompileConfig {
         key,
         address,
@@ -348,7 +461,25 @@ fn parse_precompile(key: &'static str, address: Address, v: &Value) -> Result<Pr
         enabled: addrs("enabledAddresses")?,
         managers: addrs("managerAddresses")?,
         initial_fee_config: v.get("initialFeeConfig").map(FeeConfig::from_json).transpose()?,
+        initial_mint,
+        initial_reward,
+        quorum_numerator,
+        require_primary_network_signers: v.get("requirePrimaryNetworkSigners").and_then(Value::as_bool).unwrap_or(false),
     })
+}
+
+/// avalanchego ids.ID from its cb58 string: base58 of id || sha256(id)[28..].
+pub fn cb58(s: &str) -> Result<B256> {
+    let raw = bs58::decode(s).into_vec().map_err(|e| anyhow!("cb58 {s}: {e}"))?;
+    if raw.len() != 36 {
+        bail!("cb58 {s}: expected 36 bytes, got {}", raw.len());
+    }
+    use sha2::Digest;
+    let sum = sha2::Sha256::digest(&raw[..32]);
+    if sum[28..] != raw[32..] {
+        bail!("cb58 {s}: bad checksum");
+    }
+    Ok(B256::from_slice(&raw[..32]))
 }
 
 /// geth math.HexOrDecimal256 / json numbers.

@@ -33,7 +33,7 @@ use state::commit::file::File;
 use state::commit::roll::roll;
 use state::view::{merge, View};
 
-use crate::genesis;
+use rpc::genesis;
 use crate::layered::{Layered, Pending};
 use crate::dbstore::{BlockStore, DbStore, Record};
 use crate::tree::{hex, Engine, Error, Id, Meta};
@@ -94,12 +94,14 @@ fn tick(a: &AtomicU64, t0: Instant) {
 pub struct NodeEngine {
     pub chain_id: u64,
     pub genesis: Arc<Block>,
-    pub inner: Mutex<Inner>,
+    pub inner: Arc<Mutex<Inner>>,
     pub store: Arc<Mutex<Box<dyn BlockStore>>>,
     /// The store's read API, shared with the RPC threads and the block
     /// lookups below: reads never take the writer's mutex.
     pub db: Arc<store::db::DB>,
-    pub head: Mutex<Arc<Block>>,
+    pub head: Arc<Mutex<Arc<Block>>>,
+    pub rpc_store: Arc<crate::rpc_store::PluginStore>,
+    pub rpc: rpc::Server,
     /// Accepted, not yet in the store (the checker is behind by at most CHECK_DEPTH).
     pub recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>,
     parsed: Mutex<HashMap<Id, Arc<Block>>>,
@@ -273,7 +275,11 @@ impl NodeEngine {
         let head = if head_h == 0 {
             genesis.clone()
         } else {
-            Arc::new(block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?)
+            let mut b = block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?;
+            for t in &mut b.txs {
+                t.sender = block::recover(t);
+            }
+            Arc::new(b)
         };
         eprintln!(
             "epochdb-rs: recovered: rolled at {rolled_h} (gen {gen}), head {head_h} {}, rows replayed {rows}, {ncode} code blobs, {} runs, root ok, in {:.0} ms",
@@ -312,13 +318,21 @@ impl NodeEngine {
             sync_roll >> 20,
             tip_roll >> 20
         );
+        let inner = Arc::new(Mutex::new(Inner { ex, roller, roll_budget: sync_roll }));
+        let head = Arc::new(Mutex::new(head));
+        let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), db_reads.clone(), recent.clone(), Arc::new(cfg.clone())));
+        let chain_config = serde_json::from_slice::<serde_json::Value>(&init.genesis_bytes).ok().and_then(|g| g.get("config").cloned()).unwrap_or_default();
+        let upgrades = serde_json::from_slice::<serde_json::Value>(&init.upgrade_bytes).ok();
+        let rpc = rpc::Server::new(rpc_store.clone(), Arc::new(cfg.clone()), genesis.clone(), chain_config, upgrades);
         Ok(NodeEngine {
             chain_id: cfg.chain_id,
             genesis,
-            inner: Mutex::new(Inner { ex, roller, roll_budget: sync_roll }),
+            inner,
             store,
             db: db_reads,
-            head: Mutex::new(head),
+            head,
+            rpc_store,
+            rpc,
             recent,
             parsed: Mutex::new(HashMap::new()),
             check_tx: Mutex::new(Some(check_tx)),

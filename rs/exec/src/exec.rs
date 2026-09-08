@@ -22,19 +22,26 @@
 //! - Durango: MaxInitCodeSize check (= EIP-3860 under SHANGHAI)
 //! - nothing runs at block end; EIP-158 empty-account deletion is the journal's
 
-use crate::config::{precompile_code_hash, Config, FEE_MANAGER};
-use crate::feemanager;
+use crate::config::{Config, PrecompileConfig, StateUpgrade};
+use crate::precompile::{
+    self, module_index, read_state_no_warm, Env, DEPLOYER_ALLOW_LIST, INVALIDATE_DELEGATE_UNIX, P256_VERIFY,
+    TX_ALLOW_LIST, WARP,
+};
+use crate::warp::{self, ValidatorState};
+use crate::{allowlist, feemanager, nativeminter, rewardmanager};
 use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, TxType};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
-use alloy_rpc_types_trace::geth::CallConfig;
+use alloy_rpc_types_trace::geth::{CallConfig, GethDefaultTracingOptions, PreStateConfig};
+use revm::context::result::ResultAndState;
+use revm::DatabaseRef;
 use anyhow::{anyhow, bail, Context as _, Result};
 use revm::{
     context::{
-        result::{EVMError, ExecutionResult, HaltReason},
+        result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction},
         transaction::{AccessList, AccessListItem},
-        Block as _, BlockEnv, CfgEnv, Context, ContextSetters, ContextTr, Evm, Journal, JournalTr, LocalContext,
-        Transaction as _, TxEnv,
+        Block as _, BlockEnv, Cfg as _, CfgEnv, Context, ContextSetters, ContextTr, Evm, Journal, JournalTr,
+        LocalContext, Transaction as _, TxEnv,
     },
     MainContext,
     database::{CacheDB, EmptyDB},
@@ -42,9 +49,13 @@ use revm::{
         evm::FrameTr, instructions::EthInstructions, EthFrame, EthPrecompiles, EvmTr, EvmTrError, FrameResult,
         Handler, PrecompileProvider,
     },
-    inspector::{Inspector, InspectorEvmTr, InspectorHandler},
-    interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit, CallInputs, InterpreterResult},
-    primitives::{hardfork::SpecId, AddressSet, TxKind},
+    inspector::{Inspector, InspectorEvmTr, InspectorHandler, JournalExt},
+    interpreter::{
+        interpreter::EthInterpreter, interpreter_action::FrameInit, CallInputs, CallOutcome, CallScheme, CreateInputs,
+        CreateOutcome, Gas, InstructionResult, Interpreter, InterpreterResult,
+    },
+    context_interface::cfg::gas::InitialAndFloorGas,
+    primitives::{hardfork::SpecId, AddressSet, Log, TxKind},
     state::{Account, AccountInfo, Bytecode, EvmState, EvmStorageSlot},
     Database, DatabaseCommit,
 };
@@ -59,6 +70,26 @@ pub enum StateRow {
     Account { addr: Address, val: Vec<u8> },
     Slot { addr: Address, slot: B256, val: Vec<u8> },
     CodeUse { addr: Address, code_hash: B256 },
+}
+
+/// A block-level StateDB write (module.Configure, stateupgrade.Configure).
+enum Op {
+    Touch(Address),
+    Nonce(Address, u64),
+    AddBalance(Address, U256),
+    /// SetCode as is (a precompile's 0x01).
+    Code(Address, Bytes),
+    /// SetCode with the state upgrade's nonce rule (1 when 0).
+    CodeNonce(Address, Bytes),
+    Slot(Address, U256, U256),
+}
+
+impl Op {
+    fn addr(&self) -> Address {
+        match self {
+            Op::Touch(a) | Op::Nonce(a, _) | Op::AddBalance(a, _) | Op::Code(a, _) | Op::CodeNonce(a, _) | Op::Slot(a, ..) => *a,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -84,8 +115,23 @@ pub struct CallMsg {
     pub data: Bytes,
 }
 
-#[derive(Debug, Clone)]
+/// What execute_block / call render per tx into `trace_json` (debug_ tracers).
+#[derive(Clone, Debug)]
+pub enum Trace {
+    /// geth callTracer (the store's default row is `Call(CallConfig::default())`).
+    Call(CallConfig),
+    PreState(PreStateConfig),
+    /// The struct logger (geth's default tracer).
+    Struct(GethDefaultTracingOptions),
+    /// noopTracer: `{}`.
+    Noop,
+    /// No rendering (eth_call).
+    Off,
+}
+
 pub struct CallOut {
+    /// The rendered trace under the executor's `Trace`, "" when Off.
+    pub trace_json: String,
     pub gas_used: u64,
     pub output: Bytes,
     pub revert: bool,
@@ -109,11 +155,16 @@ pub struct BlockResult {
 // ---------------------------------------------------------------------------
 // Handler: subnet-evm's gas refund and fee rules.
 
-pub struct SevmHandler<EVM, ERROR, FRAME>(PhantomData<(EVM, ERROR, FRAME)>);
+pub struct SevmHandler<EVM, ERROR, FRAME> {
+    /// What the warp predicates add to the intrinsic gas over the plain
+    /// access-list cost of their entries (precompileconfig.AccessListGasWithPredicates).
+    pub predicate_gas_delta: i128,
+    _p: PhantomData<(EVM, ERROR, FRAME)>,
+}
 
 impl<EVM, ERROR, FRAME> Default for SevmHandler<EVM, ERROR, FRAME> {
     fn default() -> Self {
-        SevmHandler(PhantomData)
+        SevmHandler { predicate_gas_delta: 0, _p: PhantomData }
     }
 }
 
@@ -126,6 +177,33 @@ where
     type Evm = EVM;
     type Error = ERROR;
     type HaltReason = HaltReason;
+
+    /// IntrinsicGas with the libevm AccessListGas hook: a warp access-list
+    /// entry costs its PredicateGas instead of 2400 + 1900 per key.
+    fn validate_initial_tx_gas(&self, evm: &mut EVM) -> Result<InitialAndFloorGas, ERROR> {
+        let mut gas = {
+            let ctx = evm.ctx_ref();
+            let tx = ctx.tx();
+            revm::handler::validation::validate_initial_tx_gas_with_gas_params(
+                tx,
+                ctx.cfg().spec().into(),
+                ctx.cfg().gas_params(),
+                ctx.cfg().is_eip7623_disabled(),
+                ctx.cfg().is_amsterdam_eip8037_enabled(),
+                ctx.cfg().tx_gas_limit_cap(),
+                None,
+            )?
+        };
+        if self.predicate_gas_delta != 0 {
+            let adjusted = gas.initial_regular_gas as i128 + self.predicate_gas_delta;
+            let limit = evm.ctx_ref().tx().gas_limit();
+            if adjusted < 0 || adjusted > u64::MAX as i128 || adjusted as u64 > limit {
+                return Err(InvalidTransaction::CallGasCostMoreThanGasLimit { initial_gas: adjusted.max(0) as u64, gas_limit: limit }.into());
+            }
+            gas.initial_regular_gas = adjusted as u64;
+        }
+        Ok(gas)
+    }
 
     /// state_transition.go refundGas(subnetEVM=true): no refund counter at all.
     fn refund(&self, _evm: &mut EVM, exec_result: &mut FrameResult, _eip7702_refund: i64) -> Result<(), ERROR> {
@@ -162,18 +240,37 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Precompiles: the eth set plus the FeeManager when its config is active.
+// Precompiles: the eth set, P256Verify under Granite, and every stateful
+// module whose config is active (params/hooks_libevm.go PrecompileOverride).
 
 pub struct SevmPrecompiles {
     eth: EthPrecompiles,
-    pub fee_manager: bool,
-    pub durango: bool,
-    pub block_number: u64,
+    warm: AddressSet,
+    /// Enabled modules by MODULES index.
+    pub enabled: [bool; 6],
+    pub block_time: u64,
+    pub env: Env,
 }
 
 impl SevmPrecompiles {
     fn new(spec: SpecId) -> Self {
-        SevmPrecompiles { eth: EthPrecompiles::new(spec), fee_manager: false, durango: false, block_number: 0 }
+        let eth = EthPrecompiles::new(spec);
+        let warm = eth.warm_addresses().clone();
+        SevmPrecompiles { eth, warm, enabled: [false; 6], block_time: 0, env: Env::default() }
+    }
+
+    fn rebuild_warm(&mut self) {
+        self.warm = self.eth.warm_addresses().clone();
+        if self.env.granite {
+            self.warm.insert(P256_VERIFY);
+        }
+    }
+
+    pub fn set_granite(&mut self, granite: bool) {
+        if self.env.granite != granite {
+            self.env.granite = granite;
+            self.rebuild_warm();
+        }
     }
 }
 
@@ -181,23 +278,147 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for SevmPrecompiles {
     type Output = InterpreterResult;
 
     fn set_spec(&mut self, spec: <CTX::Cfg as revm::context::Cfg>::Spec) -> bool {
-        <EthPrecompiles as PrecompileProvider<CTX>>::set_spec(&mut self.eth, spec)
-    }
-
-    fn run(&mut self, context: &mut CTX, inputs: &CallInputs) -> Result<Option<InterpreterResult>, String> {
-        if self.fee_manager && inputs.bytecode_address == FEE_MANAGER {
-            return feemanager::run(context, inputs, self.durango, self.block_number).map(Some);
+        let changed = <EthPrecompiles as PrecompileProvider<CTX>>::set_spec(&mut self.eth, spec);
+        if changed {
+            self.rebuild_warm();
         }
-        <EthPrecompiles as PrecompileProvider<CTX>>::run(&mut self.eth, context, inputs)
+        changed
     }
 
-    /// Only the eth precompiles are warm at tx start (vm.ActivePrecompiles).
+    fn run(&mut self, ctx: &mut CTX, inputs: &CallInputs) -> Result<Option<InterpreterResult>, String> {
+        let addr = inputs.bytecode_address;
+        if self.env.granite && addr == P256_VERIFY {
+            let input = inputs.input.as_bytes(ctx);
+            let mut gas = Gas::new(inputs.gas_limit);
+            return Ok(Some(match revm::precompile::secp256r1::p256_verify_osaka(&input, inputs.gas_limit) {
+                Ok(out) => {
+                    let _ = gas.record_regular_cost(out.gas_used);
+                    InterpreterResult::new(InstructionResult::Return, out.bytes, gas)
+                }
+                Err(_) => {
+                    gas.spend_all();
+                    InterpreterResult::new(InstructionResult::PrecompileOOG, Bytes::new(), gas)
+                }
+            }));
+        }
+        let Some(i) = module_index(addr).filter(|i| self.enabled[*i]) else {
+            return <EthPrecompiles as PrecompileProvider<CTX>>::run(&mut self.eth, ctx, inputs);
+        };
+        // makePrecompile: DELEGATECALL/CALLCODE into a stateful precompile reverts
+        // under Granite, and invalidates the tx (so the block) from InvalidateDelegateUnix.
+        if matches!(inputs.scheme, CallScheme::DelegateCall | CallScheme::CallCode) {
+            if self.env.granite {
+                let mut gas = Gas::new(inputs.gas_limit);
+                gas.spend_all();
+                return Ok(Some(InterpreterResult::new(InstructionResult::Revert, Bytes::new(), gas)));
+            }
+            if self.block_time >= INVALIDATE_DELEGATE_UNIX {
+                return Err(format!("precompile {addr} cannot be called with {:?} (InvalidateExecution: the tx is invalid)", inputs.scheme));
+            }
+        }
+        let input: Vec<u8> = inputs.input.as_bytes(ctx).to_vec();
+        let mut gas = Gas::new(inputs.gas_limit);
+        let caller = inputs.caller;
+        let read_only = inputs.is_static;
+        // The account is warm (the CALL loaded it); load again so the journal has it.
+        ctx.journal_mut().load_account(addr).map_err(|_| "load precompile account".to_string())?;
+        let r = match i {
+            0 | 2 => {
+                // The two pure allow lists: only the shared functions.
+                match precompile::split_selector(&input) {
+                    Ok((sel, args)) => allowlist::call(ctx, &self.env, addr, sel, args, &mut gas, read_only, caller)
+                        .unwrap_or_else(|| Err(precompile::invalid_selector(&sel))),
+                    Err(h) => Err(h),
+                }
+            }
+            1 => nativeminter::call(ctx, &self.env, &input, &mut gas, read_only, caller),
+            3 => feemanager::call(ctx, &self.env, &input, &mut gas, read_only, caller),
+            4 => rewardmanager::call(ctx, &self.env, &input, &mut gas, read_only, caller),
+            _ => warp::call(ctx, &self.env, &input, &mut gas, read_only, caller),
+        };
+        Ok(Some(precompile::finish(ctx, gas, r)))
+    }
+
+    /// Only the eth precompiles (plus P256Verify under Granite) are warm at tx
+    /// start (vm.ActivePrecompiles); the stateful modules are not.
     fn warm_addresses(&self) -> &AddressSet {
-        <EthPrecompiles as PrecompileProvider<CTX>>::warm_addresses(&self.eth)
+        &self.warm
     }
 
     fn contains(&self, address: &Address) -> bool {
-        (self.fee_manager && *address == FEE_MANAGER) || <EthPrecompiles as PrecompileProvider<CTX>>::contains(&self.eth, address)
+        self.warm.contains(address) || module_index(*address).is_some_and(|i| self.enabled[i])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inspector: the callTracer plus the deployer allow list (params/hooks_libevm.go
+// CanCreateContract, called by libevm's evm.create after the caller's nonce
+// bump: a create by a tx.origin without a role fails with all its gas).
+
+pub struct SevmInspector {
+    pub tracer: TracingInspector,
+    pub deployer_allow_list: bool,
+}
+
+impl<CTX: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>> Inspector<CTX, EthInterpreter> for SevmInspector {
+    fn initialize_interp(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+        self.tracer.initialize_interp(interp, context)
+    }
+    fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+        self.tracer.step(interp, context)
+    }
+    fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+        self.tracer.step_end(interp, context)
+    }
+    fn log(&mut self, context: &mut CTX, log: Log) {
+        self.tracer.log(context, log)
+    }
+    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        self.tracer.call(context, inputs)
+    }
+    fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        self.tracer.call_end(context, inputs, outcome)
+    }
+    fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        let r = self.tracer.create(context, inputs);
+        if r.is_some() || !self.deployer_allow_list {
+            return r;
+        }
+        let origin = context.tx().caller();
+        let role = read_state_no_warm(context, DEPLOYER_ALLOW_LIST, allowlist::role_slot(origin));
+        if allowlist::is_enabled(role) {
+            return None;
+        }
+        // libevm evm.create: the caller's nonce is bumped and the created address
+        // warmed before the hook refuses with gas 0.
+        {
+            use revm::context::journaled_state::account::JournaledAccountTr;
+            let nonce = match context.journal_mut().load_account_mut(inputs.caller()) {
+                Ok(mut caller) => {
+                    let n = caller.nonce();
+                    caller.bump_nonce();
+                    Some(n)
+                }
+                Err(_) => None,
+            };
+            if let Some(n) = nonce {
+                let created = inputs.created_address(n);
+                let _ = context.journal_mut().load_account(created);
+            }
+        }
+        let mut gas = Gas::new(inputs.gas_limit());
+        gas.spend_all();
+        if context.journal().depth() == 0 {
+            use revm::context::LocalContextTr;
+            context.local_mut().set_precompile_error_context(format!("tx.origin {origin} is not authorized to deploy a contract"));
+        }
+        Some(CreateOutcome::new(InterpreterResult::new(InstructionResult::PrecompileError, Bytes::new(), gas), None))
+    }
+    fn create_end(&mut self, context: &mut CTX, inputs: &CreateInputs, outcome: &mut CreateOutcome) {
+        self.tracer.create_end(context, inputs, outcome)
+    }
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+        <TracingInspector as Inspector<CTX, EthInterpreter>>::selfdestruct(&mut self.tracer, contract, target, value)
     }
 }
 
@@ -230,17 +451,47 @@ impl StateDb for Db {
 }
 
 type Ctx<D> = Context<BlockEnv, TxEnv, CfgEnv, D, Journal<D>, (), LocalContext>;
-type SevmEvm<D> = Evm<Ctx<D>, TracingInspector, EthInstructions<EthInterpreter, Ctx<D>>, SevmPrecompiles, EthFrame<EthInterpreter>>;
+type SevmEvm<D> = Evm<Ctx<D>, SevmInspector, EthInstructions<EthInterpreter, Ctx<D>>, SevmPrecompiles, EthFrame<EthInterpreter>>;
 type Err = EVMError<std::convert::Infallible>;
 
 pub struct Executor<D: StateDb = Db> {
     pub cfg: Config,
     evm: SevmEvm<D>,
+    /// The host's validator state for warp predicate verification; None
+    /// takes the header's predicate results on trust.
+    pub validator_state: Option<Box<dyn ValidatorState>>,
+    /// The previous block's proposervm P-chain height (the pre-Etna predicate
+    /// context); None when unknown (a window's first block).
+    pub prev_pchain_height: Option<u64>,
+    /// Blocks whose predicates were verified against the validator state, and
+    /// blocks that carried predicates but could only be trusted.
+    pub predicates_verified: u64,
+    pub predicates_trusted: u64,
     /// Time split of execute_block: EVM run (incl. sender-side validation), trace
     /// JSON, journal finalize + rows + DB commit.
     pub t_evm: std::time::Duration,
     pub t_trace: std::time::Duration,
     pub t_commit: std::time::Duration,
+    pub trace: Trace,
+}
+
+/// DatabaseRef over a `&mut Database` (the prestate render reads the pre-tx
+/// state out of the executor's own db).
+struct RefDb<'a, D>(std::cell::RefCell<&'a mut D>);
+impl<D: Database> DatabaseRef for RefDb<'_, D> {
+    type Error = D::Error;
+    fn basic_ref(&self, a: Address) -> std::result::Result<Option<AccountInfo>, D::Error> {
+        self.0.borrow_mut().basic(a)
+    }
+    fn code_by_hash_ref(&self, h: B256) -> std::result::Result<Bytecode, D::Error> {
+        self.0.borrow_mut().code_by_hash(h)
+    }
+    fn storage_ref(&self, a: Address, i: revm::primitives::StorageKey) -> std::result::Result<revm::primitives::StorageValue, D::Error> {
+        self.0.borrow_mut().storage(a, i)
+    }
+    fn block_hash_ref(&self, n: u64) -> std::result::Result<B256, D::Error> {
+        self.0.borrow_mut().block_hash(n)
+    }
 }
 
 impl Executor<Db> {
@@ -260,8 +511,59 @@ impl<D: StateDb> Executor<D> {
             .with_cfg(CfgEnv::new_with_spec(spec))
             .modify_cfg_chained(|c| c.chain_id = cfg.chain_id);
         let trace_cfg = TracingInspectorConfig::from_geth_call_config(&CallConfig::default());
-        let evm = Evm::new_with_inspector(ctx, TracingInspector::new(trace_cfg), EthInstructions::new_mainnet_with_spec(spec), SevmPrecompiles::new(spec));
-        Executor { cfg, evm, t_evm: Default::default(), t_trace: Default::default(), t_commit: Default::default() }
+        let inspector = SevmInspector { tracer: TracingInspector::new(trace_cfg), deployer_allow_list: false };
+        let mut precompiles = SevmPrecompiles::new(spec);
+        precompiles.env.network_id = cfg.network_id;
+        precompiles.env.blockchain_id = cfg.blockchain_id;
+        let evm = Evm::new_with_inspector(ctx, inspector, EthInstructions::new_mainnet_with_spec(spec), precompiles);
+        Executor {
+            cfg,
+            evm,
+            validator_state: None,
+            prev_pchain_height: None,
+            predicates_verified: 0,
+            predicates_trusted: 0,
+            t_evm: Default::default(),
+            t_trace: Default::default(),
+            t_commit: Default::default(),
+            trace: Trace::Call(CallConfig::default()),
+        }
+    }
+
+    /// Switches the rendered trace (and the inspector's capture config).
+    pub fn set_trace(&mut self, t: Trace) {
+        let cfg = match &t {
+            Trace::Call(c) => TracingInspectorConfig::from_geth_call_config(c),
+            Trace::PreState(c) => TracingInspectorConfig::from_geth_prestate_config(c),
+            Trace::Struct(o) => TracingInspectorConfig::from_geth_config(o),
+            Trace::Noop | Trace::Off => TracingInspectorConfig::none(),
+        };
+        self.evm.inspector.tracer = TracingInspector::new(cfg);
+        self.trace = t;
+    }
+
+    /// The trace of the tx just run, under `self.trace`; `state` is the
+    /// finalized journal (post-tx, not yet committed).
+    fn render_trace(&mut self, res: &ExecutionResult, state: &EvmState, gas_used: u64, gas_limit: u64) -> Result<String> {
+        // callTracer's root frame reports the tx gas limit as `gas` (CaptureTxStart), not the
+        // post-intrinsic gas the top call started with.
+        self.evm.inspector.tracer.set_transaction_gas_limit(gas_limit);
+        Ok(match self.trace.clone() {
+            Trace::Off => String::new(),
+            Trace::Noop => "{}".to_string(),
+            Trace::Call(c) => serde_json::to_string(&self.evm.inspector.tracer.geth_builder().geth_call_traces(c, gas_used)).context("trace json")?,
+            Trace::Struct(o) => {
+                let ret = res.output().cloned().unwrap_or_default();
+                serde_json::to_string(&self.evm.inspector.tracer.geth_builder().geth_traces(gas_used, ret, o)).context("trace json")?
+            }
+            Trace::PreState(c) => {
+                let ras = ResultAndState { result: res.clone(), state: state.clone() };
+                let (ctx, insp) = (&mut self.evm.ctx, &self.evm.inspector);
+                let db = RefDb(std::cell::RefCell::new(ctx.db_mut()));
+                let f = insp.tracer.geth_builder().geth_prestate_traces(&ras, &c, &db).map_err(|e| anyhow!("prestate: {e:?}"))?;
+                serde_json::to_string(&f).context("trace json")?
+            }
+        })
     }
 
     /// Seeds db with what the genesis materialises: the alloc and every
@@ -269,11 +571,8 @@ impl<D: StateDb> Executor<D> {
     pub fn with_db(cfg: Config, db: D) -> Result<Executor<D>> {
         let mut ex = Executor::open(cfg, db);
 
-        // Genesis.toBlock: ApplyPrecompileActivations with no parent, then the alloc on top.
-        let acts: Vec<_> = ex.cfg.activating(None, ex.cfg.genesis_timestamp).into_iter().cloned().collect();
-        for c in &acts {
-            ex.activate(c, 0)?;
-        }
+        // Genesis.toBlock: the alloc, then ApplyPrecompileActivations with no parent
+        // on top (an initialMint adds to an alloc balance).
         let alloc = ex.cfg.alloc.clone();
         let db = ex.db_mut();
         for (addr, ga) in alloc {
@@ -294,7 +593,17 @@ impl<D: StateDb> Executor<D> {
             }
             db.commit([(addr, acct)].into_iter().collect());
         }
+        let acts: Vec<_> = ex.cfg.activating(None, ex.cfg.genesis_timestamp).into_iter().cloned().collect();
+        for c in &acts {
+            ex.activate(c, 0)?;
+        }
         Ok(ex)
+    }
+
+    /// An executor over a state that already holds some block's post-state
+    /// (a window replay): no genesis is materialised.
+    pub fn resume(cfg: Config, db: D) -> Result<Executor<D>> {
+        Ok(Executor::open(cfg, db))
     }
 
     pub fn db(&self) -> &D {
@@ -310,34 +619,121 @@ impl<D: StateDb> Executor<D> {
         self.db_mut().set_block_hash(number, hash);
     }
 
-    /// ApplyPrecompileActivations for one config: disable = SelfDestruct, else
-    /// SetNonce 1, SetCode 0x01, Configure.
-    fn activate(&mut self, c: &crate::config::PrecompileConfig, block_number: u64) -> Result<Vec<StateRow>> {
+    /// ApplyPrecompileActivations for one config: disable = SelfDestruct (and
+    /// Finalise, so a re-enable in the same block starts clean), else SetNonce 1,
+    /// SetCode 0x01, module.Configure.
+    fn activate(&mut self, c: &PrecompileConfig, block_number: u64) -> Result<(Vec<StateRow>, Vec<(B256, Bytes)>)> {
         let addr = c.address;
-        let mut rows = Vec::new();
-        let mut acct = Account::default();
-        acct.mark_touch();
         if c.disable {
+            let mut acct = Account::default();
+            acct.mark_touch();
             acct.mark_selfdestruct();
-            rows.push(StateRow::Account { addr, val: Vec::new() });
-            self.db_mut().commit([(addr, acct)].into_iter().collect());
-            return Ok(rows);
+            let db = self.db_mut();
+            db.commit([(addr, acct)].into_iter().collect());
+            db.forget(addr);
+            return Ok((vec![StateRow::Account { addr, val: Vec::new() }], Vec::new()));
         }
-        let writes = feemanager::configure(c, &self.cfg.fee_config, block_number)?;
+        let mut ops = vec![Op::Nonce(addr, 1), Op::Code(addr, Bytes::from_static(&[1]))];
+        let slots: Vec<(U256, U256)> = match module_index(addr) {
+            Some(1) => {
+                let (mint, slots) = nativeminter::configure(c);
+                ops.extend(mint.into_iter().map(|(a, v)| Op::AddBalance(a, v)));
+                slots
+            }
+            Some(3) => feemanager::configure(c, &self.cfg.fee_config, block_number)?,
+            Some(4) => rewardmanager::configure(c, self.cfg.allow_fee_recipients),
+            Some(5) => Vec::new(),
+            _ => allowlist::configure(c),
+        };
+        ops.extend(slots.into_iter().map(|(k, v)| Op::Slot(addr, k, v)));
+        Ok(self.apply_ops(ops))
+    }
+
+    /// stateupgrade.Configure: per account create if absent, AddBalance,
+    /// SetCode (nonce 1 when 0, EIP-158 always on), SetState.
+    fn apply_state_upgrade(&mut self, u: &StateUpgrade) -> (Vec<StateRow>, Vec<(B256, Bytes)>) {
+        let mut ops = Vec::new();
+        for (addr, a) in &u.accounts {
+            ops.push(Op::Touch(*addr));
+            if let Some(b) = a.balance_change {
+                ops.push(Op::AddBalance(*addr, b));
+            }
+            if !a.code.is_empty() {
+                ops.push(Op::CodeNonce(*addr, a.code.clone()));
+            }
+            for (k, v) in &a.storage {
+                ops.push(Op::Slot(*addr, U256::from_be_bytes(k.0), U256::from_be_bytes(v.0)));
+            }
+        }
+        self.apply_ops(ops)
+    }
+
+    /// Applies block-level state writes outside any tx (the StateDB calls of
+    /// Configure), one commit per account in first-touch order.
+    fn apply_ops(&mut self, ops: Vec<Op>) -> (Vec<StateRow>, Vec<(B256, Bytes)>) {
+        let mut rows = Vec::new();
+        let mut code_out = Vec::new();
+        let mut order: Vec<Address> = Vec::new();
+        for op in &ops {
+            let a = op.addr();
+            if !order.contains(&a) {
+                order.push(a);
+            }
+        }
         let db = self.db_mut();
-        let mut info = db.basic(addr).unwrap().unwrap_or_default();
-        info.nonce = 1;
-        info.code_hash = precompile_code_hash();
-        info.code = Some(Bytecode::new_raw(Bytes::from_static(&[1])));
-        acct.info = info;
-        for (slot, value) in writes {
-            let prev = db.storage(addr, slot).unwrap();
-            acct.storage.insert(slot, EvmStorageSlot::new_changed(prev, value, Default::default()));
-            rows.push(StateRow::Slot { addr, slot: B256::from(slot), val: trimmed(value) });
+        for addr in order {
+            let existed = db.basic(addr).unwrap();
+            let mut acct = Account::default();
+            acct.mark_touch();
+            acct.info = existed.clone().unwrap_or_default();
+            let mut touched_code = false;
+            let mut any_write = false;
+            for op in ops.iter().filter(|o| o.addr() == addr) {
+                match op {
+                    Op::Touch(_) => {}
+                    Op::Nonce(_, n) => {
+                        acct.info.nonce = *n;
+                        any_write = true;
+                    }
+                    Op::AddBalance(_, v) => {
+                        acct.info.balance = acct.info.balance.saturating_add(*v);
+                        any_write = true;
+                    }
+                    Op::Code(_, c) | Op::CodeNonce(_, c) => {
+                        if matches!(op, Op::CodeNonce(..)) && acct.info.nonce == 0 {
+                            acct.info.nonce = 1;
+                        }
+                        let code = Bytecode::new_raw(c.clone());
+                        acct.info.code_hash = code.hash_slow();
+                        acct.info.code = Some(code);
+                        touched_code = true;
+                        any_write = true;
+                    }
+                    Op::Slot(_, k, v) => {
+                        let prev = db.storage(addr, *k).unwrap();
+                        acct.storage.insert(*k, EvmStorageSlot::new_changed(prev, *v, Default::default()));
+                        rows.push(StateRow::Slot { addr, slot: B256::from(*k), val: trimmed(*v) });
+                        any_write = true;
+                    }
+                }
+            }
+            // An account only created (or a zero add) stays empty and is not materialised (EIP-158).
+            if acct.info.is_empty() && acct.storage.is_empty() {
+                if existed.is_some() && any_write {
+                    rows.push(StateRow::Account { addr, val: Vec::new() });
+                    db.commit([(addr, acct)].into_iter().collect());
+                    db.forget(addr);
+                }
+                continue;
+            }
+            if touched_code {
+                rows.push(StateRow::CodeUse { addr, code_hash: acct.info.code_hash });
+                code_out.push((acct.info.code_hash, acct.info.code.as_ref().unwrap().original_bytes()));
+            }
+            rows.push(StateRow::Account { addr, val: account_rlp(&acct.info) });
+            db.commit([(addr, acct)].into_iter().collect());
         }
-        rows.push(StateRow::Account { addr, val: account_rlp(&acct.info) });
-        db.commit([(addr, acct)].into_iter().collect());
-        Ok(rows)
+        (rows, code_out)
     }
 
     /// Execute one block on top of the current state. `parent_time` is the parent
@@ -347,16 +743,44 @@ impl<D: StateDb> Executor<D> {
         let time = h.time;
         let mut out = BlockResult::default();
 
+        // ApplyUpgrades: precompile activations in module order, then the state upgrades.
         let acts: Vec<_> = self.cfg.activating(Some(parent_time), time).into_iter().cloned().collect();
         for c in &acts {
-            out.tail.extend(self.activate(c, h.number)?);
+            let (rows, code) = self.activate(c, h.number)?;
+            out.tail.extend(rows);
+            out.code.extend(code);
         }
+        let ups: Vec<_> = self.cfg.activating_state_upgrades(Some(parent_time), time).into_iter().cloned().collect();
+        for u in &ups {
+            let (rows, code) = self.apply_state_upgrade(u);
+            out.tail.extend(rows);
+            out.code.extend(code);
+        }
+        let this_pchain = b.pvm.as_ref().map(|p| p.pchain_height);
         if b.txs.is_empty() {
             out.receipts_root = alloy_trie::EMPTY_ROOT_HASH;
+            self.prev_pchain_height = this_pchain;
             return Ok(out);
         }
 
-        self.set_block_env(h)?;
+        let enabled = self.set_block_env(h)?;
+        let durango = self.cfg.is_durango(time);
+        let granite = self.cfg.is_granite(time);
+        let tx_allow_list = enabled[2];
+        let warp_on = enabled[5];
+
+        // The header's predicate results (customheader.PredicateBytesFromExtra), and
+        // the proposervm context height the predicates were verified at
+        // (proposervm block.go: parent's height pre-Etna, own from Etna, the epoch's under Granite).
+        let header_results = if durango { warp::parse_block_results_opt(warp::predicate_bytes_from_extra(&h.extra)).map_err(|e| anyhow!("block {}: predicate results: {e}", h.number))? } else { Default::default() };
+        let context_height = if granite {
+            b.pvm.as_ref().and_then(|p| p.epoch_pchain_height)
+        } else if self.cfg.is_etna(time) {
+            this_pchain
+        } else {
+            self.prev_pchain_height
+        };
+        let warp_cfg = if warp_on { self.cfg.warp_config(time).cloned() } else { None };
 
         let mut cumulative = 0u64;
         let mut receipts = Vec::with_capacity(b.txs.len());
@@ -385,10 +809,53 @@ impl<D: StateDb> Executor<D> {
             if cumulative + t.gas_limit > h.gas_limit {
                 bail!("block {} tx {i}: gas limit reached (pool {}, tx {})", h.number, h.gas_limit - cumulative, t.gas_limit);
             }
+            // preCheck: the sender must be on the tx allow list while it is active
+            // (an accepted block never carries an offender).
+            if tx_allow_list {
+                let role = read_state_no_warm(&mut self.evm.ctx, TX_ALLOW_LIST, allowlist::role_slot(sender));
+                if !allowlist::is_enabled(role) {
+                    bail!("block {} tx {i} ({}): cannot issue transaction from non-allow listed address: {sender}", h.number, t.hash);
+                }
+            }
+            // CheckTxPredicates: the warp entries of the access list are predicates,
+            // charged their PredicateGas and verified before execution.
+            let mut handler = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default();
+            let mut predicates: Vec<Vec<B256>> = Vec::new();
+            let mut failed: Vec<u8> = Vec::new();
+            if let Some(wc) = &warp_cfg {
+                let mut delta: i128 = 0;
+                for a in t.access_list.iter().filter(|a| a.address == WARP) {
+                    let pg = warp::predicate_gas(&a.storage_keys, granite).map_err(|e| anyhow!("block {} tx {i} ({}): {e}", h.number, t.hash))?;
+                    delta += pg as i128 - (2400 + 1900 * a.storage_keys.len() as i128);
+                    predicates.push(a.storage_keys.clone());
+                }
+                if !predicates.is_empty() {
+                    handler.predicate_gas_delta = delta;
+                    failed = header_results.get(&t.hash).and_then(|m| m.get(&WARP)).cloned().unwrap_or_default();
+                    match (&mut self.validator_state, context_height) {
+                        (Some(vs), Some(height)) => {
+                            let mut bad = Vec::new();
+                            for (pi, p) in predicates.iter().enumerate() {
+                                if warp::verify_predicate(vs.as_mut(), p, self.cfg.network_id, self.cfg.subnet_id, height, wc.quorum_numerator, wc.require_primary_network_signers).is_err() {
+                                    bad.push(pi);
+                                }
+                            }
+                            let ours = warp::bits_from_indices(&bad);
+                            if ours != failed {
+                                bail!("block {} tx {i} ({}): predicate results differ from the header (ours {:x?}, header {:x?}, pchain height {height})", h.number, t.hash, ours, failed);
+                            }
+                            self.predicates_verified += 1;
+                        }
+                        _ => self.predicates_trusted += 1,
+                    }
+                }
+            }
+            self.evm.precompiles.env.predicates = predicates;
+            self.evm.precompiles.env.failed = failed;
             let t0 = std::time::Instant::now();
             self.evm.ctx.set_tx(tx_env);
-            self.evm.inspector.fuse();
-            let res: ExecutionResult = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default()
+            self.evm.inspector.tracer.fuse();
+            let res: ExecutionResult = handler
                 .inspect_run(&mut self.evm)
                 .map_err(|e| anyhow!("block {} tx {i} ({}): {e:?}", h.number, t.hash))?;
             let t1 = std::time::Instant::now();
@@ -398,17 +865,12 @@ impl<D: StateDb> Executor<D> {
             let gas_used = res.tx_gas_used();
             cumulative += gas_used;
             let status = res.is_success();
+            let trace_json = self.render_trace(&res, &state, gas_used, t.gas_limit)?;
             let logs = res.into_logs();
             let receipt = Receipt { status: Eip658Value::Eip658(status), cumulative_gas_used: cumulative, logs }.with_bloom();
             bloom |= receipt.logs_bloom;
             let tx_type = TxType::try_from(t.tx_type).map_err(|e| anyhow!("tx type {}: {e}", t.tx_type))?;
             let receipt = ReceiptEnvelope::from_typed(tx_type, receipt);
-
-            // callTracer's root frame reports the tx gas limit as `gas` (CaptureTxStart), not the
-            // post-intrinsic gas the top call started with.
-            self.evm.inspector.set_transaction_gas_limit(t.gas_limit);
-            let frame = self.evm.inspector.geth_builder().geth_call_traces(CallConfig::default(), gas_used);
-            let trace_json = serde_json::to_string(&frame).context("trace json")?;
             let t2 = std::time::Instant::now();
             self.t_trace += t2 - t1;
 
@@ -422,11 +884,12 @@ impl<D: StateDb> Executor<D> {
         out.gas_used = cumulative;
         out.bloom = bloom;
         out.receipts_root = alloy_trie::root::ordered_trie_root_with_encoder(&receipts, |r, buf| r.encode_2718(buf));
+        self.prev_pchain_height = this_pchain;
         Ok(out)
     }
 
     /// The block context of h: spec, fee rules, active precompiles.
-    fn set_block_env(&mut self, h: &block::Header) -> Result<()> {
+    fn set_block_env(&mut self, h: &block::Header) -> Result<[bool; 6]> {
         let time = h.time;
         let spec = self.cfg.spec(time);
         let basefee = h.base_fee.ok_or_else(|| anyhow!("block {} has no base fee", h.number))?;
@@ -444,15 +907,23 @@ impl<D: StateDb> Executor<D> {
             block_env.set_blob_excess_gas_and_price(h.excess_blob_gas.unwrap_or(0), revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
         }
         self.evm.ctx.set_block(block_env);
-        self.evm.ctx.modify_cfg(|c| c.spec = spec);
+        // The gas params table (EIP-3860 initcode words and the rest) is per spec: a bare
+        // `c.spec = spec` would keep the genesis spec's table across Durango and Etna.
+        self.evm.ctx.modify_cfg(|c| c.set_spec_and_mainnet_gas_params(spec));
         let durango = self.cfg.is_durango(time);
-        self.evm.precompiles.fee_manager = self.cfg.precompile_enabled(FEE_MANAGER, time);
-        self.evm.precompiles.durango = durango;
-        self.evm.precompiles.block_number = h.number;
-        if durango && self.cfg.is_granite(time) {
-            bail!("Granite rules (P256Verify, precompile delegatecall revert) are not implemented");
+        let granite = self.cfg.is_granite(time);
+        let mut enabled = [false; 6];
+        for (i, (_, addr)) in precompile::MODULES.iter().enumerate() {
+            enabled[i] = self.cfg.precompile_enabled(*addr, time);
         }
-        Ok(())
+        let pc = &mut self.evm.precompiles;
+        pc.enabled = enabled;
+        pc.block_time = time;
+        pc.env.durango = durango;
+        pc.env.block_number = h.number;
+        pc.set_granite(granite);
+        self.evm.inspector.deployer_allow_list = enabled[0];
+        Ok(enabled)
     }
 
     /// eth_call: one message against the current state in the block context
@@ -478,14 +949,16 @@ impl<D: StateDb> Executor<D> {
         };
         self.evm.ctx.modify_cfg(|c| {
             c.disable_base_fee = true;
-            c.disable_balance_check = true;
+            // geth's DoCall keeps buyGas's balance check (gas * price + value).
+            c.disable_balance_check = false;
             c.disable_nonce_check = true;
             c.disable_eip3607 = true;
             c.disable_block_gas_limit = true;
         });
         self.evm.ctx.set_tx(tx_env);
-        self.evm.inspector.fuse();
+        self.evm.inspector.tracer.fuse();
         let res = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default().inspect_run(&mut self.evm);
+        let state = self.evm.ctx.journal_mut().finalize();
         self.evm.ctx.journal_mut().clear();
         self.evm.ctx.modify_cfg(|c| {
             c.disable_base_fee = false;
@@ -496,10 +969,11 @@ impl<D: StateDb> Executor<D> {
         });
         let res = res.map_err(|e| anyhow!("{e:?}"))?;
         let gas_used = res.tx_gas_used();
+        let trace_json = self.render_trace(&res, &state, gas_used, msg.gas)?;
         Ok(match res {
-            ExecutionResult::Success { output, .. } => CallOut { gas_used, output: output.into_data(), revert: false, halt: None },
-            ExecutionResult::Revert { output, .. } => CallOut { gas_used, output, revert: true, halt: None },
-            ExecutionResult::Halt { reason, .. } => CallOut { gas_used, output: Bytes::new(), revert: false, halt: Some(format!("{reason:?}")) },
+            ExecutionResult::Success { output, .. } => CallOut { trace_json, gas_used, output: output.into_data(), revert: false, halt: None },
+            ExecutionResult::Revert { output, .. } => CallOut { trace_json, gas_used, output, revert: true, halt: None },
+            ExecutionResult::Halt { reason, .. } => CallOut { trace_json, gas_used, output: Bytes::new(), revert: false, halt: Some(format!("{reason:?}")) },
         })
     }
 
