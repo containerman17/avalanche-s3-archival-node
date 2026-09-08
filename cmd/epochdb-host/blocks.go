@@ -36,13 +36,16 @@ import (
 
 const (
 	genChainID  = 0xbe4c // 48716
-	genSenders  = 64
+	genSenders  = 1024
 	genGasLimit = 500_000_000
-	// slotWriter runtime: calldata start, count, salt; sstore(start+i, start+i+salt)
-	// for i in [0, count). Init code copies it and returns it.
-	slotWriterInit = "6022" + "80" + "600b" + "6000" + "39" + "6000" + "f3" +
-		"602035" + "600035" + "5b" + "8115" + "6020" + "57" + "8080" + "604035" + "01" + "90" + "55" + "600101" + "90600190" + "03" + "90" + "6006" + "56" + "5b00"
-	slotsPerTx = 50
+	// Token (gen_token.sol) selectors.
+	selTransfer     = "a9059cbb"
+	selApprove      = "095ea7b3"
+	selTransferFrom = "23b872dd"
+	selMint         = "40c10f19"
+	selMintMany     = "9579f5d1"
+	holdersPerMint  = 1000 // mintMany holders per prefill tx
+	mintsPerBlock   = 12   // mintMany txs per prefill block (state growth)
 )
 
 // genChain writes chain.json for the private chain when it is absent.
@@ -109,8 +112,43 @@ type gen struct {
 	keys     []*ecdsa.PrivateKey
 	nonces   []uint64
 	contract common.Address
-	accounts uint64 // fresh accounts created so far (transfer targets)
-	slots    uint64 // slots written so far in the contract
+	holders  uint64 // token holders seeded by mintMany so far (recipients)
+	rng      uint64
+}
+
+func (g *gen) next() uint64 {
+	// splitmix64
+	g.rng += 0x9e3779b97f4a7c15
+	z := g.rng
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+// holder returns the address mintMany(seed, n, amount) gave index i:
+// address(uint160(keccak256(abi.encode(seed, i)))).
+func holder(seed, i uint64) common.Address {
+	var b [64]byte
+	binary.BigEndian.PutUint64(b[24:32], seed)
+	binary.BigEndian.PutUint64(b[56:64], i)
+	return common.BytesToAddress(crypto.Keccak256(b[:]))
+}
+
+// holderAt maps a flat holder index to (seed, i).
+func holderAt(idx uint64) common.Address { return holder(idx/holdersPerMint, idx%holdersPerMint) }
+
+func word(v uint64) []byte {
+	var b [32]byte
+	binary.BigEndian.PutUint64(b[24:], v)
+	return b[:]
+}
+
+func call(sel string, args ...[]byte) []byte {
+	data := common.FromHex(sel)
+	for _, a := range args {
+		data = append(data, common.LeftPadBytes(a, 32)...)
+	}
+	return data
 }
 
 func (g *gen) sign(i int, to *common.Address, value *big.Int, gas uint64, data []byte) []byte {
@@ -166,44 +204,38 @@ func (g *gen) submit(ctx context.Context, raws [][]byte) error {
 	return nil
 }
 
-// account returns the address of fresh account n.
-func genAccount(n uint64) common.Address {
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], n)
-	return common.BytesToAddress(crypto.Keccak256([]byte("epochdb-blockbench-account"), b[:]))
+// traffic signs n realistic token txs from random senders: 60% transfer to a
+// random holder, 20% approve, 20% transferFrom (each sender was approved by
+// its predecessor at setup). Every tx reads owner/paused/fee/treasury, two
+// frozen flags, and two or three balances, and writes two or three slots.
+func (g *gen) traffic(n int) [][]byte {
+	raws := make([][]byte, 0, n)
+	amount := word(1_000_000_000_000)
+	for i := 0; i < n; i++ {
+		s := int(g.next() % uint64(len(g.keys)))
+		to := holderAt(g.next() % g.holders)
+		switch r := g.next() % 10; {
+		case r < 6:
+			raws = append(raws, g.sign(s, &g.contract, nil, 120_000, call(selTransfer, to.Bytes(), amount)))
+		case r < 8:
+			spender := crypto.PubkeyToAddress(g.keys[(s+1)%len(g.keys)].PublicKey)
+			raws = append(raws, g.sign(s, &g.contract, nil, 80_000, call(selApprove, spender.Bytes(), word(g.next()))))
+		default:
+			from := crypto.PubkeyToAddress(g.keys[(s+len(g.keys)-1)%len(g.keys)].PublicKey)
+			raws = append(raws, g.sign(s, &g.contract, nil, 140_000, call(selTransferFrom, from.Bytes(), to.Bytes(), amount)))
+		}
+	}
+	return raws
 }
 
-// txs signs n txs: half transfers, half slot writes. fresh=true creates new
-// accounts and slots; fresh=false rewrites existing ones (reads then writes).
-func (g *gen) txs(n int, fresh bool) [][]byte {
-	raws := make([][]byte, 0, n)
-	salt := big.NewInt(time.Now().UnixNano())
-	for i := 0; i < n; i++ {
-		s := i % len(g.keys)
-		if i%2 == 0 || g.contract == (common.Address{}) {
-			var idx uint64
-			if fresh || g.accounts == 0 {
-				idx = g.accounts
-				g.accounts++
-			} else {
-				idx = uint64(i) % g.accounts
-			}
-			to := genAccount(idx)
-			raws = append(raws, g.sign(s, &to, big.NewInt(1), 21000, nil))
-			continue
-		}
-		var start uint64
-		if fresh || g.slots == 0 {
-			start = g.slots
-			g.slots += slotsPerTx
-		} else {
-			start = (uint64(i) * slotsPerTx) % g.slots
-		}
-		data := make([]byte, 96)
-		binary.BigEndian.PutUint64(data[24:32], start)
-		binary.BigEndian.PutUint64(data[56:64], slotsPerTx)
-		salt.FillBytes(data[64:96])
-		raws = append(raws, g.sign(s, &g.contract, nil, 21000+slotsPerTx*25_000+10_000, data))
+// grow signs mintsPerBlock mintMany txs from the owner, each seeding
+// holdersPerMint fresh holders.
+func (g *gen) grow() [][]byte {
+	raws := make([][]byte, 0, mintsPerBlock)
+	for i := 0; i < mintsPerBlock; i++ {
+		seed := g.holders / holdersPerMint
+		raws = append(raws, g.sign(0, &g.contract, nil, 60_000+holdersPerMint*25_000, call(selMintMany, word(seed), word(holdersPerMint), word(1_000_000_000_000_000_000))))
+		g.holders += holdersPerMint
 	}
 	return raws
 }
@@ -277,26 +309,55 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 	if last.Height() != 0 {
 		return fmt.Errorf("generator wants a fresh data dir, found height %d", last.Height())
 	}
-	// Deploy the slot writer.
-	init := common.FromHex(slotWriterInit)
-	if err := g.submit(ctx, [][]byte{g.sign(0, nil, nil, 200_000, init)}); err != nil {
+	// Deploy the token (treasury = sender 1023, fee 25 bps), fund every sender,
+	// and let every sender approve its successor: setup blocks, not timed.
+	treasury := crypto.PubkeyToAddress(g.keys[genSenders-1].PublicKey)
+	init := append(common.FromHex(tokenBin), call("", treasury.Bytes(), word(25))...)
+	if err := g.submit(ctx, [][]byte{g.sign(0, nil, nil, 2_000_000, init)}); err != nil {
 		return err
 	}
 	blk, d, err := g.mine(ctx)
 	if err != nil {
 		return err
 	}
-	if len(blk.Transactions()) != 1 {
-		return fmt.Errorf("deploy block has %d txs", len(blk.Transactions()))
+	if len(blk.Transactions()) != 1 || blk.GasUsed() == 0 {
+		return fmt.Errorf("deploy block has %d txs, gas %d", len(blk.Transactions()), blk.GasUsed())
 	}
 	g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), 0)
-	log.Printf("gen deployed slot writer at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.contract, blk.NumberU64(), d[0], d[1], d[2], pl.tracker.pid.Load())
-
+	log.Printf("gen deployed token at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.contract, blk.NumberU64(), d[0], d[1], d[2], pl.tracker.pid.Load())
+	setup := make([][]byte, 0, 2*genSenders)
+	for i := 0; i < genSenders; i++ {
+		to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
+		setup = append(setup, g.sign(0, &g.contract, nil, 80_000, call(selMint, to.Bytes(), word(1<<62))))
+	}
+	for i := 0; i < genSenders; i++ {
+		spender := crypto.PubkeyToAddress(g.keys[(i+1)%genSenders].PublicKey)
+		setup = append(setup, g.sign(i, &g.contract, nil, 80_000, call(selApprove, spender.Bytes(), word(1<<62))))
+	}
+	if err := g.submit(ctx, setup); err != nil {
+		return err
+	}
+	if blk, _, err = g.mine(ctx); err != nil {
+		return err
+	}
+	if len(blk.Transactions()) != len(setup) {
+		return fmt.Errorf("setup block has %d txs, wanted %d", len(blk.Transactions()), len(setup))
+	}
+	// Prefill: each block grows holders and carries traffic.
+	if err := g.submit(ctx, g.grow()); err != nil {
+		return err
+	}
+	if blk, _, err = g.mine(ctx); err != nil {
+		return err
+	}
+	if blk.GasUsed() == 0 {
+		return errors.New("first mintMany block used no gas")
+	}
 	// Prefill.
 	start := time.Now()
 	var blocks, txs, gas uint64
 	for time.Since(start) < prefillFor {
-		if err := g.submit(ctx, g.txs(prefillBatch, true)); err != nil {
+		if err := g.submit(ctx, append(g.grow(), g.traffic(prefillBatch)...)); err != nil {
 			return err
 		}
 		blk, _, err = g.mine(ctx)
@@ -306,7 +367,7 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 		blocks++
 		txs += uint64(len(blk.Transactions()))
 		gas += blk.GasUsed()
-		if blk.Transactions().Len() < prefillBatch {
+		if blk.Transactions().Len() < prefillBatch+mintsPerBlock {
 			// The VM left txs in the pool (block gas limit); drain before the next batch.
 			for blk.GasUsed() > genGasLimit*9/10 {
 				if blk, _, err = g.mine(ctx); err != nil {
@@ -319,7 +380,7 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 		}
 	}
 	el := time.Since(start)
-	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f accounts=%d slots=%d height=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.accounts, g.slots, blk.NumberU64())
+	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d senders=%d height=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, genSenders, blk.NumberU64())
 
 	// Measured blocks: existing state, reads and writes.
 	for _, f := range strings.Split(sizes, ",") {
@@ -328,7 +389,7 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 			return fmt.Errorf("--gen-sizes: %w", err)
 		}
 		tSubmit := time.Now()
-		if err := g.submit(ctx, g.txs(n, false)); err != nil {
+		if err := g.submit(ctx, g.traffic(n)); err != nil {
 			return err
 		}
 		submit := time.Since(tSubmit)

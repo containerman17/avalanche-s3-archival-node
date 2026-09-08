@@ -1,30 +1,65 @@
 --- a/core/state/statedb.go
 +++ b/core/state/statedb.go
-@@ -49,6 +49,13 @@
- type revision struct {
- 	id           int
+@@ -51,6 +51,13 @@
  	journalIndex int
-+}
-+
+ }
+ 
 +// accountResetter receives account resets after transaction finalization.
 +// Trie backends that keep storage with accounts can discard the old storage
 +// before accepting writes from a recreated account.
 +type accountResetter interface {
 +	ResetAccount(common.Address) error
- }
- 
++}
++
  // StateDB structs within the ethereum protocol are used to store anything
-@@ -637,6 +644,9 @@
+ // within the merkle trie. StateDBs take care of caching and storing
+ // nested states. It's the general query interface to retrieve:
+@@ -85,6 +92,7 @@
+ 	// a state transition.
+ 	stateObjects         map[common.Address]*stateObject
+ 	stateObjectsPending  map[common.Address]struct{}            // State objects finalized but not yet written to the trie
++	pendingResets        map[common.Address]struct{}            // Objects whose replacement awaits an accountResetter notice
+ 	stateObjectsDirty    map[common.Address]struct{}            // State objects modified in the current execution
+ 	stateObjectsDestruct map[common.Address]*types.StateAccount // State objects destructed in the block along with its previous value
+ 
+@@ -162,6 +170,7 @@
+ 		storagesOrigin:       make(map[common.Address]map[common.Hash][]byte),
+ 		stateObjects:         make(map[common.Address]*stateObject),
+ 		stateObjectsPending:  make(map[common.Address]struct{}),
++		pendingResets:        make(map[common.Address]struct{}),
+ 		stateObjectsDirty:    make(map[common.Address]struct{}),
+ 		stateObjectsDestruct: make(map[common.Address]*types.StateAccount),
+ 		logs:                 make(map[common.Hash][]*types.Log),
+@@ -637,6 +646,10 @@
  func (s *StateDB) createObject(addr common.Address) (newobj, prev *stateObject) {
  	prev = s.getDeletedStateObject(addr) // Note, prev might have been deleted, we need that!
  	newobj = newObject(s, addr, nil)
 +	if _, ok := s.trie.(accountResetter); ok && prev != nil {
 +		newobj.pendingAccountReset = true
++		s.pendingResets[addr] = struct{}{}
 +	}
  	if prev == nil {
  		s.journal.append(createObjectChange{account: &addr})
  	} else {
-@@ -814,7 +824,9 @@
+@@ -705,6 +718,7 @@
+ 		storagesOrigin:       copy2DSet(s.storagesOrigin),
+ 		stateObjects:         make(map[common.Address]*stateObject, len(s.journal.dirties)),
+ 		stateObjectsPending:  make(map[common.Address]struct{}, len(s.stateObjectsPending)),
++		pendingResets:        make(map[common.Address]struct{}, len(s.pendingResets)),
+ 		stateObjectsDirty:    make(map[common.Address]struct{}, len(s.journal.dirties)),
+ 		stateObjectsDestruct: maps.Clone(s.stateObjectsDestruct),
+ 		refund:               s.refund,
+@@ -747,6 +761,9 @@
+ 		}
+ 		state.stateObjectsPending[addr] = struct{}{}
+ 	}
++	for addr := range s.pendingResets {
++		state.pendingResets[addr] = struct{}{}
++	}
+ 	for addr := range s.stateObjectsDirty {
+ 		if _, exist := state.stateObjects[addr]; !exist {
+ 			state.stateObjects[addr] = s.stateObjects[addr].deepCopy(state)
+@@ -814,7 +831,9 @@
  // Finalise finalises the state by removing the destructed objects and clears
  // the journal as well as the refunds. Finalise, however, will not push any updates
  // into the tries just yet. Only IntermediateRoot or Commit will do that.
@@ -34,25 +69,29 @@
  	addressesToPrefetch := make([][]byte, 0, len(s.journal.dirties))
  	for addr := range s.journal.dirties {
  		obj, exist := s.stateObjects[addr]
-@@ -829,6 +841,7 @@
+@@ -829,6 +848,10 @@
  		}
  		if obj.selfDestructed || (deleteEmptyObjects && obj.empty()) {
  			obj.deleted = true
-+			obj.pendingAccountReset = tracksResets
++			if tracksResets {
++				obj.pendingAccountReset = true
++				s.pendingResets[addr] = struct{}{}
++			}
  
  			// We need to maintain account deletions explicitly (will remain
  			// set indefinitely). Note only the first occurred self-destruct
-@@ -854,6 +867,20 @@
- 		// will start loading tries, and when the change is eventually committed,
+@@ -855,6 +878,22 @@
  		// the commit-phase will be a lot faster
  		addressesToPrefetch = append(addressesToPrefetch, common.CopyBytes(addr[:])) // Copy needed for closure
-+	}
+ 	}
 +	if tracksResets {
 +		// Copies retain pending resets even though StateDB.Copy drops the
-+		// journal. A reverted object replacement restores its previous flag.
-+		for addr := range s.stateObjectsPending {
-+			obj := s.stateObjects[addr]
-+			if !obj.pendingAccountReset {
++		// journal. A reverted object replacement restores its previous flag,
++		// so the candidate set is a hint and the object flag decides.
++		for addr := range s.pendingResets {
++			delete(s.pendingResets, addr)
++			obj, ok := s.stateObjects[addr]
++			if !ok || !obj.pendingAccountReset {
 +				continue
 +			}
 +			obj.pendingAccountReset = false
@@ -60,9 +99,10 @@
 +				s.setError(fmt.Errorf("resetAccount (%x) error: %w", addr[:], err))
 +			}
 +		}
- 	}
++	}
  	if s.prefetcher != nil && len(addressesToPrefetch) > 0 {
  		s.prefetcher.prefetch(common.Hash{}, s.originalRoot, common.Address{}, addressesToPrefetch)
+ 	}
 --- a/core/state/state_object.go
 +++ b/core/state/state_object.go
 @@ -89,6 +89,9 @@
