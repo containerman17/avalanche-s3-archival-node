@@ -1,21 +1,31 @@
-//! The DB (store/db.go, join.go): the window over the unflushed blocks plus
-//! the sealed runs, newest to oldest; one descent for everything.
+//! The DB (store/db.go, join.go, merge.go): the window over the unflushed
+//! blocks plus the sealed runs, newest to oldest; one descent for everything.
+//!
+//! Concurrency (the Go model): the run list is an immutable VERSION object
+//! (`Arc<Version>`) that is replaced, never edited; a reader clones the Arc
+//! once per read and the runs in it stay open (mapped) until the last holder
+//! lets go, so a run retired by a merge closes when its last reader leaves.
+//! The active window is behind a RwLock the writer holds only while it
+//! appends one block; a cut moves it whole into `frozen` (an Arc the readers
+//! share) and a thread seals it into an L0 run, so no reader ever waits for
+//! a seal or a merge.
 //!
 //! Deviations from the Go store (user ruling 2026-09-08: Go/Rust artifact
-//! compatibility does not matter): the run cut seals SYNCHRONOUSLY on the
-//! writer's thread; there is no terminal merge, every sealed run is final
-//! (level 1) and goes to the spool, so a publish uploads every run and the
-//! manifest lists them all.
+//! compatibility does not matter): none in the write order; the merge does
+//! not madvise its inputs out of the page cache.
 
 use crate::casfs::{latest_pointer, Store};
 use crate::format::*;
 use crate::run::{read_footer, run_file_name, Footer, Run, RunWriter};
+use crate::sst::SstIter;
 use crate::window::{BlockWrite, Memtable, FROZEN_LOG};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RunRef {
@@ -35,6 +45,8 @@ pub struct Manifest {
 }
 
 const MANIFEST_FILE: &str = "manifest.json";
+/// The terminal boundary in TxNum slots (merge.go TerminalTxs), pinned.
+pub const TERMINAL_TXS: u64 = 8_000_000;
 
 impl Manifest {
     pub fn load(dir: &Path) -> Result<Manifest> {
@@ -68,6 +80,11 @@ impl Manifest {
     pub fn head(&self) -> Option<&str> {
         self.runs.last().map(|r| r.name.as_str())
     }
+    /// The terminal prefix: what a publish lists (Go's publishable()).
+    pub fn publishable(&self) -> Manifest {
+        let n = self.runs.iter().take_while(|r| r.level >= TERMINAL_LEVEL).count();
+        Manifest { storage_version: self.storage_version, chain_root: self.chain_root.clone(), runs: self.runs[..n].to_vec() }
+    }
 }
 
 fn decode_root(s: &str) -> Result<[u8; 32]> {
@@ -75,16 +92,52 @@ fn decode_root(s: &str) -> Result<[u8; 32]> {
     b.try_into().map_err(|_| anyhow!("store: {s:?} is not a 32-byte hash"))
 }
 
-pub struct DB {
-    pub dir: PathBuf,
-    pub cas: Store,
-    pub chain_root: [u8; 32],
-    mem: Memtable,
+/// The run list and its manifest as one immutable object.
+pub struct Version {
     pub man: Manifest,
-    runs: Vec<Arc<Run>>,
+    pub runs: Vec<Arc<Run>>,
+}
+
+/// What a read descends: the frozen window (if a cut is in flight) and the
+/// version, captured in that order so a block moving frozen -> run is seen
+/// in one of the two.
+pub struct View {
+    pub frozen: Option<Arc<Memtable>>,
+    pub ver: Arc<Version>,
+}
+
+impl View {
+    fn mems(&self) -> impl Iterator<Item = &Memtable> {
+        self.frozen.iter().map(|m| m.as_ref())
+    }
+}
+
+#[derive(Default)]
+struct MergeState {
+    running: Option<JoinHandle<Result<()>>>,
+    /// Sticky: the next maybe_merge hands it to the writer.
+    err: Option<String>,
+}
+
+/// Everything a seal or merge thread needs without the DB handle.
+struct Inner {
+    dir: PathBuf,
+    cas: Arc<Store>,
+    chain_root: [u8; 32],
+    frozen: RwLock<Option<Arc<Memtable>>>,
+    ver: RwLock<Arc<Version>>,
+    published: Mutex<Option<String>>,
+    merge: Mutex<MergeState>,
+    terminal_txs: u64,
+}
+
+pub struct DB {
+    inner: Arc<Inner>,
+    mem: RwLock<Memtable>,
+    cut: Mutex<Option<JoinHandle<Result<()>>>>,
+    read_only: bool,
     pub flush_txs: u64,
     pub flush_blocks: u64,
-    published: Option<String>,
 }
 
 impl DB {
@@ -113,7 +166,18 @@ impl DB {
             Some(r) => (r.to_tx, r.to_height + 1),
             None => (0, 0),
         };
-        let mut db = DB { dir: dir.to_path_buf(), cas, chain_root, mem: Memtable::open(&dir.join("window").join("window.log"), read_only)?, man, runs, flush_txs: FLUSH_TXS, flush_blocks: FLUSH_BLOCKS, published: None };
+        let terminal_txs = std::env::var("EPOCHDB_TERMINAL_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(TERMINAL_TXS);
+        let inner = Arc::new(Inner {
+            dir: dir.to_path_buf(),
+            cas: Arc::new(cas),
+            chain_root,
+            frozen: RwLock::new(None),
+            ver: RwLock::new(Arc::new(Version { man, runs })),
+            published: Mutex::new(None),
+            merge: Mutex::new(MergeState::default()),
+            terminal_txs,
+        });
+        let db = DB { inner, mem: RwLock::new(Memtable::open(&dir.join("window").join("window.log"), read_only)?), cut: Mutex::new(None), read_only, flush_txs: FLUSH_TXS, flush_blocks: FLUSH_BLOCKS };
         // A frozen log is a cut that did not finish: sealed first, its blocks come before the active log's.
         let fpath = dir.join("window").join(FROZEN_LOG);
         let (mut base_tx, mut base_height) = (base_tx, base_height);
@@ -125,45 +189,78 @@ impl DB {
                 base_tx = fnt;
                 base_height = fnh;
                 if !read_only {
-                    db.seal(fm, fbt, fnt, fbh, fnh)?;
+                    db.inner.seal(Arc::new(fm), fbt, fnt, fbh, fnh)?;
+                } else {
+                    *db.inner.frozen.write().unwrap() = Some(Arc::new(fm));
                 }
             } else if !read_only {
                 fm.remove()?;
             }
         }
-        db.mem.recover(base_tx, base_height)?;
+        db.mem.write().unwrap().recover(base_tx, base_height)?;
         Ok(db)
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.inner.dir
+    }
+    pub fn cas(&self) -> &Arc<Store> {
+        &self.inner.cas
+    }
+    pub fn chain_root(&self) -> [u8; 32] {
+        self.inner.chain_root
+    }
+    /// The current run list and manifest, one Arc clone: the runs in it stay
+    /// open for as long as the holder keeps it.
+    pub fn version(&self) -> Arc<Version> {
+        self.inner.ver.read().unwrap().clone()
+    }
+    pub fn manifest(&self) -> Manifest {
+        self.version().man.clone()
+    }
+    pub fn runs(&self) -> Vec<Arc<Run>> {
+        self.version().runs.clone()
+    }
+    fn view(&self) -> View {
+        self.inner.view()
+    }
+    /// The window and the view captured together (the cut takes the window
+    /// write lock, so the pair is one consistent moment): what a scan over
+    /// the window needs. Point reads probe the window first and take the
+    /// view after, which is consistent on its own (rows only ever move
+    /// window -> frozen -> run).
+    fn window_and_view(&self) -> (std::sync::RwLockReadGuard<'_, Memtable>, View) {
+        let mem = self.mem.read().unwrap();
+        let v = self.inner.view();
+        (mem, v)
+    }
+
     pub fn next_tx(&self) -> u64 {
-        let (_, next, _, _, started) = self.mem.window();
-        if started {
-            return next;
-        }
-        self.man.runs.last().map(|r| r.to_tx).unwrap_or(0)
+        self.mem.read().unwrap().window().1
     }
     pub fn next_height(&self) -> u64 {
-        let (_, _, _, next, started) = self.mem.window();
-        if started {
-            return next;
-        }
-        self.man.runs.last().map(|r| r.to_height + 1).unwrap_or(0)
+        self.mem.read().unwrap().window().3
     }
     pub fn head(&self) -> Option<u64> {
         self.next_height().checked_sub(1)
     }
-    pub fn sync(&mut self) -> Result<()> {
-        self.mem.sync()
+    /// fsyncs the window log. The buffer is flushed under the lock, the
+    /// fsync runs outside it through a second handle.
+    pub fn sync(&self) -> Result<()> {
+        let f = self.mem.write().unwrap().flush_and_dup()?;
+        f.sync_data()?;
+        Ok(())
     }
 
     /// Folds one block into the window and cuts a run when a trigger fires.
-    pub fn write_block(&mut self, b: &BlockWrite) -> Result<()> {
-        self.mem.add(b)?;
+    /// One writer thread; the window lock is held for the append only.
+    pub fn write_block(&self, b: &BlockWrite) -> Result<()> {
+        self.mem.write().unwrap().add(b)?;
         self.maybe_flush()
     }
 
-    pub fn maybe_flush(&mut self) -> Result<()> {
-        let (bt, nt, bh, nh, started) = self.mem.window();
+    pub fn maybe_flush(&self) -> Result<()> {
+        let (bt, nt, bh, nh, started) = self.mem.read().unwrap().window();
         if !started || (nt - bt < self.flush_txs && nh - bh < self.flush_blocks) {
             return Ok(());
         }
@@ -171,36 +268,123 @@ impl DB {
     }
 
     /// Cuts the window into a run now (a stop, a test).
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         self.cut_window()
     }
 
-    fn cut_window(&mut self) -> Result<()> {
-        let (bt, nt, bh, nh, started) = self.mem.window();
+    /// Waits for the in-flight cut, if any, and reports what it did.
+    pub fn wait_cut(&self) -> Result<()> {
+        let h = self.cut.lock().unwrap().take();
+        match h {
+            Some(h) => h.join().map_err(|_| anyhow!("store: the seal thread panicked"))?,
+            None => Ok(()),
+        }
+    }
+    /// Waits for the in-flight merge, if any, and reports the last merge's error.
+    pub fn wait_merge(&self) -> Result<()> {
+        self.inner.wait_merge()
+    }
+    /// Starts a terminal merge when the L0 tail has reached the boundary
+    /// (a thread), and reports the LAST merge's error, which is sticky.
+    pub fn maybe_merge(&self) -> Result<()> {
+        self.inner.maybe_merge()
+    }
+    /// Waits for the cut and the merge: nothing outlives the DB.
+    pub fn close(&self) -> Result<()> {
+        let a = self.wait_cut();
+        let b = self.wait_merge();
+        a.and(b)
+    }
+
+    /// Renames the full log to the frozen name, opens a fresh window and
+    /// seals the frozen one on a thread (the previous cut is waited for first).
+    fn cut_window(&self) -> Result<()> {
+        if self.read_only {
+            bail!("store: read-only");
+        }
+        self.wait_cut()?;
+        // The bulk of the log is fsynced outside the window lock; the seal
+        // thread fsyncs the frozen file again before it writes the run.
+        self.sync()?;
+        let mut m = self.mem.write().unwrap();
+        let (bt, nt, bh, nh, started) = m.window();
         if !started || nh == bh {
             return Ok(());
         }
-        self.mem.sync()?;
-        let dir = self.dir.join("window");
+        m.flush_and_dup()?;
+        let dir = self.inner.dir.join("window");
         let frozen = dir.join(FROZEN_LOG);
-        std::fs::rename(&self.mem.path, &frozen)?;
+        std::fs::rename(&m.path, &frozen)?;
         crate::casfs::sync_dir(&dir)?;
         let mut fresh = Memtable::open(&dir.join("window.log"), false)?;
         fresh.reset(nt, nh)?;
-        let mut m = std::mem::replace(&mut self.mem, fresh);
-        m.path = frozen;
-        self.seal(m, bt, nt, bh, nh)
+        let mut old = std::mem::replace(&mut *m, fresh);
+        old.path = frozen;
+        let old = Arc::new(old);
+        // Under the window lock: a reader that missed the fresh window finds
+        // the block in frozen.
+        *self.inner.frozen.write().unwrap() = Some(old.clone());
+        drop(m);
+        let inner = self.inner.clone();
+        *self.cut.lock().unwrap() = Some(std::thread::spawn(move || inner.seal(old, bt, nt, bh, nh)));
+        Ok(())
     }
 
-    /// Writes the frozen window into a run, publishes it in the manifest,
-    /// only then unlinks the log (publish before delete).
-    fn seal(&mut self, m: Memtable, base_tx: u64, next_tx: u64, base_height: u64, next_height: u64) -> Result<()> {
-        let prev = match self.man.runs.last() {
+    // -----------------------------------------------------------------------
+    // publish and join
+
+    /// Writes the manifest artifact (the terminal prefix) and points
+    /// `latest-<root>` at it; the bytes move on the next `sync_artifacts`.
+    pub fn publish(&self) -> Result<()> {
+        self.inner.publish()
+    }
+    /// Uploads the spool and reopens every run the upload released onto the
+    /// chunk cache (an unlinked mapped file would keep its blocks until exit).
+    pub fn sync_artifacts(&self) -> Result<Vec<String>> {
+        let released = self.inner.cas.sync()?;
+        if released.is_empty() {
+            return Ok(released);
+        }
+        let mut g = self.inner.ver.write().unwrap();
+        let cur = g.clone();
+        let mut runs = cur.runs.clone();
+        for r in runs.iter_mut() {
+            if released.contains(&r.name) {
+                let name = r.name.clone();
+                *r = Arc::new(Run::open(&self.inner.cas, &name).with_context(|| format!("store: run {name} was uploaded and unlinked but does not reopen"))?);
+            }
+        }
+        *g = Arc::new(Version { man: cur.man.clone(), runs });
+        Ok(released)
+    }
+}
+
+impl Drop for DB {
+    fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            eprintln!("store: close: {e:#}");
+        }
+    }
+}
+
+impl Inner {
+    fn view(&self) -> View {
+        let frozen = self.frozen.read().unwrap().clone();
+        let ver = self.ver.read().unwrap().clone();
+        View { frozen, ver }
+    }
+
+    /// Writes the frozen window into an L0 run, publishes it in the manifest
+    /// (durable manifest, then the version swap), only then unlinks the log.
+    fn seal(self: &Arc<Self>, m: Arc<Memtable>, base_tx: u64, next_tx: u64, base_height: u64, next_height: u64) -> Result<()> {
+        let t0 = Instant::now();
+        m.fsync()?;
+        let prev = match self.ver.read().unwrap().man.runs.last() {
             Some(r) => decode_root(&r.name)?,
             None => self.chain_root,
         };
-        let level = TERMINAL_LEVEL;
-        let path = run_file_name(&self.cas.spool, level, base_tx, next_tx);
+        let level = 0;
+        let path = run_file_name(&self.cas.local, level, base_tx, next_tx);
         let mut w = RunWriter::new(path, prev, level)?;
         if let Err(e) = write_sections(&mut w, &m) {
             w.abort();
@@ -208,23 +392,258 @@ impl DB {
         }
         let (name, _) = w.finish(&self.cas, base_tx, next_tx, base_height, next_height - 1)?;
         let run = Arc::new(Run::open(&self.cas, &name)?);
-        self.man.runs.push(RunRef { from_tx: base_tx, to_tx: next_tx, from_height: base_height, to_height: next_height - 1, name: name.clone(), level });
-        self.man.save(&self.dir)?;
-        self.runs.push(run);
+        {
+            let mut g = self.ver.write().unwrap();
+            let mut man = g.man.clone();
+            man.runs.push(RunRef { from_tx: base_tx, to_tx: next_tx, from_height: base_height, to_height: next_height - 1, name: name.clone(), level });
+            man.save(&self.dir)?;
+            let mut runs = g.runs.clone();
+            runs.push(run);
+            *g = Arc::new(Version { man, runs });
+            *self.frozen.write().unwrap() = None;
+        }
         m.remove()?;
-        eprintln!("store: sealed run {name} [blocks {base_height}..{}]", next_height - 1);
+        eprintln!("store: sealed run {name} [blocks {base_height}..{}] in {:.1}s", next_height - 1, t0.elapsed().as_secs_f64());
+        self.maybe_merge()?;
+        self.publish()
+    }
+
+    fn publish(&self) -> Result<()> {
+        let mut published = self.published.lock().unwrap();
+        let man = self.ver.read().unwrap().man.publishable();
+        let Some(head) = man.head().map(|s| s.to_string()) else { return Ok(()) };
+        if published.as_deref() == Some(&head) {
+            return Ok(());
+        }
+        let raw = serde_json::to_vec(&man)?;
+        let name = self.cas.put(&raw)?;
+        self.cas.set_pointer(&latest_pointer(&self.chain_root), &format!("manifest {name}\n"))?;
+        *published = Some(head);
         Ok(())
     }
 
     // -----------------------------------------------------------------------
+    // the terminal merge (merge.go): the L0 runs since the last terminal up
+    // to the one that crosses the boundary, 16-way merged into one terminal
+    // run, off the writer thread; the span is a function of chain content.
+
+    /// [start, end) of the next terminal, once the L0 tail holds one.
+    fn merge_span(runs: &[RunRef], terminal_txs: u64) -> Option<(usize, usize)> {
+        let mut start = runs.len();
+        while start > 0 && runs[start - 1].level < TERMINAL_LEVEL {
+            start -= 1;
+        }
+        (start..runs.len()).find(|&end| runs[end].to_tx - runs[start].from_tx >= terminal_txs).map(|end| (start, end + 1))
+    }
+
+    fn maybe_merge(self: &Arc<Self>) -> Result<()> {
+        let mut st = self.merge.lock().unwrap();
+        if let Some(e) = &st.err {
+            bail!("store: the terminal merge failed, execution stops: {e}");
+        }
+        if let Some(h) = &st.running {
+            if !h.is_finished() {
+                return Ok(());
+            }
+            let h = st.running.take().unwrap();
+            if let Err(e) = h.join().map_err(|_| anyhow!("the merge thread panicked"))? {
+                st.err = Some(format!("{e:#}"));
+                bail!("store: the terminal merge failed, execution stops: {e:#}");
+            }
+        }
+        let ver = self.ver.read().unwrap().clone();
+        let Some((start, end)) = Self::merge_span(&ver.man.runs, self.terminal_txs) else { return Ok(()) };
+        let me = self.clone();
+        st.running = Some(std::thread::spawn(move || {
+            let r = me.merge(start, end).and_then(|_| me.publish());
+            if let Err(e) = &r {
+                eprintln!("store: the terminal merge failed, execution will stop at the next flush: {e:#}");
+            }
+            r
+        }));
+        Ok(())
+    }
+
+    fn wait_merge(&self) -> Result<()> {
+        let h = self.merge.lock().unwrap().running.take();
+        let r = match h {
+            Some(h) => h.join().map_err(|_| anyhow!("store: the merge thread panicked"))?,
+            None => Ok(()),
+        };
+        let mut st = self.merge.lock().unwrap();
+        if let Err(e) = &r {
+            st.err = Some(format!("{e:#}"));
+        }
+        if let Some(e) = &st.err {
+            bail!("store: the terminal merge failed: {e}");
+        }
+        r
+    }
+
+    fn merge(&self, start: usize, end: usize) -> Result<()> {
+        let t0 = Instant::now();
+        // The merge is a reader too: the version holds its inputs open for
+        // the whole pass, whatever the swap below retires.
+        let ver = self.ver.read().unwrap().clone();
+        if end > ver.runs.len() {
+            bail!("store: merge span [{start},{end}) past {} runs", ver.runs.len());
+        }
+        let refs = ver.man.runs[start..end].to_vec();
+        let inputs = ver.runs[start..end].to_vec();
+        let prev = if start > 0 { decode_root(&ver.man.runs[start - 1].name)? } else { self.chain_root };
+        for w in refs.windows(2) {
+            if w[1].from_tx != w[0].to_tx || w[1].from_height != w[0].to_height + 1 {
+                bail!("store: merge inputs are not contiguous: {:?} then {:?}", w[0], w[1]);
+            }
+        }
+        let (from, to) = (refs[0].clone(), refs[refs.len() - 1].clone());
+        let path = run_file_name(&self.cas.spool, TERMINAL_LEVEL, from.from_tx, to.to_tx);
+        let mut w = RunWriter::new(path, prev, TERMINAL_LEVEL)?;
+        for s in SECTIONS {
+            let mut err = None;
+            let it = MergeIter::new(&inputs, s, &mut err)?;
+            if let Err(e) = w.section(s, it) {
+                w.abort();
+                return Err(e);
+            }
+            if let Some(e) = err {
+                w.abort();
+                return Err(e);
+            }
+        }
+        let rows = w.rows;
+        let (name, _) = w.finish(&self.cas, from.from_tx, to.to_tx, from.from_height, to.to_height)?;
+        // Verified: the merged run reopens and every row reads back out.
+        let merged = Run::open(&self.cas, &name).with_context(|| format!("store: merged run {name} does not reopen"))?;
+        let f = &merged.footer;
+        if f.from_tx != from.from_tx || f.to_tx != to.to_tx || f.from_height != from.from_height || f.to_height != to.to_height {
+            bail!("store: merged run {name} covers tx [{},{}) blocks [{},{}], want tx [{},{}) blocks [{},{}]", f.from_tx, f.to_tx, f.from_height, f.to_height, from.from_tx, to.to_tx, from.from_height, to.to_height);
+        }
+        for (i, s) in SECTIONS.iter().enumerate() {
+            let mut n = 0u64;
+            merged.scan_range(*s, &[], None, |_, _| {
+                n += 1;
+                true
+            })?;
+            if n != rows[i] {
+                bail!("store: merged run {name} section {s:?} reads back {n} rows, {} went in", rows[i]);
+            }
+        }
+        let merged = Arc::new(merged);
+        // Publish: the manifest lands durably, then the version swaps. The
+        // swap replaces the span and keeps every run appended meanwhile.
+        {
+            let mut g = self.ver.write().unwrap();
+            let old = &g.man.runs;
+            if end > old.len() || old[start].name != refs[0].name || old[end - 1].name != to.name {
+                bail!("store: the merged span [{start},{end}) moved under the merge: the manifest holds {} runs and no longer starts at {}", old.len(), refs[0].name);
+            }
+            let mut man = g.man.clone();
+            man.runs.splice(start..end, [RunRef { from_tx: from.from_tx, to_tx: to.to_tx, from_height: from.from_height, to_height: to.to_height, name: name.clone(), level: TERMINAL_LEVEL }]);
+            man.save(&self.dir)?;
+            let mut runs = g.runs.clone();
+            runs.splice(start..end, [merged]);
+            *g = Arc::new(Version { man, runs });
+        }
+        // Only now may the inputs go: unlink; the mapping closes with the
+        // last version holding it.
+        for r in &refs {
+            self.cas.drop_local(&r.name).with_context(|| format!("store: retire run {}", r.name))?;
+        }
+        eprintln!("store: merged {} L0 runs into terminal run {name} [tx {}..{}, blocks {}..{}]: {} chain + {} state + {} lookup rows in {:.1}s", inputs.len(), from.from_tx, to.to_tx, from.from_height, to.to_height, rows[0], rows[1], rows[2], t0.elapsed().as_secs_f64());
+        Ok(())
+    }
+}
+
+/// One input's position in one section.
+struct Cursor<'a> {
+    idx: usize,
+    it: SstIter<'a>,
+}
+
+/// The k-way merge of one section: key order, a tie (only ever a code/ row,
+/// content addressed) taken from the newest input once.
+struct MergeIter<'a> {
+    cur: Vec<Cursor<'a>>,
+    last: Vec<u8>,
+    started: bool,
+    err: &'a mut Option<anyhow::Error>,
+}
+
+impl<'a> MergeIter<'a> {
+    fn new(inputs: &'a [Arc<Run>], s: Section, err: &'a mut Option<anyhow::Error>) -> Result<MergeIter<'a>> {
+        let mut cur = Vec::with_capacity(inputs.len());
+        for (idx, r) in inputs.iter().enumerate() {
+            let mut it = r.sec[s as usize].iter();
+            if it.first()? {
+                cur.push(Cursor { idx, it });
+            }
+        }
+        Ok(MergeIter { cur, last: Vec::new(), started: false, err })
+    }
+}
+
+impl Iterator for MergeIter<'_> {
+    type Item = (Vec<u8>, Vec<u8>);
+    fn next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        loop {
+            // ponytail: a linear scan over at most 16 cursors, a heap when the fan-in grows
+            let mut best: Option<usize> = None;
+            for (i, c) in self.cur.iter().enumerate() {
+                best = match best {
+                    None => Some(i),
+                    Some(b) => {
+                        let o = c.it.key().cmp(self.cur[b].it.key());
+                        if o.is_lt() || (o.is_eq() && c.idx > self.cur[b].idx) {
+                            Some(i)
+                        } else {
+                            Some(b)
+                        }
+                    }
+                };
+            }
+            let b = best?;
+            let dup = self.started && self.cur[b].it.key() == self.last.as_slice();
+            let out = if dup { None } else { Some((self.cur[b].it.key().to_vec(), self.cur[b].it.value().to_vec())) };
+            if let Some((k, _)) = &out {
+                self.last.clear();
+                self.last.extend_from_slice(k);
+                self.started = true;
+            }
+            match self.cur[b].it.next() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.cur.swap_remove(b);
+                }
+                Err(e) => {
+                    *self.err = Some(e);
+                    self.cur.clear();
+                    return None;
+                }
+            }
+            if out.is_some() {
+                return out;
+            }
+        }
+    }
+}
+
+impl DB {
+    // -----------------------------------------------------------------------
     // reads
 
     fn chain_row(&self, fam: usize, n: u64) -> Result<Option<Vec<u8>>> {
-        if let Some(v) = self.mem.chain_get(fam, n)? {
+        if let Some(v) = self.mem.read().unwrap().chain_get(fam, n)? {
             return Ok(Some(v));
         }
+        let v = self.view();
+        for m in v.mems() {
+            if let Some(v) = m.chain_get(fam, n)? {
+                return Ok(Some(v));
+            }
+        }
         let by_height = fam_by_height(fam);
-        for r in self.runs.iter().rev() {
+        for r in v.ver.runs.iter().rev() {
             let f = &r.footer;
             let inside = if by_height { n >= f.from_height && n <= f.to_height } else { n >= f.from_tx && n < f.to_tx };
             if inside {
@@ -331,10 +750,16 @@ impl DB {
     }
 
     fn lookup_num(&self, key: &[u8]) -> Result<Option<u64>> {
-        if let Some(n) = self.mem.nums.get(key) {
+        if let Some(n) = self.mem.read().unwrap().nums.get(key) {
             return Ok(Some(*n));
         }
-        for r in self.runs.iter().rev() {
+        let v = self.view();
+        for m in v.mems() {
+            if let Some(n) = m.nums.get(key) {
+                return Ok(Some(*n));
+            }
+        }
+        for r in v.ver.runs.iter().rev() {
             if let Some(v) = r.get(Section::Lookup, key)? {
                 if v.len() != 8 {
                     bail!("store: lookup row is {} bytes, want 8", v.len());
@@ -356,10 +781,16 @@ impl DB {
 
     /// The newest value under prefix at or below TxNum at.
     fn latest(&self, prefix: &[u8], at: u64) -> Result<Option<Vec<u8>>> {
-        if let Some((v, _)) = self.mem.latest_state(prefix, at) {
+        if let Some((v, _)) = self.mem.read().unwrap().latest_state(prefix, at) {
             return Ok(Some(v));
         }
-        for r in self.runs.iter().rev() {
+        let view = self.view();
+        for m in view.mems() {
+            if let Some((v, _)) = m.latest_state(prefix, at) {
+                return Ok(Some(v));
+            }
+        }
+        for r in view.ver.runs.iter().rev() {
             if r.footer.from_tx > at {
                 continue;
             }
@@ -381,17 +812,64 @@ impl DB {
     }
     pub fn code(&self, hash: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Ok(h) = <[u8; 32]>::try_from(hash) {
-            if let Some(b) = self.mem.code.get(&h) {
+            if let Some(b) = self.mem.read().unwrap().code.get(&h) {
                 return Ok(Some(b.clone()));
             }
         }
+        let v = self.view();
+        if let Ok(h) = <[u8; 32]>::try_from(hash) {
+            for m in v.mems() {
+                if let Some(b) = m.code.get(&h) {
+                    return Ok(Some(b.clone()));
+                }
+            }
+        }
         let key = code_key(hash);
-        for r in self.runs.iter().rev() {
+        for r in v.ver.runs.iter().rev() {
             if let Some(v) = r.get(Section::State, &key)? {
                 return Ok(Some(v));
             }
         }
         Ok(None)
+    }
+
+    /// Every code blob the store holds (the runs, then the windows): the
+    /// engine's code table at open.
+    pub fn each_code(&self, mut f: impl FnMut(&[u8; 32], &[u8]) -> Result<()>) -> Result<()> {
+        let window: Vec<([u8; 32], Vec<u8>)> = {
+            let (mem, v) = self.window_and_view();
+            let mut out: Vec<_> = v.mems().chain(std::iter::once(&*mem)).flat_map(|m| m.code.iter().map(|(h, b)| (*h, b.clone()))).collect();
+            out.sort();
+            out.dedup_by(|a, b| a.0 == b.0);
+            out
+        };
+        let v = self.view();
+        let mut seen = std::collections::HashSet::new();
+        for r in &v.ver.runs {
+            let mut err = None;
+            r.scan_range(Section::State, PREFIX_CODE, None, |k, val| {
+                if !k.starts_with(PREFIX_CODE) {
+                    return false;
+                }
+                let Ok(h) = <[u8; 32]>::try_from(&k[PREFIX_CODE.len()..]) else { return true };
+                if seen.insert(h) {
+                    if let Err(e) = f(&h, val) {
+                        err = Some(e);
+                        return false;
+                    }
+                }
+                true
+            })?;
+            if let Some(e) = err {
+                return Err(e);
+            }
+        }
+        for (h, b) in &window {
+            if seen.insert(*h) {
+                f(h, b)?;
+            }
+        }
+        Ok(())
     }
 
     /// One chain family over [from, to] in one sequential pass: the runs
@@ -404,7 +882,8 @@ impl DB {
         let prefix = FAM_PREFIX[fam];
         let mut next = from;
         let mut stopped = false;
-        for r in &self.runs {
+        let v = self.view();
+        for r in &v.ver.runs {
             let ft = &r.footer;
             let (lo, hi) = if by_height { (ft.from_height, ft.to_height) } else { (ft.from_tx, ft.to_tx.wrapping_sub(1)) };
             if (ft.to_tx == ft.from_tx && !by_height) || hi < next || lo > to {
@@ -433,9 +912,10 @@ impl DB {
                 return Ok(());
             }
         }
+        drop(v);
         for n in next..=to {
-            if let Some(v) = self.mem.chain_get(fam, n)? {
-                if !f(n, &v)? {
+            if let Some(row) = self.chain_row(fam, n)? {
+                if !f(n, &row)? {
                     return Ok(());
                 }
             }
@@ -446,7 +926,10 @@ impl DB {
     /// Posting entries under prefix with TxNum in [lo, hi]: runs oldest
     /// first then the window, each source's entries TxNum-ascending.
     pub fn postings(&self, prefix: &[u8], lo: u64, hi: u64, mut f: impl FnMut(&[u8], u64, u8) -> bool) -> Result<()> {
-        for r in &self.runs {
+        let (mem, v) = self.window_and_view();
+        let window: Vec<(Vec<u8>, u64, u8)> = v.mems().chain(std::iter::once(&*mem)).flat_map(|m| m.post.iter().filter(|(g, n, _)| *n >= lo && *n <= hi && g.starts_with(prefix)).cloned()).collect();
+        drop(mem);
+        for r in &v.ver.runs {
             if r.footer.to_tx <= lo || r.footer.from_tx > hi {
                 continue;
             }
@@ -458,10 +941,10 @@ impl DB {
                 }
             }
         }
-        let mut ents: Vec<_> = self.mem.post.iter().filter(|(g, n, _)| *n >= lo && *n <= hi && g.starts_with(prefix)).collect();
+        let mut ents = window;
         ents.sort_by_key(|e| e.1);
         for (g, n, p) in ents {
-            if !f(g, *n, *p) {
+            if !f(&g, n, p) {
                 return Ok(());
             }
         }
@@ -469,7 +952,12 @@ impl DB {
     }
     /// Distinct posting groups under prefix, once per source.
     pub fn groups(&self, prefix: &[u8], mut f: impl FnMut(&[u8]) -> bool) -> Result<()> {
-        for r in &self.runs {
+        let (mem, v) = self.window_and_view();
+        let mut window: Vec<Vec<u8>> = v.mems().chain(std::iter::once(&*mem)).flat_map(|m| m.post.iter().filter(|(g, _, _)| g.starts_with(prefix)).map(|(g, _, _)| g.clone())).collect();
+        drop(mem);
+        window.sort();
+        window.dedup();
+        for r in &v.ver.runs {
             let mut stop = false;
             r.scan_groups(prefix, |g| {
                 if !f(g) {
@@ -481,9 +969,8 @@ impl DB {
                 return Ok(());
             }
         }
-        let mut seen = std::collections::HashSet::new();
-        for (g, _, _) in &self.mem.post {
-            if g.starts_with(prefix) && seen.insert(g.clone()) && !f(g) {
+        for g in &window {
+            if !f(g) {
                 return Ok(());
             }
         }
@@ -492,7 +979,11 @@ impl DB {
     /// Distinct set/ keys under prefix across every run and the window.
     pub fn set_scan(&self, prefix: &[u8], mut f: impl FnMut(&[u8]) -> bool) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
-        for r in &self.runs {
+        let (mem, v) = self.window_and_view();
+        let mut window: Vec<Vec<u8>> = v.mems().chain(std::iter::once(&*mem)).flat_map(|m| m.sets.iter().filter(|k| k.starts_with(prefix)).cloned()).collect();
+        drop(mem);
+        window.sort();
+        for r in &v.ver.runs {
             let mut stop = false;
             r.scan_set(prefix, |k| {
                 if seen.insert(k.to_vec()) && !f(k) {
@@ -504,10 +995,8 @@ impl DB {
                 return Ok(());
             }
         }
-        let mut rows: Vec<&Vec<u8>> = self.mem.sets.iter().filter(|k| k.starts_with(prefix)).collect();
-        rows.sort();
-        for k in rows {
-            if seen.insert(k.clone()) && !f(k) {
+        for k in window {
+            if seen.insert(k.clone()) && !f(&k) {
                 return Ok(());
             }
         }
@@ -516,14 +1005,15 @@ impl DB {
     /// The block a TxNum belongs to.
     pub fn height_of_tx(&self, txnum: u64) -> Result<Option<u64>> {
         let (mut lo, mut hi) = {
-            let (bt, nt, bh, nh, started) = self.mem.window();
-            if started && txnum >= bt && txnum < nt {
-                (bh, nh - 1)
-            } else {
-                match self.man.runs.iter().find(|r| txnum >= r.from_tx && txnum < r.to_tx) {
+            let win = self.mem.read().unwrap().window();
+            let v = self.view();
+            let wins: Vec<_> = v.mems().map(|m| m.window()).chain(std::iter::once(win)).collect();
+            match wins.iter().find(|w| w.4 && txnum >= w.0 && txnum < w.1).map(|w| (w.2, w.3 - 1)) {
+                Some(r) => r,
+                None => match v.ver.man.runs.iter().find(|r| txnum >= r.from_tx && txnum < r.to_tx) {
                     Some(r) => (r.from_height, r.to_height),
                     None => return Ok(None),
-                }
+                },
             }
         };
         while lo < hi {
@@ -538,37 +1028,6 @@ impl DB {
         Ok(Some(lo))
     }
 
-    // -----------------------------------------------------------------------
-    // publish and join
-
-    /// Writes the manifest artifact and points `latest-<root>` at it; the
-    /// bytes move on the next `sync_artifacts`.
-    pub fn publish(&mut self) -> Result<()> {
-        let Some(head) = self.man.head().map(|s| s.to_string()) else { return Ok(()) };
-        if self.published.as_deref() == Some(&head) {
-            return Ok(());
-        }
-        let raw = serde_json::to_vec(&self.man)?;
-        let name = self.cas.put(&raw)?;
-        self.cas.set_pointer(&latest_pointer(&self.chain_root), &format!("manifest {name}\n"))?;
-        self.published = Some(head);
-        Ok(())
-    }
-    /// Uploads the spool and reopens every run the upload released onto the
-    /// chunk cache (an unlinked mapped file would keep its blocks until exit).
-    pub fn sync_artifacts(&mut self) -> Result<Vec<String>> {
-        let released = self.cas.sync()?;
-        for i in 0..self.runs.len() {
-            if released.contains(&self.runs[i].name) {
-                let name = self.runs[i].name.clone();
-                self.runs[i] = Arc::new(Run::open(&self.cas, &name).with_context(|| format!("store: run {name} was uploaded and unlinked but does not reopen"))?);
-            }
-        }
-        Ok(released)
-    }
-    pub fn runs(&self) -> &[Arc<Run>] {
-        &self.runs
-    }
 }
 
 /// Makes dir able to serve a published chain: pointer, manifest, then the
@@ -711,4 +1170,145 @@ fn write_sections(w: &mut RunWriter, m: &Memtable) -> Result<()> {
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     w.section(Section::Lookup, rows.into_iter())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window::{StateRow, TxWrite};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn addr(h: u64, i: u64) -> [u8; 20] {
+        let mut a = [0u8; 20];
+        a[..8].copy_from_slice(&(h * 10 + i).to_be_bytes());
+        a
+    }
+    /// Block h: 3 txs, each writing one account row and one slot, plus a
+    /// tail row; the header bytes name the height.
+    fn block(h: u64) -> BlockWrite {
+        let mut b = BlockWrite { height: h, header_rlp: format!("hdr-{h:08}").into_bytes(), ..Default::default() };
+        b.container_id = state::keccak::keccak256(&b.header_rlp);
+        for i in 0..3u64 {
+            let hash = state::keccak::keccak256(&(h * 3 + i).to_be_bytes());
+            b.txs.push(TxWrite {
+                hash,
+                rlp: format!("tx-{h}-{i}").into_bytes(),
+                receipt: crate::receipts::encode(1, 21000, 21000 * (i + 1), &[]),
+                frames: b"{}".to_vec(),
+                frame_addrs: vec![],
+                state: vec![StateRow { kind: b'a', addr: addr(h, i), slot: [0; 32], val: vec![h as u8, i as u8] }, StateRow { kind: b's', addr: addr(h, i), slot: [1; 32], val: vec![9, h as u8] }],
+                sender: Some(addr(h, i)),
+                to: None,
+                created: None,
+                logs: vec![],
+            });
+        }
+        b.tail.push(StateRow { kind: b'a', addr: addr(0, 0), slot: [0; 32], val: vec![h as u8] });
+        b
+    }
+    /// Every row of block h at its own TxNum, through the public read API.
+    fn check(db: &DB, h: u64) -> Result<()> {
+        let want = block(h);
+        let hdr = db.header_rlp(h)?.ok_or_else(|| anyhow!("hdr/{h} missing"))?;
+        anyhow::ensure!(hdr == want.header_rlp, "hdr/{h}");
+        anyhow::ensure!(db.height_by_hash(&state::keccak::keccak256(&hdr))? == Some(h), "blkh {h}");
+        let (first, count) = db.block_tx_range(h)?.ok_or_else(|| anyhow!("blk/{h} missing"))?;
+        anyhow::ensure!(count == 3 && first == (h - 1) * 4, "blk/{h}: {first} {count}");
+        anyhow::ensure!(db.container_at(h)?.is_some(), "container {h}");
+        for (i, t) in want.txs.iter().enumerate() {
+            let n = first + i as u64;
+            anyhow::ensure!(db.tx_rlp(n)? == Some(t.rlp.clone()), "tx/{n}");
+            anyhow::ensure!(db.receipt(n)? == Some(t.receipt.clone()), "rcpt/{n}");
+            anyhow::ensure!(db.txnum_by_hash(&t.hash)? == Some(n), "txh {n}");
+            anyhow::ensure!(db.height_of_tx(n)? == Some(h), "height_of_tx {n}");
+            anyhow::ensure!(db.account_at(&addr(h, i as u64), n)? == Some(t.state[0].val.clone()), "account {h}/{i}");
+            anyhow::ensure!(db.storage_at(&addr(h, i as u64), &[1; 32], n)? == Some(t.state[1].val.clone()), "slot {h}/{i}");
+            let mut hit = false;
+            db.postings(&addr_prefix(&addr(h, i as u64)), n, n, |_, nn, p| {
+                hit = nn == n && p & ROLE_SENDER != 0;
+                true
+            })?;
+            anyhow::ensure!(hit, "addr posting {h}/{i}");
+        }
+        anyhow::ensure!(db.account_at(&addr(0, 0), first + 3)? == Some(vec![h as u8]), "tail {h}");
+        Ok(())
+    }
+
+    /// 8 readers hammer every read path against a writer that appends,
+    /// seals a run every 40 blocks and merges every 5 runs, while every
+    /// answer for a block at or below the published head must be right and
+    /// no read may wait on a seal or a merge.
+    #[test]
+    fn readers_never_block_on_the_writer() {
+        let dir = std::env::temp_dir().join(format!("epochdb-hammer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("EPOCHDB_TERMINAL_TXS", "800");
+        let cas = Store::local(&dir).unwrap();
+        let mut db = DB::open(&dir, cas, [1u8; 32]).unwrap();
+        db.flush_blocks = 40;
+        let db = Arc::new(db);
+        let head = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicU64::new(0));
+        const N: u64 = 1200;
+        let mut readers = Vec::new();
+        for t in 0..8u64 {
+            let (db, head, stop) = (db.clone(), head.clone(), stop.clone());
+            readers.push(std::thread::spawn(move || -> Result<(u64, f64)> {
+                let mut reads = 0u64;
+                let mut worst = 0f64;
+                let mut x = t + 1;
+                while stop.load(Ordering::Relaxed) == 0 {
+                    let h = head.load(Ordering::Relaxed);
+                    if h == 0 {
+                        continue;
+                    }
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let pick = 1 + (x >> 33) % h;
+                    let t0 = Instant::now();
+                    check(&db, pick)?;
+                    worst = worst.max(t0.elapsed().as_secs_f64());
+                    reads += 1;
+                }
+                Ok((reads, worst))
+            }));
+        }
+        let mut seals = 0;
+        for h in 1..=N {
+            let before = db.manifest().runs.len();
+            db.write_block(&block(h)).unwrap();
+            if db.manifest().runs.len() != before {
+                seals += 1;
+            }
+            head.store(h, Ordering::Relaxed);
+            if h % 256 == 0 {
+                db.sync().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+        stop.store(1, Ordering::Relaxed);
+        let mut total = 0;
+        let mut worst = 0f64;
+        for r in readers {
+            let (n, w) = r.join().unwrap().unwrap();
+            total += n;
+            worst = worst.max(w);
+        }
+        let man = db.manifest();
+        let terminals = man.publishable().runs.len();
+        eprintln!("hammer: {total} reads on 8 threads, worst {:.1} ms, {} runs ({terminals} terminal), {} cuts seen by the writer", worst * 1e3, man.runs.len(), seals);
+        assert!(total > 1000, "the readers barely ran: {total}");
+        assert!(terminals >= 3, "expected terminals from the 800-slot boundary, got {terminals}");
+        assert!(man.runs.len() < N as usize / 40, "no merge happened: {} runs", man.runs.len());
+        for h in 1..=N {
+            check(&db, h).unwrap();
+        }
+        // The merged corpus reads back exactly, its runs tile, and the
+        // retired L0 files are gone.
+        let names: Vec<_> = std::fs::read_dir(dir.join("runs")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let l0 = man.runs.iter().filter(|r| r.level < TERMINAL_LEVEL).count();
+        assert_eq!(names.len(), l0, "local dir holds {names:?}, manifest lists {l0} L0 runs");
+        assert!(worst < 2.0, "a read waited {worst:.2}s");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

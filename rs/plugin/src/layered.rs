@@ -21,14 +21,13 @@ use revm::state::{AccountInfo, Bytecode, EvmState};
 use revm::{Database, DatabaseCommit};
 
 /// What accept hands the checker: the block's ordered write set, deployed
-/// code, receipts and traces. Taken out of the Pending once.
+/// code and the executor's result (receipts, traces, state rows: the
+/// store's rows are built from it off the verify path). Taken out of the
+/// Pending once.
 pub struct Payload {
     pub ws: Vec<(Vec<u8>, Vec<u8>)>,
     pub code: Vec<(B256, Bytes)>,
-    pub receipts: Vec<u8>,
-    pub traces: Vec<String>,
-    pub gas_used: u64,
-    pub txs: u64,
+    pub result: exec::BlockResult,
 }
 
 /// A verified block's state on top of its parent's.
@@ -131,7 +130,7 @@ impl Layered {
     }
 
     /// Close the block: its Pending, with the checker's payload inside.
-    pub fn finish(&mut self, number: u64, hash: B256, time: u64, receipts: Vec<u8>, traces: Vec<String>, gas_used: u64, txs: u64) -> Pending {
+    pub fn finish(&mut self, number: u64, hash: B256, time: u64, result: exec::BlockResult) -> Pending {
         let cur = std::mem::take(&mut self.cur);
         let parent = self.parent.take();
         Pending {
@@ -142,7 +141,7 @@ impl Layered {
             map: cur.map,
             owners: cur.owners,
             code: cur.code,
-            payload: Mutex::new(Some(Payload { ws: cur.ws, code: cur.new_code, receipts, traces, gas_used, txs })),
+            payload: Mutex::new(Some(Payload { ws: cur.ws, code: cur.new_code, result })),
         }
     }
 
@@ -219,9 +218,20 @@ impl Database for Layered {
     }
 }
 
-/// Backend::commit's rows, into cur instead of the overlay.
+/// Backend::commit's rows, into cur instead of the overlay. The rows of one
+/// commit are sorted by key: revm's EvmState iterates in a per-process
+/// random order, and the write set is stored (the ws/ row), so without the
+/// sort two processes write different bytes for the same block.
 impl DatabaseCommit for Layered {
     fn commit(&mut self, changes: EvmState) {
+        let start = self.cur.ws.len();
+        self.commit_rows(changes);
+        self.cur.ws[start..].sort_by(|a, b| a.0.cmp(&b.0));
+    }
+}
+
+impl Layered {
+    fn commit_rows(&mut self, changes: EvmState) {
         for (addr, a) in changes {
             if !a.is_touched() {
                 continue;

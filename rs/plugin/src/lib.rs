@@ -4,7 +4,6 @@ pub mod genesis;
 pub mod ghttp;
 pub mod dbstore;
 pub mod layered;
-pub mod log;
 pub mod node_engine;
 pub mod rpc;
 pub mod tree;

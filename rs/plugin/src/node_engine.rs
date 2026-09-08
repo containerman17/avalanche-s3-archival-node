@@ -8,8 +8,9 @@
 //! header. accept applies the write set to the fresh overlay, hands the
 //! block to the checker thread (Dirty root one block behind: a mismatch
 //! prints both roots and exits, the Go follower's log.Fatal; then the store
-//! write), and rolls by budget. Initialize opens the rolled pair the
-//! MANIFEST names and replays the store's rows since the roll (recover.go).
+//! write: the archival rows built from the block and its exec result), and
+//! rolls by budget. Initialize opens the rolled pair the MANIFEST names and
+//! replays the store's write sets since the roll (recover.go).
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use alloy_eips::eip2718::Encodable2718;
+use store::window::BlockWrite;
 use alloy_primitives::B256;
 use anyhow::{anyhow, bail, Context as _};
 use block::Block;
@@ -33,7 +35,7 @@ use state::view::{merge, View};
 
 use crate::genesis;
 use crate::layered::{Layered, Pending};
-use crate::log::{BlockLog, BlockStore, CodeLog, Record};
+use crate::dbstore::{BlockStore, DbStore, Record};
 use crate::tree::{hex, Engine, Error, Id, Meta};
 use crate::vm::Init;
 
@@ -49,8 +51,8 @@ const FLUSH_EVERY: u64 = 256;
 const PARSED_MAX: usize = 8192;
 
 struct CheckItem {
-    want: B256,
-    record: Record,
+    block: Arc<Block>,
+    payload: crate::layered::Payload,
 }
 
 enum Msg {
@@ -94,7 +96,6 @@ pub struct NodeEngine {
     pub genesis: Arc<Block>,
     pub inner: Mutex<Inner>,
     pub store: Arc<Mutex<Box<dyn BlockStore>>>,
-    code_log: Arc<Mutex<CodeLog>>,
     pub head: Mutex<Arc<Block>>,
     /// Accepted, not yet in the store (the checker is behind by at most CHECK_DEPTH).
     pub recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>,
@@ -109,9 +110,9 @@ pub struct NodeEngine {
 }
 
 /// The checker thread: Dirty apply + root per block (a mismatch kills the
-/// process), then the store append, fsync every FLUSH_EVERY blocks on a
-/// flusher thread.
-fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn BlockStore>>>, code_log: Arc<Mutex<CodeLog>>, recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>, stats: Arc<Stats>, flush: SyncSender<()>) -> anyhow::Result<()> {
+/// process), then the store's rows (BlockWrite::from_exec + the record) and
+/// the append, fsync every FLUSH_EVERY blocks on a flusher thread.
+fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn BlockStore>>>, recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>, stats: Arc<Stats>, flush: SyncSender<()>) -> anyhow::Result<()> {
     for msg in rx {
         let it = match msg {
             Msg::Park(parked, resume) => {
@@ -121,34 +122,41 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn
             }
             Msg::Block(it) => it,
         };
-        let h = it.record.height;
+        let CheckItem { block: b, payload } = *it;
+        let h = b.height;
         let t0 = Instant::now();
         {
             let mut d = dirty.lock().unwrap();
-            let root = if it.record.ws.is_empty() {
+            let root = if payload.ws.is_empty() {
                 d.current_root()
             } else {
-                for (k, v) in &it.record.ws {
+                for (k, v) in &payload.ws {
                     d.apply(k, v).with_context(|| format!("block {h}: apply write set"))?;
                 }
                 d.root().with_context(|| format!("block {h}: state root"))?
             };
-            if root != it.want.0 {
-                eprintln!("epochdb-rs: block {h}: state root mismatch: computed {}, header {}", B256::from(root), it.want);
+            if root != b.header.root.0 {
+                eprintln!("epochdb-rs: block {h}: state root mismatch: computed {}, header {}", B256::from(root), b.header.root);
                 std::process::exit(1);
             }
         }
-        store.lock().unwrap().append(&it.record).with_context(|| format!("block {h}: store append"))?;
-        code_log.lock().unwrap().append(&it.record.code).with_context(|| format!("block {h}: code append"))?;
-        recent.lock().unwrap().remove(&it.record.id);
+        let rows = BlockWrite::from_exec(&b, &payload.result).with_context(|| format!("block {h}: store rows"))?;
+        let mut receipts = Vec::new();
+        for t in &payload.result.txs {
+            t.receipt.encode_2718(&mut receipts);
+        }
+        let record = Record { height: h, id: b.hash.0, container: b.container.clone(), receipts, traces: Vec::new(), ws: payload.ws, code: payload.code, rows: Some(rows) };
+        store.lock().unwrap().append(record).with_context(|| format!("block {h}: store append"))?;
+        recent.lock().unwrap().remove(&b.hash.0);
         stats.checked.fetch_add(1, Ordering::Relaxed);
         tick(&stats.t_check, t0);
         if h % FLUSH_EVERY == 0 {
             let _ = flush.try_send(()); // flusher busy: coalesce into the next multiple
         }
     }
-    store.lock().unwrap().sync()?;
-    code_log.lock().unwrap().sync()?;
+    let mut s = store.lock().unwrap();
+    s.sync()?;
+    s.close()?;
     Ok(())
 }
 
@@ -183,7 +191,7 @@ impl NodeEngine {
                 // The genesis state through the executor (alloc + precompiles
                 // active at 0), into the first run and trie, root-checked.
                 let mut ex = Executor::with_db(cfg.clone(), Layered::new(Backend::new())).context("genesis state")?;
-                let p = ex.db_mut().finish(0, genesis.hash, 0, Vec::new(), Vec::new(), 0, 0);
+                let p = ex.db_mut().finish(0, genesis.hash, 0, exec::BlockResult { gas_used: 0, receipts_root: Default::default(), bloom: Default::default(), txs: Vec::new(), tail: Vec::new(), code: Vec::new() });
                 let payload = p.payload.lock().unwrap().take().unwrap();
                 be.apply_ws(&payload.ws);
                 for (h, c) in p.code {
@@ -206,17 +214,16 @@ impl NodeEngine {
             }
         };
 
-        let (store, torn) = BlockLog::open(&data.join("blocks.log"))?;
-        if torn > 0 {
-            eprintln!("epochdb-rs: blocks.log: dropped a torn tail of {torn} bytes");
-        }
-        let (code_log, codes, torn) = CodeLog::open(&data.join("code.log"))?;
-        if torn > 0 {
-            eprintln!("epochdb-rs: code.log: dropped a torn tail of {torn} bytes");
-        }
-        for (h, c) in codes {
-            be.code.insert(h, Bytecode::new_raw(c));
-        }
+        let chain_root: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&init.genesis_bytes).into();
+        let store = DbStore::open(&data.join("store"), chain_root).context("open the store")?;
+        let db = store.db.clone();
+        let mut ncode = 0usize;
+        db.each_code(|h, c| {
+            be.code.insert(B256::from(*h), Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(c)));
+            ncode += 1;
+            Ok(())
+        })
+        .context("the store's code table")?;
         let head_h = store.head();
         if head_h < rolled_h {
             bail!("vmstate rolled at height {rolled_h}, but the store holds blocks only through {head_h}");
@@ -254,6 +261,8 @@ impl NodeEngine {
                 std::process::exit(1);
             }
         }
+        // Code deployed since the roll came with the write sets above through
+        // the code/ rows, so nothing else to load.
         for h in head_h.saturating_sub(256)..=head_h {
             let id = if h == 0 { genesis.hash } else { B256::from(store.id_at(h).unwrap()) };
             be.set_block_hash(h, id);
@@ -264,33 +273,33 @@ impl NodeEngine {
             Arc::new(block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?)
         };
         eprintln!(
-            "epochdb-rs: recovered: rolled at {rolled_h} (gen {gen}), head {head_h} {}, rows replayed {rows}, root ok, in {:.0} ms",
+            "epochdb-rs: recovered: rolled at {rolled_h} (gen {gen}), head {head_h} {}, rows replayed {rows}, {ncode} code blobs, {} runs, root ok, in {:.0} ms",
             head.hash,
+            db.manifest().runs.len(),
             t0.elapsed().as_secs_f64() * 1e3
         );
 
         let dirty = Arc::new(Mutex::new(dirty));
         let roller = Roller::new(dir, gen, dirty.clone(), cpus);
         let ex = Executor::open(cfg.clone(), Layered::new(be));
-        let (blocks_fd, code_fd) = (store.dup()?, code_log.dup()?);
         let store: Arc<Mutex<Box<dyn BlockStore>>> = Arc::new(Mutex::new(Box::new(store)));
-        let code_log = Arc::new(Mutex::new(code_log));
         let recent = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
         let (check_tx, check_rx) = sync_channel::<Msg>(CHECK_DEPTH);
         let (flush_tx, flush_rx) = sync_channel::<()>(1);
-        // The flusher fsyncs through its own handles so the store lock stays free.
+        // The flusher fsyncs the window log off the checker (the DB flushes
+        // its buffer under the window lock and fsyncs through a second handle).
         std::thread::spawn(move || {
             for _ in flush_rx {
-                if let Err(e) = blocks_fd.sync_data().and_then(|_| code_fd.sync_data()) {
-                    eprintln!("epochdb-rs: store fsync: {e}");
+                if let Err(e) = db.sync() {
+                    eprintln!("epochdb-rs: store fsync: {e:#}");
                     std::process::exit(1);
                 }
             }
         });
         let checker = {
-            let (dirty, store, code_log, recent, stats) = (dirty.clone(), store.clone(), code_log.clone(), recent.clone(), stats.clone());
-            std::thread::spawn(move || checker(check_rx, dirty, store, code_log, recent, stats, flush_tx))
+            let (dirty, store, recent, stats) = (dirty.clone(), store.clone(), recent.clone(), stats.clone());
+            std::thread::spawn(move || checker(check_rx, dirty, store, recent, stats, flush_tx))
         };
         eprintln!(
             "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) workers={workers} dirty-workers={cpus}",
@@ -304,7 +313,6 @@ impl NodeEngine {
             genesis,
             inner: Mutex::new(Inner { ex, roller, roll_budget: sync_roll }),
             store,
-            code_log,
             head: Mutex::new(head),
             recent,
             parsed: Mutex::new(HashMap::new()),
@@ -327,10 +335,9 @@ impl NodeEngine {
         let (rtx, rrx) = sync_channel(0);
         tx.send(Msg::Park(ptx, rrx)).map_err(|_| anyhow!("checker gone"))?;
         prx.recv().map_err(|_| anyhow!("checker gone"))?;
-        let (store, code_log) = (self.store.clone(), self.code_log.clone());
+        let store = self.store.clone();
         let res = inner.roller.finish_roll(&mut inner.ex.db_mut().backend, r, || {
             store.lock().unwrap().sync()?;
-            code_log.lock().unwrap().sync()?;
             Ok(())
         });
         rtx.send(()).map_err(|_| anyhow!("checker gone"))?;
@@ -532,14 +539,7 @@ impl NodeEngine {
         if r.bloom != h.bloom {
             return Err(format!("block {}: logsBloom differs from the header", h.number).into());
         }
-        let mut receipts = Vec::new();
-        let mut traces = Vec::with_capacity(r.txs.len());
-        for t in r.txs {
-            t.receipt.encode_2718(&mut receipts);
-            traces.push(t.trace_json);
-        }
-        let txs = traces.len() as u64;
-        Ok(inner.ex.db_mut().finish(b.height, b.hash, h.time, receipts, traces, r.gas_used, txs))
+        Ok(inner.ex.db_mut().finish(b.height, b.hash, h.time, r))
     }
 
     fn accept_inner(&self, b: &Arc<Block>, p: &Pending) -> Result<(), Error> {
@@ -558,11 +558,10 @@ impl NodeEngine {
         // From here the block's root is the header's or the checker dies.
         inner.roller.maybe_roll(be, inner.roll_budget, b.height, b.header.root);
         self.stats.executed.fetch_add(1, Ordering::Relaxed);
-        self.stats.txs.fetch_add(payload.txs, Ordering::Relaxed);
-        self.stats.gas.fetch_add(payload.gas_used, Ordering::Relaxed);
-        let record = Record { height: b.height, id: b.hash.0, container: b.container.clone(), receipts: payload.receipts, traces: payload.traces, ws: payload.ws, code: payload.code };
+        self.stats.txs.fetch_add(payload.result.txs.len() as u64, Ordering::Relaxed);
+        self.stats.gas.fetch_add(payload.result.gas_used, Ordering::Relaxed);
         let tx = self.check_tx.lock().unwrap().clone().ok_or("checker stopped")?;
-        tx.send(Msg::Block(Box::new(CheckItem { want: b.header.root, record }))).map_err(|_| "checker stopped")?;
+        tx.send(Msg::Block(Box::new(CheckItem { block: b.clone(), payload }))).map_err(|_| "checker stopped")?;
         if b.height % 256 == 0 {
             self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
         }

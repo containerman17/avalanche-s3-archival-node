@@ -12,6 +12,7 @@ state = { package = "epochdb-state", path = "../state" }
 block = { package = "epochdb-block", path = "../block" }
 exec = { package = "epochdb-exec", path = "../exec" }
 memmap2 = "0.9"
+libc = "0.2"
 zstd = "0.13"
 sha2 = "0.10"
 hmac = "0.12"

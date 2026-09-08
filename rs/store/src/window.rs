@@ -494,12 +494,22 @@ impl Memtable {
         self.f.sync_data()?;
         Ok(())
     }
+    /// fsyncs what was flushed (a frozen log, from the seal thread).
+    pub fn fsync(&self) -> Result<()> {
+        self.f.sync_data()?;
+        Ok(())
+    }
+    /// Flushes the buffer and hands back a second handle to fsync outside
+    /// the window lock.
+    pub fn flush_and_dup(&mut self) -> Result<fs::File> {
+        self.flush_buf()?;
+        Ok(self.f.try_clone()?)
+    }
 
-    /// Closes the log and deletes it (after the run it was sealed into is published).
-    pub fn remove(self) -> Result<()> {
-        let p = self.path.clone();
-        drop(self);
-        match fs::remove_file(&p) {
+    /// Unlinks the log (after the run it was sealed into is published); a
+    /// reader still holding this memtable keeps reading the open file.
+    pub fn remove(&self) -> Result<()> {
+        match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),

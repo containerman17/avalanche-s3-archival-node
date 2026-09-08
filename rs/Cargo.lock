@@ -1644,6 +1644,7 @@ dependencies = [
  "epochdb-state",
  "hex",
  "hmac",
+ "libc",
  "memmap2",
  "serde",
  "serde_json",

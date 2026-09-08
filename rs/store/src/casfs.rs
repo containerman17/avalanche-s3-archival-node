@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const CHUNK_SIZE: u64 = 4 << 20;
@@ -211,15 +212,56 @@ impl ReadAt for RemoteBlob {
 
 // ---------------------------------------------------------------------------
 // the chunk cache: <cache>/<window>/<ns>/<hash>.<idx>, 20-minute UTC windows
+// (casfs cache.go). Two watermarks in absolute free bytes on the cache
+// filesystem: below `min_free` a fill is served from memory and not written
+// (admission never evicts inline); below `evict_target` the worker drops the
+// oldest whole windows until free + freed >= target, in one pass counting
+// the bytes it freed itself. A chunk read from an old window is promoted
+// into the current one, so old windows drain into husks; `sweep` expires
+// windows past `max_age` and removes husks. The current window is never
+// evicted.
+
+const WINDOW_SECS: u64 = 1200;
+const SETTLE_SECS: u64 = 60;
+const POLL_SECS: u64 = 5;
+const SWEEP_SECS: u64 = 300;
+const TMP_MAX_AGE_SECS: u64 = 3600;
+const DEFAULT_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
+const DEFAULT_FULL_PCT: u64 = 95;
+const DEFAULT_EVICT_PCT: u64 = 90;
+
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    pub min_free: u64,
+    pub evict_target: u64,
+    pub max_age_secs: u64,
+}
+
+#[derive(Default, Debug)]
+pub struct CacheStats {
+    pub refusals: AtomicU64,
+    pub evictions: AtomicU64,
+    pub freed: AtomicU64,
+    pub fills: AtomicU64,
+}
+
+type FreeFn = Box<dyn Fn(&Path) -> Result<u64> + Send + Sync>;
 
 pub struct ChunkCache {
     root: PathBuf,
     ns: String,
     hot: Mutex<Vec<(String, Arc<Vec<u8>>)>>,
+    cfg: CacheConfig,
+    free: FreeFn,
+    pub stats: CacheStats,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn window_name(unix: u64) -> String {
-    let t = unix - unix % 1200;
+    let t = unix - unix % WINDOW_SECS;
     let days = t / 86400;
     let secs = t % 86400;
     // civil from days (Howard Hinnant)
@@ -236,26 +278,185 @@ fn window_name(unix: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}-{:02}", secs / 3600, (secs % 3600) / 60)
 }
 
-impl ChunkCache {
-    pub fn new(root: PathBuf, ns: String) -> ChunkCache {
-        ChunkCache { root, ns, hot: Mutex::new(Vec::new()) }
+/// A window name is exactly what window_name produces: fixed width, so a
+/// string compare orders windows in time; anything else is not ours.
+fn valid_window(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 16 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b'-' && name.chars().enumerate().all(|(i, c)| matches!(i, 4 | 7 | 10 | 13) || c.is_ascii_digit()) && matches!(&name[14..], "00" | "20" | "40")
+}
+
+/// Free bytes for an unprivileged writer on the filesystem holding path.
+pub fn statfs_free(path: &Path) -> Result<u64> {
+    statvfs(path).map(|(_, free)| free)
+}
+
+fn statvfs(path: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("statvfs {}", path.display()));
     }
-    fn find(&self, name: &str) -> Option<PathBuf> {
-        let mut wins: Vec<_> = fs::read_dir(&self.root).ok()?.flatten().map(|e| e.file_name()).collect();
+    Ok((st.f_blocks as u64 * st.f_frsize as u64, st.f_bavail as u64 * st.f_frsize as u64))
+}
+
+fn parse_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (n, mul) = match s.chars().last()? {
+        'h' => (&s[..s.len() - 1], 3600),
+        'm' => (&s[..s.len() - 1], 60),
+        's' => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    n.parse::<u64>().ok().map(|n| n * mul)
+}
+
+impl CacheConfig {
+    /// The Go defaults: min_free 5% of the filesystem, evict_target 10%;
+    /// EPOCHDB_CACHE_MIN_FREE (bytes) sets the floor with the target at
+    /// twice it; EPOCHDB_CACHE_MAX_AGE (seconds, or Nh / Nm / Ns).
+    pub fn from_env(root: &Path) -> Result<CacheConfig> {
+        let min_free: u64 = std::env::var("EPOCHDB_CACHE_MIN_FREE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let max_age_secs = std::env::var("EPOCHDB_CACHE_MAX_AGE").ok().and_then(|v| parse_secs(&v)).unwrap_or(DEFAULT_MAX_AGE_SECS);
+        let (min_free, evict_target) = if min_free > 0 {
+            (min_free, 2 * min_free)
+        } else {
+            let (total, _) = statvfs(root)?;
+            (total * (100 - DEFAULT_FULL_PCT) / 100, total * (100 - DEFAULT_EVICT_PCT) / 100)
+        };
+        Ok(CacheConfig { min_free, evict_target, max_age_secs })
+    }
+}
+
+impl ChunkCache {
+    pub fn new(root: PathBuf, ns: String) -> Result<ChunkCache> {
+        fs::create_dir_all(&root)?;
+        let cfg = CacheConfig::from_env(&root)?;
+        Ok(Self::with_free(root, ns, cfg, Box::new(statfs_free)))
+    }
+    /// A cache over an injected free-space reading (tests: a small fake cap).
+    pub fn with_free(root: PathBuf, ns: String, cfg: CacheConfig, free: FreeFn) -> ChunkCache {
+        ChunkCache { root, ns, hot: Mutex::new(Vec::new()), cfg, free, stats: CacheStats::default() }
+    }
+    pub fn config(&self) -> &CacheConfig {
+        &self.cfg
+    }
+    fn windows(&self) -> Vec<String> {
+        let mut wins: Vec<String> = fs::read_dir(&self.root).ok().into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| valid_window(n)).collect();
         wins.sort();
-        for w in wins.iter().rev() {
+        wins
+    }
+    /// The chunk's path, promoted into the current window on the way past.
+    fn find(&self, name: &str) -> Option<PathBuf> {
+        let cur = window_name(now_unix());
+        for w in self.windows().iter().rev() {
             let p = self.root.join(w).join(&self.ns).join(name);
             if p.is_file() {
+                if *w != cur {
+                    let dir = self.root.join(&cur).join(&self.ns);
+                    let to = dir.join(name);
+                    // A promotion that loses a race costs nothing: the old
+                    // path stays readable until its window is dropped.
+                    if fs::create_dir_all(&dir).is_ok() && fs::rename(&p, &to).is_ok() {
+                        return Some(to);
+                    }
+                }
                 return Some(p);
             }
         }
         None
     }
+    /// Writes a fetched chunk into the current window, unless the disk is
+    /// under the admission floor (a statfs error reads as full).
     fn admit(&self, name: &str, b: &[u8]) -> Result<()> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        let dir = self.root.join(window_name(now)).join(&self.ns);
+        let free = match (self.free)(&self.root) {
+            Ok(f) => f,
+            Err(_) => {
+                self.stats.refusals.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        };
+        if free < self.cfg.min_free {
+            self.stats.refusals.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.admit_in(&window_name(now_unix()), name, b)
+    }
+    fn admit_in(&self, window: &str, name: &str, b: &[u8]) -> Result<()> {
+        let dir = self.root.join(window).join(&self.ns);
         fs::create_dir_all(&dir)?;
-        write_durable(&dir.join(name), &[b])
+        write_durable(&dir.join(name), &[b])?;
+        self.stats.fills.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    /// One cleaning pass: below the eviction target, the oldest window goes,
+    /// again and again, until the target is reached or only the current
+    /// window is left. Counts its own bytes, never re-reads statfs. Reports
+    /// whether it freed anything (what the settle delay is for).
+    pub fn step(&self) -> bool {
+        let Ok(free) = (self.free)(&self.root) else { return false };
+        let mut freed = 0u64;
+        while free + freed < self.cfg.evict_target {
+            let Some(n) = self.evict_oldest() else { break };
+            freed += n;
+            self.stats.freed.fetch_add(n, Ordering::Relaxed);
+        }
+        freed > 0
+    }
+    /// Removes the oldest non-current window whole; the bytes it freed.
+    fn evict_oldest(&self) -> Option<u64> {
+        let cur = window_name(now_unix());
+        let w = self.windows().into_iter().next().filter(|w| *w < cur)?;
+        let dir = self.root.join(&w);
+        let n = dir_bytes(&dir);
+        fs::remove_dir_all(&dir).ok()?;
+        self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        Some(n)
+    }
+    /// The time-based half: windows past max_age go by name, husks (older,
+    /// empty) go, and tmp files a killed fill left behind are collected.
+    pub fn sweep(&self) {
+        let now = now_unix();
+        let cur = window_name(now);
+        let cutoff = window_name(now.saturating_sub(self.cfg.max_age_secs));
+        for w in self.windows() {
+            let dir = self.root.join(&w);
+            if w < cutoff {
+                let _ = fs::remove_dir_all(&dir);
+                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if w < cur && dir_bytes(&dir) == 0 {
+                let _ = fs::remove_dir_all(&dir);
+                continue;
+            }
+            for e in fs::read_dir(dir.join(&self.ns)).into_iter().flatten().flatten() {
+                let p = e.path();
+                let stale = p.extension().is_some_and(|x| x == "tmp") && e.metadata().and_then(|m| m.modified()).map(|t| t.elapsed().map(|d| d.as_secs() > TMP_MAX_AGE_SECS).unwrap_or(false)).unwrap_or(false);
+                if stale {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+    }
+    /// The worker: sweeps every 5 minutes, cleans every 5 s, waits a minute
+    /// after a pass that freed bytes (statfs lags a cohort of unlinks). Runs
+    /// while the store holds the cache.
+    fn spawn_worker(cache: &Arc<ChunkCache>) {
+        let weak = Arc::downgrade(cache);
+        std::thread::spawn(move || {
+            let mut last_sweep = 0u64;
+            loop {
+                let Some(c) = weak.upgrade() else { return };
+                if now_unix().saturating_sub(last_sweep) >= SWEEP_SECS {
+                    c.sweep();
+                    last_sweep = now_unix();
+                }
+                let d = if c.step() { SETTLE_SECS } else { POLL_SECS };
+                drop(c);
+                std::thread::sleep(std::time::Duration::from_secs(d));
+            }
+        });
     }
     /// One verified chunk, from RAM, the cache directory, or a ranged GET.
     fn chunk(&self, s3: &S3, hash: &str, size: u64, list: &[u8], idx: u64) -> Result<Arc<Vec<u8>>> {
@@ -295,6 +496,19 @@ impl ChunkCache {
         hot.push((name, b.clone()));
         Ok(b)
     }
+}
+
+/// Bytes under a directory (what dropping it frees).
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut n = 0;
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        match e.metadata() {
+            Ok(m) if m.is_dir() => n += dir_bytes(&e.path()),
+            Ok(m) => n += m.len(),
+            Err(_) => {}
+        }
+    }
+    n
 }
 
 pub fn verify_chunk(hash: &str, list: &[u8], idx: u64, b: &[u8]) -> Result<()> {
@@ -488,7 +702,9 @@ impl Store {
         fs::create_dir_all(&local)?;
         let cache_root = std::env::var("EPOCHDB_CACHE_DIR").ok().filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| dir.join("cache"));
         let ns = dir.canonicalize().ok().and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_else(|| "default".into());
-        Ok(Store { dir: dir.to_path_buf(), spool, local, s3: None, cache: Arc::new(ChunkCache::new(cache_root, ns)) })
+        let cache = Arc::new(ChunkCache::new(cache_root, ns)?);
+        ChunkCache::spawn_worker(&cache);
+        Ok(Store { dir: dir.to_path_buf(), spool, local, s3: None, cache })
     }
     /// Local, plus S3 when EPOCHDB_S3_ENDPOINT is set.
     pub fn open(dir: &Path) -> Result<Store> {
@@ -498,6 +714,9 @@ impl Store {
     }
     pub fn remote(&self) -> bool {
         self.s3.is_some()
+    }
+    pub fn cache(&self) -> &Arc<ChunkCache> {
+        &self.cache
     }
     pub fn spool_path(&self, hash: &str) -> PathBuf {
         self.spool.join(hash)
@@ -513,6 +732,18 @@ impl Store {
             }
         }
         None
+    }
+    /// Unlinks a run's local copy (an L0 in the local dir, or a spool copy):
+    /// a mapping still open keeps reading until it closes.
+    pub fn drop_local(&self, hash: &str) -> Result<()> {
+        if let Some(p) = self.local_path(hash) {
+            fs::remove_file(p)?;
+        }
+        let sp = self.spool_path(hash);
+        if sp.is_file() {
+            fs::remove_file(sp)?;
+        }
+        Ok(())
     }
     /// Seals a written file with its tail and renames it into the spool
     /// (terminal, uploads) or the local dir under `label-hash` (never uploads).
@@ -625,4 +856,60 @@ impl Store {
 
 pub fn latest_pointer(chain_root: &[u8; 32]) -> String {
     format!("latest-{}", hex::encode(chain_root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cache with a fake 10 KB filesystem: admission refuses under the
+    /// floor, a pass drops the oldest windows until the target, the current
+    /// window survives, a read promotes, sweep expires by age and drops husks.
+    #[test]
+    fn cache_admits_and_evicts_by_watermark() {
+        let root = std::env::temp_dir().join(format!("epochdb-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let cap = 10_000u64;
+        let cfg = CacheConfig { min_free: 2_000, evict_target: 4_000, max_age_secs: 7 * 86400 };
+        let c = ChunkCache::with_free(root.clone(), "ns".into(), cfg, Box::new(move |p| Ok(cap.saturating_sub(dir_bytes(p)))));
+        let now = now_unix();
+        let old = |days: u64| window_name(now - days * 86400);
+        let chunk = vec![7u8; 1_000];
+        // Three old windows of 2 KB each, then the current one.
+        for d in [3, 2, 1] {
+            c.admit_in(&old(d), "a.0", &chunk).unwrap();
+            c.admit_in(&old(d), "b.0", &chunk).unwrap();
+        }
+        c.admit("cur.0", &chunk).unwrap();
+        assert_eq!(dir_bytes(&root), 7_000);
+        // free = 3,000: over the floor, admitted; then 2,000, still admitted (>=); then refused.
+        c.admit("cur.1", &chunk).unwrap();
+        c.admit("cur.2", &chunk).unwrap();
+        assert_eq!(dir_bytes(&root), 9_000);
+        c.admit("cur.3", &chunk).unwrap();
+        assert_eq!(dir_bytes(&root), 9_000, "under the floor the fill is not written");
+        assert_eq!(c.stats.refusals.load(Ordering::Relaxed), 1);
+        // A pass: free 1,000 < target 4,000: drops the two oldest windows (4 KB) and stops.
+        assert!(c.step());
+        assert_eq!(c.stats.evictions.load(Ordering::Relaxed), 2);
+        assert_eq!(c.stats.freed.load(Ordering::Relaxed), 4_000);
+        assert_eq!(c.windows(), vec![old(1), window_name(now)]);
+        // A read from the old window promotes it into the current one.
+        let p = c.find("a.0").unwrap();
+        assert!(p.starts_with(root.join(window_name(now))));
+        assert!(!root.join(old(1)).join("ns").join("a.0").exists());
+        // Nothing to evict below the target but the current window: it stays.
+        c.admit_in(&old(1), "z.0", &vec![1u8; 3_000]).unwrap();
+        assert!(c.step());
+        assert_eq!(c.windows(), vec![window_name(now)]);
+        assert!(!c.step(), "only the current window is left: no progress, no theatre");
+        // Sweep: a window past max_age goes by name whatever it holds; an old husk goes.
+        c.admit_in(&old(8), "x.0", &chunk).unwrap();
+        fs::create_dir_all(root.join(old(2)).join("ns")).unwrap();
+        c.sweep();
+        assert_eq!(c.windows(), vec![window_name(now)]);
+        assert!(valid_window(&window_name(now)) && !valid_window("2026-09-09T01-15") && !valid_window("junk"));
+        let _ = fs::remove_dir_all(&root);
+    }
 }

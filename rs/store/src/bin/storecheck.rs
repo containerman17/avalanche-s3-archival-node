@@ -1,10 +1,12 @@
 //! rs/store driver and oracle CLI.
 //!
 //!   storecheck write   --dump F --genesis chain.json --upgrade upgrade.json --data DIR [--to N] [--flush-end] [--crash-at H] [--workers N]
-//!   storecheck verify  --dump F --genesis chain.json --upgrade upgrade.json --data DIR [--to N] [--postings-every N]
+//!   storecheck verify  --dump F --genesis chain.json --upgrade upgrade.json --data DIR [--to N] [--postings-every N] [--inner]
+//!                      (--inner: the store holds the unwrapped inner blocks, what a plugin under proposervm is handed)
 //!   storecheck readall --data DIR --genesis chain.json [--to N]
 //!   storecheck publish --data DIR --genesis chain.json      (EPOCHDB_S3_* in the environment)
 //!   storecheck join    --data DIR --genesis chain.json      (EPOCHDB_S3_* in the environment)
+//!   storecheck merge   --data DIR --genesis chain.json      (EPOCHDB_TERMINAL_TXS lowers the boundary; merges until no span is left)
 //!   storecheck probe   --data DIR
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -31,7 +33,9 @@ fn main() -> Result<()> {
         "publish" => publish(&args),
         "join" => join(&args),
         "probe" => probe(&args),
-        _ => Err(anyhow!("usage: storecheck write|verify|readall|publish|join|probe ...")),
+        "merge" => merge(&args),
+        "rowsum" => rowsum(&args),
+        _ => Err(anyhow!("usage: storecheck write|verify|readall|publish|join|merge|probe ...")),
     }
 }
 
@@ -96,7 +100,7 @@ fn blocks(args: &[String]) -> Result<block::Recovered> {
 }
 
 fn write(args: &[String]) -> Result<()> {
-    let (mut db, dir) = open_db(args, false)?;
+    let (db, dir) = open_db(args, false)?;
     let crash_at: u64 = arg(args, "--crash-at").map(|s| s.parse()).transpose()?.unwrap_or(0);
     let mut ex = Exec::new(args)?;
     let head = db.next_height();
@@ -132,7 +136,9 @@ fn write(args: &[String]) -> Result<()> {
         db.flush()?;
     }
     db.sync()?;
-    eprintln!("store: wrote {n} blocks {ntx} txs in {:.1}s, head {:?}, {} runs", t0.elapsed().as_secs_f64(), db.head(), db.man.runs.len());
+    db.close()?;
+    let man = db.manifest();
+    eprintln!("store: wrote {n} blocks {ntx} txs in {:.1}s, head {:?}, {} runs ({} terminal)", t0.elapsed().as_secs_f64(), db.head(), man.runs.len(), man.publishable().runs.len());
     Ok(())
 }
 
@@ -153,12 +159,21 @@ fn verify(args: &[String]) -> Result<()> {
     let t0 = Instant::now();
     let mut next_tx = 0u64;
     let (mut nblk, mut ntx, mut nstate, mut npost, mut ncode) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let inner = flag(args, "--inner");
     for b in blocks(args)? {
-        let b = b.map_err(|e| anyhow!("block decode: {e:?}"))?;
+        let mut b = b.map_err(|e| anyhow!("block decode: {e:?}"))?;
         let r = ex.run(&b)?;
         let h = b.height;
         if h > head {
             break;
+        }
+        if inner {
+            let u = block::pvm::unwrap(&b.container).map_err(|e| anyhow!("unwrap {h}: {e:?}"))?;
+            let mut ib = block::decode_container(u.inner).map_err(|e| anyhow!("inner decode {h}: {e:?}"))?;
+            for (t, o) in ib.txs.iter_mut().zip(&b.txs) {
+                t.sender = o.sender;
+            }
+            b = ib;
         }
         let bw = BlockWrite::from_exec(&b, &r)?;
         expect(&format!("hdr/{h}"), db.header_rlp(h)?, Some(b.header_rlp.to_vec()))?;
@@ -283,7 +298,7 @@ fn verify(args: &[String]) -> Result<()> {
         Ok(true)
     })?;
     expect("chain_rows tx count", m, ntx)?;
-    eprintln!("verify OK: {nblk} blocks, {ntx} txs, {nstate} state rows, {npost} posting checks, {ncode} code blobs, {} runs, {:.1}s", db.man.runs.len(), t0.elapsed().as_secs_f64());
+    eprintln!("verify OK: {nblk} blocks, {ntx} txs, {nstate} state rows, {npost} posting checks, {ncode} code blobs, {} runs, {:.1}s", db.manifest().runs.len(), t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -325,18 +340,18 @@ fn readall(args: &[String]) -> Result<()> {
             ntx += 1;
         }
     }
-    eprintln!("readall OK: {to} blocks, {ntx} txs, {nlog} logs, {nbytes} container bytes, {} runs, {:.1}s", db.man.runs.len(), t0.elapsed().as_secs_f64());
+    eprintln!("readall OK: {to} blocks, {ntx} txs, {nlog} logs, {nbytes} container bytes, {} runs, {:.1}s", db.manifest().runs.len(), t0.elapsed().as_secs_f64());
     Ok(())
 }
 
 fn publish(args: &[String]) -> Result<()> {
-    let (mut db, _) = open_db(args, false)?;
-    if !db.cas.remote() {
+    let (db, _) = open_db(args, false)?;
+    if !db.cas().remote() {
         bail!("publish: EPOCHDB_S3_ENDPOINT is not set");
     }
     db.publish()?;
     let released = db.sync_artifacts()?;
-    eprintln!("publish OK: {} runs in the manifest, {} artifacts uploaded and released", db.man.runs.len(), released.len());
+    eprintln!("publish OK: {} runs in the manifest, {} artifacts uploaded and released", db.manifest().runs.len(), released.len());
     // still serving after the release: every run reads through the chunk cache now
     let head = db.head().ok_or_else(|| anyhow!("empty"))?;
     db.header_rlp(head)?.ok_or_else(|| anyhow!("head header unreadable after release"))?;
@@ -349,7 +364,42 @@ fn join(args: &[String]) -> Result<()> {
     let cas = store::casfs::Store::open(&dir)?;
     store::db::join(&cas, &dir, root)?;
     let db = DB::open_read_only(&dir, cas, root)?;
-    eprintln!("join OK: head {:?}, {} runs, next tx {}", db.head(), db.man.runs.len(), db.next_tx());
+    eprintln!("join OK: head {:?}, {} runs, next tx {}", db.head(), db.manifest().runs.len(), db.next_tx());
+    Ok(())
+}
+
+/// Runs the terminal merge until no span is left (the retry after a kill,
+/// and the oracle's way to merge a written corpus).
+fn merge(args: &[String]) -> Result<()> {
+    let (db, _) = open_db(args, false)?;
+    let t0 = Instant::now();
+    loop {
+        let before = db.manifest().runs.len();
+        db.maybe_merge()?;
+        db.wait_merge()?;
+        let man = db.manifest();
+        if man.runs.len() == before {
+            eprintln!("merge OK: {} runs ({} terminal), {:.1}s", man.runs.len(), man.publishable().runs.len(), t0.elapsed().as_secs_f64());
+            return Ok(());
+        }
+    }
+}
+
+/// One line per chain row: family, number, length, sha256 prefix (diff two dirs).
+fn rowsum(args: &[String]) -> Result<()> {
+    let (db, _) = open_db(args, true)?;
+    let head = db.head().ok_or_else(|| anyhow!("empty store"))?;
+    let end = db.next_tx();
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    use std::io::Write;
+    for fam in 0..NUM_FAMS {
+        let to = if fam_by_height(fam) { head } else { end };
+        db.chain_rows(fam, 0, to, |n, v| {
+            writeln!(out, "{fam} {n} {} {}", v.len(), hex::encode(&Sha256::digest(v)[..8]))?;
+            Ok(true)
+        })?;
+    }
     Ok(())
 }
 
