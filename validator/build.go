@@ -32,8 +32,10 @@ import (
 const retryDelay = 100 * time.Millisecond
 
 // builder decides WHEN to build (subnet-evm's blockBuilder rules): the pool
-// has executable txs at the current head (pool.Sync waits for its reset),
-// and the timing rules (retry delay, Granite minimum block delay) allow it.
+// has executable txs, and the timing rules (retry delay, Granite minimum
+// block delay) allow it. The pool's reset after a head change is async; a
+// build that races it hands the engine a few already-mined txs, which it
+// skips (code 1).
 type builder struct {
 	pool *txpool.TxPool
 	mu   sync.Mutex
@@ -110,10 +112,13 @@ func (b *builder) waitForEvent(ctx context.Context, head *types.Header) (common.
 	return common.PendingTxs, nil
 }
 
-// hasPending: the pool, reset to the latest head, holds an executable tx.
+// hasPending: the pool holds an executable tx. Stats is O(accounts);
+// Pending would copy every pending tx, and pool.Sync FORCES a full reset
+// (it is the simulator's hook), which under a 100k-tx pool starved every
+// other pool user and stalled the chain (E2E.md run 3).
 func (b *builder) hasPending() bool {
-	b.pool.Sync()
-	return len(b.pool.Pending(txpool.PendingFilter{OnlyPlainTxs: true})) > 0
+	pending, _ := b.pool.Stats()
+	return pending > 0
 }
 
 // minNextBlockTime: Granite's minimum delay after the parent (ACP-226).
@@ -165,7 +170,6 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		return nil, err
 	}
 
-	vm.pool.Sync() // the pool's view of nonces is the accepted head's
 	filter := txpool.PendingFilter{OnlyPlainTxs: true}
 	if baseFee != nil {
 		filter.BaseFee = uint256.MustFromBig(baseFee)

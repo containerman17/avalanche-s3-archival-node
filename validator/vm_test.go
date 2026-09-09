@@ -185,7 +185,7 @@ func TestBuildVerifyAccept(t *testing.T) {
 		t.Fatalf("eth_blockNumber %d", num)
 	}
 	// The pool dropped the included txs once its (async) reset ran: nothing pending.
-	h.vm.pool.Sync()
+	h.vm.pool.Sync() // the simulator hook: forces a reset (tests only)
 	if p, q := h.vm.pool.Stats(); p+q != 0 {
 		t.Fatalf("pool still holds %d pending %d queued", p, q)
 	}

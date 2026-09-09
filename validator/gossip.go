@@ -80,11 +80,8 @@ func (g *gossipSet) subscribe(ctx context.Context) {
 }
 
 func (g *gossipSet) pendingSize() int {
-	n := 0
-	for _, txs := range g.pool.Pending(txpool.PendingFilter{}) {
-		n += len(txs)
-	}
-	return n
+	pending, _ := g.pool.Stats()
+	return pending
 }
 
 func (g *gossipSet) Add(t *gossipTx) error {

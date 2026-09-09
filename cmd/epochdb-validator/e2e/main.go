@@ -260,8 +260,7 @@ func main() {
 			check(fmt.Errorf("%s: slot0=%x", n.kind, got), "storage divergence")
 		}
 	}
-	head, err := nodes[0].ec.BlockNumber(ctx)
-	check(err, "head")
+	head := d.minHead()
 	d.compareAll(1, head)
 	proposers := d.proposers(network.Dir, chainID, head)
 	fmt.Println("functional phase OK: head", head, "proposers", proposers)
@@ -278,8 +277,7 @@ func main() {
 	// ---- load phase ----
 	if *load > 0 {
 		d.loadPhase(ethKey, &nonce, *nkeys, *rate, *load, *ours, *workers, *batch)
-		head2, err := nodes[0].ec.BlockNumber(ctx)
-		check(err, "head")
+		head2 := d.minHead()
 		d.compareAll(head+1, head2)
 		proposers = d.proposers(network.Dir, chainID, head2)
 		fmt.Println("load phase OK: head", head2, "proposers", proposers)
@@ -361,6 +359,19 @@ func canonical(raw json.RawMessage) string {
 	check(json.Unmarshal(raw, &v), "canonical")
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// minHead: the lowest accepted height across nodes (they may be a block apart).
+func (d *driver) minHead() uint64 {
+	var m uint64
+	for i, n := range d.nodes {
+		h, err := n.ec.BlockNumber(d.ctx)
+		check(err, "head")
+		if i == 0 || h < m {
+			m = h
+		}
+	}
+	return m
 }
 
 // compareAll: eth_getBlockByNumber(full) and eth_getBlockReceipts must agree
