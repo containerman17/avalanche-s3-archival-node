@@ -169,7 +169,13 @@ func (a *accountCache) refresh(root common.Hash) {
 		return
 	}
 	for i, addr := range addrs {
-		a.entries[addr] = decodeAccount(raw[i*40 : i*40+40])
+		acc := decodeAccount(raw[i*40 : i*40+40])
+		if prev := a.entries[addr]; acc.Nonce == 0 && acc.Balance.IsZero() && (prev.Nonce != 0 || (prev.Balance != nil && !prev.Balance.IsZero())) {
+			// An account the pool knew as funded now reads empty: every tx of
+			// that sender would be dropped as unpayable. Loud, it is a bug somewhere.
+			a.warn(fmt.Sprintf("validator: account %s read empty at the new head (was nonce %d balance %s)", addr, prev.Nonce, prev.Balance), nil)
+		}
+		a.entries[addr] = acc
 	}
 }
 

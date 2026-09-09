@@ -142,6 +142,8 @@ func main() {
 	workers := flag.Int("workers", 8, "load phase sender goroutines")
 	batch := flag.Int("batch", 200, "eth_sendRawTransaction per JSON-RPC batch")
 	stress := flag.Bool("stress", false, "stress genesis: 500 M gas limit, 1 ms min block delay")
+	oursN := flag.Int("ours-n", 3, "validators running our plugin")
+	stockN := flag.Int("stock-n", 2, "validators running the stock plugin")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
 		flag.Usage()
@@ -153,11 +155,11 @@ func main() {
 
 	key := genesis.EWOQKey
 	network = tmpnet.NewDefaultNetwork("epochdb-validator-e2e")
-	network.Nodes = tmpnet.NewNodesOrPanic(5)
-	nodes := make([]*node, 5)
+	network.Nodes = tmpnet.NewNodesOrPanic(*oursN + *stockN)
+	nodes := make([]*node, len(network.Nodes))
 	for i, n := range network.Nodes {
 		kind, dir := "ours", *ours
-		if i >= 3 {
+		if i >= *oursN {
 			kind, dir = "stock", *stock
 		}
 		n.RuntimeConfig = &tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago, PluginDir: dir}}
@@ -217,33 +219,35 @@ func main() {
 	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000001")
 	nonce, err := nodes[0].ec.NonceAt(ctx, from, nil)
 	check(err, "nonce")
-	for i, n := range []*node{nodes[0], nodes[3], nodes[1], nodes[4]} {
+	last := nodes[len(nodes)-1] // a stock node when there is one
+	alt := nodes[len(nodes)/2]
+	for i, n := range []*node{nodes[0], last, alt, nodes[len(nodes)-2]} {
 		r := d.send(n, ethKey, &nonce, &to, big.NewInt(int64(i+1)), nil)
 		fmt.Printf("transfer via %s: block %d status %d\n", n.kind, r.BlockNumber, r.Status)
 	}
-	r := d.send(nodes[3], ethKey, &nonce, nil, nil, storeContract)
+	r := d.send(last, ethKey, &nonce, nil, nil, storeContract)
 	contract := r.ContractAddress
-	fmt.Printf("deploy via stock: block %d status %d contract %s\n", r.BlockNumber, r.Status, contract)
+	fmt.Printf("deploy via %s: block %d status %d contract %s\n", last.kind, r.BlockNumber, r.Status, contract)
 	val := ethcommon.LeftPadBytes([]byte{0x42}, 32)
 	r = d.send(nodes[0], ethKey, &nonce, &contract, nil, val)
 	fmt.Printf("call via ours: block %d status %d\n", r.BlockNumber, r.Status)
 	if r.Status != 1 {
 		check(fmt.Errorf("status %d", r.Status), "contract call")
 	}
-	r = d.send(nodes[4], ethKey, &nonce, &contract, nil, nil)
-	fmt.Printf("failing call via stock: block %d status %d\n", r.BlockNumber, r.Status)
+	r = d.send(last, ethKey, &nonce, &contract, nil, nil)
+	fmt.Printf("failing call via %s: block %d status %d\n", last.kind, r.BlockNumber, r.Status)
 	if r.Status != 0 {
 		check(fmt.Errorf("status %d", r.Status), "failing call should fail")
 	}
 	// nonce gap: nonce+1 first (queued everywhere), then nonce (fills it).
 	gapTx := d.sign(ethKey, nonce+1, &to, big.NewInt(7), nil, 21000)
-	check(nodes[1].ec.SendTransaction(ctx, gapTx), "send gap tx")
+	check(alt.ec.SendTransaction(ctx, gapTx), "send gap tx")
 	time.Sleep(2 * time.Second)
-	if p, _ := d.pool(nodes[1]); p != 0 {
-		check(fmt.Errorf("gap tx pending on ours: %d", p), "nonce gap")
+	if p, _ := d.pool(alt); p != 0 {
+		check(fmt.Errorf("gap tx pending on %s: %d", alt.kind, p), "nonce gap")
 	}
 	fill := d.sign(ethKey, nonce, &to, big.NewInt(8), nil, 21000)
-	check(nodes[3].ec.SendTransaction(ctx, fill), "send fill tx")
+	check(last.ec.SendTransaction(ctx, fill), "send fill tx")
 	d.receipt(nodes[0], fill.Hash())
 	r = d.receipt(nodes[0], gapTx.Hash())
 	nonce += 2
@@ -263,7 +267,7 @@ func main() {
 	fmt.Println("functional phase OK: head", head, "proposers", proposers)
 	d.scanStockLogs(network.Dir, nodes)
 	bothBuilt := func(p map[string]int) {
-		if *ours != *stock && (p["ours"] == 0 || p["stock"] == 0) { // same dir = harness dry run
+		if *ours != *stock && *stockN > 0 && (p["ours"] == 0 || p["stock"] == 0) { // same dir = harness dry run
 			check(fmt.Errorf("both kinds must have built: %v", p), "proposers")
 		}
 	}

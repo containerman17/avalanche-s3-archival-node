@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	slog "golang.org/x/exp/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/database"
@@ -93,9 +95,10 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.eng, vm.config, vm.cfg, vm.ctx = eng, chainConfig, cfg, chainCtx
-	// libevm's pool logs through its own logger (reset failures, drops); at
-	// Warn and up they go to stderr, which avalanchego collects into main.log.
-	ethlog.SetDefault(ethlog.NewLogger(ethlog.NewTerminalHandlerWithLevel(os.Stderr, ethlog.LevelWarn, false)))
+	// libevm's pool logs through its own logger: Warn and up, plus the Trace
+	// lines that name a dropped tx and why (capped), go to stderr, which
+	// avalanchego collects into main.log.
+	ethlog.SetDefault(ethlog.NewLogger(&dropLogHandler{Handler: ethlog.NewTerminalHandlerWithLevel(os.Stderr, ethlog.LevelTrace, false)}))
 	vm.m = newMetrics()
 	if chainCtx.Metrics != nil {
 		if err := chainCtx.Metrics.Register("epochdb", vm.m.reg); err != nil {
@@ -475,4 +478,30 @@ func processRSS() float64 {
 	}
 	pages, _ := strconv.ParseFloat(f[1], 64)
 	return pages * float64(os.Getpagesize())
+}
+
+// dropLogHandler forwards libevm records at Warn and above, and the first
+// dropLogCap Trace/Debug records whose message says a tx was removed or
+// discarded (legacypool's "Removed old/unpayable ...", "Discarding ...",
+// "Demoting ..."), so a load run shows the pool's drop reasons.
+type dropLogHandler struct {
+	slog.Handler
+	n atomic.Int64
+}
+
+const dropLogCap = 500
+
+func (h *dropLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *dropLogHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level < slog.LevelWarn {
+		m := r.Message
+		if !(strings.HasPrefix(m, "Removed") || strings.HasPrefix(m, "Discarding") || strings.HasPrefix(m, "Demoting") || strings.HasPrefix(m, "Failed") || strings.HasPrefix(m, "Transaction pool reset") || strings.HasPrefix(m, "Unrooted")) {
+			return nil
+		}
+		if h.n.Add(1) > dropLogCap {
+			return nil
+		}
+	}
+	return h.Handler.Handle(ctx, r)
 }
