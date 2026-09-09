@@ -22,7 +22,7 @@ Dependency order: `state` <- `node`; `block` <- `exec` <- `node`, `store`, `rpc`
 ```
 cd rs
 cargo build --release                       # every bin into rs/target/release/
-cargo test --workspace --release            # 45 tests
+cargo test --workspace --release            # 48 tests
 cargo clippy --workspace                    # warnings only
 ```
 
@@ -56,7 +56,7 @@ go run ./cmd/epochdb-host-bench --dump step-containers-1-50000.bin --vm rs/targe
 
 `--batch 256` = BatchedParseBlock (1 = ParseBlock per block, what a bootstrapping avalanchego does); `--serve` keeps the HTTP mount up after the dump; `--feed-delay` paces the feed for websocket clients. Handlers mount at `http://<http>/ext/bc/<blockchainID>/rpc` and `/ws`. The harness prints a `check` line at the end (eth_blockNumber and the head hash through `/rpc` against keccak(header) of the dump's last container, `match=true`) and a `check genesis` line. A restart on the same `--data` resumes from the plugin's LastAccepted.
 
-`cmd/epochdb-host` is the same host with the fetch package (live peers) as the block source: `--chain <blockchainID> --vm rs/target/release/epochdb-rs --node <rpc uris> --data DIR`.
+`cmd/epochdb-host` is the same host with the fetch package (live peers) as the block source: `--chain <blockchainID> --vm rs/target/release/epochdb-rs --node <rpc uris> --data DIR`. `--p2p-port` is optional: without it the host is fetch-only (no inbound listener) and creates the `staker.key/.crt` identity under `--data` itself, so the NodeID is stable either way.
 
 ### Under a stock avalanchego
 
@@ -75,7 +75,8 @@ Config bytes (the chain config JSON: `~/.avalanchego/configs/chains/<blockchainI
 | key | environment fallback | meaning |
 |---|---|---|
 | `state-sync-enabled` | | ignored by the plugin (it never state-syncs); the harness passes `false` so stock subnet-evm executes every block under the same config |
-| `roll-budget-mb` | | overlay bytes before a roll while bootstrapping (default 2048 = `SyncRoll`); the tip budget after SetState(NormalOp) is `min(roll-budget-mb, 128)` |
+| `roll-budget-mb` | | overlay + Dirty bytes before a roll while bootstrapping (default 2048 = `SyncRoll`); the tip budget after SetState(NormalOp) is `min(roll-budget-mb, 128)` |
+| `roll-every-blocks`, `roll-every-secs` | | the second roll trigger, in both states: a roll is also due once this many blocks (default 500,000) or seconds (default 3600) passed since the last one, whichever first; `0` turns one off. Bounds the crash replay: on beam the byte budget never fired in 9.5M blocks and every restart replayed the whole store (90 s) |
 | `s3-endpoint`, `s3-bucket`, `s3-access-key`, `s3-secret-key` | `EPOCHDB_S3_ENDPOINT`, `EPOCHDB_S3_BUCKET`, `EPOCHDB_S3_ACCESS_KEY`, `EPOCHDB_S3_SECRET_KEY` | the casfs remote (SigV4 path style); all four required together, static keys only, no default credential chain. No endpoint = local only |
 | `s3-prefix`, `s3-region` | `EPOCHDB_S3_PREFIX`, `EPOCHDB_S3_REGION` | key prefix (default none) and region (default `auto`) |
 | `cache-dir` | `EPOCHDB_CACHE_DIR` | chunk cache root (default `<store>/cache`) |
@@ -84,7 +85,7 @@ Config bytes (the chain config JSON: `~/.avalanchego/configs/chains/<blockchainI
 | `terminal-txs` | `EPOCHDB_TERMINAL_TXS` | TxNum slots per terminal run (default 8,000,000); lowered for the merge oracle |
 | `new-chain` | `EPOCHDB_NEW_CHAIN=1` | let `join` start a chain that has no `latest-<chainroot>` pointer on the remote |
 
-The rule is mechanical: strip `EPOCHDB_`, lower case, `_` -> `-`. Values may be JSON strings, numbers or booleans (`true` = `1`). Unknown keys are ignored, so a stock subnet-evm config works as is. The plugin sets the listed variables into its own environment from the config bytes before it opens the store, so `rs/store` keeps one env-reading code path; a key in the JSON wins over an inherited variable, an absent key leaves the variable alone. The bytes are never logged whole: the startup line prints them with `s3-access-key` / `s3-secret-key` redacted.
+The rule is mechanical: strip `EPOCHDB_`, lower case, `_` -> `-`, so `EPOCHDB_ROLL_EVERY_BLOCKS=200000` on a `cmd/epochdb-host` container reaches the plugin as `roll-every-blocks`. Values may be JSON strings, numbers or booleans (`true` = `1`); the numeric keys (`roll-*`) accept a number or a string holding one (the host merges variables in as strings). Unknown keys are ignored, so a stock subnet-evm config works as is. The plugin sets the listed variables into its own environment from the config bytes before it opens the store, so `rs/store` keeps one env-reading code path; a key in the JSON wins over an inherited variable, an absent key leaves the variable alone. The bytes are never logged whole: the startup line prints them with `s3-access-key` / `s3-secret-key` redacted.
 
 Why: avalanchego's subprocess runtime (and therefore both hosts, which use it) forwards only `GRPC_*` and `GODEBUG*` variables to the plugin, plus `AVALANCHE_VM_RUNTIME_ENGINE_ADDR`. The environment column is what `storecheck`, `epochdb-rpc-serve` and the bench read directly.
 
@@ -122,6 +123,24 @@ docker run --rm --entrypoint epochdb-rs epochdb:rust-ops --version    # epochdb-
 9. Go side: `go vet ./...`, `gofmt -l` on the new Go dirs (`cmd/epochdb-host-bench`, `cmd/epochdb-vm-bench`, `cmd/epochdb-dump-fetch`, `exp/feecheck`, `exp/rpcoracle`); `exp/rpcoracle` is the read-only Go node for the ots_/edb_ differential (`otscmp.py`).
 
 Results on branch `rust` (2026-09-09 JST, local i7-10700K, load 13-19 from a parallel 1M run): Step 50k 822 blk/s (1,200-1,280 unloaded), rolls at 17,546 / 31,462 / 45,339 / 50,000, root-checked 50,000, both checks `match=true`, verify PASS (1,024,939 state rows, 104,006 posting checks); beam 50k 993 blk/s, root-checked 50,000, verify PASS (273,547 state rows, 231 code blobs); crash at 31,837 recovered in 404 ms and finished with the same sealed run `4b688741...`; differential 869/875 and 914/920 through the plugin's `/rpc`; `/ws` 192 of 192 notifications byte-equal (149 newHeads + 43 logs), latency median 0.58 ms from Accept start (stock 1.69); bench 120 s: 798,690 blocks, cum 1,534 mgas/s, peak RSS 1,282 MB (rs-node's 180 s figure: 1,348 mgas/s, 1,338 MB; the cum falls past 700k where the chain turns contract-heavy).
+
+## Memory and rolls (branch `rust-harden`, after the beam e2e in `E2E.md`)
+
+The live beam sync left three findings; all three are measured on Step 1M under the harness (`--config '{"state-sync-enabled":false,"roll-every-blocks":200000,"terminal-txs":400000}'`, so five rolls and ten terminal merges in one run; RssAnon of the plugin sampled from `/proc` every 10 s).
+
+1. The roll never fired on beam (9.5M blocks under the 2 GB budget, every restart replayed the whole store, 35M rows in 90 s). `roll-every-blocks` / `roll-every-secs` (above) is the second trigger: rolls at exactly 200,000 / 400,000 / 600,000 / 800,000 / 1,000,000, every rolled root equal to the verified one; `kill -9` at 472,362 and a restart on the same data: `recovered: rolled at 400000 (gen 2), head 472361 ..., rows replayed 1012248, ..., root ok, in 2203 ms`.
+2. The anon heap stepped up at every L0 seal: `write_sections` read the whole window's chain rows (containers, receipts, traces) into one Vec before writing the sstable, so a seal's transient memory was the window's raw size (13 GB for Step 950,001..1,000,000, whose blocks are contract heavy: the plugin hit 12 GB RssAnon at the final seal). The seal now streams every section row by row (`RunWriter::section_with`); nothing is buffered beyond the sstable's open block.
+3. What glibc's malloc kept of those transients: the plugin's global allocator is jemalloc (`tikv-jemallocator`, builds static-musl), and it prints `epochdb-rs: heap allocated=.. active=.. resident=.. retained=.. rss-anon=..` every 60 s so live memory (allocated) and the allocator's holdings (resident) can be told apart.
+
+| Step 1M under the harness | RssAnon at 1M | peak sampled RssAnon | at shutdown |
+|---|---|---|---|
+| before (whole-window Vec, glibc) | 6,500 MB | 7,393 MB | 12,033 MB (the final 13 GB window's seal) |
+| streaming seal, glibc | 2,540 MB | 2,670 MB | 2,530 MB |
+| streaming seal + jemalloc | 1,300 to 1,600 MB | 1,597 MB | 1,300 MB |
+
+jemalloc's own line at the end of the run: `allocated=1706MB resident=1885MB rss-anon=1595MB`, so what remains is live: the store's memtable of the current window (its state rows and indexes; the contract-heavy tail's are large), the executor and the code table, the 8k parsed blocks, the overlay and Dirty between rolls (180 MB with a roll every 200k blocks). Throughput: 874.7 blk/s before, 833.3 with the streaming seal (one run each, the tail runs at 85 blk/s and 750 mgas/s on the executor thread); the jemalloc run was split by the crash test, so no whole-dump figure.
+
+Open from these runs: the harness's Shutdown deadline is 30 s and `DB::close` waits for the seal and the merge in flight; on the 13 GB window the seal alone takes longer, so the harness's stopper killed the plugin at exit (`subprocess was killed`, every time, before and after). The seal is crash safe (the frozen log is re-sealed at the next open, the merge's inputs stay until the swap), the runs' `check ... match=true` lines and the recovery above are unaffected, but a stock avalanchego has a shutdown deadline too: either the window cut moves earlier for a window whose bytes pass a limit, or shutdown stops waiting for the seal.
 
 ## Remaining RPC differences vs stock subnet-evm v1.14.2 (by construction)
 

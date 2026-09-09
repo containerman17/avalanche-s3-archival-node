@@ -421,11 +421,21 @@ pub struct Roller {
     roll_t0: Instant,
     pub dirty: Arc<Mutex<Dirty>>,
     pub workers: usize,
+    /// The second trigger beside the byte budget: a roll is due once this
+    /// many blocks or this much time passed since the last one (a manifest
+    /// every so often bounds a crash replay; on beam 9.5M blocks of small rows
+    /// never reached the 2 GB budget and every restart replayed everything).
+    /// `u64::MAX` / `Duration::MAX` = off (the bench).
+    pub every_blocks: u64,
+    pub every: Duration,
+    last_h: u64,
+    last_t: Instant,
 }
 
 impl Roller {
-    pub fn new(dir: PathBuf, gen: u64, dirty: Arc<Mutex<Dirty>>, workers: usize) -> Roller {
-        Roller { dir, gen, rolls: 0, rolling: None, roll_h: 0, roll_root: B256::ZERO, roll_t0: Instant::now(), dirty, workers }
+    /// `rolled_h` is the manifest's height: the count and the clock start there.
+    pub fn new(dir: PathBuf, gen: u64, rolled_h: u64, dirty: Arc<Mutex<Dirty>>, workers: usize) -> Roller {
+        Roller { dir, gen, rolls: 0, rolling: None, roll_h: 0, roll_root: B256::ZERO, roll_t0: Instant::now(), dirty, workers, every_blocks: u64::MAX, every: Duration::MAX, last_h: rolled_h, last_t: Instant::now() }
     }
 
     pub fn rolling(&self) -> bool {
@@ -446,9 +456,12 @@ impl Roller {
         // checker holds Dirty for a whole block's root; a miss is checked
         // again next block.
         let dirty = self.dirty.try_lock().map(|d| d.bytes()).unwrap_or(0);
-        if be.overlay.bytes() + dirty < budget {
+        let due = h.saturating_sub(self.last_h) >= self.every_blocks || self.last_t.elapsed() >= self.every;
+        if (be.overlay.bytes() + dirty < budget && !due) || be.overlay.is_empty() {
             return;
         }
+        self.last_h = h;
+        self.last_t = Instant::now();
         let frozen = be.freeze();
         let base = be.run.clone().expect("run");
         let gen = self.gen + 1;

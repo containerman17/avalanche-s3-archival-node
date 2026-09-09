@@ -380,7 +380,7 @@ pub fn main(args: Vec<String>) -> Result<()> {
     );
 
     let mut ex = ex;
-    let mut roller = Roller::new(dir, 0, dirty, dirty_workers);
+    let mut roller = Roller::new(dir, 0, 0, dirty, dirty_workers);
     let blocks = block::Blocks::open(&dump, from, to)?;
     let mut it = block::recovered(blocks, workers);
     let mut parent_time = cfg.genesis_timestamp;
