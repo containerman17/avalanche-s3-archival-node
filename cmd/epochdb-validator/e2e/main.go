@@ -31,6 +31,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/config"
@@ -118,6 +120,8 @@ func main() {
 	load := flag.Duration("load", 0, "load phase duration (0 = skip)")
 	rate := flag.Int("rate", 300, "load phase tx/s")
 	nkeys := flag.Int("keys", 200, "load phase sender keys")
+	workers := flag.Int("workers", 8, "load phase sender goroutines")
+	batch := flag.Int("batch", 200, "eth_sendRawTransaction per JSON-RPC batch")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
 		flag.Usage()
@@ -241,7 +245,7 @@ func main() {
 
 	// ---- load phase ----
 	if *load > 0 {
-		d.loadPhase(ethKey, &nonce, *nkeys, *rate, *load, *ours)
+		d.loadPhase(ethKey, &nonce, *nkeys, *rate, *load, *ours, *workers, *batch)
 		head2, err := nodes[0].ec.BlockNumber(ctx)
 		check(err, "head")
 		d.compareAll(head+1, head2)
@@ -328,7 +332,7 @@ func canonical(raw json.RawMessage) string {
 // compareAll: eth_getBlockByNumber(full) and eth_getBlockReceipts must agree
 // on every node at every height in [from, to].
 func (d *driver) compareAll(from, to uint64) {
-	txs := 0
+	txs, gas := 0, uint64(0)
 	for h := from; h <= to; h++ {
 		hex := fmt.Sprintf("0x%x", h)
 		var ref [2]string
@@ -337,9 +341,14 @@ func (d *driver) compareAll(from, to uint64) {
 			rcp := canonical(rpcRaw(n.rpc, `{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":["`+hex+`"]}`))
 			if i == 0 {
 				ref = [2]string{blk, rcp}
-				var b struct{ Transactions []json.RawMessage }
+				var b struct {
+					Transactions []json.RawMessage
+					GasUsed      string
+				}
 				json.Unmarshal([]byte(blk), &b)
 				txs += len(b.Transactions)
+				g, _ := strconv.ParseUint(strings.TrimPrefix(b.GasUsed, "0x"), 16, 64)
+				gas += g
 				continue
 			}
 			if blk != ref[0] {
@@ -352,7 +361,9 @@ func (d *driver) compareAll(from, to uint64) {
 			}
 		}
 	}
-	fmt.Printf("blocks %d..%d identical on %d nodes (%d txs)\n", from, to, len(d.nodes), txs)
+	n := float64(to - from + 1)
+	fmt.Printf("blocks %d..%d identical on %d nodes: %d txs, %.0f txs/block, %.1fM gas/block (%.0f%% of 20M)\n",
+		from, to, len(d.nodes), txs, float64(txs)/n, float64(gas)/n/1e6, float64(gas)/n/20e6*100)
 }
 
 // proposers counts ACCEPTED blocks per builder kind: our plugin logs
@@ -397,47 +408,92 @@ func (d *driver) scanStockLogs(dir string, nodes []*node) {
 	fmt.Println("stock logs: no invalid-block rejections")
 }
 
-// loadPhase funds nkeys senders, then sends transfers round-robin over all
-// nodes at `rate` tx/s for `dur`, sampling every 10 s.
-func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate int, dur time.Duration, oursDir string) {
+// loadPhase funds nkeys senders, then `workers` goroutines each sign their
+// share of the keys on the fly and post JSON-RPC batches of `batch`
+// eth_sendRawTransaction to the nodes round-robin, paced to `rate` tx/s in
+// total, for `dur`; a sample line every 10 s.
+func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate int, dur time.Duration, oursDir string, workers, batch int) {
 	keys := make([]*ecdsa.PrivateKey, nkeys)
-	nonces := make([]uint64, nkeys)
-	var last ethcommon.Hash
+	var fund []string
 	for i := range keys {
 		keys[i], _ = crypto.GenerateKey()
 		addr := crypto.PubkeyToAddress(keys[i].PublicKey)
-		tx := d.sign(funder, *nonce, &addr, new(big.Int).Mul(big.NewInt(params.Ether), big.NewInt(10)), nil, 21000)
-		check(d.nodes[i%len(d.nodes)].ec.SendTransaction(d.ctx, tx), "fund")
+		tx := d.sign(funder, *nonce, &addr, new(big.Int).Mul(big.NewInt(params.Ether), big.NewInt(100)), nil, 21000)
 		*nonce++
-		last = tx.Hash()
+		fund = append(fund, rawTxReq(i, tx))
 	}
-	d.receipt(d.nodes[0], last)
+	var lastHash ethcommon.Hash
+	for i := 0; i < len(fund); i += 100 {
+		end := min(i+100, len(fund))
+		for _, r := range batchPost(d.nodes[(i/100)%len(d.nodes)].rpc, fund[i:end]) {
+			if r.Error != nil {
+				check(fmt.Errorf("%s", r.Error.Message), "fund")
+			}
+			json.Unmarshal(r.Result, &lastHash)
+		}
+	}
+	d.receipt(d.nodes[0], lastHash)
 	fmt.Printf("funded %d senders\n", nkeys)
 
+	var sent, failed atomic.Int64
 	start := time.Now()
+	deadline := start.Add(dur)
+	to := ethcommon.HexToAddress("0x2000000000000000000000000000000000000002")
+	perBatch := time.Duration(float64(batch) / (float64(rate) / float64(workers)) * float64(time.Second))
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			var mine []*ecdsa.PrivateKey
+			for i := w; i < nkeys; i += workers {
+				mine = append(mine, keys[i])
+			}
+			nonces := make([]uint64, len(mine))
+			for iter, k := 0, 0; time.Now().Before(deadline); iter++ {
+				t0 := time.Now()
+				reqs := make([]string, 0, batch)
+				owners := make([]int, 0, batch)
+				for i := 0; i < batch; i++ {
+					reqs = append(reqs, rawTxReq(i, d.sign(mine[k], nonces[k], &to, big.NewInt(1), nil, 21000)))
+					owners = append(owners, k)
+					nonces[k]++
+					k = (k + 1) % len(mine)
+				}
+				n := d.nodes[(w+iter)%len(d.nodes)]
+				bad := map[int]bool{}
+				for i, r := range batchPost(n.rpc, reqs) {
+					if r.Error != nil {
+						failed.Add(1)
+						bad[owners[i]] = true
+						if failed.Load()%1000 == 1 {
+							fmt.Println("send error:", r.Error.Message)
+						}
+					} else {
+						sent.Add(1)
+					}
+				}
+				for k := range bad { // resync a key whose tx was refused
+					if pn, err := n.ec.PendingNonceAt(d.ctx, crypto.PubkeyToAddress(mine[k].PublicKey)); err == nil {
+						nonces[k] = pn
+					}
+				}
+				if rest := perBatch - time.Since(t0); rest > 0 {
+					time.Sleep(rest)
+				}
+			}
+		}(w)
+	}
+
 	startHead, _ := d.nodes[0].ec.BlockNumber(d.ctx)
-	tick := time.NewTicker(time.Second / time.Duration(rate))
-	defer tick.Stop()
 	sample := time.NewTicker(10 * time.Second)
 	defer sample.Stop()
-	sent, failed := 0, 0
-	to := ethcommon.HexToAddress("0x2000000000000000000000000000000000000002")
-	i := 0
-	for time.Since(start) < dur {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	for running := true; running; {
 		select {
-		case <-tick.C:
-			k := i % nkeys
-			tx := d.sign(keys[k], nonces[k], &to, big.NewInt(1), nil, 21000)
-			if err := d.nodes[i%len(d.nodes)].ec.SendTransaction(d.ctx, tx); err != nil {
-				failed++
-				if failed%100 == 1 {
-					fmt.Println("send error:", err)
-				}
-			} else {
-				nonces[k]++
-				sent++
-			}
-			i++
+		case <-done:
+			running = false
 		case <-sample.C:
 			head, _ := d.nodes[0].ec.BlockNumber(d.ctx)
 			blk, _ := d.nodes[0].ec.BlockByNumber(d.ctx, new(big.Int).SetUint64(head))
@@ -446,13 +502,45 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 				ntx, gas = len(blk.Transactions()), blk.GasUsed()
 			}
 			p, q := d.pool(d.nodes[0])
-			fmt.Printf("t=%3.0fs sent=%d failed=%d head=%d (+%d) lastBlock txs=%d gas=%d pool=%d/%d rss=%s go=%s\n",
-				time.Since(start).Seconds(), sent, failed, head, head-startHead, ntx, gas, p, q,
+			fmt.Printf("t=%3.0fs sent=%d failed=%d head=%d (+%d) lastBlock txs=%d gas=%.1fM pool=%d/%d rss=%s go=%s\n",
+				time.Since(start).Seconds(), sent.Load(), failed.Load(), head, head-startHead, ntx, float64(gas)/1e6, p, q,
 				pluginRSS(oursDir), d.goStats())
 		}
 	}
-	fmt.Printf("load done: sent=%d failed=%d in %s (%.0f tx/s)\n", sent, failed, dur, float64(sent)/dur.Seconds())
+	fmt.Printf("load done: sent=%d failed=%d in %s (%.0f tx/s offered)\n", sent.Load(), failed.Load(), dur, float64(sent.Load())/dur.Seconds())
 	time.Sleep(5 * time.Second)
+	fmt.Println("final ours metrics:", d.goStats())
+}
+
+func rawTxReq(id int, tx *types.Transaction) string {
+	raw, _ := tx.MarshalBinary()
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"eth_sendRawTransaction","params":["0x%x"]}`, id, raw)
+}
+
+type rpcResp struct {
+	Result json.RawMessage           `json:"result"`
+	Error  *struct{ Message string } `json:"error"`
+}
+
+// batchPost sends one JSON-RPC batch; a transport failure counts every
+// element as failed.
+func batchPost(url string, reqs []string) []rpcResp {
+	resp, err := http.Post(url, "application/json", strings.NewReader("["+strings.Join(reqs, ",")+"]"))
+	out := make([]rpcResp, len(reqs))
+	if err != nil {
+		for i := range out {
+			out[i].Error = &struct{ Message string }{err.Error()}
+		}
+		return out
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		for i := range out {
+			out[i].Error = &struct{ Message string }{fmt.Sprintf("bad batch response: %.120s", raw)}
+		}
+	}
+	return out
 }
 
 // pluginRSS: VmRSS of our plugin processes (exe under dir) whose parent
@@ -502,7 +590,8 @@ func (d *driver) goStats() string {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	var heap, gcFrac, verifyCount, verifySum, buildCount, buildSum, xTotal float64
+	var heap, gcFrac, rss, verifyCount, verifySum, buildCount, buildSum, xTotal float64
+	var verifyB, buildB []bucket
 	for _, l := range strings.Split(string(raw), "\n") {
 		f := strings.Fields(l)
 		if len(f) != 2 || !strings.Contains(l, "epochdb") {
@@ -510,6 +599,15 @@ func (d *driver) goStats() string {
 		}
 		v, _ := strconv.ParseFloat(f[1], 64)
 		if i := strings.IndexByte(f[0], '{'); i >= 0 {
+			if le := leOf(f[0][i:]); le != "" {
+				b := bucket{count: v}
+				b.le, _ = strconv.ParseFloat(le, 64)
+				if strings.Contains(f[0], "epochdb_verify_seconds_bucket") {
+					verifyB = append(verifyB, b)
+				} else if strings.Contains(f[0], "epochdb_build_seconds_bucket") {
+					buildB = append(buildB, b)
+				}
+			}
 			f[0] = f[0][:i] // avalanche_subnetevm_vm_epochdb_<name>{chain=...}
 		}
 		switch {
@@ -517,6 +615,8 @@ func (d *driver) goStats() string {
 			heap = v
 		case strings.HasSuffix(f[0], "epochdb_go_gc_cpu_fraction"):
 			gcFrac = v
+		case strings.HasSuffix(f[0], "epochdb_process_rss_bytes"):
+			rss = v
 		case strings.HasSuffix(f[0], "epochdb_verify_seconds_count"):
 			verifyCount = v
 		case strings.HasSuffix(f[0], "epochdb_verify_seconds_sum"):
@@ -535,6 +635,50 @@ func (d *driver) goStats() string {
 		}
 		return fmt.Sprintf("%.1fms", s/c*1000)
 	}
-	return fmt.Sprintf("heap=%.0fMB gc=%.3f verify_avg=%s build_avg=%s crossings/block=%.1f",
-		heap/1e6, gcFrac, avg(verifySum, verifyCount), avg(buildSum, buildCount), xTotal/max(verifyCount, 1))
+	v50, v99 := quantiles(verifyB)
+	b50, b99 := quantiles(buildB)
+	return fmt.Sprintf("heap=%.0fMB gc=%.3f rss=%.0fMB verify avg=%s p50=%.1fms p99=%.1fms (n=%.0f) build avg=%s p50=%.1fms p99=%.1fms (n=%.0f) crossings/block=%.1f",
+		heap/1e6, gcFrac, rss/1e6, avg(verifySum, verifyCount), v50*1000, v99*1000, verifyCount,
+		avg(buildSum, buildCount), b50*1000, b99*1000, buildCount, xTotal/max(verifyCount, 1))
 }
+
+type bucket struct{ le, count float64 }
+
+func leOf(labels string) string {
+	i := strings.Index(labels, `le="`)
+	if i < 0 {
+		return ""
+	}
+	rest := labels[i+4:]
+	return rest[:strings.IndexByte(rest, '"')]
+}
+
+// quantiles: p50 and p99 (seconds) by linear interpolation over the
+// cumulative histogram buckets (+Inf clamps to the last finite bound).
+func quantiles(b []bucket) (p50, p99 float64) {
+	if len(b) == 0 {
+		return 0, 0
+	}
+	sort.Slice(b, func(i, j int) bool { return b[i].le < b[j].le })
+	total := b[len(b)-1].count
+	q := func(f float64) float64 {
+		target := f * total
+		prevLe, prevCount := 0.0, 0.0
+		for _, x := range b {
+			if x.count >= target {
+				if isInf(x.le) {
+					return prevLe
+				}
+				if x.count == prevCount {
+					return x.le
+				}
+				return prevLe + (x.le-prevLe)*(target-prevCount)/(x.count-prevCount)
+			}
+			prevLe, prevCount = x.le, x.count
+		}
+		return prevLe
+	}
+	return q(0.5), q(0.99)
+}
+
+func isInf(f float64) bool { return f > 1e300 }
