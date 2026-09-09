@@ -1,6 +1,6 @@
 # epochdb-rs
 
-The Rust rewrite of the epochdb follower: one cargo workspace under `rs/`, one binary `epochdb-rs` that is an avalanchego rpcchainvm plugin (protocol 45) with the executor, the state engine, the store and the JSON-RPC / WebSocket surface in-process. Branch `rust` is every `rs-*` branch merged. Each crate keeps its own `REPORT.md` with the design, the oracle numbers and the Go source it was ported from; this file is the map.
+The Rust rewrite of the epochdb node: one cargo workspace under `rs/` with the executor, two state engines (the flat native one and Firewood), the store and the JSON-RPC / WebSocket surface, and one engine crate (`rs/chain`) behind two shells: `epochdb-rs`, the Rust follower plugin (avalanchego rpcchainvm protocol 45, in-process), and `epochdb-validator`, the Go validator shell (`validator/`, txpool + gossip + BuildBlock) over the engine's C ABI (`rs/ffi`). Branch `rust` is every `rs-*` branch merged (`rs-ffi`, `go-validator` and `rust-firewood` last). Each crate keeps its own `REPORT.md` with the design, the oracle numbers and the Go source it was ported from; this file is the map.
 
 ## Crate map
 
@@ -9,24 +9,41 @@ The Rust rewrite of the epochdb follower: one cargo workspace under `rs/`, one b
 | `state` (`epochdb-state`) | lib `state`; bins `bench`, `rscompat` | the `latest` state engine: overlay, frozen window, run files (format v2), the Dirty trie and its root, the roll | `state/REPORT.md`, `state/LAYOUT.md` |
 | `block` (`epochdb-block`) | lib `block`; bin `blockcheck` | proposervm container unwrap, subnet-evm block / header / tx decode and encode, sender recovery, the container dump reader | `block/REPORT.md` |
 | `exec` (`epochdb-exec`) | lib `exec`; bin `epochdb-exec` | subnet-evm block execution on revm: fee rules, the stateful precompile set (allow lists, FeeManager, RewardManager, NativeMinter, warp), state upgrades, forks through Granite, the tracers (callTracer, prestate, struct, 4byte, mux) | `exec/REPORT.md` |
-| `node` (`epochdb-node`) | lib `node` | the in-process bench (`epochdb-rs --dump`): dump -> executor -> checker thread (root one block behind) -> roll; `Backend` = overlay + frozen + run | `node/REPORT.md` |
+| `node` (`epochdb-node`) | lib `node` | the in-process bench (`epochdb-rs --dump`): dump -> executor -> checker thread (root one block behind) -> roll; `Backend` = overlay + frozen + run; `firewood.rs` = the Firewood state engine (`--state firewood`, `state-engine: firewood`) | `node/REPORT.md`, `FIREWOOD.md` |
 | `store` (`epochdb-store`) | lib `store`; bin `storecheck` | storage v4: window log, L0 seal, terminal merge, Pebblev2 sstable sections, Elias-Fano postings, casfs (local spool, S3, chunk cache with eviction), reader snapshots | `store/REPORT.md` |
 | `rpc` (`epochdb-rpc`) | lib `rpc`; bin `epochdb-rpc-serve` | eth_ / debug_ / ots_ / edb_ / net_ / web3_ / txpool_ over a `Store` trait, eth_call and estimateGas through the executor, re-executing tracers, filters, the fee oracle, `/ws` with eth_subscribe | `rpc/REPORT.md` |
-| `chain` (`epochdb-chain`) | lib `chain`; bin `vbench` | the engine both shells share: `NodeEngine` (executor + roller + checker + DbStore), `Tree` of verified-not-accepted blocks, `Layered` pending state, the state root inside verify in NormalOp, `build` (subnet-evm miner semantics + customheader), the RPC store adapter; `vbench` is the validator-shape bench and build oracle | `ffi/ABI.md` |
+| `chain` (`epochdb-chain`) | lib `chain`; bin `vbench` | the engine both shells share: `NodeEngine` (executor over `Ex::Native` (Layered + roller + Dirty) or `Ex::Firewood`, checker + DbStore), `Tree` of verified-not-accepted blocks, the state root inside verify in NormalOp (native), `build` (subnet-evm miner semantics + customheader; native only), the RPC store adapter; `vbench` is the validator-shape bench and build oracle | `ffi/ABI.md` |
 | `plugin` (`epochdb-plugin`) | lib `plugin`; bin `epochdb-rs` | the rpcchainvm plugin over `chain`: `vm.proto` server, ghttp `/rpc` and `/ws` (hijack path) | `plugin/REPORT.md` |
 | `ffi` (`epochdb-ffi`) | staticlib `libepochdb_engine.a` + `ffi/epochdb_engine.h` | the C ABI over `chain` for the Go validator shell (parse / verify / accept / reject / build / account_state / rpc) | `ffi/ABI.md`, `ffi/README.md` |
 | `layout` (`epochdb-layout`) | bin `layout` | the run-file layout experiment that chose format v2 | `state/LAYOUT.md` |
+| `validator/` + `cmd/epochdb-validator` (Go, outside the workspace) | bin `epochdb-validator`; `cmd/epochdb-validator/e2e`, `/stub` | the validator shell over `ffi`: libevm txpool, tx gossip (subnet-evm wire format), BuildBlock through `epochdb_build`, `/rpc`; `e2e` is the tmpnet oracle (ours + stock validators on one chain), `stub` a canned C engine for the Go tests | `cmd/epochdb-validator/E2E.md` |
 
-Dependency order: `state` <- `node`; `block` <- `exec` <- `node`, `store`, `rpc` <- `chain` <- `plugin`, `ffi`. The protos under `plugin/proto/` are avalanchego `v1.14.3-0.20260804141953-6dc4c3b395b6` verbatim (`RPCChainVMProtocol = 45`), compiled by `plugin/build.rs` (needs `protoc`).
+Dependency order: `state` <- `node`; `block` <- `exec` <- `node`, `store`, `rpc` <- `chain` <- `plugin`, `ffi` <- `validator` (Go). The protos under `plugin/proto/` are avalanchego `v1.14.3-0.20260804141953-6dc4c3b395b6` verbatim (`RPCChainVMProtocol = 45`), compiled by `plugin/build.rs` (needs `protoc`).
 
 ## Build
 
 ```
 cd rs
-cargo build --release                       # every bin into rs/target/release/
-cargo test --workspace --release            # 50 tests
+cargo build --release                       # every Rust bin into rs/target/release/
+cargo test --workspace --release            # the unit and oracle tests
 cargo clippy --workspace                    # warnings only
 ```
+
+The binaries:
+
+| binary | build | what it is |
+|---|---|---|
+| `epochdb-rs` (`rs/plugin`) | `cargo build --release -p epochdb-plugin` | no arguments: the rpcchainvm follower plugin (`AVALANCHE_VM_RUNTIME_ENGINE_ADDR` set by avalanchego or the hosts); `--dump ...`: the in-process bench (rs/node); `--version` |
+| `epochdb-validator` (Go, `cmd/epochdb-validator`) | `cargo build --release -p epochdb-ffi && ffi/localize.sh target/release/libepochdb_engine.a`, then `cd .. && go build ./cmd/epochdb-validator` | the validator plugin: the same engine linked through `libepochdb_engine.a` (cgo, glibc), plus txpool, gossip, BuildBlock; `--version`. `go test ./validator/` runs the in-process tests against the real archive, `-tags epochdb_stub` against the canned C engine |
+| `epochdb-rpc-serve` (`rs/rpc`) | `cargo build --release -p epochdb-rpc` | the JSON-RPC / `/ws` server over a store dir on its own (no plugin): `--data DIR --genesis chain.json --upgrade upgrade.json --http ADDR` |
+| `storecheck` (`rs/store`) | `cargo build --release -p epochdb-store` | store tools: `verify` (rows against a dump), `write`, `merge`, `probe`, `rowsum`, `publish` / `join` / `readall` (casfs, S3) |
+| `epochdb-exec` (`rs/exec`) | `cargo build --release -p epochdb-exec` | the executor alone over a dump: re-executes blocks and compares gasUsed / receiptsRoot / traces against an RPC (`--rpc`, `--rpc-cache`) |
+| `vbench` (`rs/chain`) | `cargo build --release -p epochdb-chain` | the validator-shape bench and build oracle over the library engine (`--build`, `--window`, `--synthetic`, `--export-inner`) |
+| `libepochdb_engine.a` + `ffi/epochdb_engine.h` (`rs/ffi`) | `cargo build --release -p epochdb-ffi`, then `ffi/localize.sh` (mandatory before a Go link; `ffi/README.md`) | the C ABI over `chain`; `ffi/smoke/run.sh <dump> <chain.json> <upgrade.json> <workdir> [n]` is the C smoke test |
+
+### The Firewood option
+
+Every engine consumer takes a state-engine switch: `--state firewood` on the bench (`epochdb-rs --dump ...`; `--fw-cache-mb`, `--fw-kv-cache-mb`, `--fw-parallel`, `--fw-deferred`, `--fw-revisions`), `"state-engine":"firewood"` in the plugin's config bytes (with `firewood-cache-mb`, `firewood-kv-cache-mb`), and the same config bytes through the FFI (`epochdb_open`) for `epochdb-validator`. Under Firewood the state root comes from the checker thread's proposal after accept (no inline root in verify, so `epochdb_build` answers an error: block building needs the native engine); the native default keeps the inline root in NormalOp. Details and numbers: the "Firewood state engine" section below and `FIREWOOD.md`.
 
 Static binary for a box without a matching glibc:
 
@@ -101,11 +118,12 @@ Other environment variables (tools and tests only): `EPOCHDB_RPC_NOW=<unix s>` p
 
 ### The image
 
-The repo `Dockerfile` has a `rust` stage (`rust:1.97-trixie`, `musl-tools` + `protobuf-compiler`, target `x86_64-unknown-linux-musl`, cargo registry and target dir as BuildKit cache mounts like the Go stage) that builds `epochdb-rs` static and copies it into the runtime image twice: `/usr/local/bin/epochdb-rs` beside the Go binaries (what `epochdb-host --vm` points at) and `/plugins/srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy` (the stock subnet-evm VM id, for `docker cp` into a stock avalanchego's plugin dir or a bind mount of `/plugins`; a chain created under a vanity VM id wants the same file under that id, `platform.getBlockchains` says which). The entrypoint is still the Go `epochdb`. `.github/workflows/build.yml` builds the same Dockerfile on every push to `main` (unchanged: the new stage rides in the same `docker/build-push-action` step; its GHA layer cache does not hold BuildKit cache mounts, so the Rust stage is cold there unless `rs/` is untouched: 2m43s cold on a 16-thread i7-10700K, so expect 6-10 min of the docker job on a 4 vCPU runner, in parallel with the Go stage); `rs/target` is in `.dockerignore` so a local build tree never enters the context. Image 612 MB, of which `epochdb-rs` is one 78 MB layer (both paths are hard links of one file; debug info kept for backtrace line numbers).
+The repo `Dockerfile` has a `rust` stage (`rust:1.97-trixie`, `musl-tools` + `protobuf-compiler`, target `x86_64-unknown-linux-musl`, cargo registry and target dir as BuildKit cache mounts like the Go stage) that builds `epochdb-rs` static, builds the glibc `libepochdb_engine.a` and localizes it (`rs/ffi/localize.sh`) for the Go stage, which links it into `/usr/local/bin/epochdb-validator` beside the other Go binaries (glibc, cgo: the runtime image is `distroless/cc-debian13`), and copies `epochdb-rs` into the runtime image twice: `/usr/local/bin/epochdb-rs` beside the Go binaries (what `epochdb-host --vm` points at) and `/plugins/srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy` (the stock subnet-evm VM id, for `docker cp` into a stock avalanchego's plugin dir or a bind mount of `/plugins`; a chain created under a vanity VM id wants the same file under that id, `platform.getBlockchains` says which). The entrypoint is still the Go `epochdb`. `.github/workflows/build.yml` builds the same Dockerfile on every push to `main` (unchanged: the new stage rides in the same `docker/build-push-action` step; its GHA layer cache does not hold BuildKit cache mounts, so the Rust stage is cold there unless `rs/` is untouched: 2m43s cold on a 16-thread i7-10700K, so expect 6-10 min of the docker job on a 4 vCPU runner, in parallel with the Go stage); `rs/target` is in `.dockerignore` so a local build tree never enters the context. Image 774 MB (612 before `epochdb-validator` and its glibc engine archive; 4m25s locally with warm cache mounts), of which `epochdb-rs` is one 78 MB layer (both paths are hard links of one file; debug info kept for backtrace line numbers).
 
 ```
 docker build -t epochdb:rust-ops .
 docker run --rm --entrypoint epochdb-rs epochdb:rust-ops --version    # epochdb-rs/0.1.0 [rpcchainvm=45]
+docker run --rm --entrypoint epochdb-validator epochdb:rust-ops --version    # epochdb-validator/0.1 [rpcchainvm=45]
 ```
 
 `ops/compose.rust.example.yml` is one chain as `epochdb-host` + `epochdb-rs` with `EPOCHDB_*` on the container, and the equivalent stock-avalanchego layout (plugin dir + chain config file) in its comments.
