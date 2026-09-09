@@ -9,8 +9,10 @@
 //!   epochdb-rs --dump FILE --genesis chain.json --upgrade upgrade.json --data DIR
 //!       [--from 1] [--to N] [--stop-at N] [--duration S] [--workers 14]
 //!       [--roll-budget MB] [--history FILE] [--network 1]
+//!       [--state native|firewood] [--fw-cache-mb 192] [--fw-revisions 128] [--root-inline]
 
 use crate::engine;
+use crate::firewood::{Committer, Firewood, Layer, Opts};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Bytes, B256};
 use anyhow::{anyhow, bail, Context, Result};
@@ -66,6 +68,8 @@ struct CheckItem {
     stats: Stats,
     /// --root-inline: the executor waits here until the root is checked.
     ack: Option<SyncSender<()>>,
+    /// --state firewood: the block's layer (its Firewood ops come from it).
+    layer: Option<Arc<Layer>>,
 }
 
 enum Msg {
@@ -182,16 +186,69 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, mut hist: Option<History
     Ok(())
 }
 
+/// The Firewood checker: the block's ops proposed (Firewood hashes here, the
+/// proposal's root is the block's), compared with the header, committed.
+/// t_apply = propose, t_root = commit.
+fn checker_fw(rx: Receiver<Msg>, mut c: Committer, mut hist: Option<History>, stats: Arc<Mutex<Stats>>) -> Result<Committer> {
+    let (mut t_apply, mut t_root, mut t_write) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut checked = 0u64;
+    for msg in rx {
+        let it = match msg {
+            Msg::Park(parked, resume) => {
+                let _ = parked.send(());
+                let _ = resume.recv();
+                continue;
+            }
+            Msg::Block(it) => it,
+        };
+        let layer = it.layer.as_ref().expect("firewood item");
+        let t0 = Instant::now();
+        let root = c.propose(it.height, layer.ops())?;
+        let t1 = Instant::now();
+        t_apply += t1 - t0;
+        if root != it.want {
+            eprintln!("epochdb-rs: block {}: state root mismatch: firewood {root}, header {}", it.height, it.want);
+            std::process::exit(1);
+        }
+        c.commit()?;
+        t_root += t1.elapsed();
+        checked += 1;
+        if let Some(ack) = &it.ack {
+            let _ = ack.send(());
+        }
+        if let Some(h) = hist.as_mut() {
+            let t0 = Instant::now();
+            h.write(&it).with_context(|| format!("block {}: history write", it.height))?;
+            t_write += t0.elapsed();
+        }
+        let mut s = it.stats;
+        s.checked = checked;
+        s.t_apply = t_apply;
+        s.t_root = t_root;
+        s.t_write = t_write;
+        *stats.lock().unwrap() = s;
+    }
+    Ok(c)
+}
+
 fn rss_mb() -> u64 {
     let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
     let pages: u64 = s.split_whitespace().nth(1).and_then(|p| p.parse().ok()).unwrap_or(0);
     pages * 4096 >> 20
 }
 
+/// RssAnon from /proc/self/status, MB (the leak watch: file-backed pages excluded).
+fn rss_anon_mb() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    s.lines().find(|l| l.starts_with("RssAnon:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|k| k.parse::<u64>().ok()).unwrap_or(0) >> 10
+}
+
 /// The bench thread: one line every 10 s and one at exit (epochdb-vm's line
 /// verbatim, full= always 0), the time split beside it; sets `stop` once
 /// --duration seconds passed since the first executed block.
 struct Bench {
+    /// --state firewood: the checker's split is propose / commit.
+    fw: bool,
     stats: Arc<Mutex<Stats>>,
     wait_ns: Arc<AtomicU64>,
     t0: Instant,
@@ -211,13 +268,14 @@ impl Bench {
             _ => 0.0,
         };
         eprintln!(
-            "{tag} t={:.0} h={} blk={} tx={} mgas/s={window:.2} cum={cum:.2} wait={:.1} full=0 rss={} overlay={} dirty={} rolls={} rolling={}",
+            "{tag} t={:.0} h={} blk={} tx={} mgas/s={window:.2} cum={cum:.2} wait={:.1} full=0 rss={} anon={} overlay={} dirty={} rolls={} rolling={}",
             (now - self.t0).as_secs_f64(),
             s.height,
             s.blocks,
             s.txs,
             self.wait_ns.load(Ordering::Relaxed) as f64 / 1e9,
             rss_mb(),
+            rss_anon_mb(),
             s.overlay >> 20,
             s.dirty >> 20,
             s.rolls,
@@ -225,8 +283,9 @@ impl Bench {
         );
         let d = |a: Duration, b: Duration| a.saturating_sub(b).as_secs_f64();
         let l = self.last;
+        let (la, lr) = if self.fw { ("propose", "commit") } else { ("apply", "root") };
         eprintln!(
-            "split read={:.2}s evm={:.2}s trace={:.2}s commit={:.2}s | checker apply={:.2}s root={:.2}s write={:.2}s of {dt:.1}s",
+            "split read={:.2}s evm={:.2}s trace={:.2}s commit={:.2}s | checker {la}={:.2}s {lr}={:.2}s write={:.2}s of {dt:.1}s",
             d(s.t_read, l.t_read),
             d(s.t_evm, l.t_evm),
             d(s.t_trace, l.t_trace),
@@ -262,8 +321,9 @@ impl Bench {
         self.line("bench exit");
         let s = *self.stats.lock().unwrap();
         let ex = s.t_evm + s.t_trace + s.t_commit;
+        let (la, lr) = if self.fw { ("propose", "commit") } else { ("apply", "root") };
         eprintln!(
-            "split total read={:.2}s evm={:.2}s trace={:.2}s commit={:.2}s | checker apply={:.2}s root={:.2}s write={:.2}s | exec-thread {:.1} mgas/s | blocks={} root-checked={} rolls={}",
+            "split total read={:.2}s evm={:.2}s trace={:.2}s commit={:.2}s | checker {la}={:.2}s {lr}={:.2}s write={:.2}s | exec-thread {:.1} mgas/s | blocks={} root-checked={} rolls={}",
             s.t_read.as_secs_f64(),
             s.t_evm.as_secs_f64(),
             s.t_trace.as_secs_f64(),
@@ -335,6 +395,14 @@ pub fn main(args: Vec<String>) -> Result<()> {
     let t0 = Instant::now();
 
     let cfg = Config::from_genesis(&genesis, &upgrade, network).context("config")?.with_chain(blockchain_id, subnet_id);
+    match arg(&args, "--state").as_deref().unwrap_or("native") {
+        "native" => {}
+        "firewood" => {
+            let opts = Opts { cache_bytes: num::<usize>(&args, "--fw-cache-mb", 192)? * 1_000_000, revisions: num(&args, "--fw-revisions", 128)? };
+            return firewood_main(&args, cfg, dump, data, to, stop_at, workers, root_inline, duration, history, opts, t0);
+        }
+        other => bail!("--state {other}: native or firewood"),
+    }
     let dirty_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
     // Genesis: the alloc into the first run, the first trie rolled from it,
@@ -375,7 +443,7 @@ pub fn main(args: Vec<String>) -> Result<()> {
     };
     let (bench_exit_tx, bench_exit_rx) = sync_channel::<()>(1);
     let bench = {
-        let b = Bench { stats: stats.clone(), wait_ns: wait_ns.clone(), t0, first: None, last: Stats::default(), last_t: t0 };
+        let b = Bench { fw: false, stats: stats.clone(), wait_ns: wait_ns.clone(), t0, first: None, last: Stats::default(), last_t: t0 };
         let stop = stop.clone();
         std::thread::spawn(move || b.run(bench_exit_rx, duration, stop))
     };
@@ -463,7 +531,7 @@ pub fn main(args: Vec<String>) -> Result<()> {
                 ..Default::default()
             };
             let (ack, ack_rx) = if root_inline { let (t, r) = sync_channel::<()>(1); (Some(t), Some(r)) } else { (None, None) };
-            let item = CheckItem { height: h.number, want: h.root, ws, header_rlp: Bytes::from(b.header_rlp.clone()), receipts, traces, code, stats, ack };
+            let item = CheckItem { height: h.number, want: h.root, ws, header_rlp: Bytes::from(b.header_rlp.clone()), receipts, traces, code, stats, ack, layer: None };
             if check_tx.send(Msg::Block(Box::new(item))).is_err() {
                 bail!("checker stopped");
             }
@@ -484,5 +552,147 @@ pub fn main(args: Vec<String>) -> Result<()> {
     res?;
     cres?;
     let _ = Path::new(&dump);
+    Ok(())
+}
+
+/// `--state firewood`: the same loop over the Firewood engine. No roll (Firewood
+/// keeps its own node store and revisions); the checker proposes and commits.
+#[allow(clippy::too_many_arguments)]
+fn firewood_main(args: &[String], cfg: Config, dump: String, data: PathBuf, to: u64, stop_at: u64, workers: usize, root_inline: bool, duration: Option<f64>, history: Option<History>, opts: Opts, t0: Instant) -> Result<()> {
+    let dir = data.join("vmstate");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let mut committer = Committer::open(&dir, true, opts)?;
+    let mut ex = Executor::with_db(cfg.clone(), Firewood::new(committer.committed()))?;
+    let want = oracle::state_root(Executor::new(cfg.clone())?.db());
+    {
+        let db = ex.db_mut();
+        db.take_ws();
+        let layer = db.finish(0, B256::ZERO, 0).layer;
+        let nops = layer.map.len();
+        db.accept(0, layer.clone());
+        let tg = Instant::now();
+        let root = committer.propose(0, layer.ops())?;
+        if root != want {
+            bail!("genesis root mismatch: firewood {root}, alloc {want}");
+        }
+        committer.commit()?;
+        eprintln!("epochdb-rs: genesis state ok: root={want} accounts={} keys={nops} firewood={}B in {:.0}ms", cfg.alloc.len(), Committer::disk_bytes(&dir), tg.elapsed().as_secs_f64() * 1e3);
+    }
+
+    let stats = Arc::new(Mutex::new(Stats::default()));
+    let wait_ns = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (check_tx, check_rx) = sync_channel::<Msg>(CHECK_DEPTH);
+    let checker = {
+        let stats = stats.clone();
+        std::thread::spawn(move || checker_fw(check_rx, committer, history, stats))
+    };
+    let (bench_exit_tx, bench_exit_rx) = sync_channel::<()>(1);
+    let bench = {
+        let b = Bench { fw: true, stats: stats.clone(), wait_ns: wait_ns.clone(), t0, first: None, last: Stats::default(), last_t: t0 };
+        let stop = stop.clone();
+        std::thread::spawn(move || b.run(bench_exit_rx, duration, stop))
+    };
+    eprintln!(
+        "epochdb-rs: chainId={} dump={dump} heights=1..{} state=firewood cache={}MB revisions={} workers={workers} root-inline={root_inline} history={}",
+        cfg.chain_id,
+        if stop_at == u64::MAX { "end".to_string() } else { stop_at.to_string() },
+        opts.cache_bytes / 1_000_000,
+        opts.revisions,
+        arg(args, "--history").unwrap_or_default()
+    );
+
+    let blocks = block::Blocks::open(&dump, 1, to)?;
+    let mut it = block::recovered(blocks, workers);
+    let mut parent_time = cfg.genesis_timestamp;
+    let (mut nblk, mut ntx, mut gas) = (0u64, 0u64, 0u64);
+    let mut t_read = Duration::ZERO;
+    let mut t_root_wait = Duration::ZERO;
+    let mut first = true;
+    let res = (|| -> Result<()> {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let tw = Instant::now();
+            let Some(b) = it.next() else { return Ok(()) };
+            let w = tw.elapsed();
+            t_read += w;
+            wait_ns.fetch_add(w.as_nanos() as u64, Ordering::Relaxed);
+            let b = b.map_err(|e| anyhow!("block decode: {e}"))?;
+            let h = &b.header;
+            if h.number > stop_at {
+                eprintln!("epochdb-rs: reached --stop-at {stop_at}");
+                return Ok(());
+            }
+            if first {
+                ex.set_block_hash(h.number - 1, h.parent_hash);
+                first = false;
+            }
+            ex.db_mut().begin(None);
+            let r = ex.execute_block(&b, parent_time).with_context(|| format!("block {}", h.number))?;
+            if r.gas_used != h.gas_used {
+                bail!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used);
+            }
+            if r.receipts_root != h.receipt_hash {
+                bail!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash);
+            }
+            if r.bloom != h.bloom {
+                bail!("block {}: logsBloom differs from the header", h.number);
+            }
+            ex.set_block_hash(h.number, b.hash);
+            nblk += 1;
+            ntx += r.txs.len() as u64;
+            gas += r.gas_used;
+            parent_time = h.time;
+            let db = ex.db_mut();
+            let (ws, code) = db.take_ws();
+            let layer = db.finish(h.number, b.hash, h.time).layer;
+            db.accept(h.number, layer.clone());
+            let mut receipts = Vec::new();
+            let mut traces = Vec::with_capacity(r.txs.len());
+            for t in r.txs {
+                t.receipt.encode_2718(&mut receipts);
+                traces.push(t.trace_json);
+            }
+            let stats = Stats {
+                height: h.number,
+                blocks: nblk,
+                txs: ntx,
+                gas,
+                overlay: ex.db().accepted_bytes(),
+                t_read,
+                t_evm: ex.t_evm,
+                t_trace: ex.t_trace,
+                t_commit: ex.t_commit,
+                ..Default::default()
+            };
+            let (ack, ack_rx) = if root_inline { let (t, r) = sync_channel::<()>(1); (Some(t), Some(r)) } else { (None, None) };
+            let item = CheckItem { height: h.number, want: h.root, ws, header_rlp: Bytes::from(b.header_rlp.clone()), receipts, traces, code, stats, ack, layer: Some(layer) };
+            if check_tx.send(Msg::Block(Box::new(item))).is_err() {
+                bail!("checker stopped");
+            }
+            if let Some(rx) = ack_rx {
+                let t0 = Instant::now();
+                rx.recv().map_err(|_| anyhow!("checker stopped"))?;
+                t_root_wait += t0.elapsed();
+            }
+        }
+    })();
+    drop(check_tx);
+    let cres = checker.join().map_err(|_| anyhow!("checker panicked"))?;
+    let _ = bench_exit_tx.send(());
+    let _ = bench.join();
+    if root_inline {
+        eprintln!("epochdb-rs: root-inline: executor waited {:.2}s for the checker (root work on the execution path)", t_root_wait.as_secs_f64());
+    }
+    eprintln!("epochdb-rs: firewood: trie reads {} (misses in every layer)", ex.db().trie_reads);
+    res?;
+    let committer = cres?;
+    let tc = Instant::now();
+    let root = committer.root();
+    committer.close()?;
+    eprintln!("epochdb-rs: firewood closed: root={root} disk={}B in {:.0}ms", Committer::disk_bytes(&dir), tc.elapsed().as_secs_f64() * 1e3);
     Ok(())
 }
