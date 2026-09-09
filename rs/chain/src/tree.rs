@@ -152,6 +152,11 @@ impl<E: Engine> Tree<E> {
             verified.insert(*id, v);
             return Err(e);
         }
+        // Siblings and their descendants that consensus never rejects (a
+        // built block that was superseded before it was proposed, a retry on
+        // the same parent) would stay verified forever, each with its write
+        // set; nothing at or below the accepted height can be accepted now.
+        verified.retain(|_, x| self.engine.meta(&x.block).height > m.height);
         Ok(())
     }
 
