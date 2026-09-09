@@ -102,6 +102,41 @@ decode as a libevm block.
   accounts above their slot limit). Go heap 0.5-0.9 GB, GC 1.5%, plugin RSS 3.4-4.0 GB (pool + engine).
 - Send failures at the end: "already known" (the generator's batch resend after a slow RPC), harmless.
 
+## Run 5 (for the record): all-ours 3 nodes, 10 min, 2000 tx/s offered, default genesis + raised caps (2f9e8d1)
+
+- No stall: 246 load blocks (9..254) byte-identical on 3 nodes, 185,328 txs on chain (309 tx/s over the 10 min; a
+  full block every ~2.4 s), 753 txs/block average = 79% of the 20 M limit (most blocks 952 txs = 20.0 M, some short
+  ones when two nodes built on the same parent), 0 refused sends, 0 drops (drop-reason and empty-account warnings
+  silent, `account_errors` 0). Offered rate fell to 1265 tx/s because RPC round trips got longer as the pool grew.
+- Engine verify p50 2.8 ms p99 9.9 ms (n=282); engine build p50 92 ms p99 430 ms (n=255; ~1400 candidates, 952
+  included per build).
+- Pool 577k pending at the end (per-account caps 1000 x 1000 keys); Go heap 0.6-0.9 GB (the pool), GC 1.7% of CPU;
+  plugin RSS 1.6-1.85 GB growing with the pool.
+
+## Run 6 (for the record): --stress genesis, all-ours 3 nodes, 5 min, 2682 tx/s offered (2f9e8d1)
+
+- No stall: 94 load blocks (9..102) byte-identical on 3 nodes, 420,668 txs on chain = 1402 tx/s, 75 Mgas/s; block
+  size alternates between 16,029 txs = 336.6 M gas (the 1800 KiB size cap, 67% of the gas limit) and small blocks
+  (a build racing the pool's reset gets mostly already-mined candidates: "included 2005, candidates 18034"), 4475
+  txs/block average.
+- Engine verify p50 1.0 ms p99 179 ms (16k-tx blocks); engine build p50 650 ms p99 1.06 s with 18k candidates
+  (~40 us per included tx, down from 1.7 s p50 / 7.8 s max with 107k candidates in run 4).
+- Pool 350k pending; Go heap 0.3-0.5 GB, GC 1.3%; plugin RSS 1.7-2.0 GB. Per-block crossings 50-200: parse (each
+  node re-parses the others' blocks several times), account_state 1, header 1, and build retries every 100 ms while
+  a built block waits for consensus (the min delay is 1 ms here, so the retry loop dominates).
+
+## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
+
+- Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and
+  `eth_getBlockReceipts` identical on all nodes at every height in every run (1.1 M txs over runs 1-6); no
+  invalid-block lines in stock logs.
+- Engine cost at the 20 M gas / 2 s default chain: verify p50 3-5 ms, build p50 60-90 ms per full 952-tx block,
+  under 5% of the block interval. At 500 M gas: 16k-tx blocks verify in ~180 ms p99 and build in ~650 ms.
+- Go side: heap follows the pool (about 1.5 KB per pending tx), 10 MB at 300 tx/s with a drained pool, 0.5-0.9 GB
+  with 350k-580k pending; GC 0.5-2% of CPU; RSS = pool + engine (240 MB drained, 1.8-2 GB with a 500k pool).
+- Crossings per accepted block with the pool drained: ~16 (parse 3-5, verify 1-2, accept 1, build 1-6, account 1,
+  header 1, other 1-3); admission crossings only for a sender's first tx after a head change.
+
 ## Validator-side lessons (the pool under load)
 
 1. `txpool.TxPool.Sync()` is the simulator's hook: it forces a full pool reset (demote + promote of every tx under the
