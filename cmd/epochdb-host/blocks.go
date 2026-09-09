@@ -321,8 +321,14 @@ func (g *gen) pending(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if res.Result.Queued == "" {
+		return p, nil
+	}
 	q, err := strconv.ParseUint(strings.TrimPrefix(res.Result.Queued, "0x"), 16, 64)
-	return p + q, err
+	if err != nil {
+		return 0, fmt.Errorf("txpool_status queued %q: %w", res.Result.Queued, err)
+	}
+	return p + q, nil
 }
 
 // loadNonces (remote mode): the senders' chain nonces, so a rerun against a
@@ -342,16 +348,20 @@ func (g *gen) loadNonces(ctx context.Context) error {
 	rec := httptest.NewRecorder()
 	g.rpc.ServeHTTP(rec, req)
 	var results []struct {
-		ID     int    `json:"id"`
-		Result string `json:"result"`
+		ID     int             `json:"id"`
+		Result string          `json:"result"`
+		Error  json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &results); err != nil {
 		return fmt.Errorf("getTransactionCount batch: %w: %.200s", err, rec.Body.String())
 	}
 	for _, r := range results {
+		if len(r.Error) != 0 {
+			return fmt.Errorf("getTransactionCount: %s", r.Error)
+		}
 		n, err := strconv.ParseUint(strings.TrimPrefix(r.Result, "0x"), 16, 64)
 		if err != nil {
-			return err
+			return fmt.Errorf("getTransactionCount id %d: %w (%q)", r.ID, err, r.Result)
 		}
 		g.nonces[r.ID] = n
 	}
@@ -563,7 +573,11 @@ func (g *gen) rpcUint(ctx context.Context, method, params string) (uint64, error
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return 0, fmt.Errorf("%s: %w", method, err)
 	}
-	return strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
+	n, err := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w (%q)", method, err, s)
+	}
+	return n, nil
 }
 
 // awaitBlock (remote mode): wait until the network has accepted at least one
