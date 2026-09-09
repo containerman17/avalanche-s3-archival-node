@@ -53,7 +53,7 @@ const (
 	slotWriterInit = "6022" + "80" + "600b" + "6000" + "39" + "6000" + "f3" +
 		"602035" + "600035" + "5b" + "8115" + "6020" + "57" + "8080" + "604035" + "01" + "90" + "55" + "600101" + "90600190" + "03" + "90" + "6006" + "56" + "5b00"
 	slotsPerTx   = 50
-	slotsPerGrow = 1000 // fresh slots per prefill grow tx (slots kind)
+	slotsPerGrow = 500 // fresh slots per prefill grow tx (slots kind), 12.6 M gas
 )
 
 // genChain writes chain.json for the private chain when it is absent.
