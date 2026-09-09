@@ -840,8 +840,8 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 
 // runGen: prefill for prefillFor, then one timed block per entry of sizes.
 func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, kind string, prefillFor time.Duration, prefillBatch int, sizes, corpusOut string) error {
-	if _, _, ok := settleSpec(kind); kind != "token" && kind != "slots" && !ok {
-		return fmt.Errorf("--gen-kind %q: want token, slots, or settle[:<parties>x<secs>]", kind)
+	if _, _, ok := settleSpec(kind); kind != "transfer" && kind != "token" && kind != "slots" && !ok {
+		return fmt.Errorf("--gen-kind %q: want transfer, token, slots, or settle[:<parties>x<secs>]", kind)
 	}
 	configBytes, err := os.ReadFile(configPath)
 	if err != nil {
@@ -879,8 +879,8 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, ki
 // runGenRemote: the same workloads against a live node's /rpc. The network
 // mines; the funder (ewoq, funded in the e2e genesis) pays the senders.
 func runGenRemote(ctx context.Context, rpcURL, dataDir, kind string, prefillFor time.Duration, prefillBatch int, sizes string) error {
-	if _, _, ok := settleSpec(kind); kind != "token" && kind != "slots" && !ok {
-		return fmt.Errorf("--gen-kind %q: want token, slots, or settle[:<parties>x<secs>]", kind)
+	if _, _, ok := settleSpec(kind); kind != "transfer" && kind != "token" && kind != "slots" && !ok {
+		return fmt.Errorf("--gen-kind %q: want transfer, token, slots, or settle[:<parties>x<secs>]", kind)
 	}
 	g := &gen{rpc: remoteRPC(rpcURL)}
 	chainID, err := g.rpcUint(ctx, "eth_chainId", "[]")
