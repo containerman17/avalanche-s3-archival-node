@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	sevmcore "github.com/ava-labs/avalanchego/graft/subnet-evm/core"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
@@ -24,9 +23,8 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/params"
-
-	"github.com/containerman17/avalanche-s3-archival-node/chain"
-	"github.com/containerman17/avalanche-s3-archival-node/fetch"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // ewoq: the subnet-evm test key, funded in testGenesis.
@@ -47,15 +45,6 @@ const testGenesis = `{
   "coinbase": "0x0000000000000000000000000000000000000000", "number": "0x0", "gasUsed": "0x0",
   "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
 }`
-
-func testGenesisHeader(genesis []byte) *types.Header {
-	fetch.RegisterExtras(chain.SubnetEVM)
-	g := new(sevmcore.Genesis)
-	if err := json.Unmarshal(genesis, g); err != nil {
-		panic(err)
-	}
-	return g.ToBlock().Header()
-}
 
 type harness struct {
 	t      *testing.T
@@ -89,7 +78,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	key, _ := crypto.HexToECDSA(ewoqKey)
 	return &harness{t: t, vm: vm, rpc: handlers["/rpc"], key: key, addr: crypto.PubkeyToAddress(key.PublicKey),
-		signer: types.LatestSigner(vm.g.Config)}
+		signer: types.LatestSigner(vm.config)}
 }
 
 func (h *harness) call(method string, params ...any) json.RawMessage {
@@ -114,7 +103,7 @@ func (h *harness) call(method string, params ...any) json.RawMessage {
 func (h *harness) transfer(to ethcommon.Address, value *big.Int) ethcommon.Hash {
 	h.t.Helper()
 	tx := types.MustSignNewTx(h.key, h.signer, &types.DynamicFeeTx{
-		ChainID: h.vm.g.Config.ChainID, Nonce: h.nonce, To: &to, Value: value, Gas: 21000,
+		ChainID: h.vm.config.ChainID, Nonce: h.nonce, To: &to, Value: value, Gas: 21000,
 		GasFeeCap: big.NewInt(100 * params.GWei), GasTipCap: big.NewInt(params.GWei),
 	})
 	h.nonce++
@@ -217,8 +206,10 @@ func TestLatencyByBlockSize(t *testing.T) {
 			h.transfer(to, big.NewInt(1))
 		}
 		before := h.vm.eng.snapshot()
+		engBefore := histSum(h.vm.m.build)
 		blk, build, verify := h.buildAccept()
 		after := h.vm.eng.snapshot()
+		engBuild := time.Duration((histSum(h.vm.m.build) - engBefore) * float64(time.Second))
 		var x []string
 		for i := range after {
 			if d := after[i] - before[i]; d > 0 {
@@ -227,9 +218,16 @@ func TestLatencyByBlockSize(t *testing.T) {
 		}
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
-		t.Logf("txs=%d height=%d build=%v verify=%v crossings: %s | go heap=%dMB numGC=%d gcCPU=%.4f", n, blk.Height(), build, verify,
+		t.Logf("txs=%d height=%d build=%v (engine %v) verify=%v crossings: %s | go heap=%dMB numGC=%d gcCPU=%.4f", n, blk.Height(), build, engBuild, verify,
 			strings.Join(x, " "), ms.HeapAlloc>>20, ms.NumGC, ms.GCCPUFraction)
 	}
+}
+
+// histSum reads a histogram's sample sum (seconds).
+func histSum(h prometheus.Histogram) float64 {
+	m := new(dto.Metric)
+	h.Write(m)
+	return m.GetHistogram().GetSampleSum()
 }
 
 func TestRPCForward(t *testing.T) {

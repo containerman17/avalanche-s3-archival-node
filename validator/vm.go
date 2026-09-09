@@ -17,10 +17,6 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/database"
-	"github.com/ava-labs/avalanchego/graft/subnet-evm/core/txpool"
-	"github.com/ava-labs/avalanchego/graft/subnet-evm/core/txpool/legacypool"
-	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
-	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm"
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/config"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/network/p2p"
@@ -30,14 +26,14 @@ import (
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
 	"github.com/ava-labs/avalanchego/version"
+	"github.com/ava-labs/libevm/core/txpool"
+	"github.com/ava-labs/libevm/core/txpool/legacypool"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.uber.org/zap"
-
-	"github.com/containerman17/avalanche-s3-archival-node/chain"
-	"github.com/containerman17/avalanche-s3-archival-node/vmexec"
 )
 
 // Version is what avalanchego's version API reports for this VM.
@@ -51,16 +47,16 @@ var (
 
 // VM is the ChainVM. Zero value, then Initialize.
 type VM struct {
-	eng   *engine
-	g     *vmexec.Genesis
-	cfg   config.Config
-	ctx   *snow.Context
-	chain *poolChain
-	pool  *txpool.TxPool
-	net   *p2p.Network
-	push  *gossip.PushGossiper[*evm.GossipEthTx]
-	b     *builder
-	m     *metrics
+	eng    *engine
+	config *params.ChainConfig
+	cfg    config.Config
+	ctx    *snow.Context
+	chain  *poolChain
+	pool   *txpool.TxPool
+	net    *p2p.Network
+	push   *gossip.PushGossiper[*gossipTx]
+	b      *builder
+	m      *metrics
 
 	mu        sync.Mutex
 	preferred ids.ID
@@ -79,12 +75,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	if chainCtx.ChainDataDir == "" {
 		return errors.New("validator: chain data dir is required")
 	}
-	c := &chain.Chain{
-		GenesisJSON: genesisBytes, UpgradeJSON: upgradeBytes,
-		NetworkID: chainCtx.NetworkID, SubnetID: chainCtx.SubnetID, BlockchainID: chainCtx.ChainID,
-		VMKind: chain.SubnetEVM,
-	}
-	g, err := vmexec.ChainGenesis(c) // registers the libevm extras too
+	chainConfig, err := parseChainConfig(genesisBytes, upgradeBytes, chainCtx.NetworkUpgrades)
 	if err != nil {
 		return err
 	}
@@ -96,7 +87,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	if err != nil {
 		return err
 	}
-	vm.eng, vm.g, vm.cfg, vm.ctx = eng, g, cfg, chainCtx
+	vm.eng, vm.config, vm.cfg, vm.ctx = eng, chainConfig, cfg, chainCtx
 	vm.m = newMetrics()
 	if chainCtx.Metrics != nil {
 		if err := chainCtx.Metrics.Register("epochdb", vm.m.reg); err != nil {
@@ -115,7 +106,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		eng.close()
 		return err
 	}
-	vm.chain = newPoolChain(eng, g.Config, head, headID)
+	vm.chain = newPoolChain(eng, chainConfig, head, headID)
 	vm.preferred = headID
 
 	legacy := legacypool.New(legacypool.Config{
@@ -129,7 +120,9 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		eng.close()
 		return fmt.Errorf("validator: txpool: %w", err)
 	}
-	vm.pool.SetMinFee(sevmparams.GetExtra(g.Config).FeeConfig.MinBaseFee)
+	// ponytail: libevm's pool has no SetMinFee; a tx under the chain's min
+	// base fee sits in the pool until it expires, the build filter never
+	// selects it. Add the check in serveRPC/gossipSet.Add if it matters.
 	vm.pool.SetGasTip(big.NewInt(0))
 
 	vm.net, err = p2p.NewNetwork(chainCtx.Log, appSender, vm.m.reg, "p2p")
@@ -138,12 +131,12 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.bg, vm.cancel = context.WithCancel(context.Background())
-	vm.b = newBuilder(vm.pool, head.Hash())
+	vm.b = newBuilder(vm.pool)
 	vm.wg.Add(1)
 	go func() { defer vm.wg.Done(); vm.b.run(vm.bg) }()
 
 	chainCtx.Log.Info("validator: engine open", zap.Stringer("chain", chainCtx.ChainID),
-		zap.Stringer("chainId", g.Config.ChainID), zap.Uint64("height", head.Number.Uint64()), zap.String("data", chainCtx.ChainDataDir))
+		zap.Stringer("chainId", chainConfig.ChainID), zap.Uint64("height", head.Number.Uint64()), zap.String("data", chainCtx.ChainDataDir))
 	return nil
 }
 
@@ -160,10 +153,15 @@ func (vm *VM) headHeader() (*types.Header, error) {
 	return h, nil
 }
 
-// SetState: 1 bootstrapping, 2 normal op (snow.State values). Gossip and
-// block building start at NormalOp, as in subnet-evm.
+// SetState: the engine takes 1 = bootstrapping (roots checked one block
+// behind), 2 = normal op (root inline, build allowed). Gossip and block
+// building start at NormalOp, as in subnet-evm.
 func (vm *VM) SetState(_ context.Context, st snow.State) error {
-	if err := vm.eng.setState(uint32(st)); err != nil {
+	engState := uint32(1)
+	if st == snow.NormalOp {
+		engState = 2
+	}
+	if err := vm.eng.setState(engState); err != nil {
 		return err
 	}
 	if st == snow.NormalOp {
@@ -177,12 +175,12 @@ func (vm *VM) SetState(_ context.Context, st snow.State) error {
 // startGossip wires subnet-evm's tx gossip (same codec as a stock node) over
 // avalanchego's p2p gossip SDK: pull + push gossipers, the bloom-backed set.
 func (vm *VM) startGossip() error {
-	set, err := evm.NewGossipEthTxPool(vm.pool, vm.m.reg)
+	set, err := newGossipSet(vm.pool, vm.m.reg)
 	if err != nil {
 		return err
 	}
 	validators := p2p.NewValidators(vm.ctx.Log, vm.ctx.SubnetID, vm.ctx.ValidatorState, time.Minute)
-	handler, pull, push, err := gossip.NewSystem(vm.ctx.NodeID, vm.net, validators, set, evm.GossipEthTxMarshaller{},
+	handler, pull, push, err := gossip.NewSystem(vm.ctx.NodeID, vm.net, validators, set, gossipMarshaller{},
 		gossip.SystemConfig{
 			Log: vm.ctx.Log, Registry: vm.m.reg, Namespace: "eth_tx_gossip",
 			RequestPeriod: vm.cfg.PullGossipFrequency.Duration,
@@ -201,7 +199,7 @@ func (vm *VM) startGossip() error {
 	vm.push = push
 	vm.b.setNormalOp()
 	vm.wg.Add(3)
-	go func() { defer vm.wg.Done(); set.Subscribe(vm.bg) }()
+	go func() { defer vm.wg.Done(); set.subscribe(vm.bg) }()
 	go func() { defer vm.wg.Done(); gossip.Every(vm.bg, vm.ctx.Log, push, vm.cfg.PushGossipFrequency.Duration) }()
 	go func() { defer vm.wg.Done(); gossip.Every(vm.bg, vm.ctx.Log, pull, vm.cfg.PullGossipFrequency.Duration) }()
 	return nil
@@ -281,12 +279,9 @@ func (vm *VM) GetBlockIDAtHeight(_ context.Context, height uint64) (ids.ID, erro
 	return id, nil
 }
 
-// GetBlock: the engine's stored bytes, re-parsed for the metadata (a cache
-// hit inside the engine).
+// GetBlock: the engine's stored bytes (the genesis assembled), re-parsed for
+// the metadata (a cache hit inside the engine).
 func (vm *VM) GetBlock(_ context.Context, id ids.ID) (snowman.Block, error) {
-	if id == ids.ID(vm.g.Hash) {
-		return &Block{vm: vm, id: id, time: vm.g.Timestamp}, nil
-	}
 	raw, err := vm.eng.getBlock(id)
 	if err != nil {
 		return nil, database.ErrNotFound
@@ -313,8 +308,7 @@ func (vm *VM) BuildBlockWithContext(_ context.Context, bc *block.Context) (snowm
 	return vm.buildBlock(bc.PChainHeight)
 }
 
-// Block is one block the engine knows; raw is its inner bytes (nil for the
-// genesis, which avalanchego never asks the bytes of).
+// Block is one block the engine knows; raw is its inner bytes.
 type Block struct {
 	vm     *VM
 	raw    []byte
@@ -372,7 +366,6 @@ func (b *Block) Accept(context.Context) error {
 		return err
 	}
 	vm.chain.setHead(h, b.id)
-	vm.b.setChainHead(h.Hash())
 	vm.m.accept.Observe(time.Since(start).Seconds())
 
 	now := vm.eng.snapshot()
@@ -424,7 +417,7 @@ func newMetrics() *metrics {
 	m := &metrics{
 		reg:       prometheus.NewRegistry(),
 		verify:    ms("epochdb_verify_seconds", "engine verify (execution + state root inline)"),
-		build:     ms("epochdb_build_seconds", "BuildBlock: selection + engine build"),
+		build:     ms("epochdb_build_seconds", "the engine's build call (execution, header, state root)"),
 		accept:    ms("epochdb_accept_seconds", "engine accept + pool head move"),
 		verifyTxs: n("epochdb_verify_txs", "txs per verified block"),
 		buildTxs:  n("epochdb_build_txs", "txs per built block"),

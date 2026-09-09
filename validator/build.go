@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/graft/evm/constants"
-	sevmcore "github.com/ava-labs/avalanchego/graft/subnet-evm/core"
-	"github.com/ava-labs/avalanchego/graft/subnet-evm/core/txpool"
 	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/customheader"
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/customtypes"
@@ -21,6 +19,8 @@ import (
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/utils/lock"
 	ethcommon "github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core"
+	"github.com/ava-labs/libevm/core/txpool"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/holiman/uint256"
@@ -32,33 +32,31 @@ import (
 const retryDelay = 100 * time.Millisecond
 
 // builder decides WHEN to build (subnet-evm's blockBuilder rules): the pool
-// has executable txs, the pool's head is the chain head, and the timing
-// rules (retry delay, Granite minimum block delay) allow it.
+// has executable txs at the current head (pool.Sync waits for its reset),
+// and the timing rules (retry delay, Granite minimum block delay) allow it.
 type builder struct {
 	pool *txpool.TxPool
 	mu   sync.Mutex
 	cond *lock.Cond
 
-	normalOp            bool
-	chainHead, poolHead ethcommon.Hash
-	lastBuildTime       time.Time
-	lastBuildParent     ethcommon.Hash
-	admitted            atomic.Uint64
+	normalOp        bool
+	lastBuildTime   time.Time
+	lastBuildParent ethcommon.Hash
+	admitted        atomic.Uint64
 }
 
-func newBuilder(pool *txpool.TxPool, head ethcommon.Hash) *builder {
-	b := &builder{pool: pool, chainHead: head, poolHead: head}
+func newBuilder(pool *txpool.TxPool) *builder {
+	b := &builder{pool: pool}
 	b.cond = lock.NewCond(&b.mu)
 	return b
 }
 
+// run wakes waitForEvent on every promotion (new txs, or a reset after a
+// head change) and counts admitted txs.
 func (b *builder) run(ctx context.Context) {
-	txs := make(chan sevmcore.NewTxsEvent, 16)
-	reorgs := make(chan sevmcore.NewTxPoolReorgEvent, 16)
-	s1 := b.pool.SubscribeTransactions(txs, true)
-	s2 := b.pool.SubscribeNewReorgEvent(reorgs)
-	defer s1.Unsubscribe()
-	defer s2.Unsubscribe()
+	txs := make(chan core.NewTxsEvent, 16)
+	sub := b.pool.SubscribeTransactions(txs, true)
+	defer sub.Unsubscribe()
 	for {
 		select {
 		case <-ctx.Done():
@@ -66,14 +64,6 @@ func (b *builder) run(ctx context.Context) {
 		case ev := <-txs:
 			b.admitted.Add(uint64(len(ev.Txs)))
 			b.mu.Lock()
-			b.cond.Broadcast()
-			b.mu.Unlock()
-		case ev := <-reorgs:
-			if ev.Head == nil {
-				continue
-			}
-			b.mu.Lock()
-			b.poolHead = ev.Head.Hash()
 			b.cond.Broadcast()
 			b.mu.Unlock()
 		}
@@ -87,13 +77,6 @@ func (b *builder) setNormalOp() {
 	b.mu.Unlock()
 }
 
-func (b *builder) setChainHead(h ethcommon.Hash) {
-	b.mu.Lock()
-	b.chainHead = h
-	b.cond.Broadcast()
-	b.mu.Unlock()
-}
-
 func (b *builder) built(parent ethcommon.Hash) {
 	b.mu.Lock()
 	b.lastBuildTime, b.lastBuildParent = time.Now(), parent
@@ -102,8 +85,7 @@ func (b *builder) built(parent ethcommon.Hash) {
 
 func (b *builder) waitForEvent(ctx context.Context, head *types.Header) (common.Message, error) {
 	b.mu.Lock()
-	for !b.normalOp || b.chainHead != b.poolHead ||
-		b.pool.PendingSize(txpool.PendingFilter{MinTip: uint256.MustFromBig(b.pool.GasTip())}) == 0 {
+	for !b.normalOp || !b.hasPending() {
 		if err := b.cond.Wait(ctx); err != nil {
 			b.mu.Unlock()
 			return 0, err
@@ -113,10 +95,10 @@ func (b *builder) waitForEvent(ctx context.Context, head *types.Header) (common.
 	b.mu.Unlock()
 
 	var next time.Time
-	if lastParent == head.ParentHash && !lastTime.IsZero() {
-		next = lastTime.Add(retryDelay) // a retry on the same parent
+	if lastParent == head.Hash() && !lastTime.IsZero() {
+		next = lastTime.Add(retryDelay) // a retry on the same parent: the block was not accepted
 	} else {
-		next = minNextBlockTime(head)
+		next = minNextBlockTime(head) // Granite: the wait lives here, not in BuildBlock
 	}
 	if d := time.Until(next); d > 0 {
 		select {
@@ -126,6 +108,12 @@ func (b *builder) waitForEvent(ctx context.Context, head *types.Header) (common.
 		}
 	}
 	return common.PendingTxs, nil
+}
+
+// hasPending: the pool, reset to the latest head, holds an executable tx.
+func (b *builder) hasPending() bool {
+	b.pool.Sync()
+	return len(b.pool.Pending(txpool.PendingFilter{OnlyPlainTxs: true})) > 0
 }
 
 // minNextBlockTime: Granite's minimum delay after the parent (ACP-226).
@@ -166,7 +154,7 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	}
 	now := customheader.GetNextTimestamp(parent, time.Now())
 	tsMS := uint64(now.UnixMilli())
-	extra := sevmparams.GetExtra(vm.g.Config)
+	extra := sevmparams.GetExtra(vm.config)
 	feeConfig := extra.FeeConfig
 	baseFee, err := customheader.BaseFee(extra, feeConfig, parent, tsMS)
 	if err != nil {
@@ -177,7 +165,8 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		return nil, err
 	}
 
-	filter := txpool.PendingFilter{MinTip: uint256.MustFromBig(vm.pool.GasTip()), OnlyPlainTxs: true}
+	vm.pool.Sync() // the pool's view of nonces is the accepted head's
+	filter := txpool.PendingFilter{OnlyPlainTxs: true}
 	if baseFee != nil {
 		filter.BaseFee = uint256.MustFromBig(baseFee)
 	}
@@ -201,25 +190,29 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		return nil, errNoTxs
 	}
 	vm.b.built(parent.Hash())
-	vm.m.build.Observe(time.Since(start).Seconds())
 	vm.m.buildTxs.Observe(float64(out.included))
 	vm.ctx.Log.Debug("validator: built", zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
 		zap.Int("candidates", len(txs)), zap.Uint64("gasUsed", out.gasUsed), zap.Duration("took", time.Since(start)))
 	return &Block{vm: vm, raw: out.block, id: out.id, parent: parentID, height: parent.Number.Uint64() + 1, time: tsMS / 1000}, nil
 }
 
+// buildOnce: one engine crossing; epochdb_build_seconds is this call alone
+// (BuildBlock's wall time also holds the Granite min-delay wait).
 func (vm *VM) buildOnce(parent ids.ID, tsMS, pchainHeight uint64, txs types.Transactions) (buildOut, error) {
 	raw, err := rlp.EncodeToBytes(txs)
 	if err != nil {
 		return buildOut{}, err
 	}
-	return vm.eng.build(parent, tsMS, vm.coinbase(), pchainHeight, raw)
+	start := time.Now()
+	out, err := vm.eng.build(parent, tsMS, vm.coinbase(), pchainHeight, raw)
+	vm.m.build.Observe(time.Since(start).Seconds())
+	return out, err
 }
 
 // coinbase: subnet-evm's rule without a RewardManager. ponytail: a chain with
 // the RewardManager precompile needs the engine to answer the reward address.
 func (vm *VM) coinbase() ethcommon.Address {
-	if !sevmparams.GetExtra(vm.g.Config).AllowFeeRecipients {
+	if !sevmparams.GetExtra(vm.config).AllowFeeRecipients {
 		return constants.BlackholeAddr
 	}
 	if ethcommon.IsHexAddress(vm.cfg.FeeRecipient) {

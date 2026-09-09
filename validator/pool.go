@@ -2,14 +2,11 @@ package validator
 
 import (
 	"fmt"
-	"math/big"
 	"sync"
 
-	"github.com/ava-labs/avalanchego/graft/subnet-evm/commontype"
-	sevmcore "github.com/ava-labs/avalanchego/graft/subnet-evm/core"
-	sevmparams "github.com/ava-labs/avalanchego/graft/subnet-evm/params"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core"
 	"github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/ethdb"
@@ -22,14 +19,15 @@ import (
 	"github.com/holiman/uint256"
 )
 
-// poolChain is the txpool's BlockChain over the engine: the head header is
+// poolChain is the txpool's BlockChain over the engine (libevm's pool, not
+// subnet-evm's: that one links firewood's Rust runtime through
+// subnet-evm/core; the engine's rules are enforced at build time). The head header is
 // what Accept last decoded, StateAt hands out a state.StateDB whose only
 // backing "trie" answers GetAccount from the engine (nonce + balance), and
 // chain-head events come from Accept.
 type poolChain struct {
 	eng    *engine
 	config *params.ChainConfig
-	cacher *sevmcore.TxSenderCacher
 	feed   event.Feed
 
 	mu     sync.RWMutex
@@ -41,7 +39,7 @@ type poolChain struct {
 }
 
 func newPoolChain(eng *engine, config *params.ChainConfig, head *types.Header, headID ids.ID) *poolChain {
-	c := &poolChain{eng: eng, config: config, cacher: sevmcore.NewTxSenderCacher(4), recent: map[common.Hash]ids.ID{}}
+	c := &poolChain{eng: eng, config: config, recent: map[common.Hash]ids.ID{}}
 	c.acct = &accountCache{eng: eng, entries: map[common.Address]types.StateAccount{}}
 	c.setHead(head, headID)
 	return c
@@ -64,7 +62,7 @@ func (c *poolChain) setHead(h *types.Header, id ids.ID) {
 	}
 	c.mu.Unlock()
 	c.acct.refresh(h.Root)
-	c.feed.Send(sevmcore.ChainHeadEvent{Block: types.NewBlockWithHeader(h)})
+	c.feed.Send(core.ChainHeadEvent{Block: types.NewBlockWithHeader(h)})
 }
 
 func (c *poolChain) Config() *params.ChainConfig { return c.config }
@@ -98,15 +96,7 @@ func (c *poolChain) StateAt(root common.Hash) (*state.StateDB, error) {
 	return state.New(root, (*stateDB)(c), nil)
 }
 
-func (c *poolChain) SenderCacher() *sevmcore.TxSenderCacher { return c.cacher }
-
-// GetFeeConfigAt: the genesis fee config. ponytail: a FeeManager precompile
-// changing it at runtime is not read (add an engine call when a chain has one).
-func (c *poolChain) GetFeeConfigAt(parent *types.Header) (commontype.FeeConfig, *big.Int, error) {
-	return sevmparams.GetExtra(c.config).FeeConfig, common.Big0, nil
-}
-
-func (c *poolChain) SubscribeChainHeadEvent(ch chan<- sevmcore.ChainHeadEvent) event.Subscription {
+func (c *poolChain) SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription {
 	return c.feed.Subscribe(ch)
 }
 

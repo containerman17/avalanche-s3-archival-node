@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm"
 	ethcommon "github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
@@ -117,7 +116,7 @@ func (vm *VM) answerPool(req *rpcReq) []byte {
 			return rpcError(req.ID, -32000, err.Error())
 		}
 		if vm.push != nil {
-			vm.push.Add(&evm.GossipEthTx{Tx: tx})
+			vm.push.Add(&gossipTx{tx: tx})
 		}
 		return rpcResult(req.ID, tx.Hash())
 	case "eth_sendTransaction":
