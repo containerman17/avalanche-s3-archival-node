@@ -112,7 +112,10 @@ func (vm *VM) answerPool(req *rpcReq) []byte {
 		if err := tx.UnmarshalBinary(raw); err != nil {
 			return rpcError(req.ID, -32602, err.Error())
 		}
-		if err := vm.pool.Add([]*types.Transaction{tx}, true, false)[0]; err != nil {
+		// Remote, not local: locals bypass the pool's per-account and global
+		// caps, and a flood through RPC then grows the queue (and the Go heap)
+		// without bound. Remote admission gives the sender "txpool is full".
+		if err := vm.pool.Add([]*types.Transaction{tx}, false, false)[0]; err != nil {
 			return rpcError(req.ID, -32000, err.Error())
 		}
 		if vm.push != nil {

@@ -50,13 +50,16 @@ import (
 
 const subnetEVMID = "srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy"
 
+// chainGenesis: %s is the fee config; the default is subnet-evm's 20 M gas,
+// 2 s blocks; --stress raises the gas limit to 500 M with the target gas
+// scaled 100x and seeds the ACP-226 min block delay at 1 ms, so the engine,
+// not the schedule, bounds throughput.
 const chainGenesis = `{
   "config": {
     "chainId": 99999, "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0,
     "byzantiumBlock": 0, "constantinopleBlock": 0, "petersburgBlock": 0, "istanbulBlock": 0, "muirGlacierBlock": 0,
     "subnetEVMTimestamp": 0,
-    "feeConfig": {"gasLimit": 20000000, "minBaseFee": 1000000000, "targetGas": 100000000, "baseFeeChangeDenominator": 48,
-      "minBlockGasCost": 0, "maxBlockGasCost": 10000000, "targetBlockRate": 2, "blockGasCostStep": 500000},
+    %s
     "allowFeeRecipients": false
   },
   "alloc": {"8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC": {"balance": "0x52B7D2DCC80CD2E4000000"}},
@@ -65,6 +68,22 @@ const chainGenesis = `{
   "coinbase": "0x0000000000000000000000000000000000000000", "number": "0x0", "gasUsed": "0x0",
   "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
 }`
+
+const feeConfigDefault = `"feeConfig": {"gasLimit": 20000000, "minBaseFee": 1000000000, "targetGas": 100000000, "baseFeeChangeDenominator": 48,
+      "minBlockGasCost": 0, "maxBlockGasCost": 10000000, "targetBlockRate": 2, "blockGasCostStep": 500000},`
+
+const feeConfigStress = `"feeConfig": {"gasLimit": 500000000, "minBaseFee": 1000000000, "targetGas": 10000000000, "baseFeeChangeDenominator": 48,
+      "minBlockGasCost": 0, "maxBlockGasCost": 10000000, "targetBlockRate": 2, "blockGasCostStep": 500000},
+    "initialMinDelayMS": 1,`
+
+// chainConfig: the chain config bytes both plugin kinds receive. The pool
+// caps are raised so one sender's burst is not dropped at 16 pending / 64
+// queued and the global caps hold a load run's backlog; "min-delay-target"
+// is the ACP-226 delay each validator votes for (stock and ours read it).
+const chainConfig = `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false,` +
+	`"tx-pool-account-slots":1000,"tx-pool-global-slots":200000,"tx-pool-account-queue":2000,"tx-pool-global-queue":400000,` +
+	`"min-delay-target":%d,` +
+	`"eth-apis":["eth","eth-filter","net","web3","internal-eth","internal-blockchain","internal-transaction","internal-tx-pool"]}`
 
 // storeContract: init code returning an 18-byte runtime that SSTOREs
 // calldata[0:32] into slot 0, and reverts when called with no calldata.
@@ -122,6 +141,7 @@ func main() {
 	nkeys := flag.Int("keys", 200, "load phase sender keys")
 	workers := flag.Int("workers", 8, "load phase sender goroutines")
 	batch := flag.Int("batch", 200, "eth_sendRawTransaction per JSON-RPC batch")
+	stress := flag.Bool("stress", false, "stress genesis: 500 M gas limit, 1 ms min block delay")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
 		flag.Usage()
@@ -153,13 +173,16 @@ func main() {
 	network.DefaultRuntimeConfig = tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago}}
 	vmID, err := ids.FromString(subnetEVMID)
 	check(err, "vm id")
+	feeConfig, minDelay, gasLimit := feeConfigDefault, 2000, 20e6
+	if *stress {
+		feeConfig, minDelay, gasLimit = feeConfigStress, 1, 500e6
+	}
 	network.Subnets = []*tmpnet.Subnet{{
 		Name: "epochdb",
 		Chains: []*tmpnet.Chain{{
 			VMID:    vmID,
-			Genesis: []byte(chainGenesis),
-			Config: `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false,` +
-				`"eth-apis":["eth","eth-filter","net","web3","internal-eth","internal-blockchain","internal-transaction","internal-tx-pool"]}`,
+			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig)),
+			Config:  fmt.Sprintf(chainConfig, minDelay),
 		}},
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
 	}}
@@ -186,7 +209,7 @@ func main() {
 	defer teardown()
 
 	ethKey := key.ToECDSA()
-	d := &driver{ctx: ctx, nodes: nodes, chainID: big.NewInt(99999)}
+	d := &driver{ctx: ctx, nodes: nodes, chainID: big.NewInt(99999), gasLimit: gasLimit}
 	d.signer = types.LatestSignerForChainID(d.chainID)
 
 	// ---- functional phase: both node kinds submit, every node agrees ----
@@ -265,10 +288,11 @@ func main() {
 }
 
 type driver struct {
-	ctx     context.Context
-	nodes   []*node
-	chainID *big.Int
-	signer  types.Signer
+	ctx      context.Context
+	nodes    []*node
+	chainID  *big.Int
+	signer   types.Signer
+	gasLimit float64
 }
 
 func (d *driver) sign(key *ecdsa.PrivateKey, nonce uint64, to *ethcommon.Address, value *big.Int, data []byte, gas uint64) *types.Transaction {
@@ -368,8 +392,8 @@ func (d *driver) compareAll(from, to uint64) {
 		}
 	}
 	n := float64(to - from + 1)
-	fmt.Printf("blocks %d..%d identical on %d nodes: %d txs, %.0f txs/block, %.1fM gas/block (%.0f%% of 20M)\n",
-		from, to, len(d.nodes), txs, float64(txs)/n, float64(gas)/n/1e6, float64(gas)/n/20e6*100)
+	fmt.Printf("blocks %d..%d identical on %d nodes: %d txs, %.0f txs/block, %.1fM gas/block (%.0f%% of the %.0fM limit)\n",
+		from, to, len(d.nodes), txs, float64(txs)/n, float64(gas)/n/1e6, float64(gas)/n/d.gasLimit*100, d.gasLimit/1e6)
 }
 
 // proposers counts ACCEPTED blocks per builder kind: our plugin logs

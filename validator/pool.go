@@ -3,6 +3,7 @@ package validator
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/libevm/common"
@@ -38,9 +39,9 @@ type poolChain struct {
 	acct *accountCache
 }
 
-func newPoolChain(eng *engine, config *params.ChainConfig, head *types.Header, headID ids.ID) *poolChain {
+func newPoolChain(eng *engine, config *params.ChainConfig, head *types.Header, headID ids.ID, warn func(string, error)) *poolChain {
 	c := &poolChain{eng: eng, config: config, recent: map[common.Hash]ids.ID{}}
-	c.acct = &accountCache{eng: eng, entries: map[common.Address]types.StateAccount{}}
+	c.acct = &accountCache{eng: eng, warn: warn, entries: map[common.Address]types.StateAccount{}}
 	c.setHead(head, headID)
 	return c
 }
@@ -137,9 +138,11 @@ var errUnsupported = fmt.Errorf("validator: the pool state reader answers accoun
 // crossing when the head moves.
 type accountCache struct {
 	eng     *engine
+	warn    func(string, error)
 	mu      sync.Mutex
 	root    common.Hash
 	entries map[common.Address]types.StateAccount
+	errs    atomic.Uint64 // engine read failures (each one makes an account look empty to the pool)
 }
 
 const maxCachedAccounts = 8192
@@ -160,6 +163,8 @@ func (a *accountCache) refresh(root common.Hash) {
 	}
 	raw, err := a.eng.accountState(addrs, ids.Empty)
 	if err != nil {
+		a.errs.Add(1)
+		a.warn("validator: account refresh failed, cache dropped", err)
 		a.entries = map[common.Address]types.StateAccount{}
 		return
 	}
@@ -181,6 +186,8 @@ func (a *accountCache) get(addr common.Address, root common.Hash, block ids.ID) 
 		raw, err = a.eng.accountState([]common.Address{addr}, ids.Empty) // a rolled-past head: read the accepted one
 	}
 	if err != nil {
+		a.errs.Add(1)
+		a.warn("validator: account read failed, the pool sees an empty account", err)
 		return types.StateAccount{}, err
 	}
 	acc := decodeAccount(raw)

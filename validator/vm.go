@@ -33,6 +33,7 @@ import (
 	"github.com/ava-labs/libevm/core/txpool"
 	"github.com/ava-labs/libevm/core/txpool/legacypool"
 	"github.com/ava-labs/libevm/core/types"
+	ethlog "github.com/ava-labs/libevm/log"
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/prometheus/client_golang/prometheus"
@@ -92,6 +93,9 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.eng, vm.config, vm.cfg, vm.ctx = eng, chainConfig, cfg, chainCtx
+	// libevm's pool logs through its own logger (reset failures, drops); at
+	// Warn and up they go to stderr, which avalanchego collects into main.log.
+	ethlog.SetDefault(ethlog.NewLogger(ethlog.NewTerminalHandlerWithLevel(os.Stderr, ethlog.LevelWarn, false)))
 	vm.m = newMetrics()
 	if chainCtx.Metrics != nil {
 		if err := chainCtx.Metrics.Register("epochdb", vm.m.reg); err != nil {
@@ -110,7 +114,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		eng.close()
 		return err
 	}
-	vm.chain = newPoolChain(eng, chainConfig, head, headID)
+	vm.chain = newPoolChain(eng, chainConfig, head, headID, func(msg string, err error) { chainCtx.Log.Warn(msg, zap.Error(err)) })
 	vm.preferred = headID
 
 	legacy := legacypool.New(legacypool.Config{
@@ -392,7 +396,7 @@ func (b *Block) Accept(context.Context) error {
 			fields = append(fields, zap.Uint64("x_"+crossingNames[i], d))
 		}
 	}
-	fields = append(fields, zap.Uint64("x_total", total))
+	fields = append(fields, zap.Uint64("x_total", total), zap.Uint64("account_errors", vm.chain.acct.errs.Load()))
 	vm.ctx.Log.Info("validator: accepted", fields...)
 	return nil
 }
