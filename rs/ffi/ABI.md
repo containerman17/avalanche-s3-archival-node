@@ -52,6 +52,7 @@ int   epochdb_get_block(epochdb_engine*, const uint8_t id[32], epochdb_buf* bloc
 int   epochdb_build(epochdb_engine*, const uint8_t parent_id[32], uint64_t timestamp_ms,
                     const uint8_t coinbase[20], uint64_t pchain_height,
                     const uint8_t* txs, size_t /* RLP list of tx envelopes, in the miner's order */,
+                    const uint8_t* senders, size_t /* 20 bytes per candidate (the pool's recovered senders), or NULL, 0 */,
                     epochdb_build_out* out);
       // executes candidates on top of parent's state with subnet-evm's miner semantics (skip nonce-low,
       // pop sender on nonce-high/out-of-gas/underpriced, stop at gas limit), builds header (baseFee from
@@ -139,7 +140,13 @@ Signature changes against the block above, both already assumed by go-validator'
 
 No other change. Return type is C `int`; lengths are `size_t`; structs are `epochdb_buf`, `epochdb_block_meta`
 `{id[32], parent[32], height, timestamp}`, `epochdb_verify_out` `{state_root[32], gas_used, tx_count}`,
-`epochdb_build_out` `{block_bytes, id[32], gas_used, included_count, skipped, needs_more}`.
+`epochdb_build_out` `{block_bytes, id[32], gas_used, included_count, skipped, needs_more, phase_ns[10]}` (`phase_ns`:
+nanoseconds per build phase, for the Go side's per-build log line; see the header).
+
+- `epochdb_build` `senders`: the Go pool recovered every candidate's sender at admission, so Go hands them over
+  (20 bytes each, in candidate order) and the engine recovers only a candidate whose 20 bytes are zero (or every
+  candidate when `senders` is NULL). Recovery was 83% of the engine's build time (36 us per candidate, sequential;
+  BuildBlock profile in cmd/epochdb-validator/E2E.md).
 
 Semantics pinned down:
 
@@ -172,7 +179,8 @@ Semantics pinned down:
 - `epochdb_account_state`'s `block_id` may be zero or the head's id (the accepted head) or a verified block's
   id (its pending state); anything else is -3.
 - `epochdb_get_block` answers the genesis as `[header, [], []]`; verified and accepted ids return the bytes
-  handed in (or built).
+  handed in (or built), and so does a parsed block still in the parsed cache (a competing block at the accepted
+  height stays there one block: avalanchego looks it up before Reject, and ENOTFOUND there is fatal to the chain).
 - `epochdb_head_header` is the genesis header before the first accept.
 - Build and verify hold the engine's execution mutex; `epochdb_account_state`, `epochdb_rpc`,
   `epochdb_head_header`, `epochdb_get_block` and `epochdb_health` are safe from any thread at any time.

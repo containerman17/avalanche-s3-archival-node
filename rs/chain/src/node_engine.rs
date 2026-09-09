@@ -174,6 +174,10 @@ pub struct BuildOut {
     pub reasons: Vec<SkipReason>,
     /// The gas limit is not filled and every candidate was considered.
     pub needs_more: bool,
+    /// Nanoseconds per phase: 0 lock + parent begin + template, 1 sender
+    /// recovery, 2 execution, 3 fee check + finish, 4 state root, 5
+    /// assemble + hash, 6 parsed-cache insert.
+    pub phase_ns: [u64; 7],
 }
 
 pub struct Inner {
@@ -1060,11 +1064,20 @@ impl NodeEngine {
         let fc = build::fee_config_at(cfg, parent_hdr.time, |slot| db.storage(exec::precompile::FEE_MANAGER, slot).unwrap());
         let rule = build::coinbase_rule(cfg, parent_hdr.time, || db.storage(exec::precompile::REWARD_MANAGER, exec::rewardmanager::reward_address_slot()).unwrap());
         let h = build::template(cfg, &fc, parent_hdr, params, rule)?;
+        let mut phase_ns = [0u64; 7];
+        let mut lap = |i: usize, t: &mut Instant| {
+            let now = Instant::now();
+            phase_ns[i] = (now - *t).as_nanos() as u64;
+            *t = now;
+        };
+        let mut t = t0;
+        lap(0, &mut t);
         for t in &mut candidates {
             if t.sender.is_none() {
                 t.sender = block::recover(t);
             }
         }
+        lap(1, &mut t);
         let r = match ex.build_block(&h, parent_hdr.time, pchain_height, pchain_height, &candidates) {
             Ok(r) => r,
             Err(e) => {
@@ -1072,6 +1085,7 @@ impl NodeEngine {
                 return Err(format!("build on {}: {e:#}", parent_hdr.number).into());
             }
         };
+        lap(2, &mut t);
         let txs: Vec<&block::Tx> = r.included.iter().map(|&i| &candidates[i]).collect();
         let gas: Vec<u64> = r.result.txs.iter().map(|t| t.gas_used).collect();
         if let Err(e) = build::verify_block_fee(h.base_fee.unwrap(), h.block_gas_cost.unwrap_or_default(), &txs, &gas) {
@@ -1081,10 +1095,12 @@ impl NodeEngine {
         let needs_more = r.reasons.iter().all(|x| *x != SkipReason::NotReached) && h.gas_limit - r.result.gas_used >= exec::exec::TX_GAS;
         // finish takes cur out of the executor's Layered; the hash comes after the root.
         let mut p = ex.db_mut().finish(h.number, B256::ZERO, h.time, r.result);
+        lap(3, &mut t);
         let layer = {
             let g = p.payload.lock().unwrap();
             self.layer_for(&roller.dirty, parent_n.as_deref(), &g.as_ref().unwrap().ws).map_err(|e| format!("build on {}: state root: {e:#}", parent_hdr.number))?
         };
+        lap(4, &mut t);
         let result = p.payload.lock().unwrap().take().unwrap();
         let (hdr, header_rlp, bytes) = build::assemble(h, &txs, B256::from(layer.root), &result.result, &r.predicate_bytes)?;
         let hash = alloy_primitives::keccak256(&header_rlp);
@@ -1102,9 +1118,11 @@ impl NodeEngine {
             container: Bytes::from(bytes),
             pvm: None,
         });
+        lap(5, &mut t);
         self.parsed.lock().unwrap().insert(hash.0, b.clone());
+        lap(6, &mut t);
         tick(&self.stats.t_verify, t0);
-        Ok(BuildOut { block: b, pending: Pending::Native(Arc::new(p)), included: r.included, reasons: r.reasons, needs_more })
+        Ok(BuildOut { block: b, pending: Pending::Native(Arc::new(p)), included: r.included, reasons: r.reasons, needs_more, phase_ns })
     }
 
     fn accept_inner(&self, b: &Arc<Block>, p: &Pending) -> Result<(), Error> {
@@ -1177,8 +1195,11 @@ impl NodeEngine {
         // Every accept: a parsed block keeps its container and decoded txs
         // (5-10 MB for a 2000-tx slots block); swept every 256 blocks this
         // map alone reached 3.9 GB of live heap on the stress L1. Only the
-        // blocks above the accepted head (competing / pending) stay.
-        self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
+        // blocks above the accepted head (competing / pending) stay, and so
+        // do this height's siblings: consensus still asks GetBlock for a
+        // competing block it is about to reject (a chit naming it), and a
+        // "not found" there is fatal to the chain (E2E.md, BuildBlock profile).
+        self.parsed.lock().unwrap().retain(|_, x| x.height >= b.height);
         Ok(())
     }
 

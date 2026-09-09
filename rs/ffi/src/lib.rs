@@ -75,6 +75,11 @@ pub struct epochdb_build_out {
     pub skipped: epochdb_buf,
     /// 1 when the gas limit is not filled and every candidate was considered.
     pub needs_more: u8,
+    /// Nanoseconds per phase: 0 candidate decode, 1 lock + parent + header
+    /// template, 2 sender recovery, 3 execution, 4 fee check + finish, 5
+    /// state root, 6 assemble + hash, 7 parsed-cache insert, 8 tree insert,
+    /// 9 result copy into the out buffers.
+    pub phase_ns: [u64; 10],
 }
 
 /// One open chain.
@@ -336,7 +341,10 @@ pub unsafe extern "C" fn epochdb_get_block(e: *mut epochdb_engine, id: *const u8
     let en = &*e;
     en.guard(|| {
         let id = id32(id).ok_or((EPOCHDB_EINVAL, "null id".to_string()))?;
-        let b = en.block(&id).filter(|b| b.height == 0 || en.tree.block_id_at_height(b.height) == Some(id) || en.tree.pending(&id).is_some()).ok_or((EPOCHDB_ENOTFOUND, format!("block {} not found", chain::tree::hex(&id))))?;
+        // Accepted, verified, or still in the parsed cache (a competing block at
+        // the accepted height: avalanchego's rpcchainvm server looks it up
+        // before Reject, and a "not found" there shuts the chain down).
+        let b = en.block(&id).filter(|b| b.height == 0 || en.tree.block_id_at_height(b.height) == Some(id) || en.tree.pending(&id).is_some() || en.tree.engine.parsed(&id).is_some()).ok_or((EPOCHDB_ENOTFOUND, format!("block {} not found", chain::tree::hex(&id))))?;
         let bytes = if b.container.is_empty() {
             let mut body = b.header_rlp.to_vec();
             body.extend_from_slice(&[0xc0, 0xc0]);
@@ -353,7 +361,10 @@ pub unsafe extern "C" fn epochdb_get_block(e: *mut epochdb_engine, id: *const u8
 }
 
 /// Decodes an RLP list of tx envelopes (typed txs as byte strings, legacy as lists).
-fn decode_candidates(b: &[u8]) -> Result<Vec<block::Tx>, String> {
+/// `senders`: 20 bytes per candidate, or empty; a zero address means unknown
+/// (the engine recovers it). The Go pool recovered every candidate at
+/// admission, so a build normally recovers nothing.
+fn decode_candidates(b: &[u8], senders: &[u8]) -> Result<Vec<block::Tx>, String> {
     use alloy_rlp::Header as H;
     let mut p = b;
     let h = H::decode(&mut p).map_err(|e| e.to_string())?;
@@ -370,15 +381,25 @@ fn decode_candidates(b: &[u8]) -> Result<Vec<block::Tx>, String> {
         }
         let raw = if ih.list { &start[..total] } else { &start[ih.length()..total] };
         p = &start[total..];
-        out.push(block::eth::decode_tx(Bytes::copy_from_slice(raw)).map_err(|e| format!("candidate {}: {e}", out.len()))?);
+        let mut t = block::eth::decode_tx(Bytes::copy_from_slice(raw)).map_err(|e| format!("candidate {}: {e}", out.len()))?;
+        if let Some(a) = senders.get(out.len() * 20..out.len() * 20 + 20) {
+            if a.iter().any(|b| *b != 0) {
+                t.sender = Some(Address::from_slice(a));
+            }
+        }
+        out.push(t);
+    }
+    if !senders.is_empty() && senders.len() != out.len() * 20 {
+        return Err(format!("senders: {} bytes for {} candidates", senders.len(), out.len()));
     }
     Ok(out)
 }
 
 /// Builds a block on `parent_id` (zero or the head's id = the accepted head;
 /// else a verified block) at `timestamp_ms` (Unix milliseconds) from `txs`
-/// in the miner's order; the result is a verified pending block whose later
-/// verify is a lookup. See ABI.md for the semantics.
+/// in the miner's order, with their senders (`senders`: 20 bytes each, or
+/// null: the engine recovers them); the result is a verified pending block
+/// whose later verify is a lookup. See ABI.md for the semantics.
 #[no_mangle]
 pub unsafe extern "C" fn epochdb_build(
     e: *mut epochdb_engine,
@@ -388,6 +409,8 @@ pub unsafe extern "C" fn epochdb_build(
     pchain_height: u64,
     txs: *const u8,
     txs_len: usize,
+    senders: *const u8,
+    senders_len: usize,
     out: *mut epochdb_build_out,
 ) -> c_int {
     if e.is_null() || out.is_null() {
@@ -395,15 +418,23 @@ pub unsafe extern "C" fn epochdb_build(
     }
     let en = &*e;
     en.guard(|| {
-        let (Some(pid), Some(cb), Some(raw)) = (id32(parent_id), slice(coinbase, 20), slice(txs, txs_len)) else {
+        let (Some(pid), Some(cb), Some(raw), Some(snd)) = (id32(parent_id), slice(coinbase, 20), slice(txs, txs_len), slice(senders, senders_len)) else {
             return Err((EPOCHDB_EINVAL, "null argument".to_string()));
         };
-        let candidates = decode_candidates(raw).map_err(ferr)?;
+        let t0 = std::time::Instant::now();
+        let candidates = decode_candidates(raw, snd).map_err(ferr)?;
+        let t1 = std::time::Instant::now();
         let (parent, pb) = en.parent(&pid)?;
         let params = Params { timestamp_ms, coinbase: Address::from_slice(cb), desired_min_delay_excess: en.tree.engine.desired_delay_excess };
         let r = en.tree.engine.build(parent.as_ref(), &pb.header, &params, if pchain_height == 0 { None } else { Some(pchain_height) }, candidates).map_err(ferr)?;
+        let t2 = std::time::Instant::now();
         let b = r.block.clone();
         en.tree.insert_verified(b.clone(), r.pending);
+        let t3 = std::time::Instant::now();
+        let mut phase_ns = [0u64; 10];
+        phase_ns[0] = (t1 - t0).as_nanos() as u64;
+        phase_ns[1..8].copy_from_slice(&r.phase_ns);
+        phase_ns[8] = (t3 - t2).as_nanos() as u64;
         *out = epochdb_build_out {
             block_bytes: buf(b.container.to_vec()),
             id: b.hash.0,
@@ -411,7 +442,9 @@ pub unsafe extern "C" fn epochdb_build(
             included_count: r.included.len() as u64,
             skipped: buf(r.reasons.iter().map(|x| *x as u8).collect()),
             needs_more: r.needs_more as u8,
+            phase_ns,
         };
+        (*out).phase_ns[9] = t3.elapsed().as_nanos() as u64;
         Ok(EPOCHDB_OK)
     })
 }

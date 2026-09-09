@@ -84,7 +84,7 @@ const feeConfigStress = `"feeConfig": {"gasLimit": 500000000, "minBaseFee": 1000
 // caps are raised so one sender's burst is not dropped at 16 pending / 64
 // queued and the global caps hold a load run's backlog; "min-delay-target"
 // is the ACP-226 delay each validator votes for (stock and ours read it).
-const chainConfig = `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false,` +
+const chainConfig = `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false,"pprof-addr":"127.0.0.1:0",` +
 	`"tx-pool-account-slots":1000,"tx-pool-global-slots":200000,"tx-pool-account-queue":2000,"tx-pool-global-queue":400000,` +
 	`"min-delay-target":%d,` +
 	`"eth-apis":["eth","eth-filter","net","web3","internal-eth","internal-blockchain","internal-transaction","internal-tx-pool"]}`

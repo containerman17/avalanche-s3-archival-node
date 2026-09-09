@@ -182,23 +182,32 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	if baseFee != nil {
 		filter.BaseFee = uint256.MustFromBig(baseFee)
 	}
-	order := newByPriceAndNonce(vm.pool.Pending(filter), baseFee)
+	var ph phases
+	ph.lap("head") // header lookups, fee math, the Granite wait
+	pending := vm.pool.Pending(filter)
+	ph.lap("pending")
+	order := newByPriceAndNonce(pending, baseFee)
+	ph.lap("order")
 	budget := gasLimit + gasLimit/2
 	txs, gas, size := order.take(nil, budget, maxCandidateBytes)
+	ph.lap("take")
 	if len(txs) == 0 {
 		return nil, errNoTxs
 	}
-	out, err := vm.buildOnce(parentID, tsMS, pchainHeight, txs)
+	out, err := vm.buildOnce(parentID, tsMS, pchainHeight, txs, &ph)
 	if err != nil {
 		return nil, err
 	}
+	rounds := 1
 	// A second round only when the engine ran out of candidates for gas, not
 	// for size: a size-popped candidate (code 5) means the block is full.
 	if out.needsMore && !order.empty() && size < maxCandidateBytes && !bytes.Contains(out.skipped, []byte{skipSize}) {
 		txs, _, _ = order.take(txs, gas+budget, maxCandidateBytes)
-		if out, err = vm.buildOnce(parentID, tsMS, pchainHeight, txs); err != nil {
+		ph.lap("take2")
+		if out, err = vm.buildOnce(parentID, tsMS, pchainHeight, txs, &ph); err != nil {
 			return nil, err
 		}
+		rounds++
 	}
 	if out.included == 0 {
 		return nil, errNoTxs
@@ -206,23 +215,82 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	vm.b.built(parent.Hash())
 	vm.m.buildTxs.Observe(float64(out.included))
 	vm.mu.Lock()
-	vm.lastBuilt = out.id
+	vm.lastBuilt, vm.lastBuiltAt = out.id, time.Now()
 	vm.mu.Unlock()
-	vm.ctx.Log.Info("validator: built", zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
-		zap.Int("candidates", len(txs)), zap.Uint64("gasUsed", out.gasUsed), zap.Duration("took", time.Since(start)))
+	var skips [7]int
+	for _, c := range out.skipped {
+		if int(c) < len(skips) {
+			skips[c]++
+		}
+	}
+	fields := []zap.Field{zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
+		zap.Int("candidates", len(txs)), zap.Int("pendingAccounts", len(pending)), zap.Int("rounds", rounds), zap.Uint64("gasUsed", out.gasUsed),
+		zap.Int("skipNonceLow", skips[1]), zap.Int("skipFailed", skips[2]), zap.Int("skipPopped", skips[3]),
+		zap.Int("skipNoGas", skips[4]), zap.Int("skipSize", skips[5]), zap.Int("skipNotReached", skips[6]),
+		zap.Duration("took", time.Since(start))}
+	fields = append(fields, ph.fields()...)
+	vm.ctx.Log.Info("validator: built", fields...)
 	return &Block{vm: vm, raw: out.block, id: out.id, parent: parentID, height: parent.Number.Uint64() + 1, time: tsMS / 1000}, nil
+}
+
+// phases is the per-build phase split: monotonic laps, logged as fields.
+type phases struct {
+	last  time.Time
+	names []string
+	durs  []time.Duration
+}
+
+func (p *phases) lap(name string) {
+	now := time.Now()
+	if !p.last.IsZero() {
+		p.names = append(p.names, name)
+		p.durs = append(p.durs, now.Sub(p.last))
+	}
+	p.last = now
+}
+
+// add records a phase measured elsewhere (the engine's own split).
+func (p *phases) add(name string, d time.Duration) {
+	p.names = append(p.names, name)
+	p.durs = append(p.durs, d)
+	p.last = time.Now()
+}
+
+func (p *phases) fields() []zap.Field {
+	out := make([]zap.Field, 0, len(p.names))
+	for i, n := range p.names {
+		out = append(out, zap.Duration("t_"+n, p.durs[i]))
+	}
+	return out
 }
 
 // buildOnce: one engine crossing; epochdb_build_seconds is this call alone
 // (BuildBlock's wall time also holds the Granite min-delay wait).
-func (vm *VM) buildOnce(parent ids.ID, tsMS, pchainHeight uint64, txs types.Transactions) (buildOut, error) {
+func (vm *VM) buildOnce(parent ids.ID, tsMS, pchainHeight uint64, txs types.Transactions, ph *phases) (buildOut, error) {
 	raw, err := rlp.EncodeToBytes(txs)
 	if err != nil {
 		return buildOut{}, err
 	}
+	// The pool recovered every sender at admission (cached in the tx), so the
+	// engine does not recover again: that was 83% of its build time.
+	senders := make([]byte, 0, 20*len(txs))
+	for _, tx := range txs {
+		from, _ := types.Sender(vm.signer, tx) // an error leaves zeros: the engine recovers that one
+		senders = append(senders, from[:]...)
+	}
+	ph.lap("rlp")
 	start := time.Now()
-	out, err := vm.eng.build(parent, tsMS, vm.coinbase(), pchainHeight, raw)
+	out, err := vm.eng.build(parent, tsMS, vm.coinbase(), pchainHeight, raw, senders)
 	vm.m.build.Observe(time.Since(start).Seconds())
+	ph.lap("cgo")
+	if err == nil {
+		var sum time.Duration
+		for i, d := range out.phaseNS {
+			ph.add("eng_"+enginePhaseNames[i], d)
+			sum += d
+		}
+		ph.add("eng_other", ph.durs[len(ph.durs)-len(out.phaseNS)-1]-sum) // the cgo lap minus the engine's own split
+	}
 	return out, err
 }
 

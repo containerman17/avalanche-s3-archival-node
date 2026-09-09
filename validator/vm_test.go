@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/engine/enginetest"
 	"github.com/ava-labs/avalanchego/snow/snowtest"
+	"github.com/ava-labs/avalanchego/utils/logging"
 	ethcommon "github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
 	"github.com/ava-labs/libevm/core/types"
@@ -57,15 +59,22 @@ type harness struct {
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWith(t, testGenesis, `{}`)
+}
+
+// newHarnessWith: a harness on the given genesis JSON and chain config; the
+// VM's log goes to stdout (visible under -v).
+func newHarnessWith(t *testing.T, genesisJSON, config string) *harness {
 	t.Helper()
-	genesis := []byte(testGenesis)
+	genesis := []byte(genesisJSON)
 	prepareEngine(genesis)
 	ctx := snowtest.Context(t, ids.GenerateTestID())
 	ctx.ChainDataDir = t.TempDir()
+	ctx.Log = logging.NewLogger("", logging.NewWrappedCore(logging.Info, os.Stdout, logging.Plain.ConsoleEncoder()))
 	sender := &enginetest.Sender{T: t}
 	sender.Default(false)
 	vm := &VM{}
-	if err := vm.Initialize(context.Background(), ctx, nil, genesis, nil, []byte(`{}`), nil, sender); err != nil {
+	if err := vm.Initialize(context.Background(), ctx, nil, genesis, nil, []byte(config), nil, sender); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
 	t.Cleanup(func() { vm.Shutdown(context.Background()) })
@@ -196,13 +205,17 @@ func TestBuildVerifyAccept(t *testing.T) {
 }
 
 // TestLatencyByBlockSize reports build + verify latency per block size.
+// TestLatencyByBlockSize: one sender, blocks of 50..5000 transfers on a
+// 500 M gas genesis with the pool caps raised; the per-build phase split is
+// the "validator: built" log line.
 func TestLatencyByBlockSize(t *testing.T) {
 	if !realEngine {
 		t.Skip("stub engine")
 	}
-	h := newHarness(t)
+	h := newHarnessWith(t, strings.Replace(testGenesis, `"gasLimit": 20000000`, `"gasLimit": 500000000`, 1),
+		`{"tx-pool-account-slots": 10000, "tx-pool-global-slots": 20000, "tx-pool-account-queue": 10000, "tx-pool-global-queue": 20000}`)
 	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000002")
-	for _, n := range []int{50, 200, 1000} {
+	for _, n := range []int{50, 200, 1000, 5000} {
 		for i := 0; i < n; i++ {
 			h.transfer(to, big.NewInt(1))
 		}

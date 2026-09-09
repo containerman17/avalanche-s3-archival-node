@@ -80,6 +80,13 @@ typedef struct epochdb_build_out {
    * 1 when the gas limit is not filled and every candidate was considered.
    */
   uint8_t needs_more;
+  /**
+   * Nanoseconds per phase: 0 candidate decode, 1 lock + parent + header
+   * template, 2 sender recovery, 3 execution, 4 fee check + finish, 5
+   * state root, 6 assemble + hash, 7 parsed-cache insert, 8 tree insert,
+   * 9 result copy into the out buffers.
+   */
+  uint64_t phase_ns[10];
 } epochdb_build_out;
 
 #ifdef __cplusplus
@@ -154,8 +161,9 @@ int epochdb_get_block(struct epochdb_engine *e, const uint8_t *id, struct epochd
 /**
  * Builds a block on `parent_id` (zero or the head's id = the accepted head;
  * else a verified block) at `timestamp_ms` (Unix milliseconds) from `txs`
- * in the miner's order; the result is a verified pending block whose later
- * verify is a lookup. See ABI.md for the semantics.
+ * in the miner's order, with their senders (`senders`: 20 bytes each, or
+ * null: the engine recovers them); the result is a verified pending block
+ * whose later verify is a lookup. See ABI.md for the semantics.
  */
 int epochdb_build(struct epochdb_engine *e,
                   const uint8_t *parent_id,
@@ -164,6 +172,8 @@ int epochdb_build(struct epochdb_engine *e,
                   uint64_t pchain_height,
                   const uint8_t *txs,
                   size_t txs_len,
+                  const uint8_t *senders,
+                  size_t senders_len,
                   struct epochdb_build_out *out);
 
 /**

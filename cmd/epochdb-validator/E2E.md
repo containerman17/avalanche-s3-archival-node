@@ -141,6 +141,121 @@ decode as a libevm block.
   limit: pool mostly drained). Verify p50 0.8 ms p99 41 ms; build p50 21 ms p99 891 ms; Go heap 15-175 MB, GC
   0.4%, RSS 0.23-1.1 GB (pool grew to 90k late in the run).
 
+## BuildBlock profile (branch rs-buildprof off rust db5aa14)
+
+Why build cost 60-92 ms p50 per 952-tx block when vbench builds a 1,000-transfer block in 8 ms in-process: vbench's
+synthetic txs carry their sender (`synth.rs` sets it), the FFI build did not. `NodeEngine::build` recovered every
+candidate's secp256k1 sender sequentially (`block::recover`, 37 us each with libsecp256k1) before executing, and the
+Go pool had already recovered the same senders at admission (cached in the tx). Candidates are 1.5x the gas limit,
+and under a 100 ms block cadence about half of them are already mined (the pool's reset lags the head), so a build
+recovered 2-4x the included count and then skipped half with code 1.
+
+Instrumentation (kept): every build logs `validator: built` with the tx counts (candidates, included, pending
+accounts, rounds, one counter per skip code) and a monotonic phase split, Go side (`t_head` header lookups + fee
+math + Granite wait, `t_pending` Pending(), `t_order` heap build, `t_take` selection, `t_rlp` candidate RLP + sender
+list, `t_cgo` the crossing) and engine side from `epochdb_build_out.phase_ns` (`t_eng_decode`, `t_eng_template`,
+`t_eng_recover`, `t_eng_exec`, `t_eng_finish`, `t_eng_root`, `t_eng_assemble`, `t_eng_cache`, `t_eng_tree`,
+`t_eng_outbuf`, `t_eng_copyout` = Go's copy of the result buffers, `t_eng_other` = the crossing minus the sum).
+Accept of a self-built block logs `buildToAccept` (build return to Accept start). `"pprof-addr": "127.0.0.1:0"` in the
+chain config serves Go pprof and logs the bound port (`validator: pprof`); the e2e chain config sets it.
+
+Fix: Go hands the pool's recovered senders across the boundary (`epochdb_build` gained `senders, senders_len`: 20
+bytes per candidate; the engine recovers only a candidate whose 20 bytes are zero, or every candidate when NULL).
+The miner ordering, the skip codes and the crossing count are unchanged.
+
+In-process (`go test -run TestLatencyByBlockSize -v`, one sender, 500 M gas genesis, pool caps raised), engine
+call = `t_cgo`:
+
+| txs | engine call before | of which recover | after | recover after | exec | assemble | decode | Go rlp+senders | Go Pending |
+|---|---|---|---|---|---|---|---|---|---|
+| 50 | 2.5 ms | 1.9 ms | 0.49 ms | 0.4 us | 0.29 ms | 0.09 ms | 0.05 ms | 0.06 ms | 0.04 ms |
+| 200 | 13.9 ms | 10.7 ms | 1.7 ms | 0.5 us | 1.0 ms | 0.34 ms | 0.25 ms | 0.18 ms | 0.11 ms |
+| 1000 | 44.1 ms | 36.6 ms | 7.4 ms | 2.4 us | 4.7 ms | 1.6 ms | 0.8 ms | 3.0 ms | 2.1 ms |
+| 5000 | 212 ms | 179 ms | 35.6 ms | 11 us | 22.8 ms | 8.2 ms | 3.8 ms | 4.6 ms | 2.4 ms |
+
+BuildBlock wall at 1000 txs: 45.8 ms -> 13.5 ms; Verify of the own block stays a lookup (7 us). Go heap 2-13 MB,
+GC CPU under 0.5% in both.
+
+3-node all-ours --stress L1 (genesis stamped now, 1 ms min delay, pool caps raised), the e2e's batched generator at
+`--rate 4000 --keys 1000 --workers 8 --batch 250`, 3 min, machine otherwise idle (load < 1). Phase percentiles
+over every build of the three nodes (1807 builds before; blocks came every ~100 ms, so a block held 387 txs on
+average and 1012 at the p90; 286 builds included 800+ txs):
+
+| phase (ms) | before p50 | before p99 | after p50 | after p99 |
+|---|---|---|---|---|
+| took (BuildBlock wall) | 41.0 | 300 | 3.6 | 12.9 |
+| t_pending | 1.2 | 65 | 0.5 | 5.8 |
+| t_order + t_take | 0.3 | 3.4 | 0.2 | 1.3 |
+| t_rlp (+ senders after) | 0.7 | 6.2 | 0.3 | 1.9 |
+| t_cgo (the crossing) | 37.1 | 241 | 2.0 | 8.9 |
+| t_eng_decode | 0.5 | 5.2 | 0.2 | 1.2 |
+| t_eng_recover | 32.8 | 223 | 0.0 | 0.0 |
+| t_eng_exec | 1.7 | 11.0 | 0.9 | 4.7 |
+| t_eng_root | 0.6 | 2.4 | 0.5 | 1.8 |
+| t_eng_assemble | 0.4 | 3.3 | 0.2 | 1.7 |
+| tree + cache + outbuf + copyout + other | 0.1 | 0.5 | 0.0 | 0.3 |
+| buildToAccept | 86 | 803 | 32 | 144 |
+
+The after run had 3084 builds (the chain sped up: 59 ms between blocks instead of 102, so a block held 234 txs on
+average, 688 at the p90; 60 builds included 800+ txs). Per candidate the crossing went from 43 us to 8.5 us p50; the
+skip of an already-mined candidate now costs its decode only. Builds with 800+ included txs: `took` p50 85 ms p99
+523 ms before -> p50 10.2 ms p99 14.1 ms after (t_cgo 74.7 -> 7.3 ms p50, exec 5.5 -> 3.7 ms).
+
+Chain-level, before -> after (same generator, 3 min, `/ext/metrics` of node 0 at the end): engine build p50 29.5 ms
+p99 350 ms (n=849) -> p50 1.1 ms p99 9.7 ms (n=1898); engine verify p50 0.9 ms p99 10.0 ms -> p50 0.7 ms p99 8.4 ms
+(build is within 2x of verify at the p50 and p99); mean block interval 102 ms -> 59 ms; on chain 695,500 txs in 1799
+blocks (3858 tx/s, generator-limited, 0 refused) -> 721,000 txs in 3076 blocks (4000 tx/s, generator-limited, 0
+refused); block fill 387 txs = 8.1 M gas -> 234 txs = 4.9 M gas (the same tx stream over more blocks); candidates per
+build p50 845 (386 already mined) -> 344 (17 already mined; the pool's reset keeps up with the shorter build); Go heap
+13-23 MB, GC 0.3% of CPU, plugin RSS 220-235 MB -> Go heap 14-17 MB, GC 0.3%, RSS 193-204 MB; crossings per block
+69.8 -> 38.8 (fewer 100 ms build retries: buildToAccept p50 86 ms -> 32 ms). Blocks identical on the 3 nodes in both
+runs.
+
+perf (`perf record -g -F 499` on one plugin for 60 s of the load, before): 26% of the plugin's CPU was
+`rustsecp256k1_v0_11_ecdsa_recover` (the engine: build candidates plus parse of the other nodes' blocks), 22% Go's
+`secp256k1_*` (the pool's admission recovery, once per tx), 12% `legacypool.runReorg` (5% `truncatePending`),
+13% gRPC serving; `buildBlock` itself 1% (the Rust frames do not unwind into the cgo caller, so the split above
+comes from the phase log, not perf). After: `rustsecp256k1_v0_11_ecdsa_recover` 11.6% (parse of the other two nodes' blocks only), Go's
+`secp256k1_*` recovery 22% (admission), `runReorg` 12%, gRPC 17%. Go pprof (60 s CPU, after): `runtime.cgocall` 38%
+of samples, of which 62% is the pool's `secp256k1_ext_ecdsa_recover` at admission, 27% `epochdb_parse`, 4.8%
+`epochdb_build`, 4.4% `epochdb_verify`, 1.3% `epochdb_account_state`; `buildBlock` 2.9% inclusive (Pending 0.9%,
+RLP + senders 0.5%); heap in use 15 MB (the gossip bloom set's linked hashmap 3 MB, gRPC buffers 2 MB).
+
+Found on the way (default 20 M gas / 2 s genesis, fixed in the same branch): all three nodes build height h in
+the same millisecond after the 2 s Granite wait, so competing blocks at one height are the norm there. Accept
+swept the losing sibling from the tree and from the parsed cache (the rs-mem memory fix), and avalanchego's
+rpcchainvm server looks a block up (`VM.GetBlock`) before it calls `Reject` on it: the "not found" shut all three
+chains down at height 2 ("not found while processing sync message: chits"). The parsed cache now keeps the accepted
+height's siblings one block longer and `epochdb_get_block` answers a block that is still in the parsed cache.
+The --stress runs never hit it because the 1 ms delay spreads the builds out.
+
+Default genesis (20 M gas, 2 s), all-ours 3 nodes, 3 min at 2000 tx/s offered (run 5's settings), after: 105 load
+blocks (9..113) identical on 3 nodes, 74,297 txs, 708 txs/block (74% of the limit: most blocks 952 txs = 20.0 M, short
+ones when a node built on a stale parent), 2083 ms between blocks, 0 refused. Engine build p50 4.0 ms p99 19.5 ms
+(n=140; run 5 on the same settings: p50 92 ms p99 430 ms), verify p50 1.0 ms p99 14.2 ms. Per full 952-tx build
+(79 builds): `t_cgo` p50 12.7 ms p99 22.2 ms (decode 2.8, exec 5.9, root 1.5, assemble 1.6), candidates 4287 (round
+1 = 1.5x the gas limit, round 2 after `needs_more`: 1823 of them already mined, the pool's reset lags a retry),
+`t_rlp` 3.5 ms, and `t_pending` p50 114 ms p90 213 ms p99 1.6 s: `Pending()` copies every pending tx into a
+LazyTransaction (184k pending at t=120 s, 1000 keys x the raised per-account cap), and its p99 is the pool's write
+lock during a reorg of that many txs. That is now the Go side's dominant build cost under a deep pool; it is geth's
+miner design (`Pending` has no limit) and the lever is the chain config's `tx-pool-account-slots` (lesson 9), not the
+build code. `took` p50 1.9 s here is the Granite 2 s wait inside BuildBlock (the `t_head` lap), not work. Go heap
+251 MB at t=120 s (184k pending), 426 MB at the end, GC 0.4-0.7%, RSS 532-801 MB.
+
+Not the cause (ruled out by the split): `Pending()` copies (1.2 ms p50 with ~600 pending accounts and a drained
+pool; the p99 of 65 ms is the pool's write lock during a reorg), the ordering heap (0.1 ms), candidate RLP (0.7 ms),
+the result copy-out (< 0.1 ms), tree registration (< 0.1 ms), header/root work (0.6 ms; verify computes the same
+root once more for a foreign block, a self-built block is a lookup).
+
+Open items: (1) the 100 ms retry still re-runs the whole build while a built block waits for consensus
+(buildToAccept p50 86 ms, p90 334 ms before), and each retry re-selects, re-encodes and re-executes the same
+candidates; a retry now costs ~5 ms at 400 txs, so it stays as in subnet-evm. (2) Half of the candidates under a
+100 ms cadence are already mined (skipNonceLow p50 386 of 845 candidates): the pool's async reset lags the head;
+the engine's skip costs only the decode now (0.6 us per candidate). (3) The Go pool's own recovery at admission
+(22% of the plugin's CPU at 3900 tx/s) is once per tx and stays. (4) `Pending()` under a deep pool (above): 114 ms
+p50 per build at 184k pending; a pool-side cap on what a build asks for would need a Pending variant libevm does
+not have.
+
 ## Memory: where 2-4.5 GB of plugin RSS went (branch rs-mem off rust 38a82fa)
 
 Evidence from live processes (slots workload, 50 sstores per tx, 2000-tx blocks of 100k slot writes on the
@@ -175,8 +290,9 @@ blocks with a 410 MB window) is the sum of the three.
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and
   `eth_getBlockReceipts` identical on all nodes at every height in every run (1.1 M txs over runs 1-6); no
   invalid-block lines in stock logs.
-- Engine cost at the 20 M gas / 2 s default chain: verify p50 3-5 ms, build p50 60-90 ms per full 952-tx block,
-  under 5% of the block interval. At 500 M gas: 16k-tx blocks verify in ~180 ms p99 and build in ~650 ms.
+- Engine cost at the 20 M gas / 2 s default chain: verify p50 3-5 ms; build was p50 60-90 ms per full 952-tx
+  block until the BuildBlock profile below removed the engine's duplicate sender recovery (7 ms per 1000 txs
+  in-process now). At 500 M gas: 16k-tx blocks verify in ~180 ms p99 and built in ~650 ms before that fix.
 - Go side: heap follows the pool (about 1.5 KB per pending tx), 10 MB at 300 tx/s with a drained pool, 0.5-0.9 GB
   with 350k-580k pending; GC 0.5-2% of CPU; RSS = pool + engine (240 MB drained, 1.8-2 GB with a 500k pool).
 - Crossings per accepted block with the pool drained: ~16 (parse 3-5, verify 1-2, accept 1, build 1-6, account 1,
@@ -213,10 +329,8 @@ blocks with a 410 MB window) is the sum of the three.
 7. Build retries: like subnet-evm, WaitForEvent re-arms 100 ms after a build whose block is not yet accepted, so a
    height can cost up to 6 engine builds (~10 ms each at 600 txs). A cheap improvement is to skip the retry while our
    last built block is still preferred.
-8. Engine build vs verify: build executes up to 1.5x the gas limit of candidates (the miner's over-provisioning) and
-   averaged 46 ms against 2.7 ms verify at ~600 txs in Run 1 (p50 4.5 ms in Run 2, p50 60 ms at full 952-tx blocks
-   in Run 3). A profile on the rs side of build vs verify for the same block is worth it; the Go side's share is the
-   RLP of the candidates (~110 B per transfer).
+8. Engine build vs verify: resolved by the BuildBlock profile section (the engine recovered every candidate's
+   sender again; Go now hands the pool's senders over). Build is within 2x of verify at the p50 and p99.
 9. Pool memory: geth's pool keeps every pending tx decoded (~1-2 KB each); per-account slots are the effective cap.
    Chain configs for a validator should keep `tx-pool-account-slots` small (16 default) unless a few senders are meant
    to burst.

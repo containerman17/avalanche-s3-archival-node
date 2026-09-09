@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/ava-labs/avalanchego/ids"
@@ -169,25 +170,40 @@ type buildOut struct {
 	included  uint64
 	skipped   []byte
 	needsMore bool
+	// Engine phases in ns (see epochdb_build_out.phase_ns), plus the Go-side
+	// copy-out of the result buffers at the end.
+	phaseNS [nEnginePhase + 1]time.Duration
 }
 
-// build: txs is the RLP list of candidate tx envelopes in the miner's order.
-func (e *engine) build(parent ids.ID, timestampMS uint64, coinbase common.Address, pchainHeight uint64, txs []byte) (buildOut, error) {
+// enginePhaseNames name epochdb_build_out.phase_ns, then Go's copy-out.
+var enginePhaseNames = [nEnginePhase + 1]string{"decode", "template", "recover", "exec", "finish", "root", "assemble", "cache", "tree", "outbuf", "copyout"}
+
+const nEnginePhase = 10
+
+// build: txs is the RLP list of candidate tx envelopes in the miner's order,
+// senders their recovered senders (20 bytes each; nil = the engine recovers).
+func (e *engine) build(parent ids.ID, timestampMS uint64, coinbase common.Address, pchainHeight uint64, txs, senders []byte) (buildOut, error) {
 	e.crossings[xBuild].Add(1)
 	var out C.epochdb_build_out
 	rc := C.epochdb_build(e.p, c32(parent), C.uint64_t(timestampMS), (*C.uint8_t)(unsafe.Pointer(&coinbase[0])),
-		C.uint64_t(pchainHeight), cptr(txs), C.size_t(len(txs)), &out)
+		C.uint64_t(pchainHeight), cptr(txs), C.size_t(len(txs)), cptr(senders), C.size_t(len(senders)), &out)
 	if err := e.err("epochdb_build", rc); err != nil {
 		return buildOut{}, err
 	}
-	return buildOut{
+	t := time.Now()
+	o := buildOut{
 		block:     take(&out.block_bytes),
 		id:        *(*ids.ID)(unsafe.Pointer(&out.id[0])),
 		gasUsed:   uint64(out.gas_used),
 		included:  uint64(out.included_count),
 		skipped:   take(&out.skipped),
 		needsMore: out.needs_more != 0,
-	}, nil
+	}
+	for i := 0; i < nEnginePhase; i++ {
+		o.phaseNS[i] = time.Duration(out.phase_ns[i])
+	}
+	o.phaseNS[nEnginePhase] = time.Since(t)
+	return o, nil
 }
 
 // accountState reads nonce + balance of n addresses at a block's state in

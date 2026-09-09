@@ -84,8 +84,8 @@ int epochdb_get_block(epochdb_engine *e, const uint8_t id[32], epochdb_buf *out)
   blk *b = find(e, id); if (!b) return -3; *out = dup(b->raw, b->len); return 0;
 }
 int epochdb_build(epochdb_engine *e, const uint8_t parent[32], uint64_t ts, const uint8_t cb[20],
-                  uint64_t pch, const uint8_t *txs, size_t n, epochdb_build_out *out) {
-  (void)ts; (void)cb; (void)pch;
+                  uint64_t pch, const uint8_t *txs, size_t n, const uint8_t *senders, size_t senders_len, epochdb_build_out *out) {
+  (void)ts; (void)cb; (void)pch; (void)senders; (void)senders_len;
   blk *p = find(e, parent); uint64_t h = p ? p->height + 1 : e->height + 1;
   blk *b = add(e, txs, n, parent, h); if (!b) return -1;
   memset(out, 0, sizeof *out);

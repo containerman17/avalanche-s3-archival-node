@@ -13,7 +13,9 @@ import (
 	"fmt"
 	slog "golang.org/x/exp/slog"
 	"math/big"
+	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	runtimemetrics "runtime/metrics"
 	"strconv"
@@ -55,6 +57,7 @@ var (
 type VM struct {
 	eng    *engine
 	config *params.ChainConfig
+	signer types.Signer
 	cfg    config.Config
 	ctx    *snow.Context
 	chain  *poolChain
@@ -64,10 +67,11 @@ type VM struct {
 	b      *builder
 	m      *metrics
 
-	mu        sync.Mutex
-	preferred ids.ID
-	lastBuilt ids.ID            // the id of the last block we built (Accept logs "proposer": "self")
-	lastX     [nCrossing]uint64 // crossing counters at the previous Accept
+	mu          sync.Mutex
+	preferred   ids.ID
+	lastBuilt   ids.ID            // the id of the last block we built (Accept logs "proposer": "self")
+	lastBuiltAt time.Time         // when buildBlock returned it (Accept logs the consensus latency)
+	lastX       [nCrossing]uint64 // crossing counters at the previous Accept
 
 	gossipOnce sync.Once
 	cancel     context.CancelFunc
@@ -95,6 +99,18 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.eng, vm.config, vm.cfg, vm.ctx = eng, chainConfig, cfg, chainCtx
+	vm.signer = types.LatestSigner(chainConfig)
+	// "pprof-addr" in the chain config (e.g. "127.0.0.1:0") serves Go pprof
+	// there; the bound address is logged (avalanchego passes the plugin no env).
+	var dbg struct {
+		Pprof string `json:"pprof-addr"`
+	}
+	if json.Unmarshal(configBytes, &dbg) == nil && dbg.Pprof != "" {
+		if l, err := net.Listen("tcp", dbg.Pprof); err == nil {
+			chainCtx.Log.Info("validator: pprof", zap.Stringer("addr", l.Addr()))
+			go http.Serve(l, nil)
+		}
+	}
 	// libevm's pool logs through its own logger: Warn and up, plus the Trace
 	// lines that name a dropped tx and why (capped), go to stderr, which
 	// avalanchego collects into main.log.
@@ -384,11 +400,12 @@ func (b *Block) Accept(context.Context) error {
 	prev := vm.lastX
 	vm.lastX = now
 	self := vm.lastBuilt == b.id
+	builtAt := vm.lastBuiltAt
 	vm.mu.Unlock()
-	fields := make([]zap.Field, 0, nCrossing+4)
+	fields := make([]zap.Field, 0, nCrossing+5)
 	fields = append(fields, zap.Uint64("height", b.height), zap.Uint64("gasUsed", h.GasUsed))
 	if self {
-		fields = append(fields, zap.String("proposer", "self"))
+		fields = append(fields, zap.String("proposer", "self"), zap.Duration("buildToAccept", start.Sub(builtAt)))
 	}
 	total := uint64(0)
 	for i := range now {

@@ -33,6 +33,7 @@ typedef struct {
   uint64_t included_count;
   epochdb_buf skipped;
   uint8_t needs_more;
+  uint64_t phase_ns[10];
 } epochdb_build_out;
 
 epochdb_engine *epochdb_open(const uint8_t *data_dir, size_t data_dir_len,
@@ -54,7 +55,7 @@ int epochdb_get_block(epochdb_engine *, const uint8_t id[32], epochdb_buf *block
  * under Granite, TimeMilliseconds, and clamps to the parent's rules. */
 int epochdb_build(epochdb_engine *, const uint8_t parent_id[32], uint64_t timestamp_ms,
                   const uint8_t coinbase[20], uint64_t pchain_height,
-                  const uint8_t *txs, size_t txs_len, epochdb_build_out *out);
+                  const uint8_t *txs, size_t txs_len, const uint8_t *senders, size_t senders_len, epochdb_build_out *out);
 int epochdb_account_state(epochdb_engine *, const uint8_t *addrs, size_t n,
                           const uint8_t block_id[32], epochdb_buf *out);
 int epochdb_head_header(epochdb_engine *, epochdb_buf *header_rlp);
