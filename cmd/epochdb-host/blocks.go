@@ -385,14 +385,14 @@ func settleSpec(kind string) (parties, secs uint64, ok bool) {
 	return parties, secs, true
 }
 
-// settleSeed credits every (party, sec) position; sender 0, seedPerCredit
-// positions per tx.
+// settleSeed credits every (party, sec) position, seedPerCredit positions
+// per tx, senders round-robin (the pool reserves gas * fee cap per queued tx).
 func (g *gen) settleSeed(parties, secs uint64) [][]byte {
 	var raws [][]byte
 	for sec := uint64(0); sec < secs; sec++ {
 		for from := uint64(0); from < parties; from += seedPerCredit {
 			n := min(seedPerCredit, parties-from)
-			raws = append(raws, g.sign(0, &g.contract, nil, 60_000+n*30_000, call(selCredit, word(sec), word(from), word(n), word(1<<60))))
+			raws = append(raws, g.sign(len(raws)%len(g.keys), &g.contract, nil, 60_000+n*30_000, call(selCredit, word(sec), word(from), word(n), word(1<<60))))
 		}
 	}
 	return raws
@@ -594,7 +594,8 @@ func (g *gen) awaitBlock(ctx context.Context) (*mined, [3]time.Duration, error) 
 	return m, d, nil
 }
 
-// fund (remote mode): the funder (ewoq) sends every sender 1000 coins, then
+// fund (remote mode): the funder (ewoq) sends every sender 20k coins (the pool
+// reserves gas * fee cap for every queued tx: 15 coins per seed tx), then
 // the chain drains.
 func (g *gen) fund(ctx context.Context, funder *ecdsa.PrivateKey) error {
 	from := crypto.PubkeyToAddress(funder.PublicKey)
@@ -602,7 +603,17 @@ func (g *gen) fund(ctx context.Context, funder *ecdsa.PrivateKey) error {
 	if err != nil {
 		return err
 	}
-	amount := new(big.Int).Mul(big.NewInt(1000), big.NewInt(1e18))
+	amount := new(big.Int).Mul(big.NewInt(20_000), big.NewInt(1e18))
+	// A reused chain: senders funded by an earlier run keep their coins.
+	if bal, err := g.rpcResult(ctx, "eth_getBalance", fmt.Sprintf(`["%s","latest"]`, crypto.PubkeyToAddress(g.keys[0].PublicKey).Hex())); err == nil {
+		var hexBal string
+		if json.Unmarshal(bal, &hexBal) == nil {
+			if b, ok := new(big.Int).SetString(strings.TrimPrefix(hexBal, "0x"), 16); ok && b.Cmp(new(big.Int).Rsh(amount, 1)) > 0 {
+				log.Printf("gen senders already funded (sender 0 has %s wei), skipping", b)
+				return g.loadNonces(ctx)
+			}
+		}
+	}
 	raws := make([][]byte, 0, genSenders)
 	for i := 0; i < genSenders; i++ {
 		to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
