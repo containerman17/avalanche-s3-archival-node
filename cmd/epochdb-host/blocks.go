@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -44,7 +45,7 @@ const (
 	selTransferFrom = "23b872dd"
 	selMint         = "40c10f19"
 	selMintMany     = "9579f5d1"
-	holdersPerMint  = 1000 // mintMany holders per prefill tx
+	holdersPerMint  = 500 // mintMany holders per prefill tx (12.6 M gas, fits a 20 M block)
 	mintsPerBlock   = 20   // mintMany txs per prefill block (state growth)
 	// slotWriter runtime: calldata start, count, salt; sstore(start+i, start+i+salt)
 	// for i in [0, count). Init code copies it and returns it. The Clear Street
@@ -134,14 +135,16 @@ func (g *gen) save(dataDir string) error {
 
 // gen is the generator state: signers, nonces, and how much state exists.
 type gen struct {
-	vm       *plugin
-	rpc      http.Handler
+	vm       *plugin      // nil in remote mode
+	rpc      http.Handler // the plugin's /rpc, or remoteRPC
+	chainID  *big.Int
 	signer   ethtypes.Signer
 	keys     []*ecdsa.PrivateKey
 	nonces   []uint64
 	kind     string   // "token" or "slots"
 	corpus   *os.File // optional EPCORP01 recording of every accepted block
 	contract common.Address
+	head     uint64 // remote mode: last height counted by awaitBlock
 	holders  uint64 // token holders seeded by mintMany so far (recipients)
 	slots    uint64 // slots kind: slots written so far in the slot writer
 	rng      uint64
@@ -184,7 +187,7 @@ func call(sel string, args ...[]byte) []byte {
 
 func (g *gen) sign(i int, to *common.Address, value *big.Int, gas uint64, data []byte) []byte {
 	tx := ethtypes.NewTx(&ethtypes.DynamicFeeTx{
-		ChainID: big.NewInt(genChainID), Nonce: g.nonces[i], GasTipCap: big.NewInt(1_000_000_000), GasFeeCap: big.NewInt(1_000_000_000_000),
+		ChainID: g.chainID, Nonce: g.nonces[i], GasTipCap: big.NewInt(1_000_000_000), GasFeeCap: big.NewInt(1_000_000_000_000),
 		Gas: gas, To: to, Value: value, Data: data,
 	})
 	g.nonces[i]++
@@ -286,6 +289,7 @@ func (g *gen) pending(ctx context.Context) (uint64, error) {
 	var res struct {
 		Result struct {
 			Pending string `json:"pending"`
+			Queued  string `json:"queued"`
 		} `json:"result"`
 		Error json.RawMessage `json:"error"`
 	}
@@ -295,7 +299,45 @@ func (g *gen) pending(ctx context.Context) (uint64, error) {
 	if len(res.Error) != 0 {
 		return 0, fmt.Errorf("txpool_status: %s", res.Error)
 	}
-	return strconv.ParseUint(strings.TrimPrefix(res.Result.Pending, "0x"), 16, 64)
+	p, err := strconv.ParseUint(strings.TrimPrefix(res.Result.Pending, "0x"), 16, 64)
+	if err != nil {
+		return 0, err
+	}
+	q, err := strconv.ParseUint(strings.TrimPrefix(res.Result.Queued, "0x"), 16, 64)
+	return p + q, err
+}
+
+// loadNonces (remote mode): the senders' chain nonces, so a rerun against a
+// used chain signs from where it left off.
+func (g *gen) loadNonces(ctx context.Context) error {
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i := range g.keys {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `{"jsonrpc":"2.0","id":%d,"method":"eth_getTransactionCount","params":["%s","pending"]}`, i, crypto.PubkeyToAddress(g.keys[i].PublicKey).Hex())
+	}
+	sb.WriteByte(']')
+	req := httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(sb.String())).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	g.rpc.ServeHTTP(rec, req)
+	var results []struct {
+		ID     int    `json:"id"`
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &results); err != nil {
+		return fmt.Errorf("getTransactionCount batch: %w: %.200s", err, rec.Body.String())
+	}
+	for _, r := range results {
+		n, err := strconv.ParseUint(strings.TrimPrefix(r.Result, "0x"), 16, 64)
+		if err != nil {
+			return err
+		}
+		g.nonces[r.ID] = n
+	}
+	return nil
 }
 
 // drain mines until the pool has no pending txs; returns blocks, txs, gas mined.
@@ -310,8 +352,8 @@ func (g *gen) drain(ctx context.Context) (blocks, txs, gas uint64, err error) {
 			return blocks, txs, gas, err
 		}
 		blocks++
-		txs += uint64(len(blk.Transactions()))
-		gas += blk.GasUsed()
+		txs += blk.txs
+		gas += blk.gas
 	}
 }
 
@@ -343,8 +385,14 @@ func (g *gen) slotGrow() [][]byte {
 
 // mine builds one block from the mempool, then verifies and accepts it.
 // Returns the block and the three wall durations.
-func (g *gen) mine(ctx context.Context) (*ethtypes.Block, [3]time.Duration, error) {
+// mined is what the generator needs to know about an accepted block.
+type mined struct{ height, txs, gas uint64 }
+
+func (g *gen) mine(ctx context.Context) (*mined, [3]time.Duration, error) {
 	var d [3]time.Duration
+	if g.vm == nil {
+		return g.awaitBlock(ctx)
+	}
 	// ACP-226 minimum block delay: on a network where Granite activates
 	// after genesis the delay is 2 s until the builder lowers it; wait it
 	// out rather than count it as build time.
@@ -388,7 +436,125 @@ func (g *gen) mine(ctx context.Context) (*ethtypes.Block, [3]time.Duration, erro
 			return nil, d, err
 		}
 	}
-	return &eth, d, nil
+	return &mined{eth.NumberU64(), uint64(len(eth.Transactions())), eth.GasUsed()}, d, nil
+}
+
+// remoteRPC is an http.Handler that forwards the request body to a live
+// node's /rpc, so submit and pending work unchanged against a real network.
+type remoteRPC string
+
+func (u remoteRPC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	resp, err := http.Post(string(u), "application/json", r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// rpcResult posts one JSON-RPC call and returns its result.
+func (g *gen) rpcResult(ctx context.Context, method, params string) (json.RawMessage, error) {
+	req := httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"%s","params":%s}`, method, params))).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	g.rpc.ServeHTTP(rec, req)
+	var res struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		return nil, fmt.Errorf("%s: %w: %.200s", method, err, rec.Body.String())
+	}
+	if len(res.Error) != 0 {
+		return nil, fmt.Errorf("%s: %s", method, res.Error)
+	}
+	return res.Result, nil
+}
+
+func (g *gen) rpcUint(ctx context.Context, method, params string) (uint64, error) {
+	raw, err := g.rpcResult(ctx, method, params)
+	if err != nil {
+		return 0, err
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, fmt.Errorf("%s: %w", method, err)
+	}
+	return strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
+}
+
+// awaitBlock (remote mode): wait until the network has accepted at least one
+// block past g.head, then count every new block; d[0] is the wait.
+func (g *gen) awaitBlock(ctx context.Context) (*mined, [3]time.Duration, error) {
+	var d [3]time.Duration
+	t0 := time.Now()
+	h, err := g.rpcUint(ctx, "eth_blockNumber", "[]")
+	if err != nil {
+		return nil, d, err
+	}
+	for h <= g.head {
+		time.Sleep(50 * time.Millisecond)
+		if h, err = g.rpcUint(ctx, "eth_blockNumber", "[]"); err != nil {
+			return nil, d, err
+		}
+	}
+	d[0] = time.Since(t0)
+	m := &mined{height: h}
+	for n := g.head + 1; n <= h; n++ {
+		raw, err := g.rpcResult(ctx, "eth_getBlockByNumber", fmt.Sprintf(`["0x%x",false]`, n))
+		if err != nil {
+			return nil, d, err
+		}
+		var blk struct {
+			GasUsed      string   `json:"gasUsed"`
+			Transactions []string `json:"transactions"`
+		}
+		if err := json.Unmarshal(raw, &blk); err != nil {
+			return nil, d, err
+		}
+		gas, err := strconv.ParseUint(strings.TrimPrefix(blk.GasUsed, "0x"), 16, 64)
+		if err != nil {
+			return nil, d, err
+		}
+		m.txs += uint64(len(blk.Transactions))
+		m.gas += gas
+	}
+	g.head = h
+	return m, d, nil
+}
+
+// fund (remote mode): the funder (ewoq) sends every sender 1000 coins, then
+// the chain drains.
+func (g *gen) fund(ctx context.Context, funder *ecdsa.PrivateKey) error {
+	from := crypto.PubkeyToAddress(funder.PublicKey)
+	nonce, err := g.rpcUint(ctx, "eth_getTransactionCount", fmt.Sprintf(`["%s","pending"]`, from.Hex()))
+	if err != nil {
+		return err
+	}
+	amount := new(big.Int).Mul(big.NewInt(1000), big.NewInt(1e18))
+	raws := make([][]byte, 0, genSenders)
+	for i := 0; i < genSenders; i++ {
+		to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
+		tx := ethtypes.NewTx(&ethtypes.DynamicFeeTx{ChainID: g.chainID, Nonce: nonce, GasTipCap: big.NewInt(1_000_000_000), GasFeeCap: big.NewInt(1_000_000_000_000), Gas: 21000, To: &to, Value: amount})
+		nonce++
+		signed, err := ethtypes.SignTx(tx, g.signer, funder)
+		if err != nil {
+			return err
+		}
+		raw, err := signed.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		raws = append(raws, raw)
+	}
+	if err := g.submit(ctx, raws); err != nil {
+		return err
+	}
+	b, t, _, err := g.drain(ctx)
+	log.Printf("gen funded %d senders in %d blocks (%d txs)", genSenders, b, t)
+	return err
 }
 
 // setupAndPrefill deploys the token, funds and approves the senders, grows
@@ -401,6 +567,7 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	if g.kind == "slots" {
 		init = common.FromHex(slotWriterInit)
 	}
+	g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), g.nonces[0])
 	if err := g.submit(ctx, [][]byte{g.sign(0, nil, nil, 2_000_000, init)}); err != nil {
 		return err
 	}
@@ -408,11 +575,10 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	if err != nil {
 		return err
 	}
-	if len(blk.Transactions()) != 1 || blk.GasUsed() == 0 {
-		return fmt.Errorf("deploy block has %d txs, gas %d", len(blk.Transactions()), blk.GasUsed())
+	if blk.txs != 1 || blk.gas == 0 {
+		return fmt.Errorf("deploy block has %d txs, gas %d", blk.txs, blk.gas)
 	}
-	g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), 0)
-	log.Printf("gen deployed %s contract at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.kind, g.contract, blk.NumberU64(), d[0], d[1], d[2], g.vm.tracker.pid.Load())
+	log.Printf("gen deployed %s contract at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.kind, g.contract, blk.height, d[0], d[1], d[2], g.pid())
 	if g.kind != "slots" {
 		setup := make([][]byte, 0, 2*genSenders)
 		for i := 0; i < genSenders; i++ {
@@ -426,11 +592,11 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		if err := g.submit(ctx, setup); err != nil {
 			return err
 		}
-		if blk, _, err = g.mine(ctx); err != nil {
+		// One block locally (500 M gas); several on a live chain.
+		if _, txs, _, err := g.drain(ctx); err != nil {
 			return err
-		}
-		if len(blk.Transactions()) != len(setup) {
-			return fmt.Errorf("setup block has %d txs, wanted %d", len(blk.Transactions()), len(setup))
+		} else if txs != uint64(len(setup)) {
+			return fmt.Errorf("setup blocks have %d txs, wanted %d", txs, len(setup))
 		}
 	}
 	// Prefill: each block grows holders and carries traffic.
@@ -440,7 +606,7 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	if blk, _, err = g.mine(ctx); err != nil {
 		return err
 	}
-	if blk.GasUsed() == 0 {
+	if blk.gas == 0 {
 		return errors.New("first mintMany block used no gas")
 	}
 	// Prefill.
@@ -489,6 +655,44 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, ki
 	if handlers["/rpc"] == nil {
 		return errors.New("plugin has no /rpc handler")
 	}
+	lastID, err := pl.vm.LastAccepted(ctx)
+	if err != nil {
+		return err
+	}
+	last, err := pl.vm.GetBlock(ctx, lastID)
+	if err != nil {
+		return err
+	}
+	return runGenOn(ctx, pl, handlers["/rpc"], big.NewInt(genChainID), last.Height(), dataDir, kind, prefillFor, prefillBatch, sizes, corpusOut)
+}
+
+// runGenRemote: the same workloads against a live node's /rpc. The network
+// mines; the funder (ewoq, funded in the e2e genesis) pays the senders.
+func runGenRemote(ctx context.Context, rpcURL, dataDir, kind string, prefillFor time.Duration, prefillBatch int, sizes string) error {
+	g := &gen{rpc: remoteRPC(rpcURL)}
+	chainID, err := g.rpcUint(ctx, "eth_chainId", "[]")
+	if err != nil {
+		return err
+	}
+	height, err := g.rpcUint(ctx, "eth_blockNumber", "[]")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
+	return runGenOn(ctx, nil, g.rpc, new(big.Int).SetUint64(chainID), height, dataDir, kind, prefillFor, prefillBatch, sizes, "")
+}
+
+func (g *gen) pid() int64 {
+	if g.vm == nil {
+		return 0
+	}
+	return g.vm.tracker.pid.Load()
+}
+
+func runGenOn(ctx context.Context, pl *plugin, rpc http.Handler, chainID *big.Int, height uint64, dataDir, kind string, prefillFor time.Duration, prefillBatch int, sizes, corpusOut string) error {
+	var err error
 	var corpus *os.File
 	if corpusOut != "" {
 		corpus, err = os.OpenFile(corpusOut, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -500,17 +704,9 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, ki
 			return err
 		}
 	}
-	g := &gen{kind: kind, corpus: corpus, vm: pl, rpc: handlers["/rpc"], signer: ethtypes.LatestSignerForChainID(big.NewInt(genChainID)), nonces: make([]uint64, genSenders)}
+	g := &gen{kind: kind, corpus: corpus, vm: pl, rpc: rpc, chainID: chainID, head: height, signer: ethtypes.LatestSignerForChainID(chainID), nonces: make([]uint64, genSenders)}
 	for i := 0; i < genSenders; i++ {
 		g.keys = append(g.keys, genKey(i))
-	}
-	lastID, err := pl.vm.LastAccepted(ctx)
-	if err != nil {
-		return err
-	}
-	last, err := pl.vm.GetBlock(ctx, lastID)
-	if err != nil {
-		return err
 	}
 	if raw, err := os.ReadFile(genStatePath(dataDir)); err == nil {
 		var st genState
@@ -518,10 +714,22 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, ki
 			return err
 		}
 		g.kind, g.contract, g.slots, g.holders, g.nonces, g.rng = st.Kind, st.Contract, st.Slots, st.Holders, st.Nonces, st.Rng
-		log.Printf("gen resumed: kind=%s height=%d holders=%d slots=%d senders=%d vm_pid=%d (prefill skipped)", g.kind, last.Height(), g.holders, g.slots, genSenders, pl.tracker.pid.Load())
-	} else if last.Height() != 0 {
-		return fmt.Errorf("data dir at height %d without %s", last.Height(), genStatePath(dataDir))
+		log.Printf("gen resumed: kind=%s height=%d holders=%d slots=%d senders=%d vm_pid=%d (prefill skipped)", g.kind, height, g.holders, g.slots, genSenders, g.pid())
+	} else if height != 0 && pl != nil {
+		return fmt.Errorf("data dir at height %d without %s", height, genStatePath(dataDir))
 	} else {
+		if pl == nil {
+			funder, err := crypto.HexToECDSA("56289e99c94b6912bfc12adc093c9b51124f0dc54ac7a766b2bc5ccf558d8027") // ewoq
+			if err != nil {
+				return err
+			}
+			if err := g.fund(ctx, funder); err != nil {
+				return err
+			}
+			if err := g.loadNonces(ctx); err != nil {
+				return err
+			}
+		}
 		if err := g.setupAndPrefill(ctx, dataDir, prefillFor, prefillBatch); err != nil {
 			return err
 		}
@@ -542,9 +750,9 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, ki
 			return err
 		}
 		total := d[0] + d[1] + d[2]
-		log.Printf("gen block height=%d txs=%d gas=%d submit=%s build=%s verify=%s accept=%s total=%s verify_mgas/s=%.1f", blk.NumberU64(), len(blk.Transactions()), blk.GasUsed(), submit, d[0], d[1], d[2], total, float64(blk.GasUsed())/1e6/d[1].Seconds())
-		if len(blk.Transactions()) != n {
-			log.Printf("gen note: asked %d txs, block took %d (gas limit %d); draining", n, len(blk.Transactions()), genGasLimit)
+		log.Printf("gen block height=%d txs=%d gas=%d submit=%s build=%s verify=%s accept=%s total=%s verify_mgas/s=%.1f", blk.height, blk.txs, blk.gas, submit, d[0], d[1], d[2], total, float64(blk.gas)/1e6/d[1].Seconds())
+		if blk.txs != uint64(n) {
+			log.Printf("gen note: asked %d txs, block took %d; draining", n, blk.txs)
 			if _, _, _, err := g.drain(ctx); err != nil {
 				return err
 			}

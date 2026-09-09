@@ -82,6 +82,7 @@ func main() {
 	genSizes := fs.String("gen-sizes", "100,1000,5000,20000", "generator: tx counts of the timed blocks")
 	genKind := fs.String("gen-kind", "token", "generator workload: token (ERC20-like) or slots (50 storage writes per tx)")
 	genCorpus := fs.String("gen-corpus", "", "generator: record every accepted block to this new EPCORP01 file (replay it with --corpus)")
+	genRPC := fs.String("gen-rpc", "", "generator: drive a live node's /rpc URL instead of an in-process plugin (ewoq funds the senders; the network mines)")
 	fs.Parse(os.Args[1:])
 	if *genPrefill > 0 {
 		if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -97,7 +98,7 @@ func main() {
 		}
 		*chainSpec = id
 	}
-	if *chainSpec == "" || *vmPath == "" {
+	if *genRPC == "" && (*chainSpec == "" || *vmPath == "") {
 		log.Fatal("epochdb-host: --chain and --vm are required")
 	}
 	if *queueAhead < 1 || *batch < 1 {
@@ -137,6 +138,12 @@ func main() {
 		}
 	}
 
+	if *genRPC != "" {
+		if err := runGenRemote(ctx, *genRPC, *dataDir, *genKind, *genPrefill, *genBatch, *genSizes); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("epochdb-host: gen: %v", err)
+		}
+		return
+	}
 	rctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	c, err := chain.Resolve(rctx, *chainSpec, networkID, *dataDir, sources...)
 	cancel()
