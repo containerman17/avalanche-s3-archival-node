@@ -2,9 +2,9 @@
 //!
 //!   bench latest <rows file>   run bytes/key, Get 1 thread and 16 threads, Merge, Overlay heap
 //!   bench dirty                4M synthetic state (commit_test's benchState shape): Roll, Dirty 20k serial and parallel
-//!   bench deep <dir> <slots> <blocks> <workers,...>
-//!                              one contract with <slots> keccak-shaped slots (plus 1000 EOAs); per block 20k fresh
-//!                              slots + 20k updates; apply and root per block. The node file is kept in <dir>
+//!   bench deep <dir> <slots> <blocks> <workers,...> [dirty=40000]
+//!                              one contract with <slots> keccak-shaped slots (plus 1000 EOAs); per block <dirty>/2
+//!                              fresh slots + <dirty>/2 updates; apply and root per block. The node file is kept in <dir>
 //!                              and reused when present (so a profile run skips the roll).
 use state::commit::dirty::{Dirty, SeekFn};
 use state::commit::file::File;
@@ -202,7 +202,7 @@ fn deep_state(n: usize) -> (Vec<Row>, Vec<u8>) {
     (rows, h)
 }
 
-fn deep(dir: &Path, slots: usize, blocks: usize, workers: &[usize]) {
+fn deep(dir: &Path, slots: usize, blocks: usize, workers: &[usize], dirty: usize) {
     std::fs::create_dir_all(dir).unwrap();
     let t = Instant::now();
     let (rows, owner) = deep_state(slots);
@@ -246,7 +246,7 @@ fn deep(dir: &Path, slots: usize, blocks: usize, workers: &[usize]) {
         let mut key = Vec::with_capacity(65);
         for b in 0..blocks {
             let t = Instant::now();
-            for _ in 0..20_000 {
+            for _ in 0..dirty / 2 {
                 key.clear();
                 key.extend_from_slice(&owner);
                 key.push(1);
@@ -254,7 +254,7 @@ fn deep(dir: &Path, slots: usize, blocks: usize, workers: &[usize]) {
                 let wd = rng.word();
                 d.apply(&key, &trim_word(&wd)).unwrap();
             }
-            for _ in 0..20_000 {
+            for _ in 0..dirty / 2 {
                 let r = &rows[slot_rows[rng.below(slot_rows.len())]];
                 let wd = rng.word();
                 d.apply(&r.0, &trim_word(&wd)).unwrap();
@@ -263,7 +263,7 @@ fn deep(dir: &Path, slots: usize, blocks: usize, workers: &[usize]) {
             let t = Instant::now();
             let root = d.root().unwrap();
             let rt = t.elapsed();
-            println!("deep {slots} workers={w} block {b}: apply {:.1} ms root {:.1} ms, {} nodes {:.0} MB retained, root {:02x?}..", apply.as_secs_f64() * 1e3, rt.as_secs_f64() * 1e3, d.nodes(), d.bytes() as f64 / 1e6, &root[..4]);
+            println!("deep {slots} dirty={dirty} workers={w} block {b}: apply {:.1} ms root {:.1} ms, {} nodes {:.0} MB retained, root {:02x?}..", apply.as_secs_f64() * 1e3, rt.as_secs_f64() * 1e3, d.nodes(), d.bytes() as f64 / 1e6, &root[..4]);
         }
     }
     // ponytail: the rows are millions of Vecs; freeing them is seconds of noise in a profile.
@@ -275,7 +275,7 @@ fn main() {
     match a[1].as_str() {
         "latest" => latest(Path::new(&a[2])),
         "dirty" => dirty(),
-        "deep" => deep(Path::new(&a[2]), a[3].parse().unwrap(), a[4].parse().unwrap(), &a[5].split(',').map(|x| x.parse().unwrap()).collect::<Vec<_>>()),
+        "deep" => deep(Path::new(&a[2]), a[3].parse().unwrap(), a[4].parse().unwrap(), &a[5].split(',').map(|x| x.parse().unwrap()).collect::<Vec<_>>(), a.get(6).map_or(40_000, |x| x.parse().unwrap())),
         _ => panic!("bench latest <rows> | bench dirty | bench deep <dir> <slots> <blocks> <workers,...>"),
     }
 }

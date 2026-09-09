@@ -2,11 +2,12 @@
 //! queues contract writes; `root` recomputes the state root touching only
 //! the dirty paths and retains the produced nodes for the next round.
 //!
-//! The retained nodes live in one byte slab behind a hash index of slab
-//! offsets: an entry is [owner u32][plen u8][path][cap u16][len u16][blob]
-//! at a slab offset, rewritten in place when the new blob fits, else
-//! appended (the old slot is dead; root compacts when dead space passes
-//! live).
+//! The retained nodes live in byte slabs behind hash indexes of slab
+//! offsets, one shard per first path nibble (plus one for the roots) so the
+//! 16 node sets of a split root merge in parallel: an entry is
+//! [owner u32][plen u8][path][cap u16][len u16][blob] at a slab offset,
+//! rewritten in place when the new blob fits, else appended (the old slot
+//! is dead; a shard compacts when dead space passes live).
 
 use super::file::File;
 use super::roll::{NoSink, StackTrie};
@@ -209,13 +210,20 @@ fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>,
     Ok((root, sets))
 }
 
+/// One slice of the retained store: the nodes whose path starts with one
+/// nibble (or the roots), so a split root's 16 node sets merge in parallel.
+#[derive(Default)]
+struct Shard {
+    table: HashTable<u64>,
+    slab: Vec<u8>,
+    dead: usize,
+}
+
 pub struct Dirty {
     f: Arc<File>,
     seek: Arc<SeekFn>,
     root: Hash,
-    table: HashTable<u64>,
-    slab: Vec<u8>,
-    dead: usize,
+    shards: Vec<Shard>,
     owners: Vec<Hash>,
     owner_ids: HashMap<Hash, u32>,
     acct: HashMap<Hash, Pending>,
@@ -237,9 +245,7 @@ impl Dirty {
             f,
             seek,
             root,
-            table: HashTable::new(),
-            slab: Vec::new(),
-            dead: 0,
+            shards: (0..17).map(|_| Shard::default()).collect(),
             owners: Vec::new(),
             owner_ids: HashMap::new(),
             acct: HashMap::new(),
@@ -253,9 +259,7 @@ impl Dirty {
     pub fn reset(&mut self, f: Arc<File>) {
         self.root = f.root();
         self.f = f;
-        self.table = HashTable::new();
-        self.slab = Vec::new();
-        self.dead = 0;
+        self.shards = (0..17).map(|_| Shard::default()).collect();
         self.owners.clear();
         self.owner_ids.clear();
         self.acct.clear();
@@ -263,51 +267,25 @@ impl Dirty {
 
     /// The size of the retained node slab (dead space included).
     pub fn bytes(&self) -> usize {
-        self.slab.len()
+        self.shards.iter().map(|s| s.slab.len()).sum()
     }
 
     /// The retained node count.
     pub fn nodes(&self) -> usize {
-        self.table.len()
+        self.shards.iter().map(|s| s.table.len()).sum()
     }
 
     pub fn current_root(&self) -> Hash {
         self.root
     }
 
-    fn hash_key(&self, owner: u32, path: &[u8]) -> u64 {
-        let mut h = self.hasher.build_hasher();
-        std::hash::Hasher::write_u32(&mut h, owner);
-        std::hash::Hasher::write(&mut h, path);
-        std::hash::Hasher::finish(&h)
-    }
-
-    /// Entry layout helpers over the slab.
-    #[inline]
-    fn entry_matches(slab: &[u8], off: u64, owner: u32, path: &[u8]) -> bool {
-        let o = off as usize;
-        u32::from_le_bytes(slab[o..o + 4].try_into().unwrap()) == owner && slab[o + 4] as usize == path.len() && &slab[o + 5..o + 5 + path.len()] == path
-    }
-
-    #[inline]
-    fn entry_blob(slab: &[u8], off: u64) -> &[u8] {
-        let o = off as usize + 5 + slab[off as usize + 4] as usize;
-        let len = u16::from_le_bytes([slab[o + 2], slab[o + 3]]) as usize;
-        &slab[o + 4..o + 4 + len]
-    }
-
     fn lookup(&self, owner: &Hash, path: &[u8]) -> Option<&[u8]> {
         let &id = self.owner_ids.get(owner)?;
-        let h = self.hash_key(id, path);
-        let off = *self.table.find(h, |&off| Self::entry_matches(&self.slab, off, id, path))?;
-        Some(Self::entry_blob(&self.slab, off))
+        self.shards[shard_of(path)].get(&self.hasher, id, path)
     }
 
-    /// Stores blob at owner/path: in place when it fits the slot, else in a
-    /// new slot with the length rounded up to 64 so a growing node relocates
-    /// rarely.
-    fn put(&mut self, owner: &Hash, path: &[u8], blob: &[u8]) {
-        let id = match self.owner_ids.get(owner) {
+    fn intern(&mut self, owner: &Hash) -> u32 {
+        match self.owner_ids.get(owner) {
             Some(&id) => id,
             None => {
                 let id = self.owners.len() as u32;
@@ -315,63 +293,35 @@ impl Dirty {
                 self.owner_ids.insert(*owner, id);
                 id
             }
-        };
-        let h = self.hash_key(id, path);
-        let new_off = self.slab.len() as u64;
-        match self.table.find_mut(h, |&off| Self::entry_matches(&self.slab, off, id, path)) {
-            Some(cur) => {
-                let o = *cur as usize + 5 + path.len();
-                let cap = u16::from_le_bytes([self.slab[o], self.slab[o + 1]]) as usize;
-                if blob.len() <= cap {
-                    self.slab[o + 2..o + 4].copy_from_slice(&(blob.len() as u16).to_le_bytes());
-                    self.slab[o + 4..o + 4 + blob.len()].copy_from_slice(blob);
-                    return;
-                }
-                self.dead += cap + 9 + path.len();
-                *cur = new_off;
-            }
-            None => {
-                let (slab, owners, hasher) = (&self.slab, &self.owners, &self.hasher);
-                let _ = owners;
-                self.table.insert_unique(h, new_off, |&off| {
-                    let o = off as usize;
-                    let id = u32::from_le_bytes(slab[o..o + 4].try_into().unwrap());
-                    let plen = slab[o + 4] as usize;
-                    let mut hh = hasher.build_hasher();
-                    std::hash::Hasher::write_u32(&mut hh, id);
-                    std::hash::Hasher::write(&mut hh, &slab[o + 5..o + 5 + plen]);
-                    std::hash::Hasher::finish(&hh)
-                });
-            }
         }
-        let cap = (blob.len() + 63) & !63;
-        self.slab.extend_from_slice(&id.to_le_bytes());
-        self.slab.push(path.len() as u8);
-        self.slab.extend_from_slice(path);
-        self.slab.extend_from_slice(&(cap as u16).to_le_bytes());
-        self.slab.extend_from_slice(&(blob.len() as u16).to_le_bytes());
-        self.slab.extend_from_slice(blob);
-        self.slab.resize(self.slab.len() + cap - blob.len(), 0);
     }
 
-    /// Rewrites the slab without its dead slots once they outweigh the live
-    /// ones (and are worth the copy).
-    fn compact(&mut self) {
-        if self.dead < 32 << 20 || self.dead < self.slab.len() / 2 {
+    /// Stores every (owner id, path, blob), the shards in parallel when
+    /// there are enough nodes to pay for the threads, then compacts.
+    fn merge_all(&mut self, items: &[(u32, &[u8], &[u8])]) {
+        let hasher = &self.hasher;
+        if items.len() < PAR_MIN_SLOTS || self.workers <= 1 {
+            for &(id, path, blob) in items {
+                self.shards[shard_of(path)].put(hasher, id, path, blob);
+            }
+        } else {
+            std::thread::scope(|s| {
+                for (i, shard) in self.shards.iter_mut().enumerate() {
+                    s.spawn(move || {
+                        for &(id, path, blob) in items {
+                            if shard_of(path) == i {
+                                shard.put(hasher, id, path, blob);
+                            }
+                        }
+                        shard.compact();
+                    });
+                }
+            });
             return;
         }
-        let mut slab = Vec::with_capacity(self.slab.len() - self.dead);
-        let old = std::mem::take(&mut self.slab);
-        for off in self.table.iter_mut() {
-            let o = *off as usize;
-            let plen = old[o + 4] as usize;
-            let cap = u16::from_le_bytes([old[o + 5 + plen], old[o + 6 + plen]]) as usize;
-            let at = slab.len() as u64;
-            slab.extend_from_slice(&old[o..o + 9 + plen + cap]);
-            *off = at;
+        for shard in &mut self.shards {
+            shard.compact();
         }
-        self.slab = slab;
-        self.dead = 0;
     }
 
     /// Queues one contract write. Keys may come in any order; an empty
@@ -384,11 +334,20 @@ impl Dirty {
     /// tries are hashed in parallel, the account trie after them.
     pub fn root(&mut self) -> Result<Hash> {
         let pending = std::mem::take(&mut self.acct);
+        let t0 = std::time::Instant::now();
         let (root, sets) = compute(self, self.root, pending, self.workers)?;
-        for set in &sets {
-            self.merge(set);
+        let t1 = t0.elapsed();
+        let n: usize = sets.iter().map(|s| s.nodes.len()).sum();
+        let ids: Vec<u32> = sets.iter().map(|s| self.intern(&s.owner)).collect();
+        let items: Vec<(u32, &[u8], &[u8])> = sets.iter().zip(&ids).flat_map(|(s, &id)| s.nodes.iter().map(move |(p, b)| (id, p.as_slice(), b.as_slice()))).collect();
+        self.merge_all(&items);
+        let t2 = t0.elapsed();
+        drop(items);
+        drop(sets);
+        // ponytail: env-gated timing print; a Stats struct if a caller ever needs it.
+        if std::env::var_os("ROOT_TIMING").is_some() {
+            eprintln!("root timing: compute {:.1} ms merge {:.1} ms ({n} nodes) drop+compact {:.1} ms", t1.as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, (t0.elapsed() - t2).as_secs_f64() * 1e3);
         }
-        self.compact();
         self.root = root;
         Ok(root)
     }
@@ -416,18 +375,14 @@ impl Dirty {
         if l.parent_root != self.root {
             return err(format!("commit: layer built over root {} absorbed into root {}", hex(&l.parent_root), hex(&self.root)));
         }
+        let mut items = Vec::with_capacity(l.nodes.len());
         for ((owner, path), blob) in &l.nodes {
-            self.put(owner, path, blob);
+            let id = self.intern(owner);
+            items.push((id, path.as_slice(), blob.as_slice()));
         }
-        self.compact();
+        self.merge_all(&items);
         self.root = l.root;
         Ok(())
-    }
-
-    fn merge(&mut self, set: &NodeSet) {
-        for (path, blob) in &set.nodes {
-            self.put(&set.owner, path, blob);
-        }
     }
 
     /// Rebuilds the leaf node at path from the rolled flat state.
@@ -477,6 +432,99 @@ impl Dirty {
         rlp::put_header(&mut out, true, body.len());
         out.extend_from_slice(&body);
         Ok(out)
+    }
+}
+
+/// The shard of a path: its first nibble, or 16 for a trie root.
+#[inline]
+fn shard_of(path: &[u8]) -> usize {
+    path.first().map_or(16, |&n| n as usize)
+}
+
+fn hash_key(hasher: &foldhash::fast::RandomState, owner: u32, path: &[u8]) -> u64 {
+    let mut h = hasher.build_hasher();
+    std::hash::Hasher::write_u32(&mut h, owner);
+    std::hash::Hasher::write(&mut h, path);
+    std::hash::Hasher::finish(&h)
+}
+
+impl Shard {
+    /// Entry layout helpers over the slab.
+    #[inline]
+    fn entry_matches(slab: &[u8], off: u64, owner: u32, path: &[u8]) -> bool {
+        let o = off as usize;
+        u32::from_le_bytes(slab[o..o + 4].try_into().unwrap()) == owner && slab[o + 4] as usize == path.len() && &slab[o + 5..o + 5 + path.len()] == path
+    }
+
+    #[inline]
+    fn entry_blob(slab: &[u8], off: u64) -> &[u8] {
+        let o = off as usize + 5 + slab[off as usize + 4] as usize;
+        let len = u16::from_le_bytes([slab[o + 2], slab[o + 3]]) as usize;
+        &slab[o + 4..o + 4 + len]
+    }
+
+    fn get(&self, hasher: &foldhash::fast::RandomState, id: u32, path: &[u8]) -> Option<&[u8]> {
+        let h = hash_key(hasher, id, path);
+        let off = *self.table.find(h, |&off| Self::entry_matches(&self.slab, off, id, path))?;
+        Some(Self::entry_blob(&self.slab, off))
+    }
+
+    /// Stores blob at owner/path: in place when it fits the slot, else in a
+    /// new slot with the length rounded up to 64 so a growing node relocates
+    /// rarely.
+    fn put(&mut self, hasher: &foldhash::fast::RandomState, id: u32, path: &[u8], blob: &[u8]) {
+        let h = hash_key(hasher, id, path);
+        let new_off = self.slab.len() as u64;
+        match self.table.find_mut(h, |&off| Self::entry_matches(&self.slab, off, id, path)) {
+            Some(cur) => {
+                let o = *cur as usize + 5 + path.len();
+                let cap = u16::from_le_bytes([self.slab[o], self.slab[o + 1]]) as usize;
+                if blob.len() <= cap {
+                    self.slab[o + 2..o + 4].copy_from_slice(&(blob.len() as u16).to_le_bytes());
+                    self.slab[o + 4..o + 4 + blob.len()].copy_from_slice(blob);
+                    return;
+                }
+                self.dead += cap + 9 + path.len();
+                *cur = new_off;
+            }
+            None => {
+                let slab = &self.slab;
+                self.table.insert_unique(h, new_off, |&off| {
+                    let o = off as usize;
+                    let id = u32::from_le_bytes(slab[o..o + 4].try_into().unwrap());
+                    let plen = slab[o + 4] as usize;
+                    hash_key(hasher, id, &slab[o + 5..o + 5 + plen])
+                });
+            }
+        }
+        let cap = (blob.len() + 63) & !63;
+        self.slab.extend_from_slice(&id.to_le_bytes());
+        self.slab.push(path.len() as u8);
+        self.slab.extend_from_slice(path);
+        self.slab.extend_from_slice(&(cap as u16).to_le_bytes());
+        self.slab.extend_from_slice(&(blob.len() as u16).to_le_bytes());
+        self.slab.extend_from_slice(blob);
+        self.slab.resize(self.slab.len() + cap - blob.len(), 0);
+    }
+
+    /// Rewrites the slab without its dead slots once they outweigh the live
+    /// ones (and are worth the copy).
+    fn compact(&mut self) {
+        if self.dead < 2 << 20 || self.dead < self.slab.len() / 2 {
+            return;
+        }
+        let mut slab = Vec::with_capacity(self.slab.len() - self.dead);
+        let old = std::mem::take(&mut self.slab);
+        for off in self.table.iter_mut() {
+            let o = *off as usize;
+            let plen = old[o + 4] as usize;
+            let cap = u16::from_le_bytes([old[o + 5 + plen], old[o + 6 + plen]]) as usize;
+            let at = slab.len() as u64;
+            slab.extend_from_slice(&old[o..o + 9 + plen + cap]);
+            *off = at;
+        }
+        self.slab = slab;
+        self.dead = 0;
     }
 }
 
