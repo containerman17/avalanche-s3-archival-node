@@ -38,9 +38,10 @@ const retryDelay = 100 * time.Millisecond
 // build that races it hands the engine a few already-mined txs, which it
 // skips (code 1).
 type builder struct {
-	pool *txpool.TxPool
-	mu   sync.Mutex
-	cond *lock.Cond
+	pool  *txpool.TxPool
+	chain *poolChain
+	mu    sync.Mutex
+	cond  *lock.Cond
 
 	normalOp        bool
 	lastBuildTime   time.Time
@@ -48,8 +49,8 @@ type builder struct {
 	admitted        atomic.Uint64
 }
 
-func newBuilder(pool *txpool.TxPool) *builder {
-	b := &builder{pool: pool}
+func newBuilder(pool *txpool.TxPool, chain *poolChain) *builder {
+	b := &builder{pool: pool, chain: chain}
 	b.cond = lock.NewCond(&b.mu)
 	return b
 }
@@ -113,11 +114,16 @@ func (b *builder) waitForEvent(ctx context.Context, head *types.Header) (common.
 	return common.PendingTxs, nil
 }
 
-// hasPending: the pool holds an executable tx. Stats is O(accounts);
-// Pending would copy every pending tx, and pool.Sync FORCES a full reset
-// (it is the simulator's hook), which under a 100k-tx pool starved every
-// other pool user and stalled the chain (E2E.md run 3).
+// hasPending: the pool is on the accepted head and holds an executable tx.
+// While the head moves the count still holds the mined txs (chain.onMoved
+// wakes us when the reset lands). Stats is O(accounts); Pending would copy
+// every pending tx, and pool.Sync FORCES a full reset (it is the
+// simulator's hook), which under a 100k-tx pool starved every other pool
+// user and stalled the chain (E2E.md run 3).
 func (b *builder) hasPending() bool {
+	if !b.chain.isSettled() {
+		return false
+	}
 	pending, _ := b.pool.Stats()
 	return pending > 0
 }
@@ -209,10 +215,16 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		}
 		rounds++
 	}
+	// built() before the empty check: an all-skipped build (every candidate
+	// already mined, or invalid) gets the same 100 ms retry gap as a block
+	// that consensus has not accepted yet. Without it WaitForEvent fired
+	// again at once while the pool still held the skipped txs (K7 on the
+	// settle run: 11595 engine builds for 175 blocks).
+	vm.b.built(parent.Hash())
 	if out.included == 0 {
+		vm.m.buildEmpty.Inc()
 		return nil, errNoTxs
 	}
-	vm.b.built(parent.Hash())
 	vm.m.buildTxs.Observe(float64(out.included))
 	vm.mu.Lock()
 	vm.lastBuilt, vm.lastBuiltAt = out.id, time.Now()

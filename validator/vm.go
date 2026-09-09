@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/database"
@@ -66,6 +65,7 @@ type VM struct {
 	push   *gossip.PushGossiper[*gossipTx]
 	b      *builder
 	m      *metrics
+	drops  *dropLogHandler
 
 	mu          sync.Mutex
 	preferred   ids.ID
@@ -111,11 +111,13 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 			go http.Serve(l, nil)
 		}
 	}
-	// libevm's pool logs through its own logger: Warn and up, plus the Trace
-	// lines that name a dropped tx and why (capped), go to stderr, which
-	// avalanchego collects into main.log.
-	ethlog.SetDefault(ethlog.NewLogger(&dropLogHandler{Handler: ethlog.NewTerminalHandlerWithLevel(os.Stderr, ethlog.LevelTrace, false)}))
 	vm.m = newMetrics()
+	// libevm's pool logs through its own logger: Warn and up go to stderr
+	// (avalanchego relays it into the chain log); the Trace lines that name a
+	// removed tx and why are counted per reason instead (Accept logs the
+	// counts of its reset, epochdb_pool_removed_total keeps the totals).
+	vm.drops = &dropLogHandler{Handler: ethlog.NewTerminalHandlerWithLevel(os.Stderr, ethlog.LevelWarn, false), removed: vm.m.poolRemoved}
+	ethlog.SetDefault(ethlog.NewLogger(vm.drops))
 	if chainCtx.Metrics != nil {
 		if err := chainCtx.Metrics.Register("epochdb", vm.m.reg); err != nil {
 			eng.close()
@@ -133,7 +135,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		eng.close()
 		return err
 	}
-	vm.chain = newPoolChain(eng, chainConfig, head, headID, func(msg string, err error) { chainCtx.Log.Warn(msg, zap.Error(err)) })
+	vm.chain = newPoolChain(eng, chainConfig, head, headID, chainCtx.Log)
 	vm.preferred = headID
 
 	legacy := legacypool.New(legacypool.Config{
@@ -147,6 +149,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		eng.close()
 		return fmt.Errorf("validator: txpool: %w", err)
 	}
+	vm.chain.sub, vm.chain.counts = legacy, vm.drops.counts // setHead resets it on every accepted head
 	// ponytail: libevm's pool has no SetMinFee; a tx under the chain's min
 	// base fee sits in the pool until it expires, the build filter never
 	// selects it. Add the check in serveRPC/gossipSet.Add if it matters.
@@ -158,7 +161,8 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.bg, vm.cancel = context.WithCancel(context.Background())
-	vm.b = newBuilder(vm.pool)
+	vm.b = newBuilder(vm.pool, vm.chain)
+	vm.chain.onMoved = func() { vm.b.mu.Lock(); vm.b.cond.Broadcast(); vm.b.mu.Unlock() }
 	vm.wg.Add(1)
 	go func() { defer vm.wg.Done(); vm.b.run(vm.bg) }()
 
@@ -239,6 +243,7 @@ func (vm *VM) Shutdown(context.Context) error {
 	vm.closeOnce.Do(func() {
 		vm.cancel()
 		vm.wg.Wait()
+		vm.chain.settle() // the last reset lands before the pool closes under it
 		vm.pool.Close()
 		vm.eng.close()
 	})
@@ -253,7 +258,7 @@ func (vm *VM) HealthCheck(context.Context) (interface{}, error) {
 		return nil, err
 	}
 	pending, queued := vm.pool.Stats()
-	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued}, nil
+	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued, "removed": vm.drops.counts(), "settled": vm.chain.isSettled()}, nil
 }
 
 func (vm *VM) Connected(ctx context.Context, id ids.NodeID, v *version.Application) error {
@@ -385,14 +390,17 @@ func (b *Block) Accept(context.Context) error {
 	}
 	vm := b.vm
 	start := time.Now()
+	vm.chain.headMoving() // before the engine flips its height: the pool is "moving" to anyone who sees the new block
 	if err := vm.eng.accept(b.id); err != nil {
+		vm.chain.headMoved()
 		return err
 	}
 	h, err := vm.headHeader()
 	if err != nil {
+		vm.chain.headMoved()
 		return err
 	}
-	vm.chain.setHead(h, b.id)
+	vm.chain.setHead(h, b.id) // its reset goroutine calls headMoved
 	vm.m.accept.Observe(time.Since(start).Seconds())
 
 	now := vm.eng.snapshot()
@@ -435,6 +443,8 @@ type metrics struct {
 	verifyTxs, buildTxs   prometheus.Histogram
 	crossings             *prometheus.CounterVec
 	admitted              prometheus.Counter
+	poolRemoved           *prometheus.CounterVec
+	buildEmpty            prometheus.Counter
 }
 
 func newMetrics() *metrics {
@@ -455,8 +465,11 @@ func newMetrics() *metrics {
 		buildTxs:  n("epochdb_build_txs", "txs per built block"),
 		crossings: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "epochdb_crossings_total", Help: "cgo calls into the engine"}, []string{"kind"}),
 		admitted:  prometheus.NewCounter(prometheus.CounterOpts{Name: "epochdb_txs_admitted_total", Help: "txs the pool promoted to pending"}),
+		poolRemoved: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "epochdb_pool_removed_total",
+			Help: "txs the pool removed at a reset, by libevm's reason (old = mined; unpayable, cap-exceeding, fairness-exceeding, invalidated = dropped)"}, []string{"reason"}),
+		buildEmpty: prometheus.NewCounter(prometheus.CounterOpts{Name: "epochdb_build_empty_total", Help: "BuildBlock calls whose every candidate the engine skipped (no block)"}),
 	}
-	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.admitted)
+	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.admitted, m.poolRemoved, m.buildEmpty)
 	// The Go heap, GC share and RSS of the plugin process. (The stock Go and
 	// process collectors do not survive the rpcchainvm gatherer, so: gauges.)
 	gauge := func(name, help string, f func() float64) {
@@ -497,28 +510,72 @@ func processRSS() float64 {
 	return pages * float64(os.Getpagesize())
 }
 
-// dropLogHandler forwards libevm records at Warn and above, and the first
-// dropLogCap Trace/Debug records whose message says a tx was removed or
-// discarded (legacypool's "Removed old/unpayable ...", "Discarding ...",
-// "Demoting ..."), so a load run shows the pool's drop reasons.
+// dropLogHandler forwards libevm records at Warn and above to its Handler
+// and counts, instead of printing, the Trace records that say the pool
+// removed a tx ("Removed old pending transaction", "Removed unpayable queued
+// transactions" count=N, ...): under load the per-tx lines are thousands
+// per block (a 500-line cap was gone 5 s into the settle run), the counts
+// per reason per reset are what a run needs.
 type dropLogHandler struct {
 	slog.Handler
-	n atomic.Int64
+	removed *prometheus.CounterVec
+	mu      sync.Mutex
+	n       map[string]uint64
 }
-
-const dropLogCap = 500
 
 func (h *dropLogHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *dropLogHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.Level < slog.LevelWarn {
-		m := r.Message
-		if !(strings.HasPrefix(m, "Removed") || strings.HasPrefix(m, "Discarding") || strings.HasPrefix(m, "Demoting") || strings.HasPrefix(m, "Failed") || strings.HasPrefix(m, "Transaction pool reset") || strings.HasPrefix(m, "Unrooted")) {
-			return nil
+	if reason, n := removalReason(r); reason != "" && n > 0 {
+		h.mu.Lock()
+		if h.n == nil {
+			h.n = map[string]uint64{}
 		}
-		if h.n.Add(1) > dropLogCap {
-			return nil
+		h.n[reason] += n
+		h.mu.Unlock()
+		if h.removed != nil {
+			h.removed.WithLabelValues(reason).Add(float64(n))
 		}
 	}
+	if r.Level < slog.LevelWarn {
+		return nil
+	}
 	return h.Handler.Handle(ctx, r)
+}
+
+// counts: removals so far by reason (a copy).
+func (h *dropLogHandler) counts() map[string]uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]uint64, len(h.n))
+	for k, v := range h.n {
+		out[k] = v
+	}
+	return out
+}
+
+// removalReason maps legacypool's removal lines to a reason and a count:
+// "Removed <reason> pending transaction" hash=.. (one tx), "Removed <reason>
+// queued transactions" count=N, "Demoting invalidated transaction" (a nonce
+// gap in a pending list, should never happen).
+func removalReason(r slog.Record) (string, uint64) {
+	m := r.Message
+	switch {
+	case strings.HasPrefix(m, "Removed "):
+		m = strings.TrimPrefix(m, "Removed ")
+	case strings.HasPrefix(m, "Demoting invalidated"):
+		return "invalidated", 1
+	default:
+		return "", 0
+	}
+	reason, _, _ := strings.Cut(m, " ")
+	n := uint64(1)
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "count" {
+			n = uint64(a.Value.Int64())
+			return false
+		}
+		return true
+	})
+	return reason, n
 }
