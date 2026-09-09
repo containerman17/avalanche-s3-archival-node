@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RunRef {
@@ -141,6 +141,10 @@ pub struct DB {
     read_only: bool,
     pub flush_txs: u64,
     pub flush_blocks: u64,
+    pub flush_bytes: u64,
+    /// How long `close` waits for a seal or merge in flight before it
+    /// abandons it (`shutdown-grace-secs`); MAX = forever (the tools).
+    pub close_grace: Duration,
 }
 
 impl DB {
@@ -181,7 +185,8 @@ impl DB {
             terminal_txs,
             merge_crash: Mutex::new(None),
         });
-        let db = DB { inner, mem: RwLock::new(Memtable::open(&dir.join("window").join("window.log"), read_only)?), cut: Mutex::new(None), read_only, flush_txs: FLUSH_TXS, flush_blocks: FLUSH_BLOCKS };
+        let flush_bytes = std::env::var("EPOCHDB_WINDOW_MAX_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(FLUSH_BYTES);
+        let db = DB { inner, mem: RwLock::new(Memtable::open(&dir.join("window").join("window.log"), read_only)?), cut: Mutex::new(None), read_only, flush_txs: FLUSH_TXS, flush_blocks: FLUSH_BLOCKS, flush_bytes, close_grace: Duration::MAX };
         // A frozen log is a cut that did not finish: sealed first, its blocks come before the active log's.
         let fpath = dir.join("window").join(FROZEN_LOG);
         let (mut base_tx, mut base_height) = (base_tx, base_height);
@@ -264,8 +269,12 @@ impl DB {
     }
 
     pub fn maybe_flush(&self) -> Result<()> {
-        let (bt, nt, bh, nh, started) = self.mem.read().unwrap().window();
-        if !started || (nt - bt < self.flush_txs && nh - bh < self.flush_blocks) {
+        let (bt, nt, bh, nh, started, bytes) = {
+            let m = self.mem.read().unwrap();
+            let (bt, nt, bh, nh, started) = m.window();
+            (bt, nt, bh, nh, started, m.bytes())
+        };
+        if !started || (nt - bt < self.flush_txs && nh - bh < self.flush_blocks && bytes < self.flush_bytes) {
             return Ok(());
         }
         self.cut_window()
@@ -293,8 +302,34 @@ impl DB {
     pub fn maybe_merge(&self) -> Result<()> {
         self.inner.maybe_merge()
     }
-    /// Waits for the cut and the merge: nothing outlives the DB.
+    /// Waits for the cut and the merge up to `close_grace`, then abandons
+    /// them: the seal's frozen log and the merge's inputs stay on disk and
+    /// the next open re-seals / re-merges (the same recovery as a crash).
+    /// The window log itself is fsynced by the caller's `sync`.
     pub fn close(&self) -> Result<()> {
+        let deadline = Instant::now().checked_add(self.close_grace);
+        loop {
+            let busy = |h: &Option<JoinHandle<Result<()>>>| h.as_ref().is_some_and(|h| !h.is_finished());
+            let (cut, merge) = (busy(&self.cut.lock().unwrap()), busy(&self.inner.merge.lock().unwrap().running));
+            if !cut && !merge {
+                break;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                eprintln!(
+                    "store: close: abandoning the {} still running after {:.0}s (re-done at the next open)",
+                    match (cut, merge) {
+                        (true, true) => "seal and merge",
+                        (true, false) => "seal",
+                        _ => "merge",
+                    },
+                    self.close_grace.as_secs_f64()
+                );
+                drop(self.cut.lock().unwrap().take());
+                drop(self.inner.merge.lock().unwrap().running.take());
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let a = self.wait_cut();
         let b = self.wait_merge();
         a.and(b)
@@ -1394,6 +1429,36 @@ mod tests {
         let l0 = man.runs.iter().filter(|r| r.level < TERMINAL_LEVEL).count();
         assert_eq!(names.len(), l0, "local dir holds {names:?}, manifest lists {l0} L0 runs");
         assert!(worst < 2.0, "a read waited {worst:.2}s");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The byte trigger: with the block and slot triggers out of reach, a
+    /// window is cut as soon as its log passes `flush_bytes`, so after every
+    /// block the live window holds fewer bytes than the cap. (No env here:
+    /// the other tests set EPOCHDB_TERMINAL_TXS concurrently, so merges may
+    /// or may not happen and the cuts are counted at the writer.)
+    #[test]
+    fn window_is_cut_by_bytes() {
+        let dir = std::env::temp_dir().join(format!("epochdb-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = DB::open(&dir, Store::local(&dir).unwrap(), [1u8; 32]).unwrap();
+        db.flush_bytes = 8192;
+        const N: u64 = 300;
+        let (mut cuts, mut largest) = (0, 0);
+        for h in 1..=N {
+            db.write_block(&block(h)).unwrap();
+            cuts += db.cut.lock().unwrap().is_some() as usize;
+            db.wait_cut().unwrap();
+            let bytes = db.mem.read().unwrap().bytes();
+            assert!(bytes < db.flush_bytes, "block {h}: window holds {bytes} bytes, cap {}", db.flush_bytes);
+            largest = largest.max(bytes);
+        }
+        db.close().unwrap();
+        assert!(cuts >= 20, "{cuts} cuts for {N} blocks");
+        for h in 1..=N {
+            check(&db, h).unwrap();
+        }
+        eprintln!("bytes: {cuts} cuts for {N} blocks, largest live window {largest} bytes under an {} cap", db.flush_bytes);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

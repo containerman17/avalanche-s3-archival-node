@@ -695,4 +695,8 @@ impl Memtable {
     pub fn window(&self) -> (u64, u64, u64, u64, bool) {
         (self.base_tx, self.next_tx, self.base_height, self.next_height, self.started)
     }
+    /// Raw bytes of the window log so far (the byte flush trigger).
+    pub fn bytes(&self) -> u64 {
+        self.pos
+    }
 }

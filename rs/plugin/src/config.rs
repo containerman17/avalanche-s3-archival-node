@@ -25,6 +25,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("cache-min-free", "EPOCHDB_CACHE_MIN_FREE"),
     ("cache-max-age", "EPOCHDB_CACHE_MAX_AGE"),
     ("terminal-txs", "EPOCHDB_TERMINAL_TXS"),
+    ("window-max-bytes", "EPOCHDB_WINDOW_MAX_BYTES"),
     ("new-chain", "EPOCHDB_NEW_CHAIN"),
 ];
 

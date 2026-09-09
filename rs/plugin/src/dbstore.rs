@@ -41,7 +41,7 @@ pub trait BlockStore: Send {
     fn append(&mut self, r: Record) -> io::Result<()>;
     /// Make everything appended durable.
     fn sync(&self) -> io::Result<()>;
-    /// Waits for the store's background work (a seal, a merge) at shutdown.
+    /// Waits (bounded) for the store's background work (a seal, a merge) at shutdown.
     fn close(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -57,9 +57,12 @@ fn ioerr(e: anyhow::Error) -> io::Error {
 
 impl DbStore {
     /// Opens (creating) the store under `dir`; S3 from EPOCHDB_S3_* if set.
-    pub fn open(dir: &Path, chain_root: [u8; 32]) -> anyhow::Result<DbStore> {
+    /// `close_grace` bounds how long `close` waits for a seal or merge.
+    pub fn open(dir: &Path, chain_root: [u8; 32], close_grace: std::time::Duration) -> anyhow::Result<DbStore> {
         let cas = store::casfs::Store::open(dir)?;
-        Ok(DbStore { db: Arc::new(DB::open(dir, cas, chain_root)?) })
+        let mut db = DB::open(dir, cas, chain_root)?;
+        db.close_grace = close_grace;
+        Ok(DbStore { db: Arc::new(db) })
     }
 }
 

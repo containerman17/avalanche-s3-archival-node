@@ -47,6 +47,10 @@ const TIP_ROLL: usize = 128 << 20;
 /// seconds since the last roll, whichever comes first, in both states.
 const ROLL_EVERY_BLOCKS: u64 = 500_000;
 const ROLL_EVERY_SECS: u64 = 3600;
+/// `shutdown-grace-secs`: how long Shutdown waits for a seal or merge in
+/// flight before it abandons it (avalanchego kills the plugin at its own
+/// deadline; the frozen log is re-sealed at the next open either way).
+const SHUTDOWN_GRACE_SECS: u64 = 10;
 /// How many accepted blocks may wait for their root check (checkDepth).
 const CHECK_DEPTH: usize = 4;
 /// The store's group-fsync cadence in blocks (flushEvery).
@@ -199,6 +203,7 @@ impl NodeEngine {
         let tip_roll = TIP_ROLL.min(sync_roll);
         let every_blocks = conf_u64(&conf, "roll-every-blocks").unwrap_or(ROLL_EVERY_BLOCKS);
         let every_secs = conf_u64(&conf, "roll-every-secs").unwrap_or(ROLL_EVERY_SECS);
+        let grace = std::time::Duration::from_secs(conf_u64(&conf, "shutdown-grace-secs").unwrap_or(SHUTDOWN_GRACE_SECS));
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let workers = cpus.saturating_sub(2).max(1);
         let data = PathBuf::from(&init.chain_data_dir);
@@ -242,8 +247,9 @@ impl NodeEngine {
         };
 
         let chain_root: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&init.genesis_bytes).into();
-        let store = DbStore::open(&data.join("store"), chain_root).context("open the store")?;
+        let store = DbStore::open(&data.join("store"), chain_root, grace).context("open the store")?;
         let db = store.db.clone();
+        let window_max_bytes = db.flush_bytes;
         let mut ncode = 0usize;
         db.each_code(|h, c| {
             be.code.insert(B256::from(*h), Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(c)));
@@ -336,11 +342,13 @@ impl NodeEngine {
             std::thread::spawn(move || checker(check_rx, dirty, store, recent, stats, flush_tx))
         };
         eprintln!(
-            "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) roll-every={every_blocks} blocks / {every_secs}s workers={workers} dirty-workers={cpus}",
+            "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) roll-every={every_blocks} blocks / {every_secs}s window-max-bytes={} shutdown-grace={}s workers={workers} dirty-workers={cpus}",
             cfg.chain_id,
             init.chain_data_dir,
             sync_roll >> 20,
-            tip_roll >> 20
+            tip_roll >> 20,
+            window_max_bytes,
+            grace.as_secs()
         );
         let inner = Arc::new(Mutex::new(Inner { ex, roller, roll_budget: sync_roll }));
         let head = Arc::new(Mutex::new(head));

@@ -5,6 +5,9 @@ pub const STORAGE_VERSION: u32 = 4;
 
 pub const FLUSH_TXS: u64 = 500_000;
 pub const FLUSH_BLOCKS: u64 = 50_000;
+/// The third flush trigger: raw bytes of the window log (`window-max-bytes`).
+/// Bounds the final seal a shutdown may abandon, and the re-seal at open.
+pub const FLUSH_BYTES: u64 = 1 << 30;
 pub const TERMINAL_LEVEL: i32 = 1;
 
 pub const PREFIX_BLK: &[u8] = b"blk/";
