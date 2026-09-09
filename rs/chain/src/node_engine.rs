@@ -1173,9 +1173,11 @@ impl NodeEngine {
         }
         let tx = self.check_tx.lock().unwrap().clone().ok_or("checker stopped")?;
         tx.send(Msg::Block(Box::new(CheckItem { block: b.clone(), payload, root_done, layer }))).map_err(|_| "checker stopped")?;
-        if b.height % 256 == 0 {
-            self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
-        }
+        // Every accept: a parsed block keeps its container and decoded txs
+        // (5-10 MB for a 2000-tx slots block); swept every 256 blocks this
+        // map alone reached 3.9 GB of live heap on the stress L1. Only the
+        // blocks above the accepted head (competing / pending) stay.
+        self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
         Ok(())
     }
 
