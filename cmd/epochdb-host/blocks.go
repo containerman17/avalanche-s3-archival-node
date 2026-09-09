@@ -52,8 +52,15 @@ const (
 	// shape: a precompile-like tx that is nearly all state writes.
 	slotWriterInit = "6022" + "80" + "600b" + "6000" + "39" + "6000" + "f3" +
 		"602035" + "600035" + "5b" + "8115" + "6020" + "57" + "8080" + "604035" + "01" + "90" + "55" + "600101" + "90600190" + "03" + "90" + "6006" + "56" + "5b00"
-	slotsPerTx   = 50
-	slotsPerGrow = 500 // fresh slots per prefill grow tx (slots kind), 12.6 M gas
+	slotsPerTx = 50
+	// Settlement (gen_settle.sol): 400 rows per tx like the Clear Street
+	// batches; a row is 8 bytes (sec u8, from u16, to u16, qty u24).
+	selCredit     = "419cf135"
+	selSettle     = "d0322fbf"
+	rowsPerTx     = 400
+	settleGas     = 12_000_000 // ~21k gas per row when every slot is cold
+	seedPerCredit = 500        // positions per credit tx (~14 M gas)
+	slotsPerGrow  = 500        // fresh slots per prefill grow tx (slots kind), 12.6 M gas
 )
 
 // genChain writes chain.json for the private chain when it is absent.
@@ -246,6 +253,9 @@ func (g *gen) traffic(n int) [][]byte {
 	if g.kind == "slots" {
 		return g.slotTraffic(n)
 	}
+	if _, _, ok := settleSpec(g.kind); ok {
+		return g.settleTraffic(n)
+	}
 	raws := make([][]byte, 0, n)
 	amount := word(1_000_000_000_000)
 	for i := 0; i < n; i++ {
@@ -270,6 +280,9 @@ func (g *gen) traffic(n int) [][]byte {
 func (g *gen) grow() [][]byte {
 	if g.kind == "slots" {
 		return g.slotGrow()
+	}
+	if _, _, ok := settleSpec(g.kind); ok {
+		return nil // positions are seeded at setup; traffic only rewrites them
 	}
 	raws := make([][]byte, 0, mintsPerBlock)
 	for i := 0; i < mintsPerBlock; i++ {
@@ -355,6 +368,56 @@ func (g *gen) drain(ctx context.Context) (blocks, txs, gas uint64, err error) {
 		txs += blk.txs
 		gas += blk.gas
 	}
+}
+
+// settleSpec reads "settle" or "settle:<parties>x<secs>" (default 120x12,
+// the small Clear Street plant). Positions = parties * secs.
+func settleSpec(kind string) (parties, secs uint64, ok bool) {
+	if kind == "settle" {
+		return 120, 12, true
+	}
+	if !strings.HasPrefix(kind, "settle:") {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(kind, "settle:%dx%d", &parties, &secs); err != nil || parties == 0 || parties > 65536 || secs == 0 || secs > 256 {
+		return 0, 0, false
+	}
+	return parties, secs, true
+}
+
+// settleSeed credits every (party, sec) position; sender 0, seedPerCredit
+// positions per tx.
+func (g *gen) settleSeed(parties, secs uint64) [][]byte {
+	var raws [][]byte
+	for sec := uint64(0); sec < secs; sec++ {
+		for from := uint64(0); from < parties; from += seedPerCredit {
+			n := min(seedPerCredit, parties-from)
+			raws = append(raws, g.sign(0, &g.contract, nil, 60_000+n*30_000, call(selCredit, word(sec), word(from), word(n), word(1<<60))))
+		}
+	}
+	return raws
+}
+
+// settleTraffic: n txs of rowsPerTx random rows over the seeded positions.
+func (g *gen) settleTraffic(n int) [][]byte {
+	raws := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		s := int(g.next() % uint64(len(g.keys)))
+		rows := make([]byte, 8*rowsPerTx)
+		for r := 0; r < rowsPerTx; r++ {
+			x := g.next()
+			sec := (x >> 56) % g.slots
+			from := (x >> 40 & 0xffff) % g.holders
+			to := (x >> 24 & 0xffff) % g.holders
+			qty := x&0xffffff + 1
+			binary.BigEndian.PutUint64(rows[8*r:], sec<<56|from<<40|to<<24|qty)
+		}
+		// settle(bytes): selector, offset 32, length, data padded to 32.
+		data := call(selSettle, word(32), word(uint64(len(rows))))
+		data = append(data, rows...)
+		raws = append(raws, g.sign(s, &g.contract, nil, settleGas, data))
+	}
+	return raws
 }
 
 // slotCall encodes slotWriter(start, count, salt).
@@ -573,6 +636,10 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	if g.kind == "slots" {
 		init = common.FromHex(slotWriterInit)
 	}
+	parties, secs, settle := settleSpec(g.kind)
+	if settle {
+		init = common.FromHex(settleBin)
+	}
 	g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), g.nonces[0])
 	if err := g.submit(ctx, [][]byte{g.sign(0, nil, nil, 2_000_000, init)}); err != nil {
 		return err
@@ -585,7 +652,21 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		return fmt.Errorf("deploy block has %d txs, gas %d", blk.txs, blk.gas)
 	}
 	log.Printf("gen deployed %s contract at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.kind, g.contract, blk.height, d[0], d[1], d[2], g.pid())
-	if g.kind != "slots" {
+	if settle {
+		g.holders, g.slots = parties, secs
+		seed := g.settleSeed(parties, secs)
+		t0 := time.Now()
+		if err := g.submit(ctx, seed); err != nil {
+			return err
+		}
+		if b, txs, _, err := g.drain(ctx); err != nil {
+			return err
+		} else if txs != uint64(len(seed)) {
+			return fmt.Errorf("seed blocks have %d txs, wanted %d", txs, len(seed))
+		} else {
+			log.Printf("gen seeded %d positions (%d parties x %d secs) in %d blocks, %d txs, %.1fs", parties*secs, parties, secs, b, txs, time.Since(t0).Seconds())
+		}
+	} else if g.kind != "slots" {
 		setup := make([][]byte, 0, 2*genSenders)
 		for i := 0; i < genSenders; i++ {
 			to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
@@ -606,14 +687,16 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		}
 	}
 	// Prefill: each block grows holders and carries traffic.
-	if err := g.submit(ctx, g.grow()); err != nil {
-		return err
-	}
-	if blk, _, err = g.mine(ctx); err != nil {
-		return err
-	}
-	if blk.gas == 0 {
-		return errors.New("first mintMany block used no gas")
+	if grow := g.grow(); len(grow) > 0 {
+		if err := g.submit(ctx, grow); err != nil {
+			return err
+		}
+		if blk, _, err = g.mine(ctx); err != nil {
+			return err
+		}
+		if blk.gas == 0 {
+			return errors.New("first mintMany block used no gas")
+		}
 	}
 	// Prefill.
 	start := time.Now()
@@ -630,14 +713,17 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	}
 	el := time.Since(start)
 	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d slots=%d senders=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, g.slots, genSenders)
+	if settle {
+		log.Printf("gen settle: rows=%d rows/s=%.0f rows/block=%.0f gas/row=%.0f", txs*rowsPerTx, float64(txs*rowsPerTx)/el.Seconds(), float64(txs*rowsPerTx)/float64(max(blocks, 1)), float64(gas)/float64(max(txs*rowsPerTx, 1)))
+	}
 
 	return g.save(dataDir)
 }
 
 // runGen: prefill for prefillFor, then one timed block per entry of sizes.
 func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, kind string, prefillFor time.Duration, prefillBatch int, sizes, corpusOut string) error {
-	if kind != "token" && kind != "slots" {
-		return fmt.Errorf("--gen-kind %q: want token or slots", kind)
+	if _, _, ok := settleSpec(kind); kind != "token" && kind != "slots" && !ok {
+		return fmt.Errorf("--gen-kind %q: want token, slots, or settle[:<parties>x<secs>]", kind)
 	}
 	configBytes, err := os.ReadFile(configPath)
 	if err != nil {
@@ -675,6 +761,9 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, ki
 // runGenRemote: the same workloads against a live node's /rpc. The network
 // mines; the funder (ewoq, funded in the e2e genesis) pays the senders.
 func runGenRemote(ctx context.Context, rpcURL, dataDir, kind string, prefillFor time.Duration, prefillBatch int, sizes string) error {
+	if _, _, ok := settleSpec(kind); kind != "token" && kind != "slots" && !ok {
+		return fmt.Errorf("--gen-kind %q: want token, slots, or settle[:<parties>x<secs>]", kind)
+	}
 	g := &gen{rpc: remoteRPC(rpcURL)}
 	chainID, err := g.rpcUint(ctx, "eth_chainId", "[]")
 	if err != nil {

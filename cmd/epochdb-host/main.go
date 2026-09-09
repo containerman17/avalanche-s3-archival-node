@@ -80,7 +80,7 @@ func main() {
 	genPrefill := fs.Duration("gen-prefill", 0, "block generator mode: prefill a private local chain for this long, then time --gen-sizes blocks (needs --config, fresh --data)")
 	genBatch := fs.Int("gen-batch", 2000, "generator: txs submitted per prefill block")
 	genSizes := fs.String("gen-sizes", "100,1000,5000,20000", "generator: tx counts of the timed blocks")
-	genKind := fs.String("gen-kind", "token", "generator workload: token (ERC20-like) or slots (50 storage writes per tx)")
+	genKind := fs.String("gen-kind", "token", "generator workload: token (ERC20-like), slots (50 storage writes per tx), or settle[:<parties>x<secs>] (400-row settlement batches, default 120x12)")
 	genCorpus := fs.String("gen-corpus", "", "generator: record every accepted block to this new EPCORP01 file (replay it with --corpus)")
 	genRPC := fs.String("gen-rpc", "", "generator: drive a live node's /rpc URL instead of an in-process plugin (ewoq funds the senders; the network mines)")
 	fs.Parse(os.Args[1:])
