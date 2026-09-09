@@ -608,11 +608,11 @@ func (g *gen) awaitBlock(ctx context.Context) (*mined, [3]time.Duration, error) 
 				return &mined{height: g.head}, d, nil
 			}
 		}
-		if time.Since(t0) > 30*time.Second {
+		if time.Since(t0) > 180*time.Second {
 			// Nothing mined although the pool is not empty: the leftovers
 			// are stuck (a nonce gap after a dropped tx, or a dead node).
 			n, _ := g.pending(ctx)
-			return nil, d, fmt.Errorf("no block past %d for 30s, pool has %d txs", g.head, n)
+			return nil, d, fmt.Errorf("no block past %d for 180s, pool has %d txs", g.head, n)
 		}
 		time.Sleep(50 * time.Millisecond)
 		if h, err = g.rpcUint(ctx, "eth_blockNumber", "[]"); err != nil {
