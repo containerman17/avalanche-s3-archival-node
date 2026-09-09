@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{Address, Bytes, B256, U256};
 use block::Block;
-use revm::Database;
 use rpc::storedb::StoreDb;
 use rpc::{Account, Receipt, Result, StateRead, Store};
 use store::db::DB;
@@ -47,15 +46,15 @@ struct HeadState<'a>(&'a PluginStore);
 impl StateRead for HeadState<'_> {
     fn account(&mut self, a: Address) -> Result<Option<Account>> {
         let mut g = self.0.inner.lock().unwrap();
-        Ok(g.ex.db_mut().backend.basic(a).unwrap().map(|i| Account { nonce: i.nonce, balance: i.balance, code_hash: i.code_hash }))
+        Ok(g.head_account(a).map(|i| Account { nonce: i.nonce, balance: i.balance, code_hash: i.code_hash }))
     }
     fn storage(&mut self, a: Address, slot: U256) -> Result<U256> {
         let mut g = self.0.inner.lock().unwrap();
-        Ok(g.ex.db_mut().backend.storage(a, slot).unwrap())
+        Ok(g.head_storage(a, slot))
     }
     fn code(&mut self, h: B256) -> Result<Option<Bytes>> {
         let mut g = self.0.inner.lock().unwrap();
-        Ok(g.ex.db_mut().backend.code.get(&h).map(|c| c.original_bytes()))
+        Ok(g.head_code(h).map(|c| c.original_bytes()))
     }
 }
 

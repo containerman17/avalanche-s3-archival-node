@@ -9,7 +9,7 @@
 //!   epochdb-rs --dump FILE --genesis chain.json --upgrade upgrade.json --data DIR
 //!       [--from 1] [--to N] [--stop-at N] [--duration S] [--workers 14]
 //!       [--roll-budget MB] [--history FILE] [--network 1]
-//!       [--state native|firewood] [--fw-cache-mb 192] [--fw-revisions 128] [--root-inline]
+//!       [--state native|firewood] [--fw-cache-mb 192] [--fw-revisions 128] [--fw-deferred 1] [--fw-kv-cache-mb 0] [--fw-parallel auto|never|always] [--root-inline]
 
 use crate::engine;
 use crate::firewood::{Committer, Firewood, Layer, Opts};
@@ -398,7 +398,7 @@ pub fn main(args: Vec<String>) -> Result<()> {
     match arg(&args, "--state").as_deref().unwrap_or("native") {
         "native" => {}
         "firewood" => {
-            let opts = Opts { cache_bytes: num::<usize>(&args, "--fw-cache-mb", 192)? * 1_000_000, revisions: num(&args, "--fw-revisions", 128)? };
+            let opts = Opts { cache_bytes: num::<usize>(&args, "--fw-cache-mb", 192)? * 1_000_000, revisions: num(&args, "--fw-revisions", 128)?, deferred: num(&args, "--fw-deferred", 1)?, parallel: match arg(&args, "--fw-parallel").as_deref() { None | Some("auto") => "auto", Some("never") => "never", Some("always") => "always", Some(o) => bail!("--fw-parallel {o}: auto, never or always") } };
             return firewood_main(&args, cfg, dump, data, to, stop_at, workers, root_inline, duration, history, opts, t0);
         }
         other => bail!("--state {other}: native or firewood"),
@@ -563,7 +563,8 @@ fn firewood_main(args: &[String], cfg: Config, dump: String, data: PathBuf, to: 
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut committer = Committer::open(&dir, true, opts)?;
-    let mut ex = Executor::with_db(cfg.clone(), Firewood::new(committer.committed()))?;
+    let kv_bytes = num::<usize>(args, "--fw-kv-cache-mb", 0)? << 20;
+    let mut ex = Executor::with_db(cfg.clone(), Firewood::new(committer.committed()).with_kv_cache(kv_bytes))?;
     let want = oracle::state_root(Executor::new(cfg.clone())?.db());
     {
         let db = ex.db_mut();
@@ -595,11 +596,14 @@ fn firewood_main(args: &[String], cfg: Config, dump: String, data: PathBuf, to: 
         std::thread::spawn(move || b.run(bench_exit_rx, duration, stop))
     };
     eprintln!(
-        "epochdb-rs: chainId={} dump={dump} heights=1..{} state=firewood cache={}MB revisions={} workers={workers} root-inline={root_inline} history={}",
+        "epochdb-rs: chainId={} dump={dump} heights=1..{} state=firewood cache={}MB revisions={} deferred={} parallel={} kv-cache={}MB workers={workers} root-inline={root_inline} history={}",
         cfg.chain_id,
         if stop_at == u64::MAX { "end".to_string() } else { stop_at.to_string() },
         opts.cache_bytes / 1_000_000,
         opts.revisions,
+        opts.deferred,
+        opts.parallel,
+        kv_bytes >> 20,
         arg(args, "--history").unwrap_or_default()
     );
 
@@ -687,7 +691,8 @@ fn firewood_main(args: &[String], cfg: Config, dump: String, data: PathBuf, to: 
     if root_inline {
         eprintln!("epochdb-rs: root-inline: executor waited {:.2}s for the checker (root work on the execution path)", t_root_wait.as_secs_f64());
     }
-    eprintln!("epochdb-rs: firewood: trie reads {} (misses in every layer)", ex.db().trie_reads);
+    let fw = ex.db();
+    eprintln!("epochdb-rs: firewood: trie reads {} (misses in every layer) kv-cache hits {} clears {}", fw.trie_reads, fw.kv.as_ref().map_or(0, |k| k.hits), fw.kv.as_ref().map_or(0, |k| k.clears));
     res?;
     let committer = cres?;
     let tc = Instant::now();

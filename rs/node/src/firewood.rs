@@ -24,8 +24,8 @@ use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::{anyhow, Context, Result};
 use exec::exec::{account_rlp, trimmed};
 use exec::StateDb;
-use firewood::db::{Db, DbConfig, Proposal};
-use firewood::api::{ArcDynDbView, BatchOp, Db as _, DbView as _, HashKey, Proposal as _};
+use firewood::db::{Db, DbConfig, Proposal, UseParallel};
+use firewood::api::{ArcDynDbView, BatchOp, Db as _, DbView as _, Proposal as _};
 use firewood::manager::RevisionManagerConfig;
 use firewood_storage::NodeHashAlgorithm;
 use revm::state::{AccountInfo, Bytecode, EvmState};
@@ -140,7 +140,9 @@ fn slot_key(ah: &B256, sh: &B256) -> [u8; 65] {
     k
 }
 
-/// What the committer publishes: the latest committed revision and its height.
+/// What the committer publishes: the newest view the executor may read from
+/// (the latest proposal, or the committed revision) and its height; the
+/// executor drops its layers up to that height.
 pub struct Committed {
     pub view: Option<ArcDynDbView>,
     pub height: u64,
@@ -173,6 +175,62 @@ impl Pending {
     }
 }
 
+/// An optional key-value cache in front of Firewood's trie walk: the latest
+/// accepted value per contract-form key (misses included), filled on trie
+/// reads, updated by every accepted layer. A wiped account bumps its epoch,
+/// which orphans the slots cached under it. Over the byte bound the map is
+/// cleared whole.
+/// ponytail: clear-all eviction; an LRU if the clears show in the split.
+pub struct KvCache {
+    map: HashMap<Vec<u8>, (Option<Vec<u8>>, u32)>,
+    epoch: HashMap<B256, u32>,
+    bytes: usize,
+    cap: usize,
+    pub hits: u64,
+    pub clears: u64,
+}
+
+impl KvCache {
+    fn epoch_of(&self, key: &[u8]) -> u32 {
+        if key.len() == 65 {
+            self.epoch.get(&B256::from_slice(&key[..32])).copied().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn get(&mut self, key: &[u8]) -> Option<Option<&[u8]>> {
+        let e = self.epoch_of(key);
+        let (v, ve) = self.map.get(key)?;
+        if *ve != e {
+            return None;
+        }
+        self.hits += 1;
+        Some(v.as_deref())
+    }
+
+    fn put(&mut self, key: &[u8], val: Option<&[u8]>) {
+        let e = self.epoch_of(key);
+        if self.bytes >= self.cap {
+            self.map.clear();
+            self.bytes = 0;
+            self.clears += 1;
+        }
+        self.bytes += key.len() + val.map_or(0, <[u8]>::len) + 64;
+        self.map.insert(key.to_vec(), (val.map(<[u8]>::to_vec), e));
+    }
+
+    /// An accepted layer: its wipes bump the epochs, its keys take their values.
+    fn apply(&mut self, l: &Layer) {
+        for ah in &l.wiped {
+            *self.epoch.entry(*ah).or_insert(0) += 1;
+        }
+        for (k, v) in &l.map {
+            self.put(k, if v.is_empty() { None } else { Some(v) });
+        }
+    }
+}
+
 /// The executor's Firewood-backed `StateDb`.
 pub struct Firewood {
     cur: Layer,
@@ -189,6 +247,7 @@ pub struct Firewood {
     new_code: Vec<(B256, Bytes)>,
     /// Trie reads answered by Firewood (misses in every layer), for the split.
     pub trie_reads: u64,
+    pub kv: Option<KvCache>,
 }
 
 impl Firewood {
@@ -207,7 +266,14 @@ impl Firewood {
             ws: Vec::new(),
             new_code: Vec::new(),
             trie_reads: 0,
+            kv: None,
         }
+    }
+
+    /// A key-value read cache of about `bytes` (0 = none).
+    pub fn with_kv_cache(mut self, bytes: usize) -> Firewood {
+        self.kv = (bytes > 0).then(|| KvCache { map: HashMap::default(), epoch: HashMap::default(), bytes: 0, cap: bytes, hits: 0, clears: 0 });
+        self
     }
 
     /// Start a block on top of `parent` (None: the accepted head); picks up
@@ -235,7 +301,16 @@ impl Firewood {
         for (h, c) in &layer.code {
             self.code.insert(*h, c.clone());
         }
+        if let Some(kv) = &mut self.kv {
+            kv.apply(&layer);
+        }
         self.accepted.push_back((height, layer));
+    }
+
+    /// A reopened engine's code table (the store's code rows).
+    pub fn with_code(mut self, code: B256Map<Bytecode>) -> Firewood {
+        self.code = code;
+        self
     }
 
     pub fn take_ws(&mut self) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<(B256, Bytes)>) {
@@ -279,12 +354,26 @@ impl Firewood {
         if let Some(v) = self.parent.as_ref().and_then(|p| p.get(key)) {
             return v.map(<[u8]>::to_vec);
         }
+        if let Some(kv) = &mut self.kv {
+            if let Some(v) = kv.get(key) {
+                return v.map(<[u8]>::to_vec);
+            }
+        }
         for (_, l) in self.accepted.iter().rev() {
             if let Some(v) = l.get(key) {
                 return v.map(<[u8]>::to_vec);
             }
         }
         self.trie_reads += 1;
+        let v = self.trie_get(key);
+        if let Some(kv) = &mut self.kv {
+            kv.put(key, v.as_deref());
+        }
+        v
+    }
+
+    /// The committed / proposed view's value for a contract-form key.
+    fn trie_get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let view = self.view.as_ref()?;
         let mut k = [0u8; 64];
         k[..32].copy_from_slice(&key[..32]);
@@ -425,11 +514,17 @@ pub struct Opts {
     pub cache_bytes: usize,
     /// Committed revisions kept in memory (default 128).
     pub revisions: usize,
+    /// Committed revisions that may wait for the persist thread (default 1;
+    /// a crash loses at most this many commits, the replay covers them).
+    pub deferred: u64,
+    /// Firewood's parallel proposal (16 workers by first nibble): "auto" =
+    /// its default (batches of 8+ ops), "never", "always".
+    pub parallel: &'static str,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { cache_bytes: 192_000_000, revisions: 128 }
+        Opts { cache_bytes: 192_000_000, revisions: 128, deferred: 1, parallel: "auto" }
     }
 }
 
@@ -440,8 +535,15 @@ impl Committer {
         let manager = RevisionManagerConfig::builder()
             .max_revisions(opts.revisions)
             .node_cache_memory_limit(NonZeroUsize::new(opts.cache_bytes).ok_or_else(|| anyhow!("cache 0"))?)
+            .deferred_persistence_commit_count(std::num::NonZeroU64::new(opts.deferred).ok_or_else(|| anyhow!("deferred 0"))?)
             .build();
-        let cfg = DbConfig::builder().node_hash_algorithm(NodeHashAlgorithm::Ethereum).truncate(truncate).manager(manager).build();
+        let parallel = match opts.parallel {
+            "auto" => UseParallel::BatchSize(8),
+            "never" => UseParallel::Never,
+            "always" => UseParallel::Always,
+            other => anyhow::bail!("firewood parallel {other:?}: auto, never or always"),
+        };
+        let cfg = DbConfig::builder().node_hash_algorithm(NodeHashAlgorithm::Ethereum).truncate(truncate).manager(manager).use_parallel(parallel).build();
         let db: &'static Db = Box::leak(Box::new(Db::new(dir.join("firewood"), cfg).map_err(|e| anyhow!("firewood open: {e}"))?));
         let root = db.root_hash();
         let view = match root {
@@ -462,7 +564,8 @@ impl Committer {
     }
 
     /// Proposes the block's ops on top of the newest pending proposal (or
-    /// the committed revision): Firewood hashes here. Returns the root.
+    /// the committed revision): Firewood hashes here. Returns the root and
+    /// publishes the proposal's view (reads from a proposal see its parents).
     pub fn propose(&mut self, height: u64, ops: Vec<BatchOp<Vec<u8>, Vec<u8>>>) -> Result<B256> {
         let p = match self.pending.last() {
             Some((_, parent)) => parent.propose(ops),
@@ -470,25 +573,29 @@ impl Committer {
         }
         .map_err(|e| anyhow!("firewood propose {height}: {e}"))?;
         let root = p.root_hash().map(|h| B256::from_slice(h.as_ref())).unwrap_or(EMPTY_ROOT);
+        {
+            let mut c = self.committed.lock().unwrap();
+            c.view = Some(p.view());
+            c.height = height;
+        }
         self.pending.push((height, p));
         Ok(root)
     }
 
-    /// Commits the oldest pending proposal and publishes its revision.
+    /// Commits the oldest pending proposal (a proposal chain commits in order).
     pub fn commit(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
         let (h, p) = self.pending.remove(0);
-        let root: Option<HashKey> = p.root_hash();
-        p.commit().map_err(|e| anyhow!("firewood commit {h}: {e}"))?;
-        let view = match root {
-            Some(r) if r.as_ref() != EMPTY_ROOT.as_slice() => Some(self.db.view(r).map_err(|e| anyhow!("firewood view {h}: {e}"))?),
-            _ => None,
-        };
-        let mut c = self.committed.lock().unwrap();
-        c.view = view;
-        c.height = h;
+        p.commit().map_err(|e| anyhow!("firewood commit {h}: {e}"))
+    }
+
+    /// Commits every pending proposal.
+    pub fn commit_all(&mut self) -> Result<()> {
+        while !self.pending.is_empty() {
+            self.commit()?;
+        }
         Ok(())
     }
 
@@ -511,6 +618,23 @@ impl Committer {
     /// The on-disk bytes under the db dir.
     pub fn disk_bytes(dir: &Path) -> u64 {
         std::fs::read_dir(dir.join("firewood")).map(|d| d.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0)
+    }
+}
+
+impl Layer {
+    /// A stored write set (contract key form, in order) as a layer: the
+    /// recovery replay and the plugin's accept both feed Firewood from it.
+    pub fn from_ws(ws: &[(Vec<u8>, Vec<u8>)]) -> Layer {
+        let mut l = Layer::default();
+        for (k, v) in ws {
+            if k.len() == 33 && v.is_empty() {
+                let ah = B256::from_slice(&k[..32]);
+                l.map.retain(|k, _| !(k.len() == 65 && k[..32] == ah[..]));
+                l.wiped.insert(ah);
+            }
+            l.map.insert(k.clone(), v.clone());
+        }
+        l
     }
 }
 
