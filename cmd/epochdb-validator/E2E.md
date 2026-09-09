@@ -125,6 +125,22 @@ decode as a libevm block.
   node re-parses the others' blocks several times), account_state 1, header 1, and build retries every 100 ms while
   a built block waits for consensus (the min delay is 1 ms here, so the retry loop dominates).
 
+## Run 7: why stress blocks came every 2 s, and sub-second blocks (e2e 2a7f1e4-ish, plugin 2f9e8d1)
+
+- Diagnosis (read-only): nothing in the shell or avalanchego paced the 2 s. The stress genesis had `"timestamp":
+  "0x0"`; both stock's `core/genesis.go` and the engine's genesis builder write the `initialMinDelayMS` seed into the
+  genesis header only when the genesis time is Granite-active, so at a 1970 genesis the header carries no excess, the
+  first Granite block starts at `acp226.InitialDelayExcess` (~2000 ms) and ACP-226 moves it at most 200 units per
+  block toward the `min-delay-target` (about 40k blocks to reach 1 ms). The shell's WaitForEvent waits exactly
+  `parent.MinDelayExcess.Delay()`, so every block came 2 s after its parent regardless of load (the same gotcha as
+  `wiki/avalanchego_why_initialmindelayms_seed_silently_fails_on_1970_genesis.md`). The proposervm min block delay
+  was already 0 s (tmpnet `DefaultE2EFlags`), and the build retry is 100 ms.
+- Fix (harness): `--stress` stamps the genesis timestamp with `now`; the e2e prints the mean block interval.
+- Result (all-ours 3 nodes, 3 min, 3917 tx/s offered): 908 load blocks (9..916) identical on 3 nodes, 588,272 txs =
+  3268 tx/s on chain, 195 ms between blocks, 648 txs / 13.6 M gas per block (the generator, not the chain, was the
+  limit: pool mostly drained). Verify p50 0.8 ms p99 41 ms; build p50 21 ms p99 891 ms; Go heap 15-175 MB, GC
+  0.4%, RSS 0.23-1.1 GB (pool grew to 90k late in the run).
+
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and
