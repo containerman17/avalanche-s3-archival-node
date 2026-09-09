@@ -820,3 +820,55 @@ fn refused_create_and_module_error_frames() {
     let v: serde_json::Value = serde_json::from_str(&denied.trace_json).unwrap();
     assert_eq!(v["error"], format!("cannot modify allow list: modify address: {NOBODY}, from role: NoRole, to role: EnabledRole"), "{}", denied.trace_json);
 }
+
+/// The two beam bugs the live sync found, on a long-lived Executor (the
+/// plugin's): after `set_block_env` crosses into Granite the journal must
+/// learn that 0x100 (P256Verify) is a precompile, so a STATICCALL to it costs
+/// the warm 100, not the cold 2600 (beam 8,182,073 ran out of gas by exactly
+/// that); and warp's getBlockchainID() answers the configured blockchain id
+/// (beam 3,423,561 stored 32 zero bytes).
+#[test]
+fn granite_flip_warms_p256_and_get_blockchain_id_answers_the_chain() {
+    use crate::exec::{CallMsg, Executor, Trace};
+    // CALLER: STATICCALL(0xffff, 0x100, 0, 0, 0, 0) STOP
+    const CALLER: Address = address!("00000000000000000000000000000000000000ca");
+    let genesis = format!(
+        r#"{{"config":{{"chainId":1,"feeConfig":{{"gasLimit":8000000,"minBaseFee":25000000000,"targetGas":15000000,"baseFeeChangeDenominator":36,"minBlockGasCost":0,"maxBlockGasCost":1000000,"targetBlockRate":2,"blockGasCostStep":200000}},
+        "warpConfig":{{"blockTimestamp":0}}}},
+        "alloc":{{"{NOBODY}":{{"balance":"0x1000000000000000000"}},"{CALLER}":{{"code":"0x600060006000600061010061fffffa00"}}}},"timestamp":"0x0"}}"#
+    );
+    let chain = B256::repeat_byte(0xc4);
+    let cfg = Config::from_genesis(genesis.as_bytes(), b"{}", 1).unwrap().with_chain(chain, B256::repeat_byte(0x5b));
+    let granite = cfg.granite.unwrap();
+    assert!(cfg.is_etna(granite - 1), "the eth spec must not change at the flip");
+    let head = |time: u64| block::Header {
+        parent_hash: B256::ZERO, uncle_hash: B256::ZERO, coinbase: Address::ZERO, root: B256::ZERO, tx_hash: B256::ZERO, receipt_hash: B256::ZERO,
+        bloom: Default::default(), difficulty: U256::from(1), number: 1, gas_limit: 8_000_000, gas_used: 0, time, extra: Bytes::new(),
+        mix_digest: B256::ZERO, nonce: Default::default(), base_fee: Some(U256::from(25_000_000_000u64)), block_gas_cost: None, blob_gas_used: None,
+        excess_blob_gas: None, parent_beacon_root: None, time_milliseconds: None, min_delay_excess: None,
+    };
+    let msg = |to: Address, data: Vec<u8>| CallMsg { from: NOBODY, to: Some(to), gas: 100_000, gas_price: 0, value: U256::ZERO, data: data.into() };
+
+    // A fresh executor that starts under Granite: the oracle.
+    let mut fresh = Executor::new(cfg.clone()).unwrap();
+    fresh.set_trace(Trace::Off);
+    let warm = fresh.call(&head(granite), &msg(CALLER, vec![])).unwrap().gas_used;
+    // 21000 + 6 pushes + STATICCALL 100 (warm) + P256Verify 6900.
+    assert_eq!(warm, 21_000 + 6 * 3 + 100 + 6_900, "fresh executor under Granite");
+
+    // The long-lived one: a block before the flip (0x100 is an empty account,
+    // cold 2600), then a block under it.
+    let mut ex = Executor::new(cfg.clone()).unwrap();
+    ex.set_trace(Trace::Off);
+    let cold = ex.call(&head(granite - 1), &msg(CALLER, vec![])).unwrap().gas_used;
+    assert_eq!(cold, 21_000 + 6 * 3 + 2_600, "before Granite 0x100 is a cold empty account");
+    let after = ex.call(&head(granite), &msg(CALLER, vec![])).unwrap().gas_used;
+    assert_eq!(after, warm, "after the flip the long-lived executor must charge the warm precompile access");
+
+    // getBlockchainID() through the executor answers the configured id.
+    let out = ex.call(&head(granite), &msg(WARP, sel("getBlockchainID()"))).unwrap();
+    assert!(out.halt.is_none() && !out.revert, "halt {:?} revert {}", out.halt, out.revert);
+    assert_eq!(out.output.as_ref(), chain.as_slice());
+    let zero = Executor::new(Config::from_genesis(genesis.as_bytes(), b"{}", 1).unwrap()).unwrap().call(&head(granite), &msg(WARP, sel("getBlockchainID()"))).unwrap();
+    assert_eq!(zero.output.as_ref(), B256::ZERO.as_slice(), "without with_chain the answer is zeros: what the plugin used to run with");
+}

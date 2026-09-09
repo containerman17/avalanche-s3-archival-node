@@ -43,6 +43,10 @@ use crate::vm::Init;
 /// up and at the tip.
 const SYNC_ROLL: usize = 2 << 30;
 const TIP_ROLL: usize = 128 << 20;
+/// The second roll trigger (`roll-every-blocks`, `roll-every-secs`): blocks or
+/// seconds since the last roll, whichever comes first, in both states.
+const ROLL_EVERY_BLOCKS: u64 = 500_000;
+const ROLL_EVERY_SECS: u64 = 3600;
 /// How many accepted blocks may wait for their root check (checkDepth).
 const CHECK_DEPTH: usize = 4;
 /// The store's group-fsync cadence in blocks (flushEvery).
@@ -170,14 +174,20 @@ impl NodeEngine {
         Self::open_inner(init).map_err(|e| format!("{e:#}").into())
     }
 
+    /// The executor's config from Initialize: genesis + upgrade bytes under the
+    /// network's schedule, and the snow context's ids: warp's getBlockchainID
+    /// answers chain_id and predicate verification signs over subnet_id;
+    /// without them the executor runs with zeros (state root mismatch at beam
+    /// 3,423,561, a constructor storing getBlockchainID).
+    pub fn exec_config(init: &Init) -> anyhow::Result<Config> {
+        Ok(Config::from_genesis(&init.genesis_bytes, &init.upgrade_bytes, init.network_id)
+            .context("config")?
+            .with_chain(B256::from(init.chain_id), B256::from(init.subnet_id)))
+    }
+
     fn open_inner(init: &Init) -> anyhow::Result<NodeEngine> {
         let t0 = Instant::now();
-        // The snow context's ids: warp's getBlockchainID answers chain_id and predicate
-        // verification signs over subnet_id; without them the executor runs with zeros
-        // (state root mismatch at beam 3,423,561, a constructor storing getBlockchainID).
-        let cfg = Config::from_genesis(&init.genesis_bytes, &init.upgrade_bytes, init.network_id)
-            .context("config")?
-            .with_chain(B256::from(init.chain_id), B256::from(init.subnet_id));
+        let cfg = Self::exec_config(init)?;
         let genesis = Arc::new(genesis::block(&cfg, &init.genesis_bytes).map_err(|e| anyhow!("genesis: {e}"))?);
         let conf: serde_json::Value = serde_json::from_slice(&init.config_bytes).unwrap_or(serde_json::Value::Null);
         // Store settings ride in the config bytes (the env filter, see config.rs); into the env before DbStore::open.
@@ -185,8 +195,10 @@ impl NodeEngine {
         if !applied.is_empty() {
             eprintln!("epochdb-rs: config keys applied: {}", applied.join(" "));
         }
-        let sync_roll = conf.get("roll-budget-mb").and_then(|v| v.as_u64()).map(|m| (m as usize) << 20).unwrap_or(SYNC_ROLL);
+        let sync_roll = conf_u64(&conf, "roll-budget-mb").map(|m| (m as usize) << 20).unwrap_or(SYNC_ROLL);
         let tip_roll = TIP_ROLL.min(sync_roll);
+        let every_blocks = conf_u64(&conf, "roll-every-blocks").unwrap_or(ROLL_EVERY_BLOCKS);
+        let every_secs = conf_u64(&conf, "roll-every-secs").unwrap_or(ROLL_EVERY_SECS);
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let workers = cpus.saturating_sub(2).max(1);
         let data = PathBuf::from(&init.chain_data_dir);
@@ -299,7 +311,9 @@ impl NodeEngine {
         );
 
         let dirty = Arc::new(Mutex::new(dirty));
-        let roller = Roller::new(dir, gen, dirty.clone(), cpus);
+        let mut roller = Roller::new(dir, gen, rolled_h, dirty.clone(), cpus);
+        roller.every_blocks = if every_blocks == 0 { u64::MAX } else { every_blocks };
+        roller.every = if every_secs == 0 { std::time::Duration::MAX } else { std::time::Duration::from_secs(every_secs) };
         let ex = Executor::open(cfg.clone(), Layered::new(be));
         let db_reads = db.clone();
         let store: Arc<Mutex<Box<dyn BlockStore>>> = Arc::new(Mutex::new(Box::new(store)));
@@ -322,7 +336,7 @@ impl NodeEngine {
             std::thread::spawn(move || checker(check_rx, dirty, store, recent, stats, flush_tx))
         };
         eprintln!(
-            "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) workers={workers} dirty-workers={cpus}",
+            "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) roll-every={every_blocks} blocks / {every_secs}s workers={workers} dirty-workers={cpus}",
             cfg.chain_id,
             init.chain_data_dir,
             sync_roll >> 20,
@@ -610,4 +624,57 @@ impl NodeEngine {
 
 pub fn id_hex(id: &Id) -> String {
     hex(id)
+}
+
+/// A numeric config value: a JSON number, or a string holding one (the hosts
+/// merge `EPOCHDB_*` variables in as strings).
+fn conf_u64(conf: &serde_json::Value, key: &str) -> Option<u64> {
+    match conf.get(key)? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::Host;
+    use tonic::transport::Channel;
+
+    /// The Config the plugin runs the executor with carries the snow context's
+    /// ids (beam 3,423,561: a constructor stored getBlockchainID()).
+    #[tokio::test]
+    async fn exec_config_carries_the_snow_context_ids() {
+        let ch = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let init = Init {
+            network_id: 1,
+            subnet_id: [0x5bu8; 32],
+            chain_id: [0xc4u8; 32],
+            node_id: vec![],
+            public_key: vec![],
+            x_chain_id: [0; 32],
+            c_chain_id: [0; 32],
+            avax_asset_id: [0; 32],
+            chain_data_dir: String::new(),
+            genesis_bytes: br#"{"config":{"chainId":4337,"feeConfig":{"gasLimit":8000000,"minBaseFee":25000000000,"targetGas":15000000,"baseFeeChangeDenominator":36,"minBlockGasCost":0,"maxBlockGasCost":1000000,"targetBlockRate":2,"blockGasCostStep":200000},"warpConfig":{"blockTimestamp":0}},"alloc":{},"timestamp":"0x0"}"#.to_vec(),
+            upgrade_bytes: b"{}".to_vec(),
+            config_bytes: b"{}".to_vec(),
+            host: Host { db: crate::pb::rpcdb::database_client::DatabaseClient::new(ch.clone()), validator_state: crate::pb::validatorstate::validator_state_client::ValidatorStateClient::new(ch) },
+        };
+        let cfg = NodeEngine::exec_config(&init).unwrap();
+        assert_eq!(cfg.chain_id, 4337);
+        assert_eq!(cfg.blockchain_id, B256::from(init.chain_id));
+        assert_eq!(cfg.subnet_id, B256::from(init.subnet_id));
+        assert_eq!(cfg.network_id, 1);
+    }
+
+    #[test]
+    fn conf_u64_reads_numbers_and_strings() {
+        let c: serde_json::Value = serde_json::from_str(r#"{"roll-every-blocks":200000,"roll-budget-mb":"8","roll-every-secs":true}"#).unwrap();
+        assert_eq!(conf_u64(&c, "roll-every-blocks"), Some(200000));
+        assert_eq!(conf_u64(&c, "roll-budget-mb"), Some(8));
+        assert_eq!(conf_u64(&c, "roll-every-secs"), None);
+        assert_eq!(conf_u64(&c, "missing"), None);
+    }
 }
