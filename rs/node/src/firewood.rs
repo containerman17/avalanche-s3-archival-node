@@ -706,4 +706,45 @@ mod tests {
         c.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The per-proposal fixed cost: microseconds per propose + commit of a
+    /// 1-op and a 20-op batch over a 200k-account state, serial and auto
+    /// parallel. `cargo test --release -p epochdb-node -- --ignored --nocapture fw_micro`.
+    #[test]
+    #[ignore]
+    fn fw_micro() {
+        use std::time::Instant;
+        for parallel in ["never", "auto"] {
+            let dir = std::env::temp_dir().join(format!("epochdb-fw-micro-{}-{parallel}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut c = Committer::open(&dir, true, Opts { parallel, ..Opts::default() }).unwrap();
+            let acct = |i: u64| {
+                let info = AccountInfo { nonce: i, balance: U256::from(i), code_hash: alloy_primitives::KECCAK256_EMPTY, ..Default::default() };
+                (acct_key(&keccak256(Address::from_word(B256::from(U256::from(i))))).to_vec(), account_rlp(&info))
+            };
+            let mut l = Layer::default();
+            for i in 0..200_000u64 {
+                let (k, v) = acct(i);
+                l.map.insert(k, v);
+            }
+            c.propose(0, l.ops()).unwrap();
+            c.commit_all().unwrap();
+            for ops in [1u64, 20, 200] {
+                let n = 2000u64;
+                let t0 = Instant::now();
+                for b in 1..=n {
+                    let mut l = Layer::default();
+                    for j in 0..ops {
+                        let (k, v) = acct((b * 7919 + j * 104_729) % 200_000);
+                        l.map.insert(k, v);
+                    }
+                    c.propose(b, l.ops()).unwrap();
+                    c.commit_all().unwrap();
+                }
+                eprintln!("fw_micro parallel={parallel} ops/block={ops}: {:.1} us per propose+commit", t0.elapsed().as_secs_f64() * 1e6 / n as f64);
+            }
+            c.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
