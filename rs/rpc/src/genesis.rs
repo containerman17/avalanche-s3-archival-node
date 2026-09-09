@@ -86,6 +86,19 @@ pub fn block(cfg: &Config, genesis_json: &[u8]) -> Result<Block, Error> {
     let subnet_evm = cfg.subnet_evm <= time;
     let base_fee = if subnet_evm { Some(num(g.get("baseFeePerGas"))?.unwrap_or(cfg.fee_config.min_base_fee)) } else { None };
     let cancun = cfg.is_etna(time);
+    let gas_limit = match u64_of(g.get("gasLimit"))? {
+        Some(0) | None => GENESIS_GAS_LIMIT,
+        Some(l) => l,
+    };
+    // subnet-evm core/genesis.go Verify: under SubnetEVM the fee config's gas
+    // limit must equal the header's, else stock refuses the genesis.
+    if subnet_evm && cfg.fee_config.gas_limit != U256::from(gas_limit) {
+        return Err(format!(
+            "genesis: gas limit in fee config ({}) does not match gas limit in header ({gas_limit})",
+            cfg.fee_config.gas_limit
+        )
+        .into());
+    }
     let h = Header {
         parent_hash: g.get("parentHash").and_then(Value::as_str).map(|s| s.parse()).transpose()?.unwrap_or_default(),
         uncle_hash: EMPTY_UNCLES,
@@ -96,10 +109,7 @@ pub fn block(cfg: &Config, genesis_json: &[u8]) -> Result<Block, Error> {
         bloom: Bloom::default(),
         difficulty: num(g.get("difficulty"))?.unwrap_or(U256::from(GENESIS_DIFFICULTY)),
         number: u64_of(g.get("number"))?.unwrap_or(0),
-        gas_limit: match u64_of(g.get("gasLimit"))? {
-            Some(0) | None => GENESIS_GAS_LIMIT,
-            Some(l) => l,
-        },
+        gas_limit,
         gas_used: u64_of(g.get("gasUsed"))?.unwrap_or(0),
         time,
         extra,
@@ -144,6 +154,16 @@ pub(crate) mod tests {
         let again = block::eth::decode_header(&b.header_rlp).unwrap();
         assert_eq!(again.gas_limit, 20_000_000);
         assert_eq!(b.hash.to_string(), STEP_GENESIS_HASH);
+    }
+
+    /// A header gasLimit that differs from feeConfig.gasLimit is refused, as
+    /// stock's core/genesis.go Verify refuses it.
+    #[test]
+    fn fee_config_gas_limit_must_match_header() {
+        let g = STEP_GENESIS.replace(r#""gasLimit":"0x1312d00""#, r#""gasLimit":"0x1dcd6500""#);
+        let cfg = Config::from_genesis(g.as_bytes(), b"", 1).unwrap();
+        let err = block(&cfg, g.as_bytes()).err().expect("mismatch must fail").to_string();
+        assert!(err.contains("gas limit in fee config (20000000) does not match gas limit in header (500000000)"), "{err}");
     }
 
     /// Block 1's parentHash in the Step dump (checked by the harness too).
