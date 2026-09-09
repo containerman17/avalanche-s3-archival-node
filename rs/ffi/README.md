@@ -18,6 +18,17 @@ heap).
 
 ## Linking
 
+Run `rs/ffi/localize.sh <archive>` after every build of the archive: it merges the archive into one
+relocatable object and makes every defined symbol but `epochdb_*` local (blst, secp256k1, zstd, ring,
+jemalloc's `_rjem_*`, compiler-builtins and the Rust runtime included), so a host that carries its own
+copies (avalanchego's `bls` package = another blst; libevm) links without `--allow-multiple-definition`.
+`rs/ffi/golink` is the proof: `go build -tags epochdb_ffi_link ./rs/ffi/golink` links avalanchego's BLS
+signer and the engine into one binary.
+
+A Go binary that links this archive cannot also link `subnet-evm/core` (it pulls in Firewood's Rust
+staticlib; two Rust runtimes collide on `rust_eh_personality` and the allocator shims, which the host
+cannot localize). The Go shell uses libevm's `core/txpool` for that reason.
+
 cgo, glibc:
 
 ```go
