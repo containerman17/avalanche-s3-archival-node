@@ -82,6 +82,7 @@ func main() {
 	genSizes := fs.String("gen-sizes", "100,1000,5000,20000", "generator: tx counts of the timed blocks")
 	genKind := fs.String("gen-kind", "token", "generator workload: transfer (21k gas value transfers between the senders), token (ERC20-like), slots (50 storage writes per tx), or settle[:<parties>x<secs>] (400-row settlement batches, default 120x12)")
 	genCorpus := fs.String("gen-corpus", "", "generator: record every accepted block to this new EPCORP01 file (replay it with --corpus)")
+	fs.IntVar(&genStream, "gen-stream", genStream, "generator (remote, presigned stream): keep this many txs pending in the node's pool")
 	fs.IntVar(&genPresign, "gen-presign", 0, "generator (remote, settle kind): presign this many txs, then stream them keeping the pool topped up instead of the timed prefill loop")
 	genRPC := fs.String("gen-rpc", "", "generator: drive a live node's /rpc URL instead of an in-process plugin (ewoq funds the senders; the network mines)")
 	fs.Parse(os.Args[1:])

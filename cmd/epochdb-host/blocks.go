@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
@@ -145,6 +146,9 @@ func (g *gen) save(dataDir string) error {
 // timed prefill loop. Set from --gen-presign.
 var genPresign int
 
+// genStream is the pool level the presigned stream keeps topped up to.
+var genStream = 3000
+
 // gen is the generator state: signers, nonces, and how much state exists.
 type gen struct {
 	vm       *plugin      // nil in remote mode
@@ -218,12 +222,36 @@ func (g *gen) sign(i int, to *common.Address, value *big.Int, gas uint64, data [
 // submit sends raw txs to the plugin's own eth_sendRawTransaction in batches
 // of 1000 (the server's batch limit).
 func (g *gen) submit(ctx context.Context, raws [][]byte) error {
+	if len(raws) > 500 && g.vm == nil {
+		// Remote node: post the 500-tx batches concurrently, one connection each.
+		var wg sync.WaitGroup
+		errs := make(chan error, (len(raws)+499)/500)
+		for len(raws) > 0 {
+			k := min(500, len(raws))
+			part := raws[:k]
+			raws = raws[k:]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := g.submitBatch(ctx, part); err != nil {
+					errs <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		return <-errs
+	}
 	for len(raws) > 500 {
-		if err := g.submit(ctx, raws[:500]); err != nil {
+		if err := g.submitBatch(ctx, raws[:500]); err != nil {
 			return err
 		}
 		raws = raws[500:]
 	}
+	return g.submitBatch(ctx, raws)
+}
+
+func (g *gen) submitBatch(ctx context.Context, raws [][]byte) error {
 	var sb strings.Builder
 	sb.WriteByte('[')
 	for i, raw := range raws {
@@ -554,8 +582,10 @@ func (g *gen) mine(ctx context.Context) (*mined, [3]time.Duration, error) {
 // node's /rpc, so submit and pending work unchanged against a real network.
 type remoteRPC string
 
+var remoteClient = &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 128, MaxConnsPerHost: 0}}
+
 func (u remoteRPC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	resp, err := http.Post(string(u), "application/json", r.Body)
+	resp, err := remoteClient.Post(string(u), "application/json", r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -788,8 +818,8 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 			if err != nil {
 				return err
 			}
-			if n < 3000 {
-				k := min(1000, len(raws))
+			if n < uint64(genStream) {
+				k := min(genStream, len(raws))
 				if err := g.submit(ctx, raws[:k]); err != nil {
 					return err
 				}
