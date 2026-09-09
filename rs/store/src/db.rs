@@ -1116,29 +1116,32 @@ pub fn walk_runs(cas: &Store, runs: &[RunRef], chain_root: [u8; 32]) -> Result<(
 
 /// Streams the window into the three sections in key order.
 fn write_sections(w: &mut RunWriter, m: &Memtable) -> Result<()> {
-    let mut chain: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for fam in 0..NUM_FAMS {
-        m.each_chain(fam, |n, v| {
-            chain.push((num_key(FAM_PREFIX[fam], n), v));
-            Ok(())
-        })?;
-    }
-    w.section(Section::Chain, chain.into_iter())?;
-
-    let mut state: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut hashes: Vec<&[u8; 32]> = m.code.keys().collect();
-    hashes.sort();
-    for h in hashes {
-        state.push((code_key(h), m.code[h].clone()));
-    }
-    let mut prefixes: Vec<&Vec<u8>> = m.state.keys().collect();
-    prefixes.sort();
-    for p in prefixes {
-        for (tn, v) in &m.state[p] {
-            state.push((suffixed(p, *tn), v.clone()));
+    // Chain rows stream out of the log one at a time (family order then
+    // number order is key order): the window's raw chain bytes can be many
+    // GB and used to sit in one Vec for the whole seal, which is what the
+    // plugin's anon heap stepped up by at every seal.
+    w.section_with(Section::Chain, |set| {
+        for fam in 0..NUM_FAMS {
+            m.each_chain(fam, |n, v| set(&num_key(FAM_PREFIX[fam], n), &v))?;
         }
-    }
-    w.section(Section::State, state.into_iter())?;
+        Ok(())
+    })?;
+
+    w.section_with(Section::State, |set| {
+        let mut hashes: Vec<&[u8; 32]> = m.code.keys().collect();
+        hashes.sort();
+        for h in hashes {
+            set(&code_key(h), &m.code[h])?;
+        }
+        let mut prefixes: Vec<&Vec<u8>> = m.state.keys().collect();
+        prefixes.sort();
+        for p in prefixes {
+            for (tn, v) in &m.state[p] {
+                set(&suffixed(p, *tn), v)?;
+            }
+        }
+        Ok(())
+    })?;
 
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut groups: BTreeMap<&[u8], Vec<(u64, u8)>> = BTreeMap::new();

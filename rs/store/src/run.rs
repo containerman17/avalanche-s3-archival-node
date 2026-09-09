@@ -121,19 +121,32 @@ impl RunWriter {
     }
     /// Writes section s from sorted rows. Sections must come in order.
     pub fn section<I: Iterator<Item = (Vec<u8>, Vec<u8>)>>(&mut self, s: Section, rows: I) -> Result<()> {
+        self.section_with(s, |set| {
+            for (k, v) in rows {
+                set(&k, &v)?;
+            }
+            Ok(())
+        })
+    }
+    /// The streaming form: `fill` hands every row to `set` in key order and
+    /// nothing is buffered beyond the sstable's open block, so a section's
+    /// memory does not scale with its size (a seal's chain rows are the
+    /// window's raw containers, receipts and traces: 13 GB for Step
+    /// 950,001..1,000,000).
+    pub fn section_with(&mut self, s: Section, fill: impl FnOnce(&mut dyn FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()>) -> Result<()> {
         let i = s as usize;
-        if (i > 0 && self.footer.len[i - 1] == 0 && self.footer.off[i - 1] == 0 && i != 0 && self.off == 0) && false {
-            unreachable!()
-        }
         self.footer.off[i] = self.off;
         let mut n = 0u64;
         let len = {
             let mut sink = HashingSink { w: &mut self.f, h: &mut self.h, n: 0 };
             let mut w = SstWriter::new(&mut sink, writer_opts(s, self.level));
-            for (k, v) in rows {
-                w.set(&k, &v)?;
+            let mut set = |k: &[u8], v: &[u8]| -> Result<()> {
+                w.set(k, v)?;
                 n += 1;
-            }
+                Ok(())
+            };
+            fill(&mut set)?;
+            drop(set);
             w.finish()?
         };
         self.footer.len[i] = len;
