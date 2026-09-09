@@ -23,3 +23,6 @@ sha2 = "0.10"
 blst = "0.3"
 ureq = { version = "2", features = ["json"] }
 
+
+[dev-dependencies]
+bytes = "1"

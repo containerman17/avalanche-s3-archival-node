@@ -13,7 +13,7 @@
 //! replays the store's write sets since the roll (recover.go).
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -28,16 +28,20 @@ use exec::{Config, Executor, StateDb};
 use node::engine::{open_rolled, read_manifest, run_path, seek_fn, trie_path, user_data, write_manifest, Backend, Roller};
 use rayon::prelude::*;
 use revm::state::Bytecode;
-use state::commit::dirty::Dirty;
+use revm::Database;
+use state::commit::dirty::{Dirty, Layer, Writes};
 use state::commit::file::File;
 use state::commit::roll::roll;
 use state::view::{merge, View};
 
 use rpc::genesis;
+use crate::build;
 use crate::layered::{Layered, Pending};
+use alloy_primitives::{Address, U256};
+use exec::exec::SkipReason;
 use crate::dbstore::{BlockStore, DbStore, Record};
 use crate::tree::{hex, Engine, Error, Id, Meta};
-use crate::vm::Init;
+
 
 /// vmexec/budget.go: the overlay bytes that trigger a roll while catching
 /// up and at the tip.
@@ -61,12 +65,37 @@ const PARSED_MAX: usize = 8192;
 struct CheckItem {
     block: Arc<Block>,
     payload: crate::layered::Payload,
+    /// The root was computed and checked before accept (NormalOp): the
+    /// checker only renders the traces and writes the store.
+    root_done: bool,
 }
 
 enum Msg {
     Block(Box<CheckItem>),
     /// A sync item: the checker reports parked, then waits to be resumed.
     Park(SyncSender<()>, Receiver<()>),
+}
+
+/// Everything Initialize hands the engine (the snow context and the bytes).
+pub struct Init {
+    pub network_id: u32,
+    pub subnet_id: Id,
+    pub chain_id: Id,
+    pub chain_data_dir: String,
+    pub genesis_bytes: Vec<u8>,
+    pub upgrade_bytes: Vec<u8>,
+    pub config_bytes: Vec<u8>,
+}
+
+/// What `NodeEngine::build` returns: the block, its pending state (verified),
+/// which candidates went in and why the rest did not.
+pub struct BuildOut {
+    pub block: Arc<Block>,
+    pub pending: Pending,
+    pub included: Vec<usize>,
+    pub reasons: Vec<SkipReason>,
+    /// The gas limit is not filled and every candidate was considered.
+    pub needs_more: bool,
 }
 
 pub struct Inner {
@@ -93,6 +122,8 @@ pub struct Stats {
     pub t_verify: AtomicU64,
     pub t_accept: AtomicU64,
     pub t_check: AtomicU64,
+    /// Nanoseconds of the inline root (Dirty::layer_root) inside verify / build.
+    pub t_root: AtomicU64,
 }
 
 fn tick(a: &AtomicU64, t0: Instant) {
@@ -120,6 +151,13 @@ pub struct NodeEngine {
     sync_roll: usize,
     tip_roll: usize,
     t0: Instant,
+    /// NormalOp: the state root is computed inside verify (and build) on a
+    /// layer over the accepted Dirty, which then holds exactly the head's
+    /// state (the checker no longer touches it).
+    normal: AtomicBool,
+    /// `min-delay-target` (ms, the subnet-evm config key): the ACP-226 delay
+    /// excess a built block moves toward; None keeps the parent's.
+    pub desired_delay_excess: Option<u64>,
 }
 
 /// The checker thread: Dirty apply + root per block (a mismatch kills the
@@ -135,10 +173,10 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn
             }
             Msg::Block(it) => it,
         };
-        let CheckItem { block: b, payload } = *it;
+        let CheckItem { block: b, mut payload, root_done } = *it;
         let h = b.height;
         let t0 = Instant::now();
-        {
+        if !root_done {
             let mut d = dirty.lock().unwrap();
             let root = if payload.ws.is_empty() {
                 d.current_root()
@@ -153,6 +191,7 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn
                 std::process::exit(1);
             }
         }
+        exec::exec::render_deferred(&mut payload.result).with_context(|| format!("block {h}: callTracer render"))?;
         let rows = BlockWrite::from_exec(&b, &payload.result).with_context(|| format!("block {h}: store rows"))?;
         let mut receipts = Vec::new();
         for t in &payload.result.txs {
@@ -320,7 +359,9 @@ impl NodeEngine {
         let mut roller = Roller::new(dir, gen, rolled_h, dirty.clone(), cpus);
         roller.every_blocks = if every_blocks == 0 { u64::MAX } else { every_blocks };
         roller.every = if every_secs == 0 { std::time::Duration::MAX } else { std::time::Duration::from_secs(every_secs) };
-        let ex = Executor::open(cfg.clone(), Layered::new(be));
+        let mut ex = Executor::open(cfg.clone(), Layered::new(be));
+        // The callTracer JSON is rendered on the checker thread, off the verify path.
+        ex.defer_call_trace = true;
         let db_reads = db.clone();
         let store: Arc<Mutex<Box<dyn BlockStore>>> = Arc::new(Mutex::new(Box::new(store)));
         let recent = Arc::new(Mutex::new(HashMap::new()));
@@ -374,6 +415,8 @@ impl NodeEngine {
             sync_roll,
             tip_roll,
             t0,
+            normal: AtomicBool::new(false),
+            desired_delay_excess: conf_u64(&conf, "min-delay-target").map(build::desired_delay_excess),
         })
     }
 
@@ -392,7 +435,70 @@ impl NodeEngine {
             Ok(())
         });
         rtx.send(()).map_err(|_| anyhow!("checker gone"))?;
-        res
+        res?;
+        if self.normal.load(Ordering::Relaxed) {
+            self.flush_dirty(inner)?;
+        }
+        Ok(())
+    }
+
+    /// NormalOp keeps the accepted Dirty at exactly the head's state: a roll
+    /// rebuilt it and queued the overlay's rows (finish_roll), so the queue
+    /// is applied here and the root must be the head's.
+    fn flush_dirty(&self, inner: &mut Inner) -> anyhow::Result<()> {
+        let head = self.head.lock().unwrap().clone();
+        let mut d = inner.roller.dirty.lock().unwrap();
+        let root = d.root().context("dirty flush")?;
+        if root != head.header.root.0 {
+            eprintln!("epochdb-rs: dirty state at head {} has root {}, header {}", head.height, B256::from(root), head.header.root);
+            std::process::exit(1);
+        }
+        Ok(())
+    }
+
+    /// Drains the checker thread (every accepted block's root checked and
+    /// stored) and returns with it parked until `resume` is dropped.
+    fn park_checker(&self) -> anyhow::Result<SyncSender<()>> {
+        let tx = self.check_tx.lock().unwrap().clone().ok_or_else(|| anyhow!("checker stopped"))?;
+        let (ptx, prx) = sync_channel(0);
+        let (rtx, rrx) = sync_channel(0);
+        tx.send(Msg::Park(ptx, rrx)).map_err(|_| anyhow!("checker gone"))?;
+        prx.recv().map_err(|_| anyhow!("checker gone"))?;
+        Ok(rtx)
+    }
+
+    /// The state root of `ws` on top of `parent` (its pending layers, then
+    /// the accepted Dirty), as a layer.
+    fn layer_for(&self, inner: &Inner, parent: Option<&Arc<Pending>>, ws: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<Layer> {
+        let t0 = Instant::now();
+        let mut w = Writes::default();
+        for (k, v) in ws {
+            w.apply(k, v)?;
+        }
+        let parents: Vec<&Layer> = match parent {
+            Some(p) => p.layers().ok_or_else(|| anyhow!("parent {} was verified without a state root", p.number))?,
+            None => Vec::new(),
+        };
+        let d = inner.roller.dirty.lock().unwrap();
+        let l = d.layer_root(&parents, w)?;
+        tick(&self.stats.t_root, t0);
+        Ok(l)
+    }
+
+    pub fn is_normal(&self) -> bool {
+        self.normal.load(Ordering::Relaxed)
+    }
+
+    /// A block parsed earlier, by id (the ABI's verify-by-id).
+    pub fn parsed(&self, id: &Id) -> Option<Arc<Block>> {
+        self.parsed.lock().unwrap().get(id).cloned()
+    }
+
+    /// nonce and balance of `addrs` at `parent`'s state (None: the accepted head).
+    pub fn accounts(&self, parent: Option<&Arc<Pending>>, addrs: &[Address]) -> Vec<(u64, U256)> {
+        let mut g = self.inner.lock().unwrap();
+        let be = &mut g.ex.db_mut().backend;
+        addrs.iter().map(|a| Pending::account(parent.map(|p| &**p), be, *a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
     }
 
     pub fn meta_of(b: &Block) -> Meta {
@@ -475,7 +581,7 @@ impl Engine for NodeEngine {
     }
 
     fn rpc(&self, body: &[u8]) -> Vec<u8> {
-        crate::rpc::handle(self, body)
+        self.rpc.handle(body)
     }
     fn ws_server(&self) -> Option<&rpc::Server> {
         Some(&self.rpc)
@@ -483,7 +589,7 @@ impl Engine for NodeEngine {
 
     fn health(&self) -> Result<serde_json::Value, Error> {
         let h = self.head.lock().unwrap().height;
-        Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed)}))
+        Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal()}))
     }
 
     /// Bootstrapping = the catch-up budget; NormalOp = the tip budget and
@@ -493,6 +599,23 @@ impl Engine for NodeEngine {
         let inner = &mut *g;
         inner.roll_budget = if normal { self.tip_roll } else { self.sync_roll };
         eprintln!("epochdb-rs: budget {}: roll-budget={}MB", if normal { "tip" } else { "catch-up" }, inner.roll_budget >> 20);
+        if normal && !self.normal.load(Ordering::Relaxed) {
+            // Every accepted block through the checker first: from here the
+            // Dirty is the head's state and verify computes the root itself.
+            match self.park_checker() {
+                Ok(resume) => {
+                    if let Err(e) = self.flush_dirty(inner) {
+                        eprintln!("epochdb-rs: set_state: {e:#}");
+                    }
+                    drop(resume);
+                }
+                Err(e) => eprintln!("epochdb-rs: set_state: {e:#}"),
+            }
+            self.normal.store(true, Ordering::Relaxed);
+            eprintln!("epochdb-rs: NormalOp: state root inside verify");
+        } else if !normal {
+            self.normal.store(false, Ordering::Relaxed);
+        }
         if normal {
             let head = self.head.lock().unwrap().clone();
             let be = &mut inner.ex.db_mut().backend;
@@ -527,7 +650,7 @@ impl Engine for NodeEngine {
         let busy = ex.t_evm + ex.t_trace + ex.t_commit;
         let secs = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
         eprintln!(
-            "epochdb-rs: exit: blocks={blocks} txs={txs} gas={gas} root-checked={checked} rolls={} head={} | evm={:.2}s trace={:.2}s commit={:.2}s exec-thread {:.1} mgas/s | parse-batch={:.2}s parse={:.2}s verify={:.2}s accept={:.2}s checker={:.2}s | uptime {:.0}s",
+            "epochdb-rs: exit: blocks={blocks} txs={txs} gas={gas} root-checked={checked} rolls={} head={} | evm={:.2}s trace={:.2}s commit={:.2}s exec-thread {:.1} mgas/s | parse-batch={:.2}s parse={:.2}s verify={:.2}s (root {:.2}s) accept={:.2}s checker={:.2}s | uptime {:.0}s",
             inner.roller.rolls,
             self.head.lock().unwrap().height,
             ex.t_evm.as_secs_f64(),
@@ -537,6 +660,7 @@ impl Engine for NodeEngine {
             secs(&s.t_parse_batch),
             secs(&s.t_parse),
             secs(&s.t_verify),
+            secs(&s.t_root),
             secs(&s.t_accept),
             secs(&s.t_check),
             self.t0.elapsed().as_secs_f64()
@@ -591,7 +715,87 @@ impl NodeEngine {
         if r.bloom != h.bloom {
             return Err(format!("block {}: logsBloom differs from the header", h.number).into());
         }
-        Ok(inner.ex.db_mut().finish(b.height, b.hash, h.time, r))
+        let mut p = inner.ex.db_mut().finish(b.height, b.hash, h.time, r);
+        p.root = h.root;
+        // NormalOp: the root now, on a layer over the parent's (bootstrapping
+        // leaves it to the checker, one block behind; a parent verified that
+        // way has no layer, so its children follow the checker path too).
+        if self.normal.load(Ordering::Relaxed) && parent.is_none_or(|pp| pp.layer.is_some()) {
+            let layer = {
+                let g = p.payload.lock().unwrap();
+                self.layer_for(inner, parent, &g.as_ref().unwrap().ws).map_err(|e| format!("block {}: state root: {e:#}", h.number))?
+            };
+            if layer.root != h.root.0 {
+                return Err(format!("block {}: state root mismatch: computed {}, header {}", h.number, B256::from(layer.root), h.root).into());
+            }
+            p.layer = Some(Arc::new(layer));
+        }
+        Ok(p)
+    }
+
+    /// epochdb_build: the miner's block on top of `parent` (None: the accepted
+    /// head, whose header is `parent_hdr`) from `candidates` in the caller's
+    /// order; the result is a verified block (its Pending carries the root).
+    /// `pchain_height` is the proposervm context height for the predicates
+    /// (own height from Etna, the epoch's under Granite).
+    pub fn build(&self, parent: Option<&Arc<Pending>>, parent_hdr: &block::Header, params: &build::Params, pchain_height: Option<u64>, mut candidates: Vec<block::Tx>) -> Result<BuildOut, Error> {
+        if !self.normal.load(Ordering::Relaxed) {
+            return Err("build needs NormalOp (SetState 2)".into());
+        }
+        let t0 = Instant::now();
+        let mut g = self.inner.lock().unwrap();
+        let inner = &mut *g;
+        // The fee config and the coinbase rule as the parent's state holds them.
+        inner.ex.db_mut().begin(parent.cloned());
+        let (cfg, db) = inner.ex.cfg_and_db();
+        let fc = build::fee_config_at(cfg, parent_hdr.time, |slot| db.storage(exec::precompile::FEE_MANAGER, slot).unwrap());
+        let rule = build::coinbase_rule(cfg, parent_hdr.time, || db.storage(exec::precompile::REWARD_MANAGER, exec::rewardmanager::reward_address_slot()).unwrap());
+        let h = build::template(cfg, &fc, parent_hdr, params, rule)?;
+        for t in &mut candidates {
+            if t.sender.is_none() {
+                t.sender = block::recover(t);
+            }
+        }
+        let r = match inner.ex.build_block(&h, parent_hdr.time, pchain_height, pchain_height, &candidates) {
+            Ok(r) => r,
+            Err(e) => {
+                inner.ex.db_mut().begin(None);
+                return Err(format!("build on {}: {e:#}", parent_hdr.number).into());
+            }
+        };
+        let txs: Vec<&block::Tx> = r.included.iter().map(|&i| &candidates[i]).collect();
+        let gas: Vec<u64> = r.result.txs.iter().map(|t| t.gas_used).collect();
+        if let Err(e) = build::verify_block_fee(h.base_fee.unwrap(), h.block_gas_cost.unwrap_or_default(), &txs, &gas) {
+            inner.ex.db_mut().begin(None);
+            return Err(format!("build on {}: {e}", parent_hdr.number).into());
+        }
+        let needs_more = r.reasons.iter().all(|x| *x != SkipReason::NotReached) && h.gas_limit - r.result.gas_used >= exec::exec::TX_GAS;
+        // finish takes cur out of the executor's Layered; the hash comes after the root.
+        let mut p = inner.ex.db_mut().finish(h.number, B256::ZERO, h.time, r.result);
+        let layer = {
+            let g = p.payload.lock().unwrap();
+            self.layer_for(inner, parent, &g.as_ref().unwrap().ws).map_err(|e| format!("build on {}: state root: {e:#}", parent_hdr.number))?
+        };
+        let result = p.payload.lock().unwrap().take().unwrap();
+        let (hdr, header_rlp, bytes) = build::assemble(h, &txs, B256::from(layer.root), &result.result, &r.predicate_bytes)?;
+        let hash = alloy_primitives::keccak256(&header_rlp);
+        p.hash = hash;
+        p.root = hdr.root;
+        p.layer = Some(Arc::new(layer));
+        *p.payload.lock().unwrap() = Some(result);
+        let b = Arc::new(Block {
+            height: hdr.number,
+            hash,
+            container_id: hash,
+            header: hdr,
+            header_rlp: Bytes::from(header_rlp),
+            txs: txs.into_iter().cloned().collect(),
+            container: Bytes::from(bytes),
+            pvm: None,
+        });
+        self.parsed.lock().unwrap().insert(hash.0, b.clone());
+        tick(&self.stats.t_verify, t0);
+        Ok(BuildOut { block: b, pending: p, included: r.included, reasons: r.reasons, needs_more })
     }
 
     fn accept_inner(&self, b: &Arc<Block>, p: &Pending) -> Result<(), Error> {
@@ -599,6 +803,30 @@ impl NodeEngine {
         let inner = &mut *g;
         self.swap_roll(inner, false)?;
         let payload = p.payload.lock().unwrap().take().ok_or("block accepted twice")?;
+        // NormalOp: the accepted Dirty takes the block's layer (or, for a block
+        // verified while bootstrapping, its write set and root now), so the
+        // next verify's layer sits on the head's state.
+        let root_done = self.normal.load(Ordering::Relaxed);
+        if root_done {
+            let mut d = inner.roller.dirty.lock().unwrap();
+            let root = match &p.layer {
+                Some(l) => {
+                    d.absorb(l).map_err(|e| format!("block {}: absorb: {e}", b.height))?;
+                    l.root
+                }
+                None if payload.ws.is_empty() => d.current_root(),
+                None => {
+                    for (k, v) in &payload.ws {
+                        d.apply(k, v).map_err(|e| format!("block {}: apply: {e}", b.height))?;
+                    }
+                    d.root().map_err(|e| format!("block {}: root: {e}", b.height))?
+                }
+            };
+            if root != b.header.root.0 {
+                eprintln!("epochdb-rs: block {}: state root mismatch at accept: computed {}, header {}", b.height, B256::from(root), b.header.root);
+                std::process::exit(1);
+            }
+        }
         let be = &mut inner.ex.db_mut().backend;
         be.apply_ws(&payload.ws);
         for (h, c) in &p.code {
@@ -621,7 +849,7 @@ impl NodeEngine {
             self.rpc.publish(b.clone(), &receipts);
         }
         let tx = self.check_tx.lock().unwrap().clone().ok_or("checker stopped")?;
-        tx.send(Msg::Block(Box::new(CheckItem { block: b.clone(), payload }))).map_err(|_| "checker stopped")?;
+        tx.send(Msg::Block(Box::new(CheckItem { block: b.clone(), payload, root_done }))).map_err(|_| "checker stopped")?;
         if b.height % 256 == 0 {
             self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
         }
@@ -647,28 +875,18 @@ fn conf_u64(conf: &serde_json::Value, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::Host;
-    use tonic::transport::Channel;
-
     /// The Config the plugin runs the executor with carries the snow context's
     /// ids (beam 3,423,561: a constructor stored getBlockchainID()).
-    #[tokio::test]
-    async fn exec_config_carries_the_snow_context_ids() {
-        let ch = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+    #[test]
+    fn exec_config_carries_the_snow_context_ids() {
         let init = Init {
             network_id: 1,
             subnet_id: [0x5bu8; 32],
             chain_id: [0xc4u8; 32],
-            node_id: vec![],
-            public_key: vec![],
-            x_chain_id: [0; 32],
-            c_chain_id: [0; 32],
-            avax_asset_id: [0; 32],
             chain_data_dir: String::new(),
             genesis_bytes: br#"{"config":{"chainId":4337,"feeConfig":{"gasLimit":8000000,"minBaseFee":25000000000,"targetGas":15000000,"baseFeeChangeDenominator":36,"minBlockGasCost":0,"maxBlockGasCost":1000000,"targetBlockRate":2,"blockGasCostStep":200000},"warpConfig":{"blockTimestamp":0}},"alloc":{},"timestamp":"0x0"}"#.to_vec(),
             upgrade_bytes: b"{}".to_vec(),
             config_bytes: b"{}".to_vec(),
-            host: Host { db: crate::pb::rpcdb::database_client::DatabaseClient::new(ch.clone()), validator_state: crate::pb::validatorstate::validator_state_client::ValidatorStateClient::new(ch) },
         };
         let cfg = NodeEngine::exec_config(&init).unwrap();
         assert_eq!(cfg.chain_id, 4337);

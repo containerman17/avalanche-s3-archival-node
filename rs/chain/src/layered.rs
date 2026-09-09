@@ -19,6 +19,7 @@ use exec::StateDb;
 use node::engine::Backend;
 use revm::state::{AccountInfo, Bytecode, EvmState};
 use revm::{Database, DatabaseCommit};
+use state::commit::dirty::Layer;
 
 /// What accept hands the checker: the block's ordered write set, deployed
 /// code and the executor's result (receipts, traces, state rows: the
@@ -35,6 +36,13 @@ pub struct Pending {
     pub number: u64,
     pub hash: B256,
     pub time: u64,
+    /// The block's state root: computed (NormalOp, `layer` is Some) or the
+    /// header's, checked later by the checker thread (bootstrapping).
+    pub root: B256,
+    /// The trie nodes the block's root produced over its parent's (a
+    /// copy-on-write layer over the accepted Dirty), None when the root was
+    /// not computed at verify.
+    pub layer: Option<Arc<Layer>>,
     pub parent: Option<Arc<Pending>>,
     map: HashMap<Vec<u8>, Vec<u8>>,
     owners: HashSet<B256>,
@@ -43,6 +51,29 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// The layers from the oldest pending ancestor down to this block, for a
+    /// child's root; None when one of them was verified without a root.
+    pub fn layers(&self) -> Option<Vec<&Layer>> {
+        let mut out = Vec::new();
+        let mut p = Some(self);
+        while let Some(x) = p {
+            out.push(&**x.layer.as_ref()?);
+            p = x.parent.as_deref();
+        }
+        out.reverse();
+        Some(out)
+    }
+
+    /// An account as this block's state has it (its chain, then the backend).
+    pub fn account(parent: Option<&Pending>, be: &mut Backend, addr: Address) -> Option<AccountInfo> {
+        let key = acct_key(&be.addr_hash(addr));
+        match parent.and_then(|p| p.get(&key)) {
+            Some(Some(v)) => Some(decode_account(v)),
+            Some(None) => None,
+            None => be.get(&key).map(decode_account),
+        }
+    }
+
     fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
         if let Some(v) = self.map.get(key) {
             return Some(if v.is_empty() { None } else { Some(v) });
@@ -137,6 +168,8 @@ impl Layered {
             number,
             hash,
             time,
+            root: B256::ZERO,
+            layer: None,
             parent,
             map: cur.map,
             owners: cur.owners,

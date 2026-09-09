@@ -23,8 +23,9 @@ use crate::pb::vm::runtime::runtime_client::RuntimeClient;
 use crate::pb::vm::vm_server::{Vm, VmServer};
 use crate::pb::vm::*;
 use crate::pb::vm::Error as PbError;
-use crate::tree::{hex, Engine, Error, Id, Tree};
 use crate::{RPCCHAINVM_PROTOCOL, VERSION};
+use chain::tree::{hex, Engine, Error, Id, Tree};
+pub use chain::Init;
 
 pub const ENGINE_ADDR_ENV: &str = "AVALANCHE_VM_RUNTIME_ENGINE_ADDR";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,23 +36,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Host {
     pub db: DatabaseClient<Channel>,
     pub validator_state: ValidatorStateClient<Channel>,
-}
-
-/// Everything Initialize hands the VM.
-pub struct Init {
-    pub network_id: u32,
-    pub subnet_id: Id,
-    pub chain_id: Id,
-    pub node_id: Vec<u8>,
-    pub public_key: Vec<u8>,
-    pub x_chain_id: Id,
-    pub c_chain_id: Id,
-    pub avax_asset_id: Id,
-    pub chain_data_dir: String,
-    pub genesis_bytes: Vec<u8>,
-    pub upgrade_bytes: Vec<u8>,
-    pub config_bytes: Vec<u8>,
-    pub host: Host,
 }
 
 pub type Factory<E> = Box<dyn FnOnce(&Init) -> Result<E, Error> + Send>;
@@ -158,16 +142,10 @@ impl<E: Engine> Vm for VmService<E> {
             network_id: r.network_id,
             subnet_id: id32(&r.subnet_id, "subnet_id")?,
             chain_id: id32(&r.chain_id, "chain_id")?,
-            node_id: r.node_id,
-            public_key: r.public_key,
-            x_chain_id: id32(&r.x_chain_id, "x_chain_id")?,
-            c_chain_id: id32(&r.c_chain_id, "c_chain_id")?,
-            avax_asset_id: id32(&r.avax_asset_id, "avax_asset_id")?,
             chain_data_dir: r.chain_data_dir,
             genesis_bytes: r.genesis_bytes,
             upgrade_bytes: r.upgrade_bytes,
             config_bytes: r.config_bytes,
-            host: host.clone(),
         };
         let engine = tokio::task::spawn_blocking(move || factory(&init)).await.map_err(|e| Status::internal(e.to_string()))?.map_err(unknown)?;
         let _ = self.tree.set(Arc::new(Tree::new(engine)));
@@ -363,7 +341,7 @@ impl<E: Engine> Vm for VmService<E> {
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e: crate::tree::Error| unknown(e))?;
+        .map_err(unknown)?;
         Ok(Response::new(BatchedParseBlockResponse { response }))
     }
 

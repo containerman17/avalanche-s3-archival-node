@@ -1566,6 +1566,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "epochdb-chain"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "epochdb-block",
+ "epochdb-exec",
+ "epochdb-node",
+ "epochdb-rpc",
+ "epochdb-state",
+ "epochdb-store",
+ "hex",
+ "rayon",
+ "revm",
+ "secp256k1 0.31.1",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "epochdb-exec"
 version = "0.1.0"
 dependencies = [
@@ -1579,6 +1605,7 @@ dependencies = [
  "base64 0.22.1",
  "blst",
  "bs58",
+ "bytes",
  "epochdb-block",
  "revm",
  "revm-inspectors",
@@ -1586,6 +1613,19 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "ureq",
+]
+
+[[package]]
+name = "epochdb-ffi"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "bytes",
+ "epochdb-block",
+ "epochdb-chain",
+ "serde_json",
+ "tikv-jemallocator",
 ]
 
 [[package]]
@@ -1628,6 +1668,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "epochdb-block",
+ "epochdb-chain",
  "epochdb-exec",
  "epochdb-node",
  "epochdb-rpc",

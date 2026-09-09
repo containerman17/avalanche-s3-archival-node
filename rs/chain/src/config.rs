@@ -79,6 +79,7 @@ mod tests {
 
     #[test]
     fn keys_follow_the_rule_and_apply_sets_env() {
+        let _g = crate::ENV_LOCK.lock().unwrap();
         for (k, v) in KEYS {
             assert_eq!(format!("EPOCHDB_{}", k.to_uppercase().replace('-', "_")), *v, "{k}");
         }
@@ -92,5 +93,8 @@ mod tests {
         let r = redacted(cfg);
         assert!(!r.contains("hunter2") && r.contains("<redacted>") && r.contains("minio"), "{r}");
         assert_eq!(redacted(b"nope"), "<4 bytes, not JSON>");
+        for (_, var) in KEYS {
+            std::env::remove_var(var);
+        }
     }
 }

@@ -267,6 +267,27 @@ pub fn parse_block_results(b: &[u8]) -> Result<BlockResults, String> {
     Ok(out)
 }
 
+/// predicate.BlockResults.Bytes(): the linear codec (version 0) with map
+/// entries sorted by their key bytes, as avalanchego's reflectcodec writes them.
+pub fn encode_block_results(r: &BlockResults) -> Vec<u8> {
+    let mut out = vec![0u8, 0];
+    out.extend_from_slice(&(r.len() as u32).to_be_bytes());
+    let mut txs: Vec<_> = r.iter().collect();
+    txs.sort_by(|a, b| a.0.cmp(b.0));
+    for (tx, per) in txs {
+        out.extend_from_slice(tx.as_slice());
+        out.extend_from_slice(&(per.len() as u32).to_be_bytes());
+        let mut addrs: Vec<_> = per.iter().collect();
+        addrs.sort_by(|a, b| a.0.cmp(b.0));
+        for (addr, bits) in addrs {
+            out.extend_from_slice(addr.as_slice());
+            out.extend_from_slice(&(bits.len() as u32).to_be_bytes());
+            out.extend_from_slice(bits);
+        }
+    }
+    out
+}
+
 /// subnetevm.WindowSize: the fee window prefix of header.Extra.
 pub const EXTRA_WINDOW_SIZE: usize = 80;
 

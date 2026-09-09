@@ -872,3 +872,130 @@ fn granite_flip_warms_p256_and_get_blockchain_id_answers_the_chain() {
     let zero = Executor::new(Config::from_genesis(genesis.as_bytes(), b"{}", 1).unwrap()).unwrap().call(&head(granite), &msg(WARP, sel("getBlockchainID()"))).unwrap();
     assert_eq!(zero.output.as_ref(), B256::ZERO.as_slice(), "without with_chain the answer is zeros: what the plugin used to run with");
 }
+
+/// A hand-built transfer for the build tests: the sender is given (no
+/// signature needed), `raw` only matters for the size rule and the hash.
+fn fake_tx(sender: Address, nonce: u64, gas_limit: u64, gas_price: u128, to: Address, value: U256, raw_len: usize) -> block::Tx {
+    let mut raw = vec![0xf8u8; raw_len.max(8)];
+    raw[1..8].copy_from_slice(&nonce.to_be_bytes()[1..]);
+    raw[0] = sender.0[0];
+    let raw = ::bytes::Bytes::from(raw);
+    block::Tx { hash: alloy_primitives::keccak256(&raw), raw, sender: Some(sender), tx_type: 0, chain_id: Some(1), nonce, gas_price, gas_tip: gas_price, gas_limit, to: Some(to), value, input: ::bytes::Bytes::new(), access_list: Vec::new(), v: 37, r: U256::ZERO, s: U256::ZERO, recid: 0, body_off: 0, sig_off: 0 }
+}
+
+fn build_header(gas_limit: u64) -> block::Header {
+    block::Header {
+        parent_hash: B256::ZERO, uncle_hash: B256::ZERO, coinbase: REWARD, root: B256::ZERO, tx_hash: B256::ZERO, receipt_hash: B256::ZERO,
+        bloom: Default::default(), difficulty: U256::from(1), number: 1, gas_limit, gas_used: 0, time: 10, extra: Bytes::from(vec![0u8; 80]),
+        mix_digest: B256::ZERO, nonce: Default::default(), base_fee: Some(U256::from(25_000_000_000u64)), block_gas_cost: Some(U256::ZERO), blob_gas_used: None,
+        excess_blob_gas: None, parent_beacon_root: None, time_milliseconds: None, min_delay_excess: None,
+    }
+}
+
+/// miner.commitTransactions over a candidate list: nonce too low is
+/// skipped (Shift), any other failure pops the sender (its later txs are
+/// skipped), a tx over the gas left or the size target pops the sender, the
+/// loop stops under 21,000 gas; what is included applied in order and the
+/// receipts root / gasUsed follow.
+#[test]
+fn build_block_skip_and_pop_rules() {
+    use crate::exec::{Executor, SkipReason::*};
+    let genesis = format!(
+        r#"{{"config":{{"chainId":1,"feeConfig":{{"gasLimit":8000000,"minBaseFee":25000000000,"targetGas":15000000,"baseFeeChangeDenominator":36,"minBlockGasCost":0,"maxBlockGasCost":1000000,"targetBlockRate":2,"blockGasCostStep":200000}}}},
+        "alloc":{{"{ADMIN}":{{"balance":"0x1000000000000000000"}},"{ENABLED}":{{"balance":"0x1000000000000000000"}},"{MANAGER}":{{"balance":"0x1000000000000000000"}},"{NOBODY}":{{"balance":"0x0"}}}},"timestamp":"0x0"}}"#
+    );
+    let cfg = Config::from_genesis(genesis.as_bytes(), b"{}", 1).unwrap();
+    let mut ex = Executor::new(cfg.clone()).unwrap();
+    let price = 30_000_000_000u128;
+    let one = U256::from(1u64);
+    let cands = vec![
+        fake_tx(ADMIN, 0, 21_000, price, REWARD, one, 100),   // 0 included
+        fake_tx(ADMIN, 0, 21_000, price, REWARD, one, 100),   // 1 nonce too low: skipped, ADMIN stays
+        fake_tx(ADMIN, 1, 21_000, price, REWARD, one, 100),   // 2 included
+        fake_tx(ENABLED, 5, 21_000, price, REWARD, one, 100), // 3 nonce too high: popped
+        fake_tx(ENABLED, 0, 21_000, price, REWARD, one, 100), // 4 sender popped
+        fake_tx(NOBODY, 0, 21_000, price, REWARD, one, 100),  // 5 insufficient funds: popped
+        fake_tx(MANAGER, 0, 21_000, price, REWARD, one, 100), // 6 included
+        fake_tx(ADMIN, 2, 21_000, 1, REWARD, one, 100),       // 7 fee cap below base fee: popped
+        fake_tx(ADMIN, 3, 21_000, price, REWARD, one, 100),   // 8 sender popped
+        fake_tx(MANAGER, 1, 21_000, price, REWARD, one, 100), // 9 included
+    ];
+    let h = build_header(8_000_000);
+    let r = ex.build_block(&h, 0, None, None, &cands).unwrap();
+    assert_eq!(r.included, vec![0, 2, 6, 9]);
+    assert_eq!(r.reasons, vec![Included, NonceTooLow, Included, Invalid, SenderPopped, Invalid, Included, Invalid, SenderPopped, Included]);
+    assert_eq!(r.result.gas_used, 4 * 21_000);
+    assert_eq!(r.result.txs.len(), 4);
+    assert_eq!(r.result.txs[3].cumulative_gas_used, 84_000);
+    assert!(r.predicate_bytes.is_empty(), "pre-Durango: no predicate results");
+    use revm::Database as _;
+    assert_eq!(ex.db_mut().basic(ADMIN).unwrap().unwrap().nonce, 2);
+    assert_eq!(ex.db_mut().basic(REWARD).unwrap().unwrap().balance, U256::from(4u64) + U256::from(4 * 21_000) * U256::from(price));
+
+    // The gas pool: a 50,000-gas tx when 40,000 are left pops its sender; the
+    // loop stops once under 21,000 remain, the rest is not reached.
+    let mut ex = Executor::new(cfg.clone()).unwrap();
+    let cands = vec![
+        fake_tx(ADMIN, 0, 21_000, price, REWARD, one, 100),
+        fake_tx(ADMIN, 1, 21_000, price, REWARD, one, 100),
+        fake_tx(ENABLED, 0, 50_000, price, REWARD, one, 100), // 40,000 left: popped
+        fake_tx(ENABLED, 1, 21_000, price, REWARD, one, 100), // sender popped
+        fake_tx(MANAGER, 0, 21_000, price, REWARD, one, 100), // included (19,000 left)
+        fake_tx(MANAGER, 1, 21_000, price, REWARD, one, 100), // not reached
+    ];
+    let r = ex.build_block(&build_header(82_000), 0, None, None, &cands).unwrap();
+    assert_eq!(r.reasons, vec![Included, Included, NoGas, SenderPopped, Included, NotReached]);
+    assert_eq!(r.result.gas_used, 63_000);
+
+    // The 1800 KiB size target: a tx that would pass it pops its sender.
+    let mut ex = Executor::new(cfg.clone()).unwrap();
+    let cands = vec![
+        fake_tx(ADMIN, 0, 21_000, price, REWARD, one, 1800 * 1024 - 50),
+        fake_tx(ENABLED, 0, 21_000, price, REWARD, one, 100), // over the target: popped
+        fake_tx(MANAGER, 0, 21_000, price, REWARD, one, 40),  // fits
+    ];
+    let r = ex.build_block(&build_header(8_000_000), 0, None, None, &cands).unwrap();
+    assert_eq!(r.reasons, vec![Included, Size, Included]);
+
+    // Durango: the predicate results bytes are the empty codec map.
+    let mut d = Config::from_genesis(genesis.as_bytes(), b"{}", 1).unwrap();
+    d.durango = Some(5);
+    let mut ex = Executor::new(d).unwrap();
+    let r = ex.build_block(&build_header(8_000_000), 0, None, None, &[fake_tx(ADMIN, 0, 21_000, price, REWARD, one, 100)]).unwrap();
+    assert_eq!(r.predicate_bytes, vec![0, 0, 0, 0, 0, 0]);
+    // encode_block_results sorts by tx hash then address and round-trips through the parser.
+    let mut br = crate::warp::BlockResults::default();
+    br.insert(B256::repeat_byte(2), [(crate::precompile::WARP, vec![1u8])].into_iter().collect());
+    br.insert(B256::repeat_byte(1), [(crate::precompile::WARP, vec![])].into_iter().collect());
+    let enc = crate::warp::encode_block_results(&br);
+    assert_eq!(&enc[..6], &[0, 0, 0, 0, 0, 2]);
+    assert_eq!(&enc[6..38], B256::repeat_byte(1).as_slice());
+    assert_eq!(crate::warp::parse_block_results(&enc).unwrap(), br);
+}
+
+/// The deferred callTracer render equals the synchronous one.
+#[test]
+fn deferred_call_trace_renders_the_same_json() {
+    use crate::exec::Executor;
+    let genesis = format!(
+        r#"{{"config":{{"chainId":1,"feeConfig":{{"gasLimit":8000000,"minBaseFee":25000000000,"targetGas":15000000,"baseFeeChangeDenominator":36,"minBlockGasCost":0,"maxBlockGasCost":1000000,"targetBlockRate":2,"blockGasCostStep":200000}}}},
+        "alloc":{{"{ADMIN}":{{"balance":"0x1000000000000000000"}}}},"timestamp":"0x0"}}"#
+    );
+    let cfg = Config::from_genesis(genesis.as_bytes(), b"{}", 1).unwrap();
+    let mut h = build_header(8_000_000);
+    h.gas_used = 42_000;
+    let txs = vec![fake_tx(ADMIN, 0, 21_000, 30_000_000_000, REWARD, U256::from(1u64), 100), fake_tx(ADMIN, 1, 21_000, 30_000_000_000, NOBODY, U256::from(2u64), 100)];
+    let b = block::Block { height: 1, hash: B256::repeat_byte(9), container_id: B256::ZERO, header: h, header_rlp: ::bytes::Bytes::new(), txs, container: ::bytes::Bytes::new(), pvm: None };
+    let mut sync = Executor::new(cfg.clone()).unwrap();
+    let r1 = sync.execute_block(&b, 0).unwrap();
+    let mut lazy = Executor::new(cfg).unwrap();
+    lazy.defer_call_trace = true;
+    let mut r2 = lazy.execute_block(&b, 0).unwrap();
+    assert!(r2.txs.iter().all(|t| t.trace_json.is_empty() && t.deferred.is_some()));
+    crate::exec::render_deferred(&mut r2).unwrap();
+    for (a, c) in r1.txs.iter().zip(&r2.txs) {
+        assert_eq!(a.trace_json, c.trace_json);
+        assert!(c.deferred.is_none());
+    }
+    assert!(r1.txs[0].trace_json.contains(r#""type":"CALL""#));
+}

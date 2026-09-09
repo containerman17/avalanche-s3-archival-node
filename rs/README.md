@@ -12,10 +12,12 @@ The Rust rewrite of the epochdb follower: one cargo workspace under `rs/`, one b
 | `node` (`epochdb-node`) | lib `node` | the in-process bench (`epochdb-rs --dump`): dump -> executor -> checker thread (root one block behind) -> roll; `Backend` = overlay + frozen + run | `node/REPORT.md` |
 | `store` (`epochdb-store`) | lib `store`; bin `storecheck` | storage v4: window log, L0 seal, terminal merge, Pebblev2 sstable sections, Elias-Fano postings, casfs (local spool, S3, chunk cache with eviction), reader snapshots | `store/REPORT.md` |
 | `rpc` (`epochdb-rpc`) | lib `rpc`; bin `epochdb-rpc-serve` | eth_ / debug_ / ots_ / edb_ / net_ / web3_ / txpool_ over a `Store` trait, eth_call and estimateGas through the executor, re-executing tracers, filters, the fee oracle, `/ws` with eth_subscribe | `rpc/REPORT.md` |
-| `plugin` (`epochdb-plugin`) | lib `plugin`; bin `epochdb-rs` | the rpcchainvm plugin: `vm.proto` server, block tree, `NodeEngine` (executor + roller + checker + DbStore), ghttp `/rpc` and `/ws` (hijack path), genesis header | `plugin/REPORT.md` |
+| `chain` (`epochdb-chain`) | lib `chain`; bin `vbench` | the engine both shells share: `NodeEngine` (executor + roller + checker + DbStore), `Tree` of verified-not-accepted blocks, `Layered` pending state, the state root inside verify in NormalOp, `build` (subnet-evm miner semantics + customheader), the RPC store adapter; `vbench` is the validator-shape bench and build oracle | `ffi/ABI.md` |
+| `plugin` (`epochdb-plugin`) | lib `plugin`; bin `epochdb-rs` | the rpcchainvm plugin over `chain`: `vm.proto` server, ghttp `/rpc` and `/ws` (hijack path) | `plugin/REPORT.md` |
+| `ffi` (`epochdb-ffi`) | staticlib `libepochdb_engine.a` + `ffi/epochdb_engine.h` | the C ABI over `chain` for the Go validator shell (parse / verify / accept / reject / build / account_state / rpc) | `ffi/ABI.md`, `ffi/README.md` |
 | `layout` (`epochdb-layout`) | bin `layout` | the run-file layout experiment that chose format v2 | `state/LAYOUT.md` |
 
-Dependency order: `state` <- `node`; `block` <- `exec` <- `node`, `store`, `rpc` <- `plugin`. The protos under `plugin/proto/` are avalanchego `v1.14.3-0.20260804141953-6dc4c3b395b6` verbatim (`RPCChainVMProtocol = 45`), compiled by `plugin/build.rs` (needs `protoc`).
+Dependency order: `state` <- `node`; `block` <- `exec` <- `node`, `store`, `rpc` <- `chain` <- `plugin`, `ffi`. The protos under `plugin/proto/` are avalanchego `v1.14.3-0.20260804141953-6dc4c3b395b6` verbatim (`RPCChainVMProtocol = 45`), compiled by `plugin/build.rs` (needs `protoc`).
 
 ## Build
 
