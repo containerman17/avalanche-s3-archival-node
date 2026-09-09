@@ -238,10 +238,15 @@ func main() {
 	d.compareAll(1, head)
 	proposers := d.proposers(network.Dir, chainID, head)
 	fmt.Println("functional phase OK: head", head, "proposers", proposers)
-	if *ours != *stock && (proposers["ours"] == 0 || proposers["stock"] == 0) { // same dir = harness dry run
-		check(fmt.Errorf("both kinds must have built: %v", proposers), "proposers")
-	}
 	d.scanStockLogs(network.Dir, nodes)
+	bothBuilt := func(p map[string]int) {
+		if *ours != *stock && (p["ours"] == 0 || p["stock"] == 0) { // same dir = harness dry run
+			check(fmt.Errorf("both kinds must have built: %v", p), "proposers")
+		}
+	}
+	if *load == 0 {
+		bothBuilt(proposers) // 8 blocks: the proposer schedule may pick one kind only
+	}
 
 	// ---- load phase ----
 	if *load > 0 {
@@ -252,6 +257,7 @@ func main() {
 		proposers = d.proposers(network.Dir, chainID, head2)
 		fmt.Println("load phase OK: head", head2, "proposers", proposers)
 		d.scanStockLogs(network.Dir, nodes)
+		bothBuilt(proposers)
 	}
 	if *keep {
 		fmt.Println("network kept running at", network.Dir)
