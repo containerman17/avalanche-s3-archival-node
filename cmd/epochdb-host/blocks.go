@@ -558,6 +558,14 @@ func (g *gen) awaitBlock(ctx context.Context) (*mined, [3]time.Duration, error) 
 		return nil, d, err
 	}
 	for h <= g.head {
+		if time.Since(t0) > 2*time.Second {
+			// The pool count lags the head for a moment after Accept, so
+			// drain can see "pending" for txs already mined. Empty pool and
+			// no new block: nothing is coming, report zero.
+			if n, err := g.pending(ctx); err == nil && n == 0 {
+				return &mined{height: g.head}, d, nil
+			}
+		}
 		if time.Since(t0) > 30*time.Second {
 			// Nothing mined although the pool is not empty: the leftovers
 			// are stuck (a nonce gap after a dropped tx, or a dead node).
