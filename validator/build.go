@@ -191,7 +191,10 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	}
 	vm.b.built(parent.Hash())
 	vm.m.buildTxs.Observe(float64(out.included))
-	vm.ctx.Log.Debug("validator: built", zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
+	vm.mu.Lock()
+	vm.lastBuilt = out.id
+	vm.mu.Unlock()
+	vm.ctx.Log.Info("validator: built", zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
 		zap.Int("candidates", len(txs)), zap.Uint64("gasUsed", out.gasUsed), zap.Duration("took", time.Since(start)))
 	return &Block{vm: vm, raw: out.block, id: out.id, parent: parentID, height: parent.Number.Uint64() + 1, time: tsMS / 1000}, nil
 }

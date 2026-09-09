@@ -13,6 +13,10 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"os"
+	runtimemetrics "runtime/metrics"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,7 +36,6 @@ import (
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.uber.org/zap"
 )
 
@@ -60,6 +63,7 @@ type VM struct {
 
 	mu        sync.Mutex
 	preferred ids.ID
+	lastBuilt ids.ID            // the id of the last block we built (Accept logs "proposer": "self")
 	lastX     [nCrossing]uint64 // crossing counters at the previous Accept
 
 	gossipOnce sync.Once
@@ -372,9 +376,13 @@ func (b *Block) Accept(context.Context) error {
 	vm.mu.Lock()
 	prev := vm.lastX
 	vm.lastX = now
+	self := vm.lastBuilt == b.id
 	vm.mu.Unlock()
-	fields := make([]zap.Field, 0, nCrossing+3)
+	fields := make([]zap.Field, 0, nCrossing+4)
 	fields = append(fields, zap.Uint64("height", b.height), zap.Uint64("gasUsed", h.GasUsed))
+	if self {
+		fields = append(fields, zap.String("proposer", "self"))
+	}
 	total := uint64(0)
 	for i := range now {
 		d := now[i] - prev[i]
@@ -424,7 +432,43 @@ func newMetrics() *metrics {
 		crossings: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "epochdb_crossings_total", Help: "cgo calls into the engine"}, []string{"kind"}),
 		admitted:  prometheus.NewCounter(prometheus.CounterOpts{Name: "epochdb_txs_admitted_total", Help: "txs the pool promoted to pending"}),
 	}
-	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.admitted,
-		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})) // heap, GC, RSS of the plugin process
+	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.admitted)
+	// The Go heap, GC share and RSS of the plugin process. (The stock Go and
+	// process collectors do not survive the rpcchainvm gatherer, so: gauges.)
+	gauge := func(name, help string, f func() float64) {
+		m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name, Help: help}, f))
+	}
+	gauge("epochdb_go_heap_alloc_bytes", "live Go heap objects", func() float64 { return runtimeMetric("/memory/classes/heap/objects:bytes") })
+	gauge("epochdb_go_gc_cycles_total", "GC cycles", func() float64 { return runtimeMetric("/gc/cycles/total:gc-cycles") })
+	gauge("epochdb_go_gc_cpu_fraction", "GC CPU seconds / total CPU seconds since start",
+		func() float64 {
+			return runtimeMetric("/cpu/classes/gc/total:cpu-seconds") / max(runtimeMetric("/cpu/classes/total:cpu-seconds"), 1e-9)
+		})
+	gauge("epochdb_process_rss_bytes", "resident set size of the plugin process", processRSS)
 	return m
+}
+
+func runtimeMetric(name string) float64 {
+	s := []runtimemetrics.Sample{{Name: name}}
+	runtimemetrics.Read(s)
+	switch s[0].Value.Kind() {
+	case runtimemetrics.KindUint64:
+		return float64(s[0].Value.Uint64())
+	case runtimemetrics.KindFloat64:
+		return s[0].Value.Float64()
+	}
+	return 0
+}
+
+func processRSS() float64 {
+	raw, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0
+	}
+	f := strings.Fields(string(raw))
+	if len(f) < 2 {
+		return 0
+	}
+	pages, _ := strconv.ParseFloat(f[1], 64)
+	return pages * float64(os.Getpagesize())
 }

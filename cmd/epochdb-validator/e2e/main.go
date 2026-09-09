@@ -232,7 +232,7 @@ func main() {
 	head, err := nodes[0].ec.BlockNumber(ctx)
 	check(err, "head")
 	d.compareAll(1, head)
-	proposers := d.proposers(network.Dir, chainID)
+	proposers := d.proposers(network.Dir, chainID, head)
 	fmt.Println("functional phase OK: head", head, "proposers", proposers)
 	if *ours != *stock && (proposers["ours"] == 0 || proposers["stock"] == 0) { // same dir = harness dry run
 		check(fmt.Errorf("both kinds must have built: %v", proposers), "proposers")
@@ -245,7 +245,7 @@ func main() {
 		head2, err := nodes[0].ec.BlockNumber(ctx)
 		check(err, "head")
 		d.compareAll(head+1, head2)
-		proposers = d.proposers(network.Dir, chainID)
+		proposers = d.proposers(network.Dir, chainID, head2)
 		fmt.Println("load phase OK: head", head2, "proposers", proposers)
 		d.scanStockLogs(network.Dir, nodes)
 	}
@@ -355,22 +355,21 @@ func (d *driver) compareAll(from, to uint64) {
 	fmt.Printf("blocks %d..%d identical on %d nodes (%d txs)\n", from, to, len(d.nodes), txs)
 }
 
-// proposers counts built blocks per node kind from the chain logs: ours logs
-// "validator: built", stock subnet-evm logs "Commit new mining work".
-func (d *driver) proposers(dir string, chainID ids.ID) map[string]int {
+// proposers counts ACCEPTED blocks per builder kind: our plugin logs
+// "proposer": "self" when it accepts a block it built; the rest were stock's.
+func (d *driver) proposers(dir string, chainID ids.ID, head uint64) map[string]int {
 	out := map[string]int{}
 	for _, n := range d.nodes {
-		path := filepath.Join(n.DataDir, "logs", chainID.String()+".log")
-		raw, err := os.ReadFile(path)
+		if n.kind != "ours" {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(n.DataDir, "logs", chainID.String()+".log"))
 		if err != nil {
 			continue
 		}
-		if n.kind == "ours" {
-			out[n.kind] += strings.Count(string(raw), "validator: built")
-		} else {
-			out[n.kind] += strings.Count(string(raw), "Commit new mining work")
-		}
+		out["ours"] += strings.Count(string(raw), `"proposer": "self"`)
 	}
+	out["stock"] = int(head) - out["ours"]
 	return out
 }
 
@@ -456,7 +455,8 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 	time.Sleep(5 * time.Second)
 }
 
-// pluginRSS: VmRSS of every process whose exe lives under dir (our plugins).
+// pluginRSS: VmRSS of our plugin processes (exe under dir) whose parent
+// avalanchego belongs to this network (another network may share the dir).
 func pluginRSS(dir string) string {
 	out, err := exec.Command("pgrep", "-f", filepath.Join(dir, subnetEVMID)).Output()
 	if err != nil {
@@ -468,6 +468,11 @@ func pluginRSS(dir string) string {
 		if err != nil {
 			continue
 		}
+		if ppid := field(string(st), "PPid:"); ppid != "" {
+			if cmd, _ := os.ReadFile("/proc/" + ppid + "/cmdline"); !strings.Contains(string(cmd), network.Dir) {
+				continue
+			}
+		}
 		for _, l := range strings.Split(string(st), "\n") {
 			if strings.HasPrefix(l, "VmRSS:") {
 				kb, _ := strconv.Atoi(strings.Fields(l)[1])
@@ -477,6 +482,15 @@ func pluginRSS(dir string) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ",")
+}
+
+func field(status, key string) string {
+	for _, l := range strings.Split(status, "\n") {
+		if strings.HasPrefix(l, key) {
+			return strings.Fields(l)[1]
+		}
+	}
+	return ""
 }
 
 // goStats pulls our plugin's Go heap and GC share plus verify/build p50 from
@@ -495,10 +509,13 @@ func (d *driver) goStats() string {
 			continue
 		}
 		v, _ := strconv.ParseFloat(f[1], 64)
+		if i := strings.IndexByte(f[0], '{'); i >= 0 {
+			f[0] = f[0][:i] // avalanche_subnetevm_vm_epochdb_<name>{chain=...}
+		}
 		switch {
-		case strings.HasSuffix(f[0], "go_memstats_heap_alloc_bytes"):
+		case strings.HasSuffix(f[0], "epochdb_go_heap_alloc_bytes"):
 			heap = v
-		case strings.Contains(f[0], "gc_cpu_fraction"):
+		case strings.HasSuffix(f[0], "epochdb_go_gc_cpu_fraction"):
 			gcFrac = v
 		case strings.HasSuffix(f[0], "epochdb_verify_seconds_count"):
 			verifyCount = v
