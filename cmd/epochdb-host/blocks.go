@@ -259,6 +259,44 @@ func (g *gen) grow() [][]byte {
 	return raws
 }
 
+// pending returns the tx pool's pending count via txpool_status.
+func (g *gen) pending(ctx context.Context) (uint64, error) {
+	req := httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"txpool_status","params":[]}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	g.rpc.ServeHTTP(rec, req)
+	var res struct {
+		Result struct {
+			Pending string `json:"pending"`
+		} `json:"result"`
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		return 0, fmt.Errorf("txpool_status: %w", err)
+	}
+	if len(res.Error) != 0 {
+		return 0, fmt.Errorf("txpool_status: %s", res.Error)
+	}
+	return strconv.ParseUint(strings.TrimPrefix(res.Result.Pending, "0x"), 16, 64)
+}
+
+// drain mines until the pool has no pending txs; returns blocks, txs, gas mined.
+func (g *gen) drain(ctx context.Context) (blocks, txs, gas uint64, err error) {
+	for {
+		n, err := g.pending(ctx)
+		if err != nil || n == 0 {
+			return blocks, txs, gas, err
+		}
+		blk, _, err := g.mine(ctx)
+		if err != nil {
+			return blocks, txs, gas, err
+		}
+		blocks++
+		txs += uint64(len(blk.Transactions()))
+		gas += blk.GasUsed()
+	}
+}
+
 // mine builds one block from the mempool, then verifies and accepts it.
 // Returns the block and the three wall durations.
 func (g *gen) mine(ctx context.Context) (*ethtypes.Block, [3]time.Duration, error) {
@@ -343,27 +381,14 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		if err := g.submit(ctx, append(g.grow(), g.traffic(prefillBatch)...)); err != nil {
 			return err
 		}
-		blk, _, err = g.mine(ctx)
+		b, t, ga, err := g.drain(ctx)
 		if err != nil {
 			return err
 		}
-		blocks++
-		txs += uint64(len(blk.Transactions()))
-		gas += blk.GasUsed()
-		if blk.Transactions().Len() < prefillBatch+mintsPerBlock {
-			// The VM left txs in the pool (block gas limit); drain before the next batch.
-			for blk.GasUsed() > genGasLimit*9/10 {
-				if blk, _, err = g.mine(ctx); err != nil {
-					return err
-				}
-				blocks++
-				txs += uint64(len(blk.Transactions()))
-				gas += blk.GasUsed()
-			}
-		}
+		blocks, txs, gas = blocks+b, txs+t, gas+ga
 	}
 	el := time.Since(start)
-	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d senders=%d height=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, genSenders, blk.NumberU64())
+	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d senders=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, genSenders)
 
 	return g.save(dataDir)
 }
@@ -437,10 +462,8 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 		log.Printf("gen block height=%d txs=%d gas=%d submit=%s build=%s verify=%s accept=%s total=%s verify_mgas/s=%.1f", blk.NumberU64(), len(blk.Transactions()), blk.GasUsed(), submit, d[0], d[1], d[2], total, float64(blk.GasUsed())/1e6/d[1].Seconds())
 		if len(blk.Transactions()) != n {
 			log.Printf("gen note: asked %d txs, block took %d (gas limit %d); draining", n, len(blk.Transactions()), genGasLimit)
-			for blk.GasUsed() > genGasLimit*9/10 {
-				if blk, _, err = g.mine(ctx); err != nil {
-					return err
-				}
+			if _, _, _, err := g.drain(ctx); err != nil {
+				return err
 			}
 		}
 		if err := g.save(dataDir); err != nil {
