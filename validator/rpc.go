@@ -102,6 +102,9 @@ func (vm *VM) poolMethod(raw []byte) (*rpcReq, bool) {
 }
 
 func (vm *VM) answerPool(req *rpcReq) []byte {
+	if req.Method != "eth_sendRawTransaction" && req.Method != "eth_sendTransaction" {
+		vm.chain.settle() // a read waits for the pool to reach the accepted head (E2E.md lesson 5)
+	}
 	switch req.Method {
 	case "eth_sendRawTransaction":
 		var raw hexutil.Bytes

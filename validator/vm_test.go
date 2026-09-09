@@ -193,8 +193,8 @@ func TestBuildVerifyAccept(t *testing.T) {
 	if num != 1 {
 		t.Fatalf("eth_blockNumber %d", num)
 	}
-	// The pool dropped the included txs once its (async) reset ran: nothing pending.
-	h.vm.pool.Sync() // the simulator hook: forces a reset (tests only)
+	// The pool demoted the included txs once its reset landed: nothing pending.
+	h.vm.chain.settle()
 	if p, q := h.vm.pool.Stats(); p+q != 0 {
 		t.Fatalf("pool still holds %d pending %d queued", p, q)
 	}
@@ -337,7 +337,7 @@ func TestPoolDrainsUnderChurn(t *testing.T) {
 			sent += perRound
 		}
 		blk, _, _ := h.buildAccept()
-		h.vm.pool.Sync()
+		h.vm.chain.settle()
 		p, q := h.vm.pool.Stats()
 		raw, err := h.vm.eng.accountState(addrs[:3], ids.Empty)
 		if err != nil {
@@ -352,13 +352,13 @@ func TestPoolDrainsUnderChurn(t *testing.T) {
 	}
 	// Drain whatever the last block left (the gas budget can split a round).
 	for i := 0; i < 5; i++ {
-		h.vm.pool.Sync()
+		h.vm.chain.settle()
 		if p, q := h.vm.pool.Stats(); p+q == 0 {
 			break
 		}
 		h.buildAccept()
 	}
-	h.vm.pool.Sync()
+	h.vm.chain.settle()
 	if p, q := h.vm.pool.Stats(); p+q != 0 {
 		t.Fatalf("pool did not drain: pending=%d queued=%d", p, q)
 	}

@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core"
 	"github.com/ava-labs/libevm/core/state"
+	"github.com/ava-labs/libevm/core/txpool"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/event"
@@ -18,39 +21,95 @@ import (
 	"github.com/ava-labs/libevm/trie/trienode"
 	"github.com/ava-labs/libevm/triedb"
 	"github.com/holiman/uint256"
+	"go.uber.org/zap"
 )
 
 // poolChain is the txpool's BlockChain over the engine (libevm's pool, not
 // subnet-evm's: that one links firewood's Rust runtime through
 // subnet-evm/core; the engine's rules are enforced at build time). The head header is
 // what Accept last decoded, StateAt hands out a state.StateDB whose only
-// backing "trie" answers GetAccount from the engine (nonce + balance), and
-// chain-head events come from Accept.
+// backing "trie" answers GetAccount from the engine (nonce + balance).
+//
+// The pool's head moves asynchronously (the reset walks every pending
+// account: 570 ms at 100k pending, too slow for Accept), but never
+// invisibly: Accept calls headMoving before the engine flips its height and
+// the reset's goroutine calls headMoved when the subpool is on the new head.
+// While a move is in flight the builder sees no pending txs and the pool's
+// RPC reads (txpool_status, eth_getTransactionCount "pending", ...) wait, so
+// no caller reads a mined tx as pending after seeing the block. libevm's
+// own head event is not used: txpool.TxPool's loop would run the reset with
+// no way to know when it landed (E2E.md, "Validator-side lessons" 5).
 type poolChain struct {
 	eng    *engine
 	config *params.ChainConfig
-	feed   event.Feed
+	feed   event.Feed // subscribed by txpool.TxPool, never sent on
+	sub    txpool.SubPool
+	log    logging.Logger
 
 	mu     sync.RWMutex
 	head   *types.Header
 	headID ids.ID
 	recent map[common.Hash]ids.ID // root -> block id of the last few heads
 
+	moving  int // head moves in flight (Accept started, pool reset not landed)
+	settled *sync.Cond
+	onMoved func()            // the builder's wake-up
+	removed map[string]uint64 // the drop handler's counters at the last reset
+	counts  func() map[string]uint64
+
 	acct *accountCache
 }
 
-func newPoolChain(eng *engine, config *params.ChainConfig, head *types.Header, headID ids.ID, warn func(string, error)) *poolChain {
-	c := &poolChain{eng: eng, config: config, recent: map[common.Hash]ids.ID{}}
-	c.acct = &accountCache{eng: eng, warn: warn, entries: map[common.Address]types.StateAccount{}}
+func newPoolChain(eng *engine, config *params.ChainConfig, head *types.Header, headID ids.ID, log logging.Logger) *poolChain {
+	c := &poolChain{eng: eng, config: config, log: log, recent: map[common.Hash]ids.ID{}}
+	c.settled = sync.NewCond(&c.mu)
+	c.acct = &accountCache{eng: eng, warn: func(msg string, err error) { log.Warn(msg, zap.Error(err)) }, entries: map[common.Address]types.StateAccount{}}
 	c.setHead(head, headID)
 	return c
 }
 
-// setHead records the accepted head and tells the pool. One crossing: every
-// cached account is re-read at the new head so the pool's reset (which reads
-// every pending sender) never crosses.
+// headMoving: a head move starts (before the engine accepts, so a client
+// that sees the new height finds the pool already waiting on it).
+func (c *poolChain) headMoving() {
+	c.mu.Lock()
+	c.moving++
+	c.mu.Unlock()
+}
+
+// headMoved: one move is over (the reset landed, or Accept failed).
+func (c *poolChain) headMoved() {
+	c.mu.Lock()
+	c.moving--
+	c.mu.Unlock()
+	c.settled.Broadcast()
+	if c.onMoved != nil {
+		c.onMoved()
+	}
+}
+
+// isSettled: no head move in flight (the builder's check, non-blocking).
+func (c *poolChain) isSettled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.moving == 0
+}
+
+// settle blocks until the pool is on the accepted head (the RPC reads).
+func (c *poolChain) settle() {
+	c.mu.Lock()
+	for c.moving > 0 {
+		c.settled.Wait()
+	}
+	c.mu.Unlock()
+}
+
+// setHead records the accepted head and starts the pool's reset on it. One
+// crossing: every cached account is re-read at the new head so the reset
+// (which reads every pending sender) never crosses. The caller's headMoving
+// is paired with headMoved when the reset lands.
 func (c *poolChain) setHead(h *types.Header, id ids.ID) {
 	c.mu.Lock()
+	old := c.head
 	c.head, c.headID = h, id
 	c.recent[h.Root] = id
 	if len(c.recent) > 16 {
@@ -63,7 +122,25 @@ func (c *poolChain) setHead(h *types.Header, id ids.ID) {
 	}
 	c.mu.Unlock()
 	c.acct.refresh(h.Root)
-	c.feed.Send(core.ChainHeadEvent{Block: types.NewBlockWithHeader(h)})
+	if c.sub == nil {
+		return // Initialize: the pool does not exist yet, it starts on this head
+	}
+	go func() {
+		start := time.Now()
+		c.sub.Reset(old, h) // demote the mined txs, promote the now-executable
+		fields := []zap.Field{zap.Uint64("height", h.Number.Uint64()), zap.Duration("took", time.Since(start))}
+		if c.counts != nil {
+			now := c.counts()
+			for reason, n := range now {
+				if d := n - c.removed[reason]; d > 0 {
+					fields = append(fields, zap.Uint64(reason, d)) // old = mined; anything else is a drop
+				}
+			}
+			c.removed = now
+		}
+		c.headMoved()
+		c.log.Info("validator: pool reset", fields...)
+	}()
 }
 
 func (c *poolChain) Config() *params.ChainConfig { return c.config }

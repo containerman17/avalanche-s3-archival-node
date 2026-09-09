@@ -326,6 +326,42 @@ RssAnon): height ~187: 1.32 GB / 2.0 GB before -> 140 MB / 415 MB after; height 
 flat across the three nodes (135-140 MB allocated). The compare tab's original observation (2.0-2.6 GB at 273
 blocks with a 410 MB window) is the sum of the three.
 
+## Run 9: the settle rounds that "lost" 400 txs (2 all-ours --stress nodes, plugin 8287607; branch go-pooldrop)
+
+- Symptom (two networks, 224437 and 231202): the epochdb-host settle generator (1024 senders, 400 settle txs of 12 M
+  gas per round) stopped with `no block past 365 for 30s, pool has 0 txs` after round 3 (round 5 on the second
+  network); no block after 365 on either node, `txpool_status` 0/0 on both.
+- Nothing was dropped. Blocks 334..365 hold exactly 1200 = 3 x 400 settle txs (400 at 344, 800 at 355, 1200 at 365;
+  2000 = 5 x 400 through 390 on the second network); the next round was never submitted, the generator failed inside
+  `drain()` after the last one. Every settle sender holds 19999.7 ETH, base fee flat at the 1 gwei floor, fee cap
+  1000 gwei, 12 M tx gas vs a 500 M limit, `account_errors` 0 on every accepted line. The pool's drop lines could not
+  say either way: the 500-line Trace cap was used up 5 s into the run, mostly by `Removed old/unpayable queued
+  transactions count=0`.
+- Mechanism: the engine answers `eth_blockNumber` as soon as `epochdb_accept` returns; the pool's reset ran later on
+  libevm's `TxPool.loop` after Accept's ChainHeadEvent (header decode, a 1024-account refresh, a goroutine hop, the
+  reset itself). `drain()` polls the height every 50 ms and calls `txpool_status` at once; on the block that mined
+  the last tx of a round it read the mined txs as still pending and waited for a block no tx justified. The same lag
+  woke `WaitForEvent` (Stats() > 0) into builds whose every candidate the engine skipped as nonce-low; those returned
+  `errNoTxs` with no log line and no retry gap: `epochdb_build_seconds_count` 11595 vs `epochdb_build_txs_count` 175
+  on K7 (9155 / 191 on Ny; 4870 / 198 and 5483 / 192 on the second network).
+- Fix (validator only): `Block.Accept` calls `chain.headMoving()` before `eng.accept`; `setHead` runs the subpool's
+  `Reset` on a goroutine and calls `headMoved()` when it lands (`validator: pool reset {height, took, old, ...}`
+  at Info, the removals by libevm's reason: `old` = mined, anything else a drop; totals in
+  `epochdb_pool_removed_total{reason}` and health `removed`). The builder sees no pending txs while a move is in
+  flight and is woken when it lands; every pool RPC read (`txpool_status`, `txpool_content*`,
+  `eth_pendingTransactions`, `eth_getTransactionCount "pending"`) waits for it. `buildBlock` arms the 100 ms retry
+  gap before the empty check too (`epochdb_build_empty_total`). Not synchronous: the reset walks every pending
+  account, 570 ms at 104k pending (1000 senders x 104 txs; `EPOCHDB_DEEP=1 go test -run TestAcceptCostDeepPool`);
+  Accept stays at 1.7-2.9 ms there, the pool settles 350-530 ms later.
+- Evidence: `TestPoolHeadMovesWithAccept` against 8287607 reads `txpool_status` pending=7 right after Accept in 4 of
+  5 runs; with the fix 0. On a fresh 2-node --stress network, a probe that sends 400 transfers per round, polls the
+  height every 2 ms and reads `txpool_status` at once (classifying against the blocks' tx counts afterwards): before
+  1 read of 98 counted 22 mined txs as pending, 3.1 engine builds per block; after 0 of 74, slowest reset 1 ms.
+  Empty builds remain (2.6 per block, bounded by the retry gap): consensus builds on a preferred, not yet accepted
+  parent while the pool sits at the accepted head, so that parent's txs are candidates the engine skips.
+- Generator side (epochdb-host `drain`/`awaitBlock`, other worktree): when no block comes and `pending()` reads 0,
+  return instead of failing; the count it saw was a stale one.
+
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and
@@ -351,6 +387,11 @@ blocks with a 410 MB window) is the sum of the three.
    `tx-pool-account-slots/queue` are the levers, the global pending cap is soft.
 4. Candidate volume is the build cost: cap by bytes (the miner's 1800 KiB target) as well as gas, and do not re-run
    the build on `needs_more` when the block was size-capped.
+5. The pool's head moves after Accept, asynchronously; anyone who has seen the new height (the engine answers
+   `eth_blockNumber` first) must not read the pool until the reset landed. `Block.Accept` marks the move before the
+   engine accepts, `setHead` runs the reset on a goroutine and clears it; the builder's `hasPending` is false while
+   marked, the pool RPC reads `settle()` first (Run 9). libevm's ChainHeadEvent is not sent: its loop gives no
+   landing signal, and `pool.Sync()` (tests only) resets on the wrong old head.
 
 ## Deviations and open items
 
@@ -367,9 +408,10 @@ blocks with a 410 MB window) is the sum of the three.
    not read. `GetFeeConfigAt`-style runtime fee config changes (FeeManager) are not read by the Go side (the engine
    enforces them at build/verify).
 6. tmpnet has no ConvertSubnetToL1 helper: the "L1" is a 5-validator permissioned subnet.
-7. Build retries: like subnet-evm, WaitForEvent re-arms 100 ms after a build whose block is not yet accepted, so a
-   height can cost up to 6 engine builds (~10 ms each at 600 txs). A cheap improvement is to skip the retry while our
-   last built block is still preferred.
+7. Build retries: like subnet-evm, WaitForEvent re-arms 100 ms after a build whose block is not yet accepted (since
+   Run 9 also after a build that skipped every candidate), so a height can cost up to 6 engine builds (~10 ms each
+   at 600 txs). A cheap improvement is to skip the retry while our last built block is still preferred; a bigger one
+   is subnet-evm's: move the pool with SetPreference, not Accept, so a preferred parent's txs are no candidates.
 8. Engine build vs verify: resolved by the BuildBlock profile section (the engine recovered every candidate's
    sender again; Go now hands the pool's senders over). Build is within 2x of verify at the p50 and p99.
 9. Pool memory: geth's pool keeps every pending tx decoded (~1-2 KB each); per-account slots are the effective cap.
