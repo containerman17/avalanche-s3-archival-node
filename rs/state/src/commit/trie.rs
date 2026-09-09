@@ -3,7 +3,7 @@
 //! for every dirty node that is stored separately (>= 32 bytes, or the
 //! root). Smaller nodes are embedded in their parent's RLP.
 
-use super::{compact_to_hex, err, key_to_nibbles, put_compact, Result};
+use super::{compact_to_hex, err, key_to_nibbles, put_compact, Error, Result};
 use crate::keccak::{keccak256, EMPTY_ROOT};
 use crate::rlp;
 use crate::Hash;
@@ -87,6 +87,141 @@ impl<'a> Trie<'a> {
         self.prefix.clear();
         self.root = delete(&self.cx, root, &mut self.prefix, &nib)?.1;
         Ok(())
+    }
+
+    /// Applies ops (key bytes, value; an empty value deletes) and commits,
+    /// the 16 subtries under the root branch spread over `workers` threads
+    /// (the update walk, then the hashing). Falls back to the serial path
+    /// when the root is not a branch, or when the deletes leave it with
+    /// fewer than two children and it must collapse.
+    pub fn commit_par(mut self, ops: &[(Vec<u8>, Vec<u8>)], workers: usize) -> Result<(Hash, NodeSet)> {
+        let root = std::mem::replace(&mut self.root, Node::Empty);
+        let root = match root {
+            Node::Hash(h) => resolve(&self.cx, &[], h)?,
+            n => n,
+        };
+        let (mut kids, root_hash) = match root {
+            Node::Branch { kids, flags } if workers > 1 => (kids, flags.hash),
+            n => {
+                self.root = n;
+                for (k, v) in ops {
+                    self.update(k, v.clone())?;
+                }
+                return Ok(self.commit());
+            }
+        };
+        let mut groups: [Vec<(Vec<u8>, &[u8])>; 16] = std::array::from_fn(|_| Vec::new());
+        for (k, v) in ops {
+            let nib = key_to_nibbles(k);
+            groups[nib[0] as usize].push((nib, v));
+        }
+        struct Slot {
+            kid: Node,
+            changed: bool,
+            deleted: bool,
+            out: Option<(Enc, NodeSet)>,
+        }
+        let slots: Vec<std::sync::Mutex<Slot>> = kids.iter_mut().map(|k| std::sync::Mutex::new(Slot { kid: std::mem::replace(k, Node::Empty), changed: false, deleted: false, out: None })).collect();
+        let n = workers.min(16);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let commit_next = std::sync::atomic::AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(n);
+        let par_commit = std::sync::atomic::AtomicBool::new(false);
+        let errors: std::sync::Mutex<Vec<Error>> = std::sync::Mutex::new(Vec::new());
+        let cx = &self.cx;
+        let owner = self.cx.owner;
+        std::thread::scope(|s| {
+            for _ in 0..n {
+                s.spawn(|| {
+                    let mut prefix = Vec::with_capacity(64);
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= 16 {
+                            break;
+                        }
+                        let mut slot = slots[i].lock().unwrap();
+                        let mut kid = std::mem::replace(&mut slot.kid, Node::Empty);
+                        for (nib, v) in &groups[i] {
+                            prefix.clear();
+                            prefix.push(i as u8);
+                            let r = if v.is_empty() {
+                                delete(cx, kid, &mut prefix, &nib[1..]).map(|(d, n)| {
+                                    slot.deleted |= d;
+                                    slot.changed |= d;
+                                    n
+                                })
+                            } else {
+                                slot.changed = true;
+                                insert(cx, kid, &mut prefix, &nib[1..], v.to_vec())
+                            };
+                            match r {
+                                Ok(n) => kid = n,
+                                Err(e) => {
+                                    errors.lock().unwrap().push(e);
+                                    kid = Node::Empty;
+                                    break;
+                                }
+                            }
+                        }
+                        slot.kid = kid;
+                    }
+                    if barrier.wait().is_leader() {
+                        let alive = slots.iter().filter(|s| !matches!(s.lock().unwrap().kid, Node::Empty)).count();
+                        par_commit.store(alive >= 2 && errors.lock().unwrap().is_empty(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    barrier.wait();
+                    if !par_commit.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    loop {
+                        let i = commit_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= 16 {
+                            break;
+                        }
+                        let mut slot = slots[i].lock().unwrap();
+                        let kid = std::mem::replace(&mut slot.kid, Node::Empty);
+                        let mut set = NodeSet { owner, nodes: Vec::new() };
+                        prefix.clear();
+                        prefix.push(i as u8);
+                        let e = commit(kid, &mut prefix, &mut set);
+                        slot.out = Some((e, set));
+                    }
+                });
+            }
+        });
+        if let Some(e) = errors.into_inner().unwrap().pop() {
+            return Err(e);
+        }
+        let mut slots: Vec<Slot> = slots.into_iter().map(|m| m.into_inner().unwrap()).collect();
+        let changed = slots.iter().any(|s| s.changed);
+        if !par_commit.into_inner() {
+            let deleted = slots.iter().any(|s| s.deleted);
+            for (k, s) in kids.iter_mut().zip(slots.iter_mut()) {
+                *k = std::mem::replace(&mut s.kid, Node::Empty);
+            }
+            self.root = if deleted {
+                reduce(&self.cx, kids, &mut Vec::new())?
+            } else {
+                Node::Branch { kids, flags: if changed { DIRTY } else { Flags { hash: root_hash, dirty: false } } }
+            };
+            return Ok(self.commit());
+        }
+        let mut set = NodeSet { owner, nodes: Vec::new() };
+        let mut body = Vec::with_capacity(17 * 33);
+        for s in slots.iter_mut() {
+            let (e, sub) = s.out.take().unwrap();
+            put_enc(&mut body, &e);
+            set.nodes.extend(sub.nodes);
+        }
+        body.push(0x80);
+        let root = match (changed, root_hash) {
+            (false, Some(h)) => h,
+            _ => match finish(list(&body), true, &[], &mut set) {
+                Enc::Hash(h) => h,
+                _ => unreachable!("the root is always hashed"),
+            },
+        };
+        Ok((root, set))
     }
 
     /// Hashes the trie and collects every stored dirty node.
@@ -310,35 +445,37 @@ fn delete(cx: &Cx, n: Node, prefix: &mut Vec<u8>, key: &[u8]) -> Result<(bool, N
             if !matches!(kids[i], Node::Empty) {
                 return Ok((true, Node::Branch { kids, flags: DIRTY }));
             }
-            // Reduction: a branch with one child left becomes a short node.
-            let mut pos = None;
-            let mut count = 0;
-            for (j, k) in kids.iter().enumerate() {
-                if !matches!(k, Node::Empty) {
-                    count += 1;
-                    pos = Some(j);
-                }
-            }
-            if count >= 2 {
-                return Ok((true, Node::Branch { kids, flags: DIRTY }));
-            }
-            let Some(pos) = pos else { return Ok((true, Node::Empty)) };
-            let mut child = std::mem::replace(&mut kids[pos], Node::Empty);
-            if let Node::Hash(h) = child {
-                prefix.push(pos as u8);
-                child = resolve(cx, prefix, h)?;
-                prefix.pop();
-            }
-            Ok((
-                true,
-                match child {
-                    Node::Leaf { key: ck, val, .. } => Node::Leaf { key: concat(&[pos as u8], &ck), val, flags: DIRTY },
-                    Node::Ext { key: ck, child: cc, .. } => Node::Ext { key: concat(&[pos as u8], &ck), child: cc, flags: DIRTY },
-                    other => Node::Ext { key: vec![pos as u8], child: Box::new(other), flags: DIRTY },
-                },
-            ))
+            Ok((true, reduce(cx, kids, prefix)?))
         }
     }
+}
+
+/// The dirty branch of kids, or what it collapses to when at most one child
+/// is left: a leaf or extension absorbing the child's nibble, or Empty.
+fn reduce(cx: &Cx, mut kids: Box<[Node; 16]>, prefix: &mut Vec<u8>) -> Result<Node> {
+    let mut pos = None;
+    let mut count = 0;
+    for (j, k) in kids.iter().enumerate() {
+        if !matches!(k, Node::Empty) {
+            count += 1;
+            pos = Some(j);
+        }
+    }
+    if count >= 2 {
+        return Ok(Node::Branch { kids, flags: DIRTY });
+    }
+    let Some(pos) = pos else { return Ok(Node::Empty) };
+    let mut child = std::mem::replace(&mut kids[pos], Node::Empty);
+    if let Node::Hash(h) = child {
+        prefix.push(pos as u8);
+        child = resolve(cx, prefix, h)?;
+        prefix.pop();
+    }
+    Ok(match child {
+        Node::Leaf { key: ck, val, .. } => Node::Leaf { key: concat(&[pos as u8], &ck), val, flags: DIRTY },
+        Node::Ext { key: ck, child: cc, .. } => Node::Ext { key: concat(&[pos as u8], &ck), child: cc, flags: DIRTY },
+        other => Node::Ext { key: vec![pos as u8], child: Box::new(other), flags: DIRTY },
+    })
 }
 
 enum Enc {

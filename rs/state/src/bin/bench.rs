@@ -2,6 +2,10 @@
 //!
 //!   bench latest <rows file>   run bytes/key, Get 1 thread and 16 threads, Merge, Overlay heap
 //!   bench dirty                4M synthetic state (commit_test's benchState shape): Roll, Dirty 20k serial and parallel
+//!   bench deep <dir> <slots> <blocks> <workers,...> [dirty=40000]
+//!                              one contract with <slots> keccak-shaped slots (plus 1000 EOAs); per block <dirty>/2
+//!                              fresh slots + <dirty>/2 updates; apply and root per block. The node file is kept in <dir>
+//!                              and reused when present (so a profile run skips the roll).
 use state::commit::dirty::{Dirty, SeekFn};
 use state::commit::file::File;
 use state::commit::roll::roll;
@@ -9,7 +13,7 @@ use state::overlay::Overlay;
 use state::run::{Run, Writer};
 use state::sample::*;
 use state::view::{merge, View};
-use state::RowsIter;
+use state::{KvIter, RowsIter};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -178,11 +182,100 @@ fn dirty() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// One contract with n slots, 1000 plain accounts around it.
+fn deep_state(n: usize) -> (Vec<Row>, Vec<u8>) {
+    let mut rng = Rng::new(21);
+    let mut rows: Vec<Row> = Vec::with_capacity(n + 1001);
+    let h = rng.bytes(32);
+    rows.push(([h.clone(), vec![0]].concat(), contract_row(&[1], &[1], &EMPTY_CODE_HASH)));
+    for _ in 0..n {
+        let sh = rng.bytes(32);
+        let w = rng.word();
+        rows.push(([h.clone(), vec![1], sh].concat(), trim_word(&w)));
+    }
+    for i in 0..1000u64 {
+        let a = rng.bytes(32);
+        rows.push(([a, vec![0]].concat(), contract_row(&[1], &i.to_be_bytes()[7..], &EMPTY_CODE_HASH)));
+    }
+    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    rows.dedup_by(|a, b| a.0 == b.0);
+    (rows, h)
+}
+
+fn deep(dir: &Path, slots: usize, blocks: usize, workers: &[usize], dirty: usize) {
+    std::fs::create_dir_all(dir).unwrap();
+    let t = Instant::now();
+    let (rows, owner) = deep_state(slots);
+    let rows = Arc::new(rows);
+    let path = dir.join(format!("deep-{slots}.nodes"));
+    let gen = t.elapsed();
+    if !path.exists() {
+        let t = Instant::now();
+        let (_, st) = roll(&mut RowsIter::new(&rows), &path, [0; 32]).unwrap();
+        println!("roll {slots} slots: nodes {} bytes {} in {:.2?} (gen {gen:.2?})", st.nodes, st.bytes, t.elapsed());
+    } else {
+        println!("reusing {} (gen {gen:.2?})", path.display());
+    }
+    // Leaves come from a real run file, as in the node (the seek is a Run iter, not a Vec search).
+    let rpath = dir.join(format!("deep-{slots}.run"));
+    if !rpath.exists() {
+        let mut w = Writer::create(&rpath).unwrap();
+        for (k, v) in rows.iter() {
+            w.add(k, v).unwrap();
+        }
+        w.close().unwrap();
+    }
+    let run = Arc::new(Run::open(&rpath).unwrap());
+    let seek: Arc<SeekFn> = Arc::new(move |prefix: &[u8]| {
+        let mut it = run.iter(Some(prefix), None);
+        if it.next() {
+            Some((it.key().to_vec(), it.value().to_vec()))
+        } else {
+            None
+        }
+    });
+    let f = Arc::new(File::open(&path).unwrap());
+    // Read both files once so they are page-cache resident for every config.
+    std::hint::black_box(std::fs::read(&path).unwrap().len() + std::fs::read(&rpath).unwrap().len());
+    let owner: [u8; 32] = owner.as_slice().try_into().unwrap();
+    let slot_rows: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].0.len() == 65).collect();
+    for &w in workers {
+        let mut rng = Rng::new(31);
+        let mut d = Dirty::new(f.clone(), seek.clone());
+        d.workers = w;
+        let mut key = Vec::with_capacity(65);
+        for b in 0..blocks {
+            let t = Instant::now();
+            for _ in 0..dirty / 2 {
+                key.clear();
+                key.extend_from_slice(&owner);
+                key.push(1);
+                key.extend_from_slice(&rng.bytes(32));
+                let wd = rng.word();
+                d.apply(&key, &trim_word(&wd)).unwrap();
+            }
+            for _ in 0..dirty / 2 {
+                let r = &rows[slot_rows[rng.below(slot_rows.len())]];
+                let wd = rng.word();
+                d.apply(&r.0, &trim_word(&wd)).unwrap();
+            }
+            let apply = t.elapsed();
+            let t = Instant::now();
+            let root = d.root().unwrap();
+            let rt = t.elapsed();
+            println!("deep {slots} dirty={dirty} workers={w} block {b}: apply {:.1} ms root {:.1} ms, {} nodes {:.0} MB retained, root {:02x?}..", apply.as_secs_f64() * 1e3, rt.as_secs_f64() * 1e3, d.nodes(), d.bytes() as f64 / 1e6, &root[..4]);
+        }
+    }
+    // ponytail: the rows are millions of Vecs; freeing them is seconds of noise in a profile.
+    std::process::exit(0);
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a[1].as_str() {
         "latest" => latest(Path::new(&a[2])),
         "dirty" => dirty(),
-        _ => panic!("bench latest <rows> | bench dirty"),
+        "deep" => deep(Path::new(&a[2]), a[3].parse().unwrap(), a[4].parse().unwrap(), &a[5].split(',').map(|x| x.parse().unwrap()).collect::<Vec<_>>(), a.get(6).map_or(40_000, |x| x.parse().unwrap())),
+        _ => panic!("bench latest <rows> | bench dirty | bench deep <dir> <slots> <blocks> <workers,...>"),
     }
 }
