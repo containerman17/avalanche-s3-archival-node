@@ -157,6 +157,7 @@ type gen struct {
 	corpus   *os.File // optional EPCORP01 recording of every accepted block
 	contract common.Address
 	head     uint64 // remote mode: last height counted by awaitBlock
+	lastBlk  time.Time // remote mode: when awaitBlock last saw a new block
 	holders  uint64 // token holders seeded by mintMany so far (recipients)
 	slots    uint64 // slots kind: slots written so far in the slot writer
 	rng      uint64
@@ -593,10 +594,9 @@ func (g *gen) awaitBlock(ctx context.Context) (*mined, [3]time.Duration, error) 
 		return nil, d, err
 	}
 	for h <= g.head {
-		if time.Since(t0) > 2*time.Second {
-			// The pool count lags the head for a moment after Accept, so
-			// drain can see "pending" for txs already mined. Empty pool and
-			// no new block: nothing is coming, report zero.
+		if time.Since(t0) > 15*time.Second {
+			// The queried node's pool can be empty while a peer still holds
+			// and mines the rest, so only a long quiet spell counts as done.
 			if n, err := g.pending(ctx); err == nil && n == 0 {
 				raw, _ := g.rpcResult(ctx, "txpool_status", "[]")
 				log.Printf("gen drain: pool empty and no block past %d for %s (txpool_status %s)", g.head, time.Since(t0).Round(time.Millisecond), raw)
@@ -615,6 +615,7 @@ func (g *gen) awaitBlock(ctx context.Context) (*mined, [3]time.Duration, error) 
 		}
 	}
 	d[0] = time.Since(t0)
+	g.lastBlk = time.Now()
 	m := &mined{height: h}
 	for n := g.head + 1; n <= h; n++ {
 		raw, err := g.rpcResult(ctx, "eth_getBlockByNumber", fmt.Sprintf(`["0x%x",false]`, n))
@@ -794,6 +795,10 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		}
 		blocks, txs, gas = blocks+b, txs+t, gas+ga
 		prefillFor = 0
+		// The window ends at the last block, not at the quiet spell.
+		if !g.lastBlk.IsZero() {
+			start = start.Add(time.Since(g.lastBlk))
+		}
 	}
 	for time.Since(start) < prefillFor {
 		if err := g.submit(ctx, append(g.grow(), g.traffic(prefillBatch)...)); err != nil {
