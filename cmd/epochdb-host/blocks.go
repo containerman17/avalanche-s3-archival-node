@@ -362,8 +362,21 @@ func (g *gen) loadNonces(ctx context.Context) error {
 func (g *gen) drain(ctx context.Context) (blocks, txs, gas uint64, err error) {
 	for {
 		n, err := g.pending(ctx)
-		if err != nil || n == 0 {
+		if err != nil {
 			return blocks, txs, gas, err
+		}
+		if n == 0 {
+			// The pool empties when the last block is built; count that
+			// block too if it is already at the head.
+			if g.vm == nil {
+				if h, err := g.rpcUint(ctx, "eth_blockNumber", "[]"); err == nil && h > g.head {
+					prev := g.head
+					if m, _, err := g.awaitBlock(ctx); err == nil {
+						blocks, txs, gas = blocks+m.height-prev, txs+m.txs, gas+m.gas
+					}
+				}
+			}
+			return blocks, txs, gas, nil
 		}
 		blk, _, err := g.mine(ctx)
 		if err != nil {
