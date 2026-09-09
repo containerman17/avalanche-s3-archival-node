@@ -5,7 +5,7 @@
 //!
 //! One VM call at a time (avalanchego holds ctx.Lock around every call), so
 //! the whole tree sits behind one mutex.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -69,14 +69,48 @@ struct Verified<E: Engine> {
     pending: Arc<E::Pending>,
 }
 
+/// Blocks consensus saw (verified) whose pending state is gone: rejected, or
+/// superseded by a sibling's accept. Consensus still names them by id
+/// (avalanchego's rpcchainvm server calls GetBlock before Reject; chits,
+/// GetAncestors), and a "not found" for a block it knows is fatal to the
+/// chain. Bytes + meta only, FIFO-bounded by count and bytes.
+struct Dropped<E: Engine> {
+    map: HashMap<Id, Arc<E::Block>>,
+    order: VecDeque<(Id, usize)>,
+    bytes: usize,
+}
+
+/// The dropped-block cache bound: whichever fills first.
+pub const DROPPED_MAX_BLOCKS: usize = 1024;
+pub const DROPPED_MAX_BYTES: usize = 64 << 20;
+
+impl<E: Engine> Dropped<E> {
+    fn insert(&mut self, engine: &E, b: Arc<E::Block>) {
+        let m = engine.meta(&b);
+        if self.map.contains_key(&m.id) {
+            return;
+        }
+        let n = engine.bytes(&b).len();
+        self.map.insert(m.id, b);
+        self.order.push_back((m.id, n));
+        self.bytes += n;
+        while self.order.len() > DROPPED_MAX_BLOCKS || self.bytes > DROPPED_MAX_BYTES {
+            let Some((id, n)) = self.order.pop_front() else { break };
+            self.map.remove(&id);
+            self.bytes -= n;
+        }
+    }
+}
+
 pub struct Tree<E: Engine> {
     pub engine: E,
     verified: Mutex<HashMap<Id, Verified<E>>>,
+    dropped: Mutex<Dropped<E>>,
 }
 
 impl<E: Engine> Tree<E> {
     pub fn new(engine: E) -> Tree<E> {
-        Tree { engine, verified: Mutex::new(HashMap::new()) }
+        Tree { engine, verified: Mutex::new(HashMap::new()), dropped: Mutex::new(Dropped { map: HashMap::new(), order: VecDeque::new(), bytes: 0 }) }
     }
 
     pub fn parse(&self, bytes: Bytes) -> Result<E::Block, Error> {
@@ -87,12 +121,22 @@ impl<E: Engine> Tree<E> {
         self.engine.last_accepted()
     }
 
-    /// Verified blocks first, then the engine's accepted ones.
+    /// Verified blocks first, then dropped (rejected / superseded) ones,
+    /// then the engine's accepted ones.
     pub fn get_block(&self, id: &Id) -> Option<Arc<E::Block>> {
         if let Some(v) = self.verified.lock().unwrap().get(id) {
             return Some(v.block.clone());
         }
+        if let Some(b) = self.dropped.lock().unwrap().map.get(id) {
+            return Some(b.clone());
+        }
         self.engine.get_block(id).map(Arc::new)
+    }
+
+    /// A block whose pending state was dropped (rejected, or a sibling at
+    /// its height was accepted).
+    pub fn is_dropped(&self, id: &Id) -> bool {
+        self.dropped.lock().unwrap().map.contains_key(id)
     }
 
     pub fn block_id_at_height(&self, h: u64) -> Option<Id> {
@@ -110,6 +154,9 @@ impl<E: Engine> Tree<E> {
         let mut verified = self.verified.lock().unwrap();
         if verified.contains_key(&m.id) || self.is_accepted(&m) {
             return Ok(m);
+        }
+        if self.is_dropped(&m.id) {
+            return Err(format!("block {} {} was rejected: a sibling at its height was accepted", m.height, hex(&m.id)).into());
         }
         let head = self.engine.meta(&self.engine.last_accepted());
         let parent = if m.parent == head.id {
@@ -156,7 +203,11 @@ impl<E: Engine> Tree<E> {
         // built block that was superseded before it was proposed, a retry on
         // the same parent) would stay verified forever, each with its write
         // set; nothing at or below the accepted height can be accepted now.
-        verified.retain(|_, x| self.engine.meta(&x.block).height > m.height);
+        // Their pending state goes, their bytes stay retrievable.
+        let mut dropped = self.dropped.lock().unwrap();
+        for (_, x) in verified.extract_if(|_, x| self.engine.meta(&x.block).height <= m.height) {
+            dropped.insert(&self.engine, x.block);
+        }
         Ok(())
     }
 
@@ -171,13 +222,22 @@ impl<E: Engine> Tree<E> {
         self.verified.lock().unwrap().insert(m.id, Verified { block: Arc::new(b), pending: Arc::new(pending) });
     }
 
-    /// Reject drops the pending state; unknown ids are fine (already dropped).
+    /// Reject drops the pending state and keeps the block retrievable;
+    /// unknown ids are fine (already dropped).
     pub fn reject(&self, id: &Id) {
-        self.verified.lock().unwrap().remove(id);
+        if let Some(v) = self.verified.lock().unwrap().remove(id) {
+            self.dropped.lock().unwrap().insert(&self.engine, v.block);
+        }
     }
 
     pub fn verified_len(&self) -> usize {
         self.verified.lock().unwrap().len()
+    }
+
+    /// (blocks, bytes) held by the dropped-block cache.
+    pub fn dropped_size(&self) -> (usize, usize) {
+        let d = self.dropped.lock().unwrap();
+        (d.map.len(), d.bytes)
     }
 }
 
@@ -329,5 +389,69 @@ mod tests {
         let again = t.parse(t.engine.bytes(&t.get_block(&md.id).unwrap())).unwrap();
         assert_eq!(t.verify(again, None).unwrap(), md);
         assert_eq!(t.verified_len(), 0);
+    }
+
+    /// Consensus names a block by id after its sibling was accepted
+    /// (avalanchego's rpcchainvm server calls GetBlock before Reject): the
+    /// loser, its verified child and a never-rejected superseded build stay
+    /// retrievable with their pending state gone.
+    #[test]
+    fn accept_keeps_the_losers_retrievable_without_state() {
+        let t = Tree::new(genesis());
+        let a = t.parse(mk([0; 32], 1, "x=A")).unwrap();
+        let b = t.parse(mk([0; 32], 1, "x=B")).unwrap();
+        let c = t.parse(mk([0; 32], 1, "x=C")).unwrap();
+        let (ma, mb, mc) = (t.verify(a, None).unwrap(), t.verify(b, None).unwrap(), t.verify(c, None).unwrap());
+        let cb = t.parse(mk(mb.id, 2, "x=2")).unwrap();
+        let mcb = t.verify(cb, None).unwrap();
+        assert_eq!(t.verified_len(), 4);
+        t.accept(&ma.id).unwrap();
+        // Pending state of everything at or below height 1 is gone; the child
+        // of B (height 2) too, its parent's state cannot be applied any more.
+        assert_eq!(t.verified_len(), 1);
+        assert!(t.pending(&mb.id).is_none());
+        assert!(t.pending(&mc.id).is_none());
+        assert!(t.pending(&mcb.id).is_some());
+        assert_eq!(t.dropped_size().0, 2);
+        // Every id consensus saw still answers get_block / meta.
+        for m in [&ma, &mb, &mc, &mcb] {
+            let got = t.get_block(&m.id).expect("block consensus saw is retrievable");
+            assert_eq!(&t.engine.meta(&got), m);
+        }
+        // Verifying a dropped sibling again is a clean error, not a panic or a re-execution.
+        let again = t.parse(mk([0; 32], 1, "x=B")).unwrap();
+        let e = t.verify(again, None).unwrap_err().to_string();
+        assert!(e.contains("was rejected"), "{e}");
+        // Reject of a dropped block, twice, is a no-op success; the block stays retrievable.
+        t.reject(&mb.id);
+        t.reject(&mb.id);
+        assert!(t.get_block(&mb.id).is_some());
+        // Reject of a still-verified block moves it to the dropped set.
+        t.reject(&mcb.id);
+        assert_eq!(t.verified_len(), 0);
+        assert!(t.pending(&mcb.id).is_none());
+        assert!(t.get_block(&mcb.id).is_some());
+        assert!(t.verify(t.parse(mk(mb.id, 2, "x=2")).unwrap(), None).is_err());
+        assert_eq!(t.dropped_size().0, 3);
+        // The accepted chain is untouched.
+        assert_eq!(t.engine.state.lock().unwrap().0["x"], "A");
+        assert_eq!(t.block_id_at_height(1), Some(ma.id));
+    }
+
+    #[test]
+    fn dropped_cache_is_bounded() {
+        let t = Tree::new(genesis());
+        for i in 0..(DROPPED_MAX_BLOCKS + 10) {
+            let m = t.verify(t.parse(mk([0; 32], 1, &format!("x={i}"))).unwrap(), None).unwrap();
+            t.reject(&m.id);
+        }
+        let (n, bytes) = t.dropped_size();
+        assert_eq!(n, DROPPED_MAX_BLOCKS);
+        assert!(bytes <= DROPPED_MAX_BYTES);
+        // The oldest went first.
+        let first = t.engine.meta(&t.parse(mk([0; 32], 1, "x=0")).unwrap());
+        assert!(t.get_block(&first.id).is_none());
+        let last = t.engine.meta(&t.parse(mk([0; 32], 1, &format!("x={}", DROPPED_MAX_BLOCKS + 9))).unwrap());
+        assert!(t.get_block(&last.id).is_some());
     }
 }

@@ -341,10 +341,11 @@ pub unsafe extern "C" fn epochdb_get_block(e: *mut epochdb_engine, id: *const u8
     let en = &*e;
     en.guard(|| {
         let id = id32(id).ok_or((EPOCHDB_EINVAL, "null id".to_string()))?;
-        // Accepted, verified, or still in the parsed cache (a competing block at
-        // the accepted height: avalanchego's rpcchainvm server looks it up
-        // before Reject, and a "not found" there shuts the chain down).
-        let b = en.block(&id).filter(|b| b.height == 0 || en.tree.block_id_at_height(b.height) == Some(id) || en.tree.pending(&id).is_some() || en.tree.engine.parsed(&id).is_some()).ok_or((EPOCHDB_ENOTFOUND, format!("block {} not found", chain::tree::hex(&id))))?;
+        // Accepted, verified, dropped (rejected or superseded: the tree keeps
+        // their bytes, avalanchego's rpcchainvm server looks a block up before
+        // Reject and a "not found" for a block consensus knows shuts the chain
+        // down), or still in the parsed cache.
+        let b = en.block(&id).ok_or((EPOCHDB_ENOTFOUND, format!("block {} not found", chain::tree::hex(&id))))?;
         let bytes = if b.container.is_empty() {
             let mut body = b.header_rlp.to_vec();
             body.extend_from_slice(&[0xc0, 0xc0]);

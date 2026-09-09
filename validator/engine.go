@@ -143,7 +143,11 @@ func (e *engine) lastAccepted() (ids.ID, uint64, error) {
 	return id, uint64(h), err
 }
 
+// errNotFound: the engine does not know the id / height (rc EPOCHDB_ENOTFOUND).
+// Any other failure is a real error and must not be mistaken for it.
 var errNotFound = errors.New("not found")
+
+const rcNotFound = -3 // EPOCHDB_ENOTFOUND
 
 func (e *engine) blockIDAtHeight(h uint64) (ids.ID, error) {
 	e.crossings[xOther].Add(1)
@@ -157,8 +161,12 @@ func (e *engine) blockIDAtHeight(h uint64) (ids.ID, error) {
 func (e *engine) getBlock(id ids.ID) ([]byte, error) {
 	e.crossings[xOther].Add(1)
 	var b C.epochdb_buf
-	if rc := C.epochdb_get_block(e.p, c32(id), &b); rc != 0 {
+	rc := C.epochdb_get_block(e.p, c32(id), &b)
+	if rc == rcNotFound {
 		return nil, errNotFound
+	}
+	if err := e.err("epochdb_get_block", rc); err != nil {
+		return nil, err
 	}
 	return take(&b), nil
 }

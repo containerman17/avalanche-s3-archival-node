@@ -310,8 +310,15 @@ func (vm *VM) GetBlockIDAtHeight(_ context.Context, height uint64) (ids.ID, erro
 // the metadata (a cache hit inside the engine).
 func (vm *VM) GetBlock(_ context.Context, id ids.ID) (snowman.Block, error) {
 	raw, err := vm.eng.getBlock(id)
-	if err != nil {
+	if errors.Is(err, errNotFound) {
+		// Only a true unknown id: consensus fetches it from a peer. Any
+		// other error for a block consensus knows shuts the chain down
+		// (avalanchego's rpcchainvm server calls GetBlock before Reject).
 		return nil, database.ErrNotFound
+	}
+	if err != nil {
+		vm.ctx.Log.Error("validator: GetBlock failed", zap.Stringer("id", id), zap.Error(err))
+		return nil, err
 	}
 	m, err := vm.eng.parse(raw)
 	if err != nil {
