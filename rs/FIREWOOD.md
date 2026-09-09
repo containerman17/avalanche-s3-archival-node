@@ -24,7 +24,7 @@ All bench runs: `epochdb-rs --dump DUMP --genesis chain.json --upgrade upgrade.j
 | Step 1M, `--fw-cache-mb 4096` | pipelined | `blocks=1000000 root-checked=1000000`, 685 s, cum 660.7 mgas/s, peak RSS 3,850 MB, propose 310 s + commit 59 s, 13,771,290 trie reads, 622,483,264 B on disk (one file `firewood.db`) |
 | Step 1M, `--fw-cache-mb 4096` | `--root-inline` | `root-checked=1000000`, 962 s, cum 470.2 mgas/s, peak RSS 3,835 MB, propose 292 s + commit 51 s, the executor waited 391.6 s for the checker, 19,321,611 trie reads, same root `0xb0a501d5...9445` and 622,483,264 B |
 | beam 1M, `--fw-cache-mb 4096` | pipelined | `root-checked=1000000`, 391 s, cum 178.3 mgas/s (exec-thread 657.5), peak RSS 1,143 MB, propose 219.7 s + commit 150.9 s (1M commits, each waiting for the persist thread), 6,333,014 trie reads, 263,577,758 B on disk; genesis root `0xe3f8738b...bb60` |
-| beam 1M | `--root-inline` | BEAM_INLINE |
+| beam 1M, `--fw-cache-mb 4096` | `--root-inline` | `root-checked=1000000`, 378 s, cum 184.5 mgas/s, peak RSS 1,144 MB, propose 167.6 s + commit 54.5 s, the executor waited 265.2 s, 9,393,203 trie reads, same root `0xc0df2d77...c74e`, 263,577,758 B |
 
 Genesis roots: Step `0x51736d52...0d21` from the alloc into the first proposal (equal to the alloy-trie recompute); beam's from its chain.json header.
 
@@ -40,15 +40,37 @@ Firewood's persisted revision was 20 blocks behind the store's head after the ki
 
 Firewood has no roll: every commit is a revision, old revisions past `max_revisions` (128) are reaped and their nodes' space goes to the free list, so the file holds the current state plus the last 128 deltas. What replaces our files: `run.N` (the sorted flat state) -> Firewood's node store (trie nodes in one file, branch nodes with child addresses and hashes, leaves with the value); `trie.N` (the rolled hash file) -> the same nodes (hashes live in the branch children); MANIFEST -> Firewood's header (persisted root address) + the store's headers to find the height.
 
-| after Step 1M | native (`run.N` + `trie.N`, from `node/REPORT.md` at the 495k roll: 111 MB + 95 MB, whole 1M measured below) | Firewood `firewood.db` |
+| dump | native `run.N` + `trie.N` (+ MANIFEST) | Firewood `firewood.db` |
 |---|---|---|
-| bytes | NATIVE_DISK | 622,483,264 (one file; free-list space included) |
+| Step, 1M blocks | not measured whole (the A/B stops at 180 s); at 894,408 blocks (5 rolls, `--roll-budget 256`) 345,569,787 B; `node/REPORT.md`'s roll at 495k: run 111 MB + trie 95 MB | 622,483,264 B (one file, free-list space and the last 128 revisions included) |
+| Step, 691k blocks (the 180 s A/B) | 345,569,787 B at 894k (above) | 546,675,328 B at 691k |
+| beam, 1M blocks | 51,780,163 B (run.1 20.1 MB + trie.1 31.7 MB) | 263,577,758 B |
+
+Firewood's file is 1.8x (Step) to 5x (beam) ours: a trie node per key with 16 child addresses and hashes per branch, plus the reaped revisions' free space, against our sorted flat run plus a hash file with only the branch hashes.
 
 ## A/B (same machine, same hour, sequential)
 
 Step 1M, `--duration 180 --workers 14`, native with `--roll-budget 256`; beam 1M whole dump. Load average before each run below 3. Firewood settings: `max_revisions` 128, `deferred_persistence_commit_count` 1, `use_parallel` `BatchSize(8)` (its default), node cache as listed.
 
-AB_TABLE
+All seven runs back to back at 13:30-13:55 JST with the validator load tests paused (load average 2.0-3.4 at each start, the idle avalanchego test nodes only), Step 1M, `--duration 180 --workers 14`, one run each; blocks = executed and root-checked in the 180 s (both shapes check every block: pipelined one block behind, inline before the next block).
+
+| engine | shape | blocks in 180 s | cum mgas/s | blk/s | peak RSS | RssAnon 10 s -> 180 s | split (s) | disk |
+|---|---|---|---|---|---|---|---|---|
+| native, `--roll-budget 256` | pipelined | 894,408 | 1,335 | 4,969 | 753 MB | 181 -> 257 (peak 385) | evm 139.8 trace 15.7 commit 4.8; checker apply 1.4 root 67.2; 5 rolls | 345.6 MB |
+| native | `--root-inline` | 780,742 | 991 | 4,337 | 657 MB | 104 -> 161 | evm 58.0 trace 7.0 commit 4.4; root 54.2; executor waited 88.9 | 341.5 MB |
+| firewood, cache 4 GB | pipelined | 691,486 | 879 | 3,842 | 3,291 MB | 257 -> 3,092 | evm 74.2 trace 5.8 commit 5.5; checker propose 127.2 commit 37.5 | 546.7 MB |
+| firewood, cache 4 GB | `--root-inline` | 520,821 | 614 | 2,893 | 1,817 MB | 194 -> 1,704 | evm 36.9 trace 3.4 commit 3.8; propose 73.8 commit 21.6; executor waited 119.6 | 297.5 MB |
+| firewood, cache 4 GB, `--fw-kv-cache-mb 512` | pipelined | 686,284 | 874 | 3,813 | 3,431 MB | 288 -> 3,245 | evm 63.2 (kv hits 3,353,236, trie reads 4,604,650 -> 2,814,464, 2 clears); propose 124.1 commit 40.0 | 545.5 MB |
+| firewood, cache 192 MB (default) | pipelined | 694,362 | 882 | 3,858 | 531 MB | 253 -> 241 (peak 338) | evm 74.0; propose 124.6 commit 39.0 | 547.3 MB |
+| firewood, cache 4 GB, keccak-asm build | `--root-inline` | 530,206 | 624 | 2,946 | 1,811 MB | 199 -> 1,736 | evm 38.7; propose 70.9 commit 22.0; executor waited 117.3 | 303.4 MB |
+
+Reading it:
+
+- Pipelined, Firewood reaches 66 percent of native's cum mgas/s (879 vs 1,335) and 77 percent of its blk/s; inline 62 percent (614 vs 991). In both shapes the checker is the bound: propose + commit = 165 s of the 180 s pipelined (native's Dirty root: 69 s), so the executor idles 40 percent of the time (evm 74 s), where native's executor runs 140 s of the 180.
+- The 4 GB node cache buys nothing on Step 1M (691k vs 694k blocks at 192 MB): the whole trie is ~550 MB on disk and sits in the page cache either way; the cache only saves deserialization. What the 4 GB cache does is fill RSS: RssAnon grows 257 -> 3,092 MB in 180 s (about 1 GB per 100k blocks of new nodes) and plateaus at 3.6 GB in the 1M runs. At 192 MB RssAnon is flat (253 -> 241 MB, peak 338), so there is no leak in the pure-Rust use over 700k blocks: the Go-side observation (a few hundred MB/h under cgo) is not reproduced here; what grows is the bounded cache.
+- The kv read cache saves the executor 11 s of evm time (trie reads down 39 percent, 3.35M hits) but the run is checker-bound, so the block count is unchanged; it pays off only in the inline shape or once propose gets faster. 2 clears in 180 s at 512 MB (the bound counts key + value + 64 B per entry).
+- keccak-asm: propose 73.8 -> 70.9 s (4 percent) on the mixed 1M window, 8 percent on Step 50k; the hasher is not the lever it looked like.
+- Beam 1M whole dump (above, oracles): native 97 s pipelined / 180 s inline vs Firewood 391 s / 378 s. Beam's blocks are tiny (1.36 txs on average) so the per-proposal and per-commit fixed cost dominates: 1M commits at 55-150 s (each commit hands the revision to the persist thread and, with `deferred_persistence_commit_count` 1, waits for the previous one to be written), 1M proposals at 168-220 s. Native's Dirty root over the same blocks: 59-65 s.
 
 ## Where Firewood spends its time (measured, not reasoned)
 
@@ -75,13 +97,19 @@ Step 50k `--root-inline`, two runs each, same binary otherwise:
 | `sha3` soft (v0.8.0) | 5.89 s / 5.78 s | 2.01 / 1.98 s | 10.34 / 10.16 s |
 | `keccak-asm` | 5.37 s / 5.36 s | 1.94 / 1.95 s | 9.58 / 9.62 s |
 
-8 percent off propose on small blocks (the profile's 30 percent keccak share is of the checker thread's samples, of which propose is ~70 percent; keccak-asm is about 2x the soft backend on 136-byte inputs, so ~10 percent was the ceiling). ASM_TAIL
+8 percent off propose on small blocks (the profile's 30 percent keccak share is of the checker thread's samples, of which propose is ~70 percent; keccak-asm is about 2x the soft backend on 136-byte inputs, so ~10 percent was the ceiling). On the mixed Step 1M 180 s window (the A/B's last row) propose went 73.8 -> 70.9 s (4 percent), the kv-cache-free executor unchanged. A clear but small win; the patch is upstream-ready as written (`$S/rs/firewood/firewood-keccak-asm.patch`), the larger levers are elsewhere (below).
 
 ### Per-block fixed cost
 
 `fw_micro` (ignored unit test, `cargo test --release -p epochdb-node -- --ignored --nocapture fw_micro`): propose + commit of a 1 / 20 / 200-op batch over a 200,000-account state, 2,000 blocks each:
 
-FW_MICRO
+| ops per block | `never` (serial) | `auto` (parallel from 8 ops) |
+|---|---|---|
+| 1 | 18.7 us | 18.1 us |
+| 20 | 390 us | 882 us |
+| 200 | 3,202 us | 3,734 us |
+
+Measured at load average ~40 (the validator tests were running), so the absolute values are 2-4x a quiet box (the bench saw 90 us per 20-op block serial at load 2); the shape holds: ~18 us per proposal + commit is the floor (a `NodeStore` per proposal, the root re-hash, the commit's handoff to the persist thread), the parallel path adds ~500 us of dispatch per proposal at 20 ops and is still slower at 200 ops on one 8-core box, and the per-op cost is 16-20 us serial (a 200k-account trie is 5 levels deep: ~5 node copies, ~5 hashes and one leaf per op).
 
 ### Profile (perf, 499 Hz, dwarf call graphs) of Step 50k `--root-inline`
 
@@ -104,7 +132,7 @@ Per-block fixed overhead vs per-node: see `fw_micro` above; on Step 50k the chec
 
 ## Memory
 
-RssAnon sampled every 10 s from `/proc/self/status` (the `anon=` field of the bench line). Step 1M pipelined, 4 GB node cache: 258 MB at 10 s, 994 MB at 70 s, 1,795 MB at 130 s, 3,098 MB at 190 s, 3,390 MB at 310 s, 3,543 MB at 430 s, 3,620 MB at 550 s, 3,626 MB at 670 s; second-half slope 2,093 MB/h, last 120 s flat within 20 MB. That curve is the node cache filling to its 4 GB limit (the hot state of Step 1M is ~600 MB of nodes, the cache keeps written nodes only by default), not the Go-side leak: the 192 MB run below shows the plateau where the cache is bounded. RSS192
+RssAnon sampled every 10 s from `/proc/self/status` (the `anon=` field of the bench line). Step 1M pipelined, 4 GB node cache: 258 MB at 10 s, 994 MB at 70 s, 1,795 MB at 130 s, 3,098 MB at 190 s, 3,390 MB at 310 s, 3,543 MB at 430 s, 3,620 MB at 550 s, 3,626 MB at 670 s; second-half slope 2,093 MB/h, last 120 s flat within 20 MB. That curve is the node cache filling to its 4 GB limit (the hot state of Step 1M is ~600 MB of nodes, the cache keeps written nodes only by default), not the Go-side leak: the 192 MB run below shows the plateau where the cache is bounded. The A/B's 192 MB row: RssAnon 253 MB at 10 s, 241 MB at 180 s (peak 338 MB) over 694k blocks, slope within noise.
 
 ## Deviations and open items
 
