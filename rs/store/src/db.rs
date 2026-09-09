@@ -1168,13 +1168,7 @@ fn write_sections(w: &mut RunWriter, m: &Memtable) -> Result<()> {
         for h in hashes {
             set(&code_key(h), &m.code[h])?;
         }
-        let mut prefixes: Vec<&Vec<u8>> = m.state.keys().collect();
-        prefixes.sort();
-        for p in prefixes {
-            for (tn, v) in &m.state[p] {
-                set(&suffixed(p, *tn), v)?;
-            }
-        }
+        m.each_state_sorted(|k, tn, v| set(&suffixed(k, tn), v))?;
         Ok(())
     })?;
 

@@ -475,11 +475,27 @@ pub unsafe extern "C" fn epochdb_health(e: *mut epochdb_engine, out: *mut epochd
     }
     let en = &*e;
     en.guard(|| {
-        let v = en.tree.engine.health().map_err(ferr)?;
+        let mut v = en.tree.engine.health().map_err(ferr)?;
+        heap_stats(&mut v);
         *out = buf(v.to_string().into_bytes());
         Ok(EPOCHDB_OK)
     })
 }
+
+/// jemalloc's own accounting of the engine's heap (bytes), so the Go side
+/// can split the process RSS between the pool and the engine.
+#[cfg(feature = "jemalloc")]
+fn heap_stats(v: &mut serde_json::Value) {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    let _ = epoch::advance();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("heap-allocated".into(), stats::allocated::read().unwrap_or(0).into());
+        o.insert("heap-resident".into(), stats::resident::read().unwrap_or(0).into());
+    }
+}
+
+#[cfg(not(feature = "jemalloc"))]
+fn heap_stats(_: &mut serde_json::Value) {}
 
 /// Frees a buffer returned by any function above (a null / empty one is fine).
 #[no_mangle]

@@ -1793,6 +1793,7 @@ dependencies = [
  "epochdb-block",
  "epochdb-chain",
  "serde_json",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
 ]
 

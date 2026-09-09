@@ -6,8 +6,10 @@ pub const STORAGE_VERSION: u32 = 4;
 pub const FLUSH_TXS: u64 = 500_000;
 pub const FLUSH_BLOCKS: u64 = 50_000;
 /// The third flush trigger: raw bytes of the window log (`window-max-bytes`).
-/// Bounds the final seal a shutdown may abandon, and the re-seal at open.
-pub const FLUSH_BYTES: u64 = 1 << 30;
+/// Bounds the final seal a shutdown may abandon, the re-seal at open, and
+/// the memtable's resident memory (~1.3x the log). 128 MiB: a validator's
+/// RSS matters more than seal frequency (one L0 run per 128 MiB of rows).
+pub const FLUSH_BYTES: u64 = 1 << 27;
 pub const TERMINAL_LEVEL: i32 = 1;
 
 pub const PREFIX_BLK: &[u8] = b"blk/";
