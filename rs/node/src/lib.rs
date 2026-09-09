@@ -3,3 +3,4 @@
 //! `epochdb-rs --dump` mode). The plugin crate builds the VM on top.
 pub mod bench;
 pub mod engine;
+pub mod firewood;

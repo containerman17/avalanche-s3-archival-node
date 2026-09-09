@@ -193,7 +193,7 @@ fn run_dump(engine: NodeEngine, dump: &str, to: u64, do_build: bool, quiet: bool
         let s = &tree.engine.stats;
         let ns = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
         let g = tree.engine.inner.lock().unwrap();
-        eprintln!("vbench: split verify={:.2}s (root {:.2}s) accept={:.2}s checker={:.2}s | exec thread evm={:.2}s trace(receipts+deferred take)={:.2}s commit={:.2}s", ns(&s.t_verify), ns(&s.t_root), ns(&s.t_accept), ns(&s.t_check), g.ex.t_evm.as_secs_f64(), g.ex.t_trace.as_secs_f64(), g.ex.t_commit.as_secs_f64());
+        eprintln!("vbench: split verify={:.2}s (root {:.2}s) accept={:.2}s checker={:.2}s | exec thread evm={:.2}s trace(receipts+deferred take)={:.2}s commit={:.2}s", ns(&s.t_verify), ns(&s.t_root), ns(&s.t_accept), ns(&s.t_check), g.ex.split().0.as_secs_f64(), g.ex.split().1.as_secs_f64(), g.ex.split().2.as_secs_f64());
     }
     tree.engine.shutdown();
     if built_bad > 0 {

@@ -45,7 +45,7 @@ fn siblings_root_in_verify_accept_one_reject_other() {
     let b = t.engine.build(None, &g.header, &p(ts), None, vec![tx(0, 3)]).unwrap();
     assert_ne!(a.block.hash, b.block.hash);
     assert_ne!(a.block.header.root, b.block.header.root);
-    assert!(a.pending.layer.is_some() && b.pending.layer.is_some());
+    assert!(a.pending.has_layer() && b.pending.has_layer());
     assert_eq!(a.included, vec![0, 1]);
     let (ha, hb) = (a.block.hash.0, b.block.hash.0);
     t.insert_verified(a.block.clone(), a.pending);
@@ -133,13 +133,13 @@ fn bootstrapping_then_normal_op() {
     for b in &blocks[..2] {
         let p = t.engine.parse(b.container.clone()).unwrap();
         t.verify(p, None).unwrap();
-        assert!(t.pending(&b.hash.0).unwrap().layer.is_none());
+        assert!(!t.pending(&b.hash.0).unwrap().has_layer());
         t.accept(&b.hash.0).unwrap();
     }
     t.engine.set_state(true);
     let p = t.engine.parse(blocks[2].container.clone()).unwrap();
     t.verify(p, None).unwrap();
-    assert!(t.pending(&blocks[2].hash.0).unwrap().layer.is_some(), "NormalOp verify carries the root layer");
+    assert!(t.pending(&blocks[2].hash.0).unwrap().has_layer(), "NormalOp verify carries the root layer");
     t.accept(&blocks[2].hash.0).unwrap();
     assert_eq!(t.engine.accounts(None, &[s.address])[0].0, 3);
     t.engine.shutdown();

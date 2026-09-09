@@ -18,3 +18,8 @@ alloy-eips = { version = "2", features = ["std"] }
 anyhow = "1"
 base64 = "0.22"
 serde_json = "1"
+firewood = { git = "https://github.com/ava-labs/firewood.git", tag = "v0.8.0", features = ["ethhash"] }
+firewood-storage = { git = "https://github.com/ava-labs/firewood.git", tag = "v0.8.0", features = ["ethhash"] }
+
+[dev-dependencies]
+alloy-trie = "0.9"

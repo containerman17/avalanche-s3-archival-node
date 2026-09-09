@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use chain::build::Params;
-use chain::layered::Pending;
+use chain::node_engine::Pending;
 use chain::{Engine, Id, Init, NodeEngine, Tree};
 
 /// jemalloc for the engine's allocations (the plugin's choice too: glibc
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn epochdb_verify(e: *mut epochdb_engine, id: *const u8, p
         let b = en.block(&id).ok_or((EPOCHDB_ENOTFOUND, format!("block {} was not parsed", chain::tree::hex(&id))))?;
         en.tree.verify(b.clone(), if pchain_height == 0 { None } else { Some(pchain_height) }).map_err(ferr)?;
         if !out.is_null() {
-            let root = en.tree.pending(&id).map_or(b.header.root, |p| p.root);
+            let root = en.tree.pending(&id).and_then(|p| p.root()).unwrap_or(b.header.root);
             *out = epochdb_verify_out { state_root: root.0, gas_used: b.header.gas_used, tx_count: b.txs.len() as u64 };
         }
         Ok(EPOCHDB_OK)

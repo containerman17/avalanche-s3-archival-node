@@ -11,6 +11,16 @@
 //! write: the archival rows built from the block and its exec result), and
 //! rolls by budget. Initialize opens the rolled pair the MANIFEST names and
 //! replays the store's write sets since the roll (recover.go).
+//!
+//! `state-engine: "firewood"` swaps the flat state for rs/node's Firewood
+//! engine: verify executes on `Firewood` (the same pending chain, layers
+//! instead of overlays), accept hands the block's layer to the checker,
+//! which proposes it (Firewood hashes, the proposal's root is the block's),
+//! and commits the proposal chain every FW_COMMIT_EVERY blocks right after
+//! the store's fsync, so Firewood's persisted revision never runs ahead of
+//! the store. No roll: Firewood's node store and revisions replace run /
+//! trie / MANIFEST; recovery finds the persisted root's height among the
+//! store's headers and replays the write sets since.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,6 +36,7 @@ use block::Block;
 use bytes::Bytes;
 use exec::{Config, Executor, StateDb};
 use node::engine::{open_rolled, read_manifest, run_path, seek_fn, trie_path, user_data, write_manifest, Backend, Roller};
+use node::firewood::{self, height_of_root, Committer, Firewood, Layer as FwLayer};
 use rayon::prelude::*;
 use revm::state::Bytecode;
 use revm::Database;
@@ -36,7 +47,7 @@ use state::view::{merge, View};
 
 use rpc::genesis;
 use crate::build;
-use crate::layered::{Layered, Pending};
+use crate::layered::{Layered, Payload};
 use alloy_primitives::{Address, U256};
 use exec::exec::SkipReason;
 use crate::dbstore::{BlockStore, DbStore, Record};
@@ -61,13 +72,80 @@ const CHECK_DEPTH: usize = 4;
 const FLUSH_EVERY: u64 = 256;
 /// Parsed blocks kept by id (the host re-parses in Verify).
 const PARSED_MAX: usize = 8192;
+/// Firewood: proposals accumulate as a chain and commit after the store's
+/// fsync every this many blocks (the chain depth bounds a proposal read).
+const FW_COMMIT_EVERY: u64 = 32;
 
 struct CheckItem {
     block: Arc<Block>,
-    payload: crate::layered::Payload,
-    /// The root was computed and checked before accept (NormalOp): the
-    /// checker only renders the traces and writes the store.
+    payload: Payload,
+    /// The root was computed and checked before accept (NormalOp, native):
+    /// the checker only renders the traces and writes the store.
     root_done: bool,
+    /// Firewood: the block's layer (its ops).
+    layer: Option<Arc<FwLayer>>,
+}
+
+/// A verified block's state on top of its parent's, for either engine.
+pub enum Pending {
+    Native(Arc<crate::layered::Pending>),
+    Firewood { p: Arc<firewood::Pending>, payload: Mutex<Option<Payload>> },
+}
+
+impl Pending {
+    fn take_payload(&self) -> Option<Payload> {
+        match self {
+            Pending::Native(p) => p.payload.lock().unwrap().take(),
+            Pending::Firewood { payload, .. } => payload.lock().unwrap().take(),
+        }
+    }
+    fn native(&self) -> Option<&Arc<crate::layered::Pending>> {
+        match self {
+            Pending::Native(p) => Some(p),
+            Pending::Firewood { .. } => None,
+        }
+    }
+    fn firewood(&self) -> Option<&Arc<firewood::Pending>> {
+        match self {
+            Pending::Firewood { p, .. } => Some(p),
+            Pending::Native(_) => None,
+        }
+    }
+    /// The block's state root as verify settled it (native: computed in
+    /// NormalOp, else the header's); None under Firewood, where the checker
+    /// proposes it after accept.
+    /// Native, NormalOp: the root was computed inside verify (a layer over the
+    /// accepted Dirty is attached).
+    pub fn has_layer(&self) -> bool {
+        self.native().is_some_and(|p| p.layer.is_some())
+    }
+    pub fn root(&self) -> Option<B256> {
+        match self {
+            Pending::Native(p) => Some(p.root),
+            Pending::Firewood { .. } => None,
+        }
+    }
+    fn meta(&self) -> (B256, u64, u64) {
+        match self {
+            Pending::Native(p) => (p.hash, p.number, p.time),
+            Pending::Firewood { p, .. } => (p.hash, p.number, p.time),
+        }
+    }
+}
+
+/// The executor over one of the two state engines.
+pub enum Ex {
+    Native(Executor<Layered>),
+    Firewood(Executor<Firewood>),
+}
+
+impl Ex {
+    pub fn split(&self) -> (std::time::Duration, std::time::Duration, std::time::Duration) {
+        match self {
+            Ex::Native(ex) => (ex.t_evm, ex.t_trace, ex.t_commit),
+            Ex::Firewood(ex) => (ex.t_evm, ex.t_trace, ex.t_commit),
+        }
+    }
 }
 
 enum Msg {
@@ -99,9 +177,41 @@ pub struct BuildOut {
 }
 
 pub struct Inner {
-    pub ex: Executor<Layered>,
-    roller: Roller,
+    pub ex: Ex,
+    /// None under Firewood (no roll).
+    roller: Option<Roller>,
     roll_budget: usize,
+}
+
+impl Inner {
+    /// The accepted head's state (the RPC's `latest`): outside a verify, the
+    /// executor's db reads the accepted state.
+    pub fn head_account(&mut self, a: alloy_primitives::Address) -> Option<revm::state::AccountInfo> {
+        use revm::Database;
+        match &mut self.ex {
+            Ex::Native(ex) => ex.db_mut().backend.basic(a).unwrap(),
+            Ex::Firewood(ex) => ex.db_mut().basic(a).unwrap(),
+        }
+    }
+    pub fn head_storage(&mut self, a: alloy_primitives::Address, slot: alloy_primitives::U256) -> alloy_primitives::U256 {
+        use revm::Database;
+        match &mut self.ex {
+            Ex::Native(ex) => ex.db_mut().backend.storage(a, slot).unwrap(),
+            Ex::Firewood(ex) => ex.db_mut().storage(a, slot).unwrap(),
+        }
+    }
+    pub fn head_code(&mut self, h: B256) -> Option<Bytecode> {
+        match &mut self.ex {
+            Ex::Native(ex) => ex.db_mut().backend.code.get(&h).cloned(),
+            Ex::Firewood(ex) => ex.db_mut().code.get(&h).cloned(),
+        }
+    }
+}
+
+/// The checker's root oracle: Dirty (native) or Firewood's proposals.
+enum RootCheck {
+    Dirty(Arc<Mutex<Dirty>>),
+    Firewood(Committer),
 }
 
 // SAFETY: revm's Evm holds an Rc (LocalContext's shared memory buffer) and
@@ -145,7 +255,7 @@ pub struct NodeEngine {
     pub recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>,
     parsed: Mutex<HashMap<Id, Arc<Block>>>,
     check_tx: Mutex<Option<SyncSender<Msg>>>,
-    checker: Mutex<Option<std::thread::JoinHandle<anyhow::Result<()>>>>,
+    checker: Mutex<Option<std::thread::JoinHandle<anyhow::Result<Option<Committer>>>>>,
     pub stats: Arc<Stats>,
     pool: rayon::ThreadPool,
     sync_roll: usize,
@@ -163,7 +273,7 @@ pub struct NodeEngine {
 /// The checker thread: Dirty apply + root per block (a mismatch kills the
 /// process), then the store's rows (BlockWrite::from_exec + the record) and
 /// the append, fsync every FLUSH_EVERY blocks on a flusher thread.
-fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn BlockStore>>>, recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>, stats: Arc<Stats>, flush: SyncSender<()>) -> anyhow::Result<()> {
+fn checker(rx: Receiver<Msg>, mut root_check: RootCheck, store: Arc<Mutex<Box<dyn BlockStore>>>, recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>, stats: Arc<Stats>, flush: SyncSender<()>) -> anyhow::Result<Option<Committer>> {
     for msg in rx {
         let it = match msg {
             Msg::Park(parked, resume) => {
@@ -173,21 +283,26 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn
             }
             Msg::Block(it) => it,
         };
-        let CheckItem { block: b, mut payload, root_done } = *it;
+        let CheckItem { block: b, mut payload, root_done, layer } = *it;
         let h = b.height;
         let t0 = Instant::now();
         if !root_done {
-            let mut d = dirty.lock().unwrap();
-            let root = if payload.ws.is_empty() {
-                d.current_root()
-            } else {
-                for (k, v) in &payload.ws {
-                    d.apply(k, v).with_context(|| format!("block {h}: apply write set"))?;
+            let root = match &mut root_check {
+                RootCheck::Dirty(dirty) => {
+                    let mut d = dirty.lock().unwrap();
+                    if payload.ws.is_empty() {
+                        B256::from(d.current_root())
+                    } else {
+                        for (k, v) in &payload.ws {
+                            d.apply(k, v).with_context(|| format!("block {h}: apply write set"))?;
+                        }
+                        B256::from(d.root().with_context(|| format!("block {h}: state root"))?)
+                    }
                 }
-                d.root().with_context(|| format!("block {h}: state root"))?
+                RootCheck::Firewood(c) => c.propose(h, layer.as_ref().expect("firewood layer").ops())?,
             };
-            if root != b.header.root.0 {
-                eprintln!("epochdb-rs: block {h}: state root mismatch: computed {}, header {}", B256::from(root), b.header.root);
+            if root != b.header.root {
+                eprintln!("epochdb-rs: block {h}: state root mismatch: computed {root}, header {}", b.header.root);
                 std::process::exit(1);
             }
         }
@@ -201,15 +316,34 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, store: Arc<Mutex<Box<dyn
         store.lock().unwrap().append(record).with_context(|| format!("block {h}: store append"))?;
         recent.lock().unwrap().remove(&b.hash.0);
         stats.checked.fetch_add(1, Ordering::Relaxed);
-        tick(&stats.t_check, t0);
-        if h % FLUSH_EVERY == 0 {
-            let _ = flush.try_send(()); // flusher busy: coalesce into the next multiple
+        match &mut root_check {
+            RootCheck::Dirty(_) => {
+                if h % FLUSH_EVERY == 0 {
+                    let _ = flush.try_send(()); // flusher busy: coalesce into the next multiple
+                }
+            }
+            RootCheck::Firewood(c) => {
+                // The store's rows through h are durable before Firewood's
+                // revision at h can be: sync here, then commit the chain.
+                if h % FW_COMMIT_EVERY == 0 {
+                    store.lock().unwrap().sync()?;
+                    c.commit_all().with_context(|| format!("block {h}: firewood commit"))?;
+                }
+            }
         }
+        tick(&stats.t_check, t0);
     }
     let mut s = store.lock().unwrap();
     s.sync()?;
+    let c = match root_check {
+        RootCheck::Dirty(_) => None,
+        RootCheck::Firewood(mut c) => {
+            c.commit_all().context("firewood commit at close")?;
+            Some(c)
+        }
+    };
     s.close()?;
-    Ok(())
+    Ok(c)
 }
 
 impl NodeEngine {
@@ -248,6 +382,13 @@ impl NodeEngine {
         let data = PathBuf::from(&init.chain_data_dir);
         std::fs::create_dir_all(&data)?;
         let dir = data.join("vmstate");
+        let engine = conf.get("state-engine").and_then(|v| v.as_str()).unwrap_or("native").to_string();
+        if engine == "firewood" {
+            let opts = firewood::Opts { cache_bytes: conf_u64(&conf, "firewood-cache-mb").unwrap_or(192) as usize * 1_000_000, ..Default::default() };
+            return Self::open_firewood(init, cfg, genesis, conf, opts, sync_roll, tip_roll, grace, workers, cpus, data, t0);
+        } else if engine != "native" {
+            bail!("state-engine {engine:?}: native or firewood");
+        }
 
         let mut be = Backend::new();
         let (gen, rolled_h, run, file) = match read_manifest(&dir)? {
@@ -362,6 +503,131 @@ impl NodeEngine {
         let mut ex = Executor::open(cfg.clone(), Layered::new(be));
         // The callTracer JSON is rendered on the checker thread, off the verify path.
         ex.defer_call_trace = true;
+        let ex = Ex::Native(ex);
+        eprintln!(
+            "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) roll-every={every_blocks} blocks / {every_secs}s window-max-bytes={} shutdown-grace={}s workers={workers} dirty-workers={cpus}",
+            cfg.chain_id,
+            init.chain_data_dir,
+            sync_roll >> 20,
+            tip_roll >> 20,
+            window_max_bytes,
+            grace.as_secs()
+        );
+        Self::finish_open(init, &conf, cfg, genesis, store, db, head, ex, Some(roller), RootCheck::Dirty(dirty), sync_roll, tip_roll, workers, t0)
+    }
+
+    /// The Firewood engine's open: genesis into the first proposal on an
+    /// empty db, else the persisted root's height found among the store's
+    /// headers and the write sets since replayed through proposals.
+    #[allow(clippy::too_many_arguments)]
+    fn open_firewood(init: &Init, cfg: Config, genesis: Arc<Block>, conf: serde_json::Value, opts: firewood::Opts, sync_roll: usize, tip_roll: usize, grace: std::time::Duration, workers: usize, cpus: usize, data: PathBuf, t0: Instant) -> anyhow::Result<NodeEngine> {
+        let _ = cpus;
+        let dir = data.join("vmstate");
+        std::fs::create_dir_all(&dir)?;
+        let mut committer = Committer::open(&dir, false, opts).context("firewood")?;
+        let fw_root = committer.root();
+        let kv_bytes = (conf_u64(&conf, "firewood-kv-cache-mb").unwrap_or(0) as usize) << 20;
+        let mut fw = Firewood::new(committer.committed()).with_kv_cache(kv_bytes);
+        let mut rolled_h = 0u64;
+        if fw_root == firewood::EMPTY_ROOT {
+            let mut ex = Executor::with_db(cfg.clone(), fw).context("genesis state")?;
+            let db = ex.db_mut();
+            db.take_ws();
+            let layer = db.finish(0, genesis.hash, 0).layer;
+            db.accept(0, layer.clone());
+            let root = committer.propose(0, layer.ops())?;
+            if root != genesis.header.root {
+                bail!("genesis root mismatch: firewood {root}, header {}", genesis.header.root);
+            }
+            committer.commit_all()?;
+            eprintln!("epochdb-rs: genesis state ok: root={root} hash={} accounts={} keys={} firewood={}B", genesis.hash, cfg.alloc.len(), layer.map.len(), Committer::disk_bytes(&dir));
+            fw = Firewood::new(committer.committed()).with_kv_cache(kv_bytes);
+            for (h, c) in &layer.code {
+                fw.code.insert(*h, c.clone());
+            }
+            let _ = ex;
+        }
+
+        let chain_root: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&init.genesis_bytes).into();
+        let store = DbStore::open(&data.join("store"), chain_root, grace).context("open the store")?;
+        let db = store.db.clone();
+        let mut ncode = 0usize;
+        db.each_code(|h, c| {
+            fw.code.insert(B256::from(*h), Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(c)));
+            ncode += 1;
+            Ok(())
+        })
+        .context("the store's code table")?;
+        let head_h = store.head();
+        let header_at = |h: u64| -> anyhow::Result<block::Header> {
+            if h == 0 {
+                return Ok(genesis.header.clone());
+            }
+            let c = store.container(h)?.ok_or_else(|| anyhow!("the store holds no block at {h}"))?;
+            Ok(block::decode_container(c).map_err(|e| anyhow!("block {h}: {e}"))?.header)
+        };
+        if head_h >= 1 && header_at(1)?.parent_hash != genesis.hash {
+            bail!("the store's block 1 has parent {}, the genesis is {}", header_at(1)?.parent_hash, genesis.hash);
+        }
+        if fw_root != firewood::EMPTY_ROOT {
+            rolled_h = height_of_root(fw_root, head_h, |h| Ok(header_at(h)?.root))?;
+        }
+        let mut rows = 0usize;
+        for h in rolled_h + 1..=head_h {
+            let r = store.read(h)?.ok_or_else(|| anyhow!("the store holds no block at {h}"))?;
+            let layer = FwLayer::from_ws(&r.ws);
+            let root = committer.propose(h, layer.ops()).with_context(|| format!("replay block {h}"))?;
+            let want = header_at(h)?.root;
+            if root != want {
+                eprintln!("epochdb-rs: recovery: state rebuilt through height {h} has root {root}, header {want}");
+                std::process::exit(1);
+            }
+            rows += r.ws.len();
+            if h % FW_COMMIT_EVERY == 0 {
+                committer.commit_all()?;
+            }
+        }
+        committer.commit_all()?;
+        fw = Firewood::new(committer.committed()).with_kv_cache(kv_bytes).with_code(fw.code);
+        for h in head_h.saturating_sub(256)..=head_h {
+            let id = if h == 0 { genesis.hash } else { B256::from(store.id_at(h).unwrap()) };
+            fw.set_block_hash(h, id);
+        }
+        let head = if head_h == 0 {
+            genesis.clone()
+        } else {
+            let mut b = block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?;
+            for t in &mut b.txs {
+                t.sender = block::recover(t);
+            }
+            Arc::new(b)
+        };
+        eprintln!(
+            "epochdb-rs: recovered: firewood at {rolled_h} (root {}), head {head_h} {}, rows replayed {rows}, {ncode} code blobs, {} runs, root ok, in {:.0} ms",
+            committer.root(),
+            head.hash,
+            db.manifest().runs.len(),
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        let mut ex = Executor::open(cfg.clone(), fw);
+        ex.defer_call_trace = true;
+        let ex = Ex::Firewood(ex);
+        eprintln!(
+            "epochdb-rs: chainId={} data={} state-engine=firewood cache={}MB revisions={} kv-cache={}MB commit-every={FW_COMMIT_EVERY} window-max-bytes={} shutdown-grace={}s workers={workers}",
+            cfg.chain_id,
+            init.chain_data_dir,
+            opts.cache_bytes / 1_000_000,
+            opts.revisions,
+            kv_bytes >> 20,
+            db.flush_bytes,
+            grace.as_secs()
+        );
+        Self::finish_open(init, &conf, cfg, genesis, store, db, head, ex, None, RootCheck::Firewood(committer), sync_roll, tip_roll, workers, t0)
+    }
+
+    /// The threads and the shared handles, the same for both engines.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_open(init: &Init, conf: &serde_json::Value, cfg: Config, genesis: Arc<Block>, store: DbStore, db: Arc<store::db::DB>, head: Arc<Block>, ex: Ex, roller: Option<Roller>, root_check: RootCheck, sync_roll: usize, tip_roll: usize, workers: usize, t0: Instant) -> anyhow::Result<NodeEngine> {
         let db_reads = db.clone();
         let store: Arc<Mutex<Box<dyn BlockStore>>> = Arc::new(Mutex::new(Box::new(store)));
         let recent = Arc::new(Mutex::new(HashMap::new()));
@@ -379,18 +645,9 @@ impl NodeEngine {
             }
         });
         let checker = {
-            let (dirty, store, recent, stats) = (dirty.clone(), store.clone(), recent.clone(), stats.clone());
-            std::thread::spawn(move || checker(check_rx, dirty, store, recent, stats, flush_tx))
+            let (store, recent, stats) = (store.clone(), recent.clone(), stats.clone());
+            std::thread::spawn(move || checker(check_rx, root_check, store, recent, stats, flush_tx))
         };
-        eprintln!(
-            "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) roll-every={every_blocks} blocks / {every_secs}s window-max-bytes={} shutdown-grace={}s workers={workers} dirty-workers={cpus}",
-            cfg.chain_id,
-            init.chain_data_dir,
-            sync_roll >> 20,
-            tip_roll >> 20,
-            window_max_bytes,
-            grace.as_secs()
-        );
         let inner = Arc::new(Mutex::new(Inner { ex, roller, roll_budget: sync_roll }));
         let head = Arc::new(Mutex::new(head));
         let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), db_reads.clone(), recent.clone(), Arc::new(cfg.clone())));
@@ -423,14 +680,15 @@ impl NodeEngine {
     /// A finished roll swaps in with the checker parked; `wait` blocks for a
     /// roll still running (shutdown).
     fn swap_roll(&self, inner: &mut Inner, wait: bool) -> anyhow::Result<()> {
-        let Some(r) = inner.roller.poll_roll(wait)? else { return Ok(()) };
+        let (Some(roller), Ex::Native(ex)) = (&mut inner.roller, &mut inner.ex) else { return Ok(()) };
+        let Some(r) = roller.poll_roll(wait)? else { return Ok(()) };
         let tx = self.check_tx.lock().unwrap().clone().ok_or_else(|| anyhow!("checker stopped"))?;
         let (ptx, prx) = sync_channel(0);
         let (rtx, rrx) = sync_channel(0);
         tx.send(Msg::Park(ptx, rrx)).map_err(|_| anyhow!("checker gone"))?;
         prx.recv().map_err(|_| anyhow!("checker gone"))?;
         let store = self.store.clone();
-        let res = inner.roller.finish_roll(&mut inner.ex.db_mut().backend, r, || {
+        let res = roller.finish_roll(&mut ex.db_mut().backend, r, || {
             store.lock().unwrap().sync()?;
             Ok(())
         });
@@ -446,8 +704,9 @@ impl NodeEngine {
     /// rebuilt it and queued the overlay's rows (finish_roll), so the queue
     /// is applied here and the root must be the head's.
     fn flush_dirty(&self, inner: &mut Inner) -> anyhow::Result<()> {
+        let Some(roller) = &inner.roller else { return Ok(()) };
         let head = self.head.lock().unwrap().clone();
-        let mut d = inner.roller.dirty.lock().unwrap();
+        let mut d = roller.dirty.lock().unwrap();
         let root = d.root().context("dirty flush")?;
         if root != head.header.root.0 {
             eprintln!("epochdb-rs: dirty state at head {} has root {}, header {}", head.height, B256::from(root), head.header.root);
@@ -469,7 +728,7 @@ impl NodeEngine {
 
     /// The state root of `ws` on top of `parent` (its pending layers, then
     /// the accepted Dirty), as a layer.
-    fn layer_for(&self, inner: &Inner, parent: Option<&Arc<Pending>>, ws: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<Layer> {
+    fn layer_for(&self, dirty: &Mutex<Dirty>, parent: Option<&crate::layered::Pending>, ws: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<Layer> {
         let t0 = Instant::now();
         let mut w = Writes::default();
         for (k, v) in ws {
@@ -479,7 +738,7 @@ impl NodeEngine {
             Some(p) => p.layers().ok_or_else(|| anyhow!("parent {} was verified without a state root", p.number))?,
             None => Vec::new(),
         };
-        let d = inner.roller.dirty.lock().unwrap();
+        let d = dirty.lock().unwrap();
         let l = d.layer_root(&parents, w)?;
         tick(&self.stats.t_root, t0);
         Ok(l)
@@ -497,8 +756,23 @@ impl NodeEngine {
     /// nonce and balance of `addrs` at `parent`'s state (None: the accepted head).
     pub fn accounts(&self, parent: Option<&Arc<Pending>>, addrs: &[Address]) -> Vec<(u64, U256)> {
         let mut g = self.inner.lock().unwrap();
-        let be = &mut g.ex.db_mut().backend;
-        addrs.iter().map(|a| Pending::account(parent.map(|p| &**p), be, *a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
+        let info = |i: Option<revm::state::AccountInfo>| i.map_or((0, U256::ZERO), |i| (i.nonce, i.balance));
+        match &mut g.ex {
+            Ex::Native(ex) => {
+                let be = &mut ex.db_mut().backend;
+                let parent = parent.and_then(|p| p.native()).map(|p| &**p);
+                addrs.iter().map(|a| info(crate::layered::Pending::account(parent, be, *a))).collect()
+            }
+            Ex::Firewood(ex) => {
+                // Reads through the parent's pending chain; nothing executes
+                // between two blocks, so begin is only the read position.
+                let db = ex.db_mut();
+                db.begin(parent.and_then(|p| p.firewood()).cloned());
+                let out = addrs.iter().map(|a| info(db.basic(*a).unwrap())).collect();
+                db.begin(None);
+                out
+            }
+        }
     }
 
     pub fn meta_of(b: &Block) -> Meta {
@@ -598,7 +872,9 @@ impl Engine for NodeEngine {
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
         inner.roll_budget = if normal { self.tip_roll } else { self.sync_roll };
-        eprintln!("epochdb-rs: budget {}: roll-budget={}MB", if normal { "tip" } else { "catch-up" }, inner.roll_budget >> 20);
+        if inner.roller.is_some() {
+            eprintln!("epochdb-rs: budget {}: roll-budget={}MB", if normal { "tip" } else { "catch-up" }, inner.roll_budget >> 20);
+        }
         if normal && !self.normal.load(Ordering::Relaxed) {
             // Every accepted block through the checker first: from here the
             // Dirty is the head's state and verify computes the root itself.
@@ -612,15 +888,15 @@ impl Engine for NodeEngine {
                 Err(e) => eprintln!("epochdb-rs: set_state: {e:#}"),
             }
             self.normal.store(true, Ordering::Relaxed);
-            eprintln!("epochdb-rs: NormalOp: state root inside verify");
+            eprintln!("epochdb-rs: NormalOp: state root {}", if inner.roller.is_some() { "inside verify" } else { "on the checker (firewood)" });
         } else if !normal {
             self.normal.store(false, Ordering::Relaxed);
         }
-        if normal {
+        if let (true, Some(roller), Ex::Native(ex)) = (normal, &mut inner.roller, &mut inner.ex) {
             let head = self.head.lock().unwrap().clone();
-            let be = &mut inner.ex.db_mut().backend;
+            let be = &mut ex.db_mut().backend;
             if !be.overlay.is_empty() {
-                inner.roller.maybe_roll(be, 0, head.height, head.header.root);
+                roller.maybe_roll(be, 0, head.height, head.header.root);
             }
         }
     }
@@ -630,7 +906,7 @@ impl Engine for NodeEngine {
     fn shutdown(&self) {
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
-        if inner.roller.rolling() {
+        if inner.roller.as_ref().is_some_and(|r| r.rolling()) {
             eprintln!("epochdb-rs: shutdown: waiting for the roll");
             if let Err(e) = self.swap_roll(inner, true) {
                 eprintln!("epochdb-rs: shutdown: roll: {e:#}");
@@ -641,21 +917,29 @@ impl Engine for NodeEngine {
             match j.join() {
                 Ok(Err(e)) => eprintln!("epochdb-rs: checker: {e:#}"),
                 Err(_) => eprintln!("epochdb-rs: checker panicked"),
-                Ok(Ok(())) => {}
+                Ok(Ok(Some(c))) => {
+                    let t = Instant::now();
+                    let root = c.root();
+                    match c.close() {
+                        Ok(()) => eprintln!("epochdb-rs: firewood closed: root={root} in {:.0} ms", t.elapsed().as_secs_f64() * 1e3),
+                        Err(e) => eprintln!("epochdb-rs: firewood close: {e:#}"),
+                    }
+                }
+                Ok(Ok(None)) => {}
             }
         }
-        let ex = &inner.ex;
+        let (t_evm, t_trace, t_commit) = inner.ex.split();
         let s = &self.stats;
         let (blocks, txs, gas, checked) = (s.executed.load(Ordering::Relaxed), s.txs.load(Ordering::Relaxed), s.gas.load(Ordering::Relaxed), s.checked.load(Ordering::Relaxed));
-        let busy = ex.t_evm + ex.t_trace + ex.t_commit;
+        let busy = t_evm + t_trace + t_commit;
         let secs = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
         eprintln!(
             "epochdb-rs: exit: blocks={blocks} txs={txs} gas={gas} root-checked={checked} rolls={} head={} | evm={:.2}s trace={:.2}s commit={:.2}s exec-thread {:.1} mgas/s | parse-batch={:.2}s parse={:.2}s verify={:.2}s (root {:.2}s) accept={:.2}s checker={:.2}s | uptime {:.0}s",
-            inner.roller.rolls,
+            inner.roller.as_ref().map_or(0, |r| r.rolls),
             self.head.lock().unwrap().height,
-            ex.t_evm.as_secs_f64(),
-            ex.t_trace.as_secs_f64(),
-            ex.t_commit.as_secs_f64(),
+            t_evm.as_secs_f64(),
+            t_trace.as_secs_f64(),
+            t_commit.as_secs_f64(),
             if busy.is_zero() { 0.0 } else { gas as f64 / busy.as_secs_f64() / 1e6 },
             secs(&s.t_parse_batch),
             secs(&s.t_parse),
@@ -693,7 +977,7 @@ impl NodeEngine {
     fn verify_inner(&self, b: &Arc<Block>, parent: Option<&Arc<Pending>>) -> Result<Pending, Error> {
         let mut g = self.inner.lock().unwrap();
         let (ph, pn, pt) = match parent {
-            Some(p) => (p.hash, p.number, p.time),
+            Some(p) => p.meta(),
             None => {
                 let h = self.head.lock().unwrap();
                 (h.hash, h.height, h.header.time)
@@ -702,35 +986,55 @@ impl NodeEngine {
         if b.header.parent_hash != ph || b.height != pn + 1 {
             return Err(format!("block {} {} parent {} does not follow {} {}", b.height, b.hash, b.header.parent_hash, pn, ph).into());
         }
-        let inner = &mut *g;
-        inner.ex.db_mut().begin(parent.cloned());
-        let r = inner.ex.execute_block(b, pt).map_err(|e| format!("block {}: {e:#}", b.height))?;
+        let Inner { ex, roller, .. } = &mut *g;
         let h = &b.header;
-        if r.gas_used != h.gas_used {
-            return Err(format!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used).into());
-        }
-        if r.receipts_root != h.receipt_hash {
-            return Err(format!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash).into());
-        }
-        if r.bloom != h.bloom {
-            return Err(format!("block {}: logsBloom differs from the header", h.number).into());
-        }
-        let mut p = inner.ex.db_mut().finish(b.height, b.hash, h.time, r);
-        p.root = h.root;
-        // NormalOp: the root now, on a layer over the parent's (bootstrapping
-        // leaves it to the checker, one block behind; a parent verified that
-        // way has no layer, so its children follow the checker path too).
-        if self.normal.load(Ordering::Relaxed) && parent.is_none_or(|pp| pp.layer.is_some()) {
-            let layer = {
-                let g = p.payload.lock().unwrap();
-                self.layer_for(inner, parent, &g.as_ref().unwrap().ws).map_err(|e| format!("block {}: state root: {e:#}", h.number))?
-            };
-            if layer.root != h.root.0 {
-                return Err(format!("block {}: state root mismatch: computed {}, header {}", h.number, B256::from(layer.root), h.root).into());
+        let check = |r: &exec::BlockResult| -> Result<(), Error> {
+            if r.gas_used != h.gas_used {
+                return Err(format!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used).into());
             }
-            p.layer = Some(Arc::new(layer));
+            if r.receipts_root != h.receipt_hash {
+                return Err(format!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash).into());
+            }
+            if r.bloom != h.bloom {
+                return Err(format!("block {}: logsBloom differs from the header", h.number).into());
+            }
+            Ok(())
+        };
+        match ex {
+            Ex::Native(ex) => {
+                let parent = parent.map(|p| p.native().expect("firewood pending under the native engine").clone());
+                ex.db_mut().begin(parent.clone());
+                let r = ex.execute_block(b, pt).map_err(|e| format!("block {}: {e:#}", b.height))?;
+                check(&r)?;
+                let mut p = ex.db_mut().finish(b.height, b.hash, h.time, r);
+                p.root = h.root;
+                // NormalOp: the root now, on a layer over the parent's (bootstrapping
+                // leaves it to the checker, one block behind; a parent verified that
+                // way has no layer, so its children follow the checker path too).
+                if self.normal.load(Ordering::Relaxed) && parent.as_ref().is_none_or(|pp| pp.layer.is_some()) {
+                    let dirty = &roller.as_ref().expect("the native engine rolls").dirty;
+                    let layer = {
+                        let g = p.payload.lock().unwrap();
+                        self.layer_for(dirty, parent.as_deref(), &g.as_ref().unwrap().ws).map_err(|e| format!("block {}: state root: {e:#}", h.number))?
+                    };
+                    if layer.root != h.root.0 {
+                        return Err(format!("block {}: state root mismatch: computed {}, header {}", h.number, B256::from(layer.root), h.root).into());
+                    }
+                    p.layer = Some(Arc::new(layer));
+                }
+                Ok(Pending::Native(Arc::new(p)))
+            }
+            Ex::Firewood(ex) => {
+                let parent = parent.map(|p| p.firewood().expect("native pending under the firewood engine").clone());
+                ex.db_mut().begin(parent);
+                let r = ex.execute_block(b, pt).map_err(|e| format!("block {}: {e:#}", b.height))?;
+                check(&r)?;
+                let db = ex.db_mut();
+                let (ws, code) = db.take_ws();
+                let p = Arc::new(db.finish(b.height, b.hash, h.time));
+                Ok(Pending::Firewood { p, payload: Mutex::new(Some(Payload { ws, code, result: r })) })
+            }
         }
-        Ok(p)
     }
 
     /// epochdb_build: the miner's block on top of `parent` (None: the accepted
@@ -744,10 +1048,14 @@ impl NodeEngine {
         }
         let t0 = Instant::now();
         let mut g = self.inner.lock().unwrap();
-        let inner = &mut *g;
+        let Inner { ex, roller, .. } = &mut *g;
+        let (Ex::Native(ex), Some(roller)) = (ex, roller) else {
+            return Err("build needs the native state engine (firewood computes roots on the checker thread)".into());
+        };
+        let parent_n = parent.map(|p| p.native().expect("firewood pending under the native engine").clone());
         // The fee config and the coinbase rule as the parent's state holds them.
-        inner.ex.db_mut().begin(parent.cloned());
-        let (cfg, db) = inner.ex.cfg_and_db();
+        ex.db_mut().begin(parent_n.clone());
+        let (cfg, db) = ex.cfg_and_db();
         let fc = build::fee_config_at(cfg, parent_hdr.time, |slot| db.storage(exec::precompile::FEE_MANAGER, slot).unwrap());
         let rule = build::coinbase_rule(cfg, parent_hdr.time, || db.storage(exec::precompile::REWARD_MANAGER, exec::rewardmanager::reward_address_slot()).unwrap());
         let h = build::template(cfg, &fc, parent_hdr, params, rule)?;
@@ -756,25 +1064,25 @@ impl NodeEngine {
                 t.sender = block::recover(t);
             }
         }
-        let r = match inner.ex.build_block(&h, parent_hdr.time, pchain_height, pchain_height, &candidates) {
+        let r = match ex.build_block(&h, parent_hdr.time, pchain_height, pchain_height, &candidates) {
             Ok(r) => r,
             Err(e) => {
-                inner.ex.db_mut().begin(None);
+                ex.db_mut().begin(None);
                 return Err(format!("build on {}: {e:#}", parent_hdr.number).into());
             }
         };
         let txs: Vec<&block::Tx> = r.included.iter().map(|&i| &candidates[i]).collect();
         let gas: Vec<u64> = r.result.txs.iter().map(|t| t.gas_used).collect();
         if let Err(e) = build::verify_block_fee(h.base_fee.unwrap(), h.block_gas_cost.unwrap_or_default(), &txs, &gas) {
-            inner.ex.db_mut().begin(None);
+            ex.db_mut().begin(None);
             return Err(format!("build on {}: {e}", parent_hdr.number).into());
         }
         let needs_more = r.reasons.iter().all(|x| *x != SkipReason::NotReached) && h.gas_limit - r.result.gas_used >= exec::exec::TX_GAS;
         // finish takes cur out of the executor's Layered; the hash comes after the root.
-        let mut p = inner.ex.db_mut().finish(h.number, B256::ZERO, h.time, r.result);
+        let mut p = ex.db_mut().finish(h.number, B256::ZERO, h.time, r.result);
         let layer = {
             let g = p.payload.lock().unwrap();
-            self.layer_for(inner, parent, &g.as_ref().unwrap().ws).map_err(|e| format!("build on {}: state root: {e:#}", parent_hdr.number))?
+            self.layer_for(&roller.dirty, parent_n.as_deref(), &g.as_ref().unwrap().ws).map_err(|e| format!("build on {}: state root: {e:#}", parent_hdr.number))?
         };
         let result = p.payload.lock().unwrap().take().unwrap();
         let (hdr, header_rlp, bytes) = build::assemble(h, &txs, B256::from(layer.root), &result.result, &r.predicate_bytes)?;
@@ -795,48 +1103,63 @@ impl NodeEngine {
         });
         self.parsed.lock().unwrap().insert(hash.0, b.clone());
         tick(&self.stats.t_verify, t0);
-        Ok(BuildOut { block: b, pending: p, included: r.included, reasons: r.reasons, needs_more })
+        Ok(BuildOut { block: b, pending: Pending::Native(Arc::new(p)), included: r.included, reasons: r.reasons, needs_more })
     }
 
     fn accept_inner(&self, b: &Arc<Block>, p: &Pending) -> Result<(), Error> {
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
         self.swap_roll(inner, false)?;
-        let payload = p.payload.lock().unwrap().take().ok_or("block accepted twice")?;
-        // NormalOp: the accepted Dirty takes the block's layer (or, for a block
-        // verified while bootstrapping, its write set and root now), so the
-        // next verify's layer sits on the head's state.
-        let root_done = self.normal.load(Ordering::Relaxed);
-        if root_done {
-            let mut d = inner.roller.dirty.lock().unwrap();
-            let root = match &p.layer {
-                Some(l) => {
-                    d.absorb(l).map_err(|e| format!("block {}: absorb: {e}", b.height))?;
-                    l.root
-                }
-                None if payload.ws.is_empty() => d.current_root(),
-                None => {
-                    for (k, v) in &payload.ws {
-                        d.apply(k, v).map_err(|e| format!("block {}: apply: {e}", b.height))?;
+        let payload = p.take_payload().ok_or("block accepted twice")?;
+        let mut layer = None;
+        let mut root_done = false;
+        let Inner { ex, roller, roll_budget } = inner;
+        match (ex, p) {
+            (Ex::Native(ex), Pending::Native(p)) => {
+                // NormalOp: the accepted Dirty takes the block's layer (or, for a block
+                // verified while bootstrapping, its write set and root now), so the
+                // next verify's layer sits on the head's state.
+                root_done = self.normal.load(Ordering::Relaxed);
+                let roller = roller.as_mut().expect("the native engine rolls");
+                if root_done {
+                    let mut d = roller.dirty.lock().unwrap();
+                    let root = match &p.layer {
+                        Some(l) => {
+                            d.absorb(l).map_err(|e| format!("block {}: absorb: {e}", b.height))?;
+                            l.root
+                        }
+                        None if payload.ws.is_empty() => d.current_root(),
+                        None => {
+                            for (k, v) in &payload.ws {
+                                d.apply(k, v).map_err(|e| format!("block {}: apply: {e}", b.height))?;
+                            }
+                            d.root().map_err(|e| format!("block {}: root: {e}", b.height))?
+                        }
+                    };
+                    if root != b.header.root.0 {
+                        eprintln!("epochdb-rs: block {}: state root mismatch at accept: computed {}, header {}", b.height, B256::from(root), b.header.root);
+                        std::process::exit(1);
                     }
-                    d.root().map_err(|e| format!("block {}: root: {e}", b.height))?
                 }
-            };
-            if root != b.header.root.0 {
-                eprintln!("epochdb-rs: block {}: state root mismatch at accept: computed {}, header {}", b.height, B256::from(root), b.header.root);
-                std::process::exit(1);
+                let be = &mut ex.db_mut().backend;
+                be.apply_ws(&payload.ws);
+                for (h, c) in &p.code {
+                    be.code.insert(*h, c.clone());
+                }
+                be.set_block_hash(b.height, b.hash);
+                // From here the block's root is the header's or the checker dies.
+                roller.maybe_roll(be, *roll_budget, b.height, b.header.root);
             }
+            (Ex::Firewood(ex), Pending::Firewood { p, .. }) => {
+                let db = ex.db_mut();
+                db.accept(b.height, p.layer.clone());
+                db.set_block_hash(b.height, b.hash);
+                layer = Some(p.layer.clone());
+            }
+            _ => unreachable!("pending block of the other engine"),
         }
-        let be = &mut inner.ex.db_mut().backend;
-        be.apply_ws(&payload.ws);
-        for (h, c) in &p.code {
-            be.code.insert(*h, c.clone());
-        }
-        be.set_block_hash(b.height, b.hash);
         *self.head.lock().unwrap() = b.clone();
         self.recent.lock().unwrap().insert(b.hash.0, b.clone());
-        // From here the block's root is the header's or the checker dies.
-        inner.roller.maybe_roll(be, inner.roll_budget, b.height, b.header.root);
         self.stats.executed.fetch_add(1, Ordering::Relaxed);
         self.stats.txs.fetch_add(payload.result.txs.len() as u64, Ordering::Relaxed);
         self.stats.gas.fetch_add(payload.result.gas_used, Ordering::Relaxed);
@@ -849,7 +1172,7 @@ impl NodeEngine {
             self.rpc.publish(b.clone(), &receipts);
         }
         let tx = self.check_tx.lock().unwrap().clone().ok_or("checker stopped")?;
-        tx.send(Msg::Block(Box::new(CheckItem { block: b.clone(), payload, root_done }))).map_err(|_| "checker stopped")?;
+        tx.send(Msg::Block(Box::new(CheckItem { block: b.clone(), payload, root_done, layer }))).map_err(|_| "checker stopped")?;
         if b.height % 256 == 0 {
             self.parsed.lock().unwrap().retain(|_, x| x.height > b.height);
         }
