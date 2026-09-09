@@ -598,6 +598,8 @@ func (g *gen) awaitBlock(ctx context.Context) (*mined, [3]time.Duration, error) 
 			// drain can see "pending" for txs already mined. Empty pool and
 			// no new block: nothing is coming, report zero.
 			if n, err := g.pending(ctx); err == nil && n == 0 {
+				raw, _ := g.rpcResult(ctx, "txpool_status", "[]")
+				log.Printf("gen drain: pool empty and no block past %d for %s (txpool_status %s)", g.head, time.Since(t0).Round(time.Millisecond), raw)
 				return &mined{height: g.head}, d, nil
 			}
 		}
@@ -772,6 +774,10 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 					return err
 				}
 				raws = raws[k:]
+				if len(raws) == 0 {
+					n, _ := g.pending(ctx)
+					log.Printf("gen stream: all txs submitted, pool has %d", n)
+				}
 				continue
 			}
 			if h, err := g.rpcUint(ctx, "eth_blockNumber", "[]"); err == nil && h > g.head {
