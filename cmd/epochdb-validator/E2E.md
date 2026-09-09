@@ -72,7 +72,35 @@ decode as a libevm block.
   ("Removed old/unpayable ...", "Discarding ...", reset failures) are forwarded to stderr (first 500). The in-process
   churn test above did not reproduce a wrong nonce or balance view. Re-run pending a machine slot (Run 3).
 
-## Run 3: TODO (all-ours 3-node, 10 min at 2000 tx/s, fixed pool admission) and Run 4: TODO (--stress genesis, 5 min)
+## Run 3: all-ours 3 nodes, 10 min at 2000 tx/s offered (bf263f8, localized archive, fixed admission, raised caps)
+
+- No tx was dropped: the drop-reason forwarding and the empty-account warning stayed silent, `account_errors` 0
+  on every block. So run 2's "12k txs vanished" was not a pool view bug; see below.
+- Blocks 9..135 (first 4.5 min): FULL, 952 txs = 20.0 M gas every 2 s; verify p50 5 ms p99 17 ms, engine build p50
+  60 ms p99 99 ms (candidates = 1.5x the gas limit, ~1400 txs executed per build).
+- Then the chain crawled (135 -> 142 in 5 min) with 100k txs PENDING and the RPC door slowing from 2000 to 40 tx/s.
+  Root cause (read from libevm): the builder called `pool.Sync()` before every pending check and every BuildBlock;
+  in libevm's TxPool that is the simulator hook and it FORCES a full pool reset (demote + promote of every tx under
+  the pool's write lock), and `hasPending`/`pendingSize` used `Pending()`, which copies every pending tx under the
+  same lock. With 100k pending, every wake became a multi-second reset; adds starved; WaitForEvent sat in Sync. Run
+  2's stall was the same mechanism plus the unbounded local queue. Fixed at 9a563ca: no Sync in the build path (a
+  build racing the async reset hands the engine a few already-mined txs, which it skips, code 1), pending checks
+  via `Stats()`.
+- Go heap 100-300 MB with 100k pending txs (the pool itself, ~1-2 KB per tx), GC 2% of CPU, RSS 350-750 MB.
+
+## Run 4: --stress genesis (500 M gas, 1 ms min delay), all-ours 3 nodes, 5 min at 3145 tx/s offered (9a563ca)
+
+- No stall. 39 load blocks (9..47) byte-identical on 3 nodes: 364,532 txs on chain = 1215 tx/s, 65 Mgas/s.
+- Blocks: 16,029 txs = 336.6 M gas (67% of the limit): the engine's miner size target (1800 KiB of tx bytes) caps a
+  transfer-only block, not gas. One block per ~11 s.
+- Engine verify p50 0.9 ms p99 196 ms (16k-tx blocks). Engine build p50 1.7 s, p99 above the histogram's 5 s bucket
+  ("took 7.8 s" in the log): the Go side handed 107k candidates per build (1.5x the gas limit in 21k-gas txs, then
+  re-sent 2x on `needs_more`, which the size cap also sets), 12 MB of RLP and 90k engine pops per build. Fixed after
+  the run: candidates are capped by bytes too (1800 KiB + 1/8) and there is no second round after a size pop
+  (code 5 in `skipped`). Expect build cost to follow the 16k included txs (~50 ms per 1000 in-process).
+- Pool 480k pending (per-account cap 1000 x 1000 keys; the global pending cap is soft in geth's pool: it only trims
+  accounts above their slot limit). Go heap 0.5-0.9 GB, GC 1.5%, plugin RSS 3.4-4.0 GB (pool + engine).
+- Send failures at the end: "already known" (the generator's batch resend after a slow RPC), harmless.
 
 ## Deviations and open items
 
@@ -81,8 +109,8 @@ decode as a libevm block.
    `SetMinFee` (a tx under the chain's min base fee is held until it expires, the build filter skips it) and the
    fee-config gas limit check at admission. The gossip set is a 90-line adaptation of `plugin/evm/eth_gossiper.go`
    (same wire format, bloom, push/pull), for the same reason.
-2. blst: avalanchego's bls (supranational blst via cgo) and the engine's `blst` crate both define the assembly symbols;
-   linked with `-Wl,--allow-multiple-definition`. Open item for rs/ffi: localize blst symbols in the staticlib.
+2. blst/secp256k1/jemalloc/Rust runtime symbols: the archive is localized by `rs/ffi/localize.sh` (17 `epochdb_*`
+   globals only), so it links next to avalanchego's bls and firewood without `--allow-multiple-definition`.
 3. `/ws` is not mounted (the engine's ws server has no socket door through the FFI).
 4. `txpool_content` / `eth_pendingTransactions` return libevm's tx JSON (hash, no `from`), not ethapi's RPCTransaction.
 5. Coinbase: `allowFeeRecipients=false` -> blackhole, else the config's `feeRecipient`; a RewardManager precompile is
@@ -92,5 +120,10 @@ decode as a libevm block.
 7. Build retries: like subnet-evm, WaitForEvent re-arms 100 ms after a build whose block is not yet accepted, so a
    height can cost up to 6 engine builds (~10 ms each at 600 txs). A cheap improvement is to skip the retry while our
    last built block is still preferred.
-8. Engine build vs verify: at ~600 txs build averaged 46 ms against 2.7 ms verify in Run 1 (p50 4.5 ms in Run 2, so
-   the average is dominated by a p99 tail of ~0.5 s); worth a profile on the rs side.
+8. Engine build vs verify: build executes up to 1.5x the gas limit of candidates (the miner's over-provisioning) and
+   averaged 46 ms against 2.7 ms verify at ~600 txs in Run 1 (p50 4.5 ms in Run 2, p50 60 ms at full 952-tx blocks
+   in Run 3). A profile on the rs side of build vs verify for the same block is worth it; the Go side's share is the
+   RLP of the candidates (~110 B per transfer).
+9. Pool memory: geth's pool keeps every pending tx decoded (~1-2 KB each); per-account slots are the effective cap.
+   Chain configs for a validator should keep `tx-pool-account-slots` small (16 default) unless a few senders are meant
+   to burst.

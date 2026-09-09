@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"errors"
@@ -132,6 +133,13 @@ func minNextBlockTime(parent *types.Header) time.Time {
 
 var errNoTxs = errors.New("validator: no transactions to build with")
 
+// The miner's block size target (subnet-evm: 1800 KiB of tx bytes), with
+// slack: candidates past it can only be popped by the engine (skip code 5).
+const (
+	maxCandidateBytes = 1800*1024 + 1800*1024/8
+	skipSize          = 5
+)
+
 // buildBlock selects candidates from the pool by effective tip and nonce
 // (the miner's order), capped at 1.5x the gas limit, and hands them to the
 // engine in one crossing (two when the limit is not filled and the pool has
@@ -176,7 +184,7 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	}
 	order := newByPriceAndNonce(vm.pool.Pending(filter), baseFee)
 	budget := gasLimit + gasLimit/2
-	txs, gas := order.take(nil, budget)
+	txs, gas, size := order.take(nil, budget, maxCandidateBytes)
 	if len(txs) == 0 {
 		return nil, errNoTxs
 	}
@@ -184,8 +192,10 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	if err != nil {
 		return nil, err
 	}
-	if out.needsMore && !order.empty() {
-		txs, _ = order.take(txs, gas+budget)
+	// A second round only when the engine ran out of candidates for gas, not
+	// for size: a size-popped candidate (code 5) means the block is full.
+	if out.needsMore && !order.empty() && size < maxCandidateBytes && !bytes.Contains(out.skipped, []byte{skipSize}) {
+		txs, _, _ = order.take(txs, gas+budget, maxCandidateBytes)
 		if out, err = vm.buildOnce(parentID, tsMS, pchainHeight, txs); err != nil {
 			return nil, err
 		}
@@ -310,14 +320,19 @@ func (o *byPriceAndNonce) head(from ethcommon.Address, tx *txpool.LazyTransactio
 func (o *byPriceAndNonce) empty() bool { return len(o.heads) == 0 }
 
 // take appends resolved txs in order to dst until the summed gas limits
-// reach budget; a sender whose next tx cannot pay the base fee is dropped.
-func (o *byPriceAndNonce) take(dst types.Transactions, budget uint64) (types.Transactions, uint64) {
-	var gas uint64
-	for len(o.heads) > 0 && gas < budget {
+// reach budget or the summed sizes reach maxBytes; a sender whose next tx
+// cannot pay the base fee is dropped.
+func (o *byPriceAndNonce) take(dst types.Transactions, budget uint64, maxBytes uint64) (types.Transactions, uint64, uint64) {
+	var gas, size uint64
+	for _, tx := range dst {
+		size += tx.Size()
+	}
+	for len(o.heads) > 0 && gas < budget && size < maxBytes {
 		h := o.heads[0]
 		if tx := h.tx.Resolve(); tx != nil {
 			dst = append(dst, tx)
 			gas += h.tx.Gas
+			size += tx.Size()
 		}
 		if rest := o.txs[h.from]; len(rest) > 0 {
 			if nh := o.head(h.from, rest[0]); nh != nil {
@@ -329,5 +344,5 @@ func (o *byPriceAndNonce) take(dst types.Transactions, budget uint64) (types.Tra
 		}
 		heap.Pop(&o.heads)
 	}
-	return dst, gas
+	return dst, gas, size
 }
