@@ -91,3 +91,23 @@ func TestPluginConfig(t *testing.T) {
 		t.Fatal("missing file accepted")
 	}
 }
+
+// Without --p2p-port the fetcher never persists a staking identity; the host
+// creates one itself so the NodeID is stable across restarts.
+func TestEnsureStakingIdentity(t *testing.T) {
+	dir := t.TempDir()
+	if err := ensureStakingIdentity(dir); err != nil {
+		t.Fatal(err)
+	}
+	id1, err := nodeIDFrom(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureStakingIdentity(dir); err != nil {
+		t.Fatal(err)
+	}
+	id2, err := nodeIDFrom(dir)
+	if err != nil || id1 != id2 {
+		t.Fatalf("identity changed on the second run: %s != %s (%v)", id1, id2, err)
+	}
+}

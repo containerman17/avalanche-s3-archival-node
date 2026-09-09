@@ -67,7 +67,7 @@ func main() {
 	dataDir := fs.String("data", "./data", "data directory: plugin db, staking identity, chain.json, optional upgrade.json")
 	nodeURI := fs.String("node", "", "comma-separated Avalanche RPC node URIs (bootstrap peers, P-chain validator state)")
 	httpAddr := fs.String("http", "127.0.0.1:19900", "HTTP listen address; the plugin's handlers mount at /ext/bc/<chainID>/<path>")
-	p2pPort := fs.Int("p2p-port", 0, "p2p listen port (persists staker.key/.crt under --data, so the NodeID is stable)")
+	p2pPort := fs.Int("p2p-port", 0, "p2p listen port so other nodes can dial us; 0 = fetch-only, no inbound listener. Either way the NodeID comes from staker.key/.crt under --data (created on first run)")
 	holdSpec := fs.String("hold-until", "", "hand the VM its first block only once this much is fetched ahead of it: N blocks, or N txs as Ntx (100000, 250000tx)")
 	queueAhead := fs.Int("queue-ahead", 100_000, "blocks the host keeps fetched ahead of the VM in its own ring, in front of the fetch package's fixed window")
 	batch := fs.Int("batch", 256, "blocks per BatchedParseBlock; up to 2 parsed batches wait ahead of verification")
@@ -117,8 +117,13 @@ func main() {
 		log.Fatal("epochdb-host: the primary network's C-chain is not an L1 (coreth is not a plugin)")
 	}
 
-	// The fetcher dials first: it is what persists the staking identity, and
-	// the dial is the slow part of startup anyway.
+	// The staking identity under --data is the host's NodeID for the snow
+	// context. With a p2p port the fetcher persists it (peers dial us by it);
+	// without one the fetcher runs on an ephemeral cert, so it is created here.
+	if err := ensureStakingIdentity(*dataDir); err != nil {
+		log.Fatalf("epochdb-host: staking identity: %v", err)
+	}
+	// The fetcher dials first: the dial is the slow part of startup anyway.
 	f, err := fetch.New(fetch.Config{NodeURI: *nodeURI, Chain: c, ListenPort: *p2pPort, DataDir: *dataDir})
 	if err != nil {
 		log.Fatalf("epochdb-host: fetch: %v", err)
@@ -730,7 +735,17 @@ type pidTracker struct{ pid atomic.Int64 }
 func (t *pidTracker) TrackProcess(pid int) { t.pid.Store(int64(pid)) }
 func (t *pidTracker) UntrackProcess(int)   { t.pid.Store(0) }
 
-// nodeIDFrom derives the NodeID from the staking cert the fetcher persisted.
+// ensureStakingIdentity creates staker.key/.crt under dataDir when absent
+// (the same files the fetcher persists when it listens).
+func ensureStakingIdentity(dataDir string) error {
+	keyPath, certPath := filepath.Join(dataDir, "staker.key"), filepath.Join(dataDir, "staker.crt")
+	if _, err := os.Stat(keyPath); err == nil {
+		return nil
+	}
+	return staking.InitNodeStakingKeyPair(keyPath, certPath)
+}
+
+// nodeIDFrom derives the NodeID from the staking cert under dataDir.
 func nodeIDFrom(dataDir string) (ids.NodeID, error) {
 	tlsCert, err := staking.LoadTLSCertFromFiles(filepath.Join(dataDir, "staker.key"), filepath.Join(dataDir, "staker.crt"))
 	if err != nil {
