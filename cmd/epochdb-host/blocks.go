@@ -64,7 +64,7 @@ func genChain(dataDir string) (string, error) {
 		"config": map[string]any{
 			"chainId": genChainID, "initialMinDelayMS": 1,
 			"feeConfig": map[string]any{
-				"gasLimit": genGasLimit, "minBaseFee": 1_000_000_000, "targetGas": genGasLimit * 2,
+				"gasLimit": genGasLimit, "minBaseFee": 1_000_000_000, "targetGas": genGasLimit * 100,
 				"baseFeeChangeDenominator": 48, "minBlockGasCost": 0, "maxBlockGasCost": 0,
 				"targetBlockRate": 2, "blockGasCostStep": 0,
 			},
@@ -172,7 +172,7 @@ func call(sel string, args ...[]byte) []byte {
 
 func (g *gen) sign(i int, to *common.Address, value *big.Int, gas uint64, data []byte) []byte {
 	tx := ethtypes.NewTx(&ethtypes.DynamicFeeTx{
-		ChainID: big.NewInt(genChainID), Nonce: g.nonces[i], GasTipCap: big.NewInt(1_000_000_000), GasFeeCap: big.NewInt(5_000_000_000),
+		ChainID: big.NewInt(genChainID), Nonce: g.nonces[i], GasTipCap: big.NewInt(1_000_000_000), GasFeeCap: big.NewInt(1_000_000_000_000),
 		Gas: gas, To: to, Value: value, Data: data,
 	})
 	g.nonces[i]++
