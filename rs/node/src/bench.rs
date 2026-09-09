@@ -64,6 +64,8 @@ struct CheckItem {
     traces: Vec<String>,
     code: Vec<(B256, Bytes)>,
     stats: Stats,
+    /// --root-inline: the executor waits here until the root is checked.
+    ack: Option<SyncSender<()>>,
 }
 
 enum Msg {
@@ -160,6 +162,9 @@ fn checker(rx: Receiver<Msg>, dirty: Arc<Mutex<Dirty>>, mut hist: Option<History
                 std::process::exit(1);
             }
             dirty_bytes = d.bytes();
+        }
+        if let Some(ack) = &it.ack {
+            let _ = ack.send(());
         }
         if let Some(h) = hist.as_mut() {
             let t0 = Instant::now();
@@ -319,6 +324,9 @@ pub fn main(args: Vec<String>) -> Result<()> {
     let stop_at: u64 = num(&args, "--stop-at", u64::MAX)?.min(to);
     let workers: usize = num(&args, "--workers", 4)?;
     let roll_budget: usize = num::<usize>(&args, "--roll-budget", 2048)? << 20;
+    // --root-inline: the state root is checked before the next block executes
+    // (the validator shape, Verify carries the root) instead of one block behind.
+    let root_inline = args.iter().any(|a| a == "--root-inline");
     let duration: Option<f64> = arg(&args, "--duration").map(|s| s.parse()).transpose()?;
     let history = arg(&args, "--history").map(|p| History::open(&p)).transpose()?;
     if from != 1 {
@@ -372,7 +380,7 @@ pub fn main(args: Vec<String>) -> Result<()> {
         std::thread::spawn(move || b.run(bench_exit_rx, duration, stop))
     };
     eprintln!(
-        "epochdb-rs: chainId={} dump={dump} heights={from}..{} roll-budget={}MB workers={workers} dirty-workers={dirty_workers} history={}",
+        "epochdb-rs: chainId={} dump={dump} heights={from}..{} roll-budget={}MB workers={workers} dirty-workers={dirty_workers} root-inline={root_inline} history={}",
         cfg.chain_id,
         if stop_at == u64::MAX { "end".to_string() } else { stop_at.to_string() },
         roll_budget >> 20,
@@ -386,6 +394,7 @@ pub fn main(args: Vec<String>) -> Result<()> {
     let mut parent_time = cfg.genesis_timestamp;
     let (mut nblk, mut ntx, mut gas) = (0u64, 0u64, 0u64);
     let mut t_read = Duration::ZERO;
+    let mut t_root_wait = Duration::ZERO;
     let mut first = true;
     let res = (|| -> Result<()> {
         loop {
@@ -453,9 +462,15 @@ pub fn main(args: Vec<String>) -> Result<()> {
                 t_commit: ex.t_commit,
                 ..Default::default()
             };
-            let item = CheckItem { height: h.number, want: h.root, ws, header_rlp: Bytes::from(b.header_rlp.clone()), receipts, traces, code, stats };
+            let (ack, ack_rx) = if root_inline { let (t, r) = sync_channel::<()>(1); (Some(t), Some(r)) } else { (None, None) };
+            let item = CheckItem { height: h.number, want: h.root, ws, header_rlp: Bytes::from(b.header_rlp.clone()), receipts, traces, code, stats, ack };
             if check_tx.send(Msg::Block(Box::new(item))).is_err() {
                 bail!("checker stopped");
+            }
+            if let Some(rx) = ack_rx {
+                let t0 = Instant::now();
+                rx.recv().map_err(|_| anyhow!("checker stopped"))?;
+                t_root_wait += t0.elapsed();
             }
         }
     })();
@@ -463,6 +478,9 @@ pub fn main(args: Vec<String>) -> Result<()> {
     let cres = checker.join().map_err(|_| anyhow!("checker panicked"))?;
     let _ = bench_exit_tx.send(());
     let _ = bench.join();
+    if root_inline {
+        eprintln!("epochdb-rs: root-inline: executor waited {:.2}s for the checker (root work on the execution path)", t_root_wait.as_secs_f64());
+    }
     res?;
     cres?;
     let _ = Path::new(&dump);
