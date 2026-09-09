@@ -140,6 +140,11 @@ func (g *gen) save(dataDir string) error {
 	return os.WriteFile(genStatePath(dataDir), raw, 0o644)
 }
 
+// genPresign > 0 (remote mode, workloads without a grow step): sign this many
+// traffic txs before the measured window and stream them instead of the
+// timed prefill loop. Set from --gen-presign.
+var genPresign int
+
 // gen is the generator state: signers, nonces, and how much state exists.
 type gen struct {
 	vm       *plugin      // nil in remote mode
@@ -720,6 +725,40 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	// Prefill.
 	start := time.Now()
 	var blocks, txs, gas uint64
+	if genPresign > 0 && g.vm == nil && len(g.grow()) == 0 {
+		// Presigned stream: sign everything first, then keep the pool topped
+		// up so the chain never starves and signing is outside the window.
+		raws := g.traffic(genPresign)
+		log.Printf("gen presigned %d txs in %.1fs", len(raws), time.Since(start).Seconds())
+		start = time.Now()
+		for len(raws) > 0 {
+			n, err := g.pending(ctx)
+			if err != nil {
+				return err
+			}
+			if n < 3000 {
+				k := min(1000, len(raws))
+				if err := g.submit(ctx, raws[:k]); err != nil {
+					return err
+				}
+				raws = raws[k:]
+				continue
+			}
+			if h, err := g.rpcUint(ctx, "eth_blockNumber", "[]"); err == nil && h > g.head {
+				prev := g.head
+				if m, _, err := g.awaitBlock(ctx); err == nil {
+					blocks, txs, gas = blocks+m.height-prev, txs+m.txs, gas+m.gas
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		b, t, ga, err := g.drain(ctx)
+		if err != nil {
+			return err
+		}
+		blocks, txs, gas = blocks+b, txs+t, gas+ga
+		prefillFor = 0
+	}
 	for time.Since(start) < prefillFor {
 		if err := g.submit(ctx, append(g.grow(), g.traffic(prefillBatch)...)); err != nil {
 			return err
