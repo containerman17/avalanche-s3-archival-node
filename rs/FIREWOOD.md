@@ -130,6 +130,33 @@ The persist worker (commit's write side): `process_unpersisted_nodes` + `write_b
 
 Per-block fixed overhead vs per-node: see `fw_micro` above; on Step 50k the checker spent 90 us per block serial for ~20 ops, i.e. hashing ~20 leaves plus their ~5-deep branch paths (~100 nodes), 0.9 us per node all-in.
 
+### Profile of the contract-heavy window (Step 700k-880k, `--root-inline`, 4 GB cache)
+
+`perf record -F 499 -p PID -- sleep 240` attached to the 1M inline run once it passed 700,000 (blocks 708k-883k in the window, 382,441 samples; the validator load tests were running, load ~7, relative shares only). Thread roles by top symbol:
+
+| role | share of all samples | threads |
+|---|---|---|
+| executor (EVM, trace JSON, our layer maps) | 40.5 percent | 1 |
+| Firewood propose: the checker + `ParallelMerkle`'s rayon workers | 33.0 percent | 13 |
+| sender recovery pool (secp256k1) | 12.2 percent | 14 |
+| Firewood persist worker (commit's write side) | 11.7 percent | 1 |
+
+Inside the propose side (checker + workers, 100 percent = their samples), the buckets the coordinator asked for:
+
+| bucket | share | symbols | fixable by |
+|---|---|---|---|
+| worker dispatch and idle spinning | 32.2 percent | `crossbeam_epoch::pin` / `try_advance` 7.5, `Stealer::steal` 1.9, `futex::Mutex::lock_contended` 1.8, `rayon_core::wait_until_cold`, channel sends: 16 workers fed one op at a time over mpsc channels, spinning between batches | a PR: persistent workers that take whole sub-batches, or one worker per touched subtrie only (`UseParallel::Never` is faster below ~100 ops) |
+| keccak itself | 17.6 percent | `keccak::backends::soft::keccak_p` 12.9, `Keccak256::finalize_into` 9.5 (software backend) | a PR: `keccak-asm` (measured 4-8 percent of propose, this table says the ceiling on this window is ~9 percent) |
+| node copies in `read_for_update` | 13.8 percent | `Child::clone` 11.8, `BranchNode::clone_one`, `Box<BranchNode>::clone` 3.3, `memmove` 5.3: a proposal copies every branch node on every touched path (16 `Child` entries with their hashes) before it edits one child | a PR: copy-on-write per child / `Arc::unwrap_or_clone` only when shared, or edit in place inside one proposal |
+| allocation / drop | 12.5 percent | jemalloc `edata_heap_remove_first` 3.2, `drop_glue::<Child>`, `SmallVec::from_iter` | follows from the copies above |
+| ethhash encoding | 10.4 percent | `hash_node` 3.7, `children_hashes` 2.1, `rlp::encode_list` 1.9, `nibbles_to_eth_compact`, `fix_account_storage_root_value` (the account special case is under 1 percent) | small; the RLP is what Ethereum hashing is |
+| node reads / deserialize | 3.4 percent | `read_cached_node` 4.0 (cache hits; the 4 GB cache holds the tail's nodes) | n/a here |
+| trie mutation (`Merkle::insert` / `remove_prefix`) | 2.9 percent | | n/a |
+
+The commit side (persist worker, 11.7 percent of all samples): `process_unpersisted_nodes` 28.7 + `write_batch` and the persist loop 20.7 = 53 percent serialization and writes, `drop_glue::<Child>` and jemalloc 28 percent (the persisted nodes' in-memory copies are freed here), `insert_into_cache` + `rapidhash` 7 percent. With `deferred_persistence_commit_count` 1 every commit waits for the previous revision's write; this is the durability model (a revision per block, persisted in order), and raising the count trades crash-replay depth for commit latency (the replay is ours, 305 rows in 187 ms after the kill -9 above). Native's equivalent cost is the roll (merge + trie file) every 200k blocks, off the checker entirely.
+
+Per-block fixed cost vs per-node: `fw_micro` puts the floor at ~18 us per proposal + commit (a `NodeStore` per proposal, root re-hash, the persist handoff) and 16-20 us per op serial on a 5-deep trie; on the contract-heavy window the propose side is per-node bound (copies + hashing + dispatch), on beam it is per-block bound (1.36 txs per block, 1M commits = 55-150 s).
+
 ## Memory
 
 RssAnon sampled every 10 s from `/proc/self/status` (the `anon=` field of the bench line). Step 1M pipelined, 4 GB node cache: 258 MB at 10 s, 994 MB at 70 s, 1,795 MB at 130 s, 3,098 MB at 190 s, 3,390 MB at 310 s, 3,543 MB at 430 s, 3,620 MB at 550 s, 3,626 MB at 670 s; second-half slope 2,093 MB/h, last 120 s flat within 20 MB. That curve is the node cache filling to its 4 GB limit (the hot state of Step 1M is ~600 MB of nodes, the cache keeps written nodes only by default), not the Go-side leak: the 192 MB run below shows the plateau where the cache is bounded. The A/B's 192 MB row: RssAnon 253 MB at 10 s, 241 MB at 180 s (peak 338 MB) over 694k blocks, slope within noise.
