@@ -428,17 +428,20 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 		*nonce++
 		fund = append(fund, rawTxReq(i, tx))
 	}
-	var lastHash ethcommon.Hash
+	// One funder, so chunks of 100 in nonce order to one node, each chunk
+	// mined before the next: remote pools cap a sender at 16 pending + 64
+	// queued, so a flood of 1000 from one account would be dropped elsewhere.
 	for i := 0; i < len(fund); i += 100 {
 		end := min(i+100, len(fund))
-		for _, r := range batchPost(d.nodes[(i/100)%len(d.nodes)].rpc, fund[i:end]) {
+		var lastHash ethcommon.Hash
+		for _, r := range batchPost(d.nodes[0].rpc, fund[i:end]) {
 			if r.Error != nil {
 				check(fmt.Errorf("%s", r.Error.Message), "fund")
 			}
 			json.Unmarshal(r.Result, &lastHash)
 		}
+		d.receipt(d.nodes[0], lastHash)
 	}
-	d.receipt(d.nodes[0], lastHash)
 	fmt.Printf("funded %d senders\n", nkeys)
 
 	var sent, failed atomic.Int64
