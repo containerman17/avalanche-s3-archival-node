@@ -820,9 +820,11 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 			}
 			if n < uint64(genStream) {
 				k := min(genStream, len(raws))
+				t0 := time.Now()
 				if err := g.submit(ctx, raws[:k]); err != nil {
 					return err
 				}
+				log.Printf("gen stream: admitted %d txs in %s (%.0f tx/s), pool had %d", k, time.Since(t0).Round(time.Millisecond), float64(k)/time.Since(t0).Seconds(), n)
 				raws = raws[k:]
 				if len(raws) == 0 {
 					n, _ := g.pending(ctx)
