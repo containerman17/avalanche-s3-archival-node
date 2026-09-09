@@ -488,9 +488,8 @@ impl NodeEngine {
             genesis.clone()
         } else {
             let mut b = block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?;
-            for t in &mut b.txs {
-                t.sender = block::recover(t);
-            }
+            // one block at startup: rayon's global pool is fine here
+            b.txs.par_iter_mut().for_each(|t| t.sender = block::recover(t));
             Arc::new(b)
         };
         eprintln!(
@@ -601,9 +600,8 @@ impl NodeEngine {
             genesis.clone()
         } else {
             let mut b = block::decode_container(store.container(head_h)?.unwrap()).map_err(|e| anyhow!("head: {e}"))?;
-            for t in &mut b.txs {
-                t.sender = block::recover(t);
-            }
+            // one block at startup: rayon's global pool is fine here
+            b.txs.par_iter_mut().for_each(|t| t.sender = block::recover(t));
             Arc::new(b)
         };
         eprintln!(
@@ -958,14 +956,33 @@ impl Engine for NodeEngine {
 }
 
 impl NodeEngine {
+    /// Recovers the senders of `txs` that have none, on the pool when the
+    /// block is big enough for the dispatch to pay (33 us per recovery, so a
+    /// 50k-tx block would spend 1.6 s single threaded).
+    fn recover_senders(&self, txs: &mut [block::Tx]) {
+        if txs.len() < 64 {
+            for t in txs.iter_mut() {
+                if t.sender.is_none() {
+                    t.sender = block::recover(t);
+                }
+            }
+        } else {
+            self.pool.install(|| {
+                txs.par_iter_mut().for_each(|t| {
+                    if t.sender.is_none() {
+                        t.sender = block::recover(t);
+                    }
+                })
+            });
+        }
+    }
+
     fn parse_inner(&self, bytes: Bytes) -> Result<Arc<Block>, Error> {
         let mut b = block::decode_container(bytes)?;
         if let Some(c) = self.parsed.lock().unwrap().get(&b.hash.0) {
             return Ok(c.clone());
         }
-        for t in &mut b.txs {
-            t.sender = block::recover(t);
-        }
+        self.recover_senders(&mut b.txs);
         let b = Arc::new(b);
         let mut p = self.parsed.lock().unwrap();
         if p.len() >= PARSED_MAX {
@@ -1072,11 +1089,7 @@ impl NodeEngine {
         };
         let mut t = t0;
         lap(0, &mut t);
-        for t in &mut candidates {
-            if t.sender.is_none() {
-                t.sender = block::recover(t);
-            }
-        }
+        self.recover_senders(&mut candidates);
         lap(1, &mut t);
         let r = match ex.build_block(&h, parent_hdr.time, pchain_height, pchain_height, &candidates) {
             Ok(r) => r,
