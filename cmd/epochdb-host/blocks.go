@@ -380,14 +380,19 @@ func (g *gen) drain(ctx context.Context) (blocks, txs, gas uint64, err error) {
 			return blocks, txs, gas, err
 		}
 		if n == 0 {
-			// The pool empties when the last block is built; count that
-			// block too if it is already at the head.
+			// An empty pool is not proof of done: subnet-evm admits txs
+			// asynchronously, a peer may still hold the rest, and the pool
+			// empties when the last block is built. awaitBlock returns the
+			// next block, or after a 15 s quiet spell with the pool empty.
 			if g.vm == nil {
-				if h, err := g.rpcUint(ctx, "eth_blockNumber", "[]"); err == nil && h > g.head {
-					prev := g.head
-					if m, _, err := g.awaitBlock(ctx); err == nil {
-						blocks, txs, gas = blocks+m.height-prev, txs+m.txs, gas+m.gas
-					}
+				prev := g.head
+				m, _, err := g.awaitBlock(ctx)
+				if err != nil {
+					return blocks, txs, gas, err
+				}
+				if m.height > prev {
+					blocks, txs, gas = blocks+m.height-prev, txs+m.txs, gas+m.gas
+					continue
 				}
 			}
 			return blocks, txs, gas, nil
