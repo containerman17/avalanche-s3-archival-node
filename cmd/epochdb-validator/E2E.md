@@ -102,6 +102,19 @@ decode as a libevm block.
   accounts above their slot limit). Go heap 0.5-0.9 GB, GC 1.5%, plugin RSS 3.4-4.0 GB (pool + engine).
 - Send failures at the end: "already known" (the generator's batch resend after a slow RPC), harmless.
 
+## Validator-side lessons (the pool under load)
+
+1. `txpool.TxPool.Sync()` is the simulator's hook: it forces a full pool reset (demote + promote of every tx under the
+   write lock). Never call it on the build path; the async reset after a head change is fine, the engine skips the
+   few already-mined txs a racing build includes.
+2. `Pending()` copies every pending tx into LazyTransactions under the pool's write lock; use it once per build, never
+   for "is there anything pending" (use `Stats()`, O(accounts)) nor per gossip event.
+3. Local admission (`pool.Add(txs, local=true)`) exempts a sender from every cap; an RPC flood then grows the queue
+   and the Go heap without bound (2.8 GB, GC 33% in run 2). Admit RPC txs as remote; the chain config's
+   `tx-pool-account-slots/queue` are the levers, the global pending cap is soft.
+4. Candidate volume is the build cost: cap by bytes (the miner's 1800 KiB target) as well as gas, and do not re-run
+   the build on `needs_more` when the block was size-capped.
+
 ## Deviations and open items
 
 1. Pool: libevm's `core/txpool` instead of subnet-evm's. subnet-evm/core links firewood's Rust staticlib and two Rust
