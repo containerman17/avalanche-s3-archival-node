@@ -2,11 +2,9 @@ package validator
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../rs/ffi -I${SRCDIR}/../cmd/epochdb-validator/stub
-#cgo !epochdb_stub LDFLAGS: -L${SRCDIR}/../rs/target/release -lepochdb_engine -lm -ldl -lpthread -Wl,--allow-multiple-definition
-// --allow-multiple-definition: avalanchego's bls (supranational blst, cgo) and the
-// engine's blst crate both define the blst assembly symbols; the linker keeps the
-// Go side's copy. Same code, same ABI. Open item for rs/ffi: localize blst in the
-// staticlib and drop the flag.
+#cgo !epochdb_stub LDFLAGS: -L${SRCDIR}/../rs/target/release -lepochdb_engine -lm -ldl -lpthread
+// The archive must be localized (rs/ffi/localize.sh) so its blst, secp256k1 and
+// Rust runtime symbols do not collide with avalanchego's bls and firewood.
 #include <stdlib.h>
 #include "epochdb_engine.h"
 */
