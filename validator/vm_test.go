@@ -212,7 +212,7 @@ func TestLatencyByBlockSize(t *testing.T) {
 	if !realEngine {
 		t.Skip("stub engine")
 	}
-	h := newHarnessWith(t, strings.Replace(testGenesis, `"gasLimit": 20000000`, `"gasLimit": 500000000`, 1),
+	h := newHarnessWith(t, stressGenesis(),
 		`{"tx-pool-account-slots": 10000, "tx-pool-global-slots": 20000, "tx-pool-account-queue": 10000, "tx-pool-global-queue": 20000}`)
 	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000002")
 	for _, n := range []int{50, 200, 1000, 5000} {
@@ -388,4 +388,11 @@ func TestPoolChainGetBlock(t *testing.T) {
 	if h.vm.chain.GetBlock(ethcommon.Hash(b1.ID()), 2) != nil {
 		t.Fatal("GetBlock with a wrong number must be nil")
 	}
+}
+
+// stressGenesis is testGenesis with a 500 M gas limit in BOTH the fee config
+// and the header: the engine refuses a mismatch, as stock does.
+func stressGenesis() string {
+	g := strings.Replace(testGenesis, `"gasLimit": 20000000`, `"gasLimit": 500000000`, 1)
+	return strings.Replace(g, `"gasLimit": "0x1312d00"`, `"gasLimit": "0x1dcd6500"`, 1)
 }

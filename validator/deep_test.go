@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +23,7 @@ func TestAcceptCostDeepPool(t *testing.T) {
 	if !realEngine || os.Getenv("EPOCHDB_DEEP") == "" {
 		t.Skip("real engine + EPOCHDB_DEEP=1")
 	}
-	h := newHarnessWith(t, strings.Replace(testGenesis, `"gasLimit": 20000000`, `"gasLimit": 500000000`, 1),
+	h := newHarnessWith(t, stressGenesis(),
 		`{"tx-pool-account-slots": 10000, "tx-pool-global-slots": 400000, "tx-pool-account-queue": 10000, "tx-pool-global-queue": 400000}`)
 	const nkeys, perKey = 1000, 120
 	keys := make([]*ecdsa.PrivateKey, nkeys)
