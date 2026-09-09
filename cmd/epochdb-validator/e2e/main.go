@@ -213,7 +213,38 @@ func main() {
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
 	}}
 
-	check(tmpnet.BootstrapNewNetwork(ctx, log, network, ""), "bootstrap")
+	bootCtx, bootCancel := context.WithTimeout(ctx, 2*time.Minute)
+	bootErr := tmpnet.BootstrapNewNetwork(bootCtx, log, network, "")
+	bootCancel()
+	if bootErr != nil {
+		// tmpnet creates the chain on the bootstrap node before that node has
+		// the chain config, so a non-default state-scheme conflicts at the
+		// restart. Wipe that node's standalone chain DB and start it again.
+		fixed := false
+		for _, n := range network.Nodes {
+			logs, _ := filepath.Glob(filepath.Join(n.DataDir, "logs", "*.log"))
+			hit := false
+			for _, l := range logs {
+				if b, _ := os.ReadFile(l); bytes.Contains(b, []byte("state scheme conflict")) {
+					hit = true
+				}
+			}
+			if !hit {
+				continue
+			}
+			check(n.Stop(ctx), "stop for scheme reset")
+			dbs, _ := filepath.Glob(filepath.Join(n.DataDir, "chainData", "*", "db"))
+			for _, d := range dbs {
+				check(os.RemoveAll(filepath.Dir(d)), "wipe chain data")
+			}
+			check(network.StartNode(ctx, n), "restart after scheme reset")
+			fixed = true
+		}
+		if !fixed {
+			check(bootErr, "bootstrap")
+		}
+		check(tmpnet.WaitForHealthyNodes(ctx, log, network.Nodes), "healthy after scheme reset")
+	}
 	chainID := network.Subnets[0].Chains[0].ChainID
 	fmt.Println("network:", network.Dir, "chain:", chainID)
 	for _, n := range nodes {
