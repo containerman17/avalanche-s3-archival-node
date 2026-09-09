@@ -77,6 +77,7 @@ func main() {
 	genPrefill := fs.Duration("gen-prefill", 0, "block generator mode: prefill a private local chain for this long, then time --gen-sizes blocks (needs --config, fresh --data)")
 	genBatch := fs.Int("gen-batch", 2000, "generator: txs submitted per prefill block")
 	genSizes := fs.String("gen-sizes", "100,1000,5000,20000", "generator: tx counts of the timed blocks")
+	genKind := fs.String("gen-kind", "token", "generator workload: token (ERC20-like) or slots (50 storage writes per tx)")
 	fs.Parse(os.Args[1:])
 	if *genPrefill > 0 {
 		if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -141,7 +142,7 @@ func main() {
 		if *configPath == "" {
 			log.Fatal("epochdb-host: --gen-prefill requires --config")
 		}
-		if err := runGen(ctx, c, *vmPath, *dataDir, *configPath, *genPrefill, *genBatch, *genSizes); err != nil && !errors.Is(err, context.Canceled) {
+		if err := runGen(ctx, c, *vmPath, *dataDir, *configPath, *genKind, *genPrefill, *genBatch, *genSizes); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatalf("epochdb-host: gen: %v", err)
 		}
 		return

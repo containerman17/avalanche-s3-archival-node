@@ -46,6 +46,13 @@ const (
 	selMintMany     = "9579f5d1"
 	holdersPerMint  = 1000 // mintMany holders per prefill tx
 	mintsPerBlock   = 20   // mintMany txs per prefill block (state growth)
+	// slotWriter runtime: calldata start, count, salt; sstore(start+i, start+i+salt)
+	// for i in [0, count). Init code copies it and returns it. The Clear Street
+	// shape: a precompile-like tx that is nearly all state writes.
+	slotWriterInit = "6022" + "80" + "600b" + "6000" + "39" + "6000" + "f3" +
+		"602035" + "600035" + "5b" + "8115" + "6020" + "57" + "8080" + "604035" + "01" + "90" + "55" + "600101" + "90600190" + "03" + "90" + "6006" + "56" + "5b00"
+	slotsPerTx   = 50
+	slotsPerGrow = 1000 // fresh slots per prefill grow tx (slots kind)
 )
 
 // genChain writes chain.json for the private chain when it is absent.
@@ -107,7 +114,9 @@ func genKey(i int) *ecdsa.PrivateKey {
 // genState is what a finished prefill leaves in the data dir, so later runs
 // skip setup and prefill and go straight to timed blocks on the grown state.
 type genState struct {
+	Kind     string         `json:"kind"`
 	Contract common.Address `json:"contract"`
+	Slots    uint64         `json:"slots"`
 	Holders  uint64         `json:"holders"`
 	Nonces   []uint64       `json:"nonces"`
 	Rng      uint64         `json:"rng"`
@@ -116,7 +125,7 @@ type genState struct {
 func genStatePath(dataDir string) string { return filepath.Join(dataDir, "gen-state.json") }
 
 func (g *gen) save(dataDir string) error {
-	raw, err := json.Marshal(genState{Contract: g.contract, Holders: g.holders, Nonces: g.nonces, Rng: g.rng})
+	raw, err := json.Marshal(genState{Kind: g.kind, Contract: g.contract, Slots: g.slots, Holders: g.holders, Nonces: g.nonces, Rng: g.rng})
 	if err != nil {
 		return err
 	}
@@ -130,8 +139,10 @@ type gen struct {
 	signer   ethtypes.Signer
 	keys     []*ecdsa.PrivateKey
 	nonces   []uint64
+	kind     string // "token" or "slots"
 	contract common.Address
 	holders  uint64 // token holders seeded by mintMany so far (recipients)
+	slots    uint64 // slots kind: slots written so far in the slot writer
 	rng      uint64
 }
 
@@ -228,6 +239,9 @@ func (g *gen) submit(ctx context.Context, raws [][]byte) error {
 // its predecessor at setup). Every tx reads owner/paused/fee/treasury, two
 // frozen flags, and two or three balances, and writes two or three slots.
 func (g *gen) traffic(n int) [][]byte {
+	if g.kind == "slots" {
+		return g.slotTraffic(n)
+	}
 	raws := make([][]byte, 0, n)
 	amount := word(1_000_000_000_000)
 	for i := 0; i < n; i++ {
@@ -250,6 +264,9 @@ func (g *gen) traffic(n int) [][]byte {
 // grow signs mintsPerBlock mintMany txs from the owner, each seeding
 // holdersPerMint fresh holders.
 func (g *gen) grow() [][]byte {
+	if g.kind == "slots" {
+		return g.slotGrow()
+	}
 	raws := make([][]byte, 0, mintsPerBlock)
 	for i := 0; i < mintsPerBlock; i++ {
 		seed := g.holders / holdersPerMint
@@ -297,6 +314,32 @@ func (g *gen) drain(ctx context.Context) (blocks, txs, gas uint64, err error) {
 	}
 }
 
+// slotCall encodes slotWriter(start, count, salt).
+func slotCall(start, count, salt uint64) []byte {
+	return call("", word(start), word(count), word(salt))
+}
+
+// slotTraffic: n txs each rewriting slotsPerTx existing random-offset slots.
+func (g *gen) slotTraffic(n int) [][]byte {
+	raws := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		s := int(g.next() % uint64(len(g.keys)))
+		start := g.next() % (g.slots - slotsPerTx)
+		raws = append(raws, g.sign(s, &g.contract, nil, 21000+slotsPerTx*25_000+10_000, slotCall(start, slotsPerTx, g.next())))
+	}
+	return raws
+}
+
+// slotGrow: mintsPerBlock txs each writing slotsPerGrow fresh slots.
+func (g *gen) slotGrow() [][]byte {
+	raws := make([][]byte, 0, mintsPerBlock)
+	for i := 0; i < mintsPerBlock; i++ {
+		raws = append(raws, g.sign(0, &g.contract, nil, 60_000+slotsPerGrow*25_000, slotCall(g.slots, slotsPerGrow, 1)))
+		g.slots += slotsPerGrow
+	}
+	return raws
+}
+
 // mine builds one block from the mempool, then verifies and accepts it.
 // Returns the block and the three wall durations.
 func (g *gen) mine(ctx context.Context) (*ethtypes.Block, [3]time.Duration, error) {
@@ -334,6 +377,9 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	// and let every sender approve its successor: setup blocks, not timed.
 	treasury := crypto.PubkeyToAddress(g.keys[genSenders-1].PublicKey)
 	init := append(common.FromHex(tokenBin), call("", treasury.Bytes(), word(25))...)
+	if g.kind == "slots" {
+		init = common.FromHex(slotWriterInit)
+	}
 	if err := g.submit(ctx, [][]byte{g.sign(0, nil, nil, 2_000_000, init)}); err != nil {
 		return err
 	}
@@ -345,24 +391,26 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		return fmt.Errorf("deploy block has %d txs, gas %d", len(blk.Transactions()), blk.GasUsed())
 	}
 	g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), 0)
-	log.Printf("gen deployed token at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.contract, blk.NumberU64(), d[0], d[1], d[2], g.vm.tracker.pid.Load())
-	setup := make([][]byte, 0, 2*genSenders)
-	for i := 0; i < genSenders; i++ {
-		to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
-		setup = append(setup, g.sign(0, &g.contract, nil, 80_000, call(selMint, to.Bytes(), word(1<<62))))
-	}
-	for i := 0; i < genSenders; i++ {
-		spender := crypto.PubkeyToAddress(g.keys[(i+1)%genSenders].PublicKey)
-		setup = append(setup, g.sign(i, &g.contract, nil, 80_000, call(selApprove, spender.Bytes(), word(1<<62))))
-	}
-	if err := g.submit(ctx, setup); err != nil {
-		return err
-	}
-	if blk, _, err = g.mine(ctx); err != nil {
-		return err
-	}
-	if len(blk.Transactions()) != len(setup) {
-		return fmt.Errorf("setup block has %d txs, wanted %d", len(blk.Transactions()), len(setup))
+	log.Printf("gen deployed %s contract at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.kind, g.contract, blk.NumberU64(), d[0], d[1], d[2], g.vm.tracker.pid.Load())
+	if g.kind != "slots" {
+		setup := make([][]byte, 0, 2*genSenders)
+		for i := 0; i < genSenders; i++ {
+			to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
+			setup = append(setup, g.sign(0, &g.contract, nil, 80_000, call(selMint, to.Bytes(), word(1<<62))))
+		}
+		for i := 0; i < genSenders; i++ {
+			spender := crypto.PubkeyToAddress(g.keys[(i+1)%genSenders].PublicKey)
+			setup = append(setup, g.sign(i, &g.contract, nil, 80_000, call(selApprove, spender.Bytes(), word(1<<62))))
+		}
+		if err := g.submit(ctx, setup); err != nil {
+			return err
+		}
+		if blk, _, err = g.mine(ctx); err != nil {
+			return err
+		}
+		if len(blk.Transactions()) != len(setup) {
+			return fmt.Errorf("setup block has %d txs, wanted %d", len(blk.Transactions()), len(setup))
+		}
 	}
 	// Prefill: each block grows holders and carries traffic.
 	if err := g.submit(ctx, g.grow()); err != nil {
@@ -388,13 +436,16 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		blocks, txs, gas = blocks+b, txs+t, gas+ga
 	}
 	el := time.Since(start)
-	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d senders=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, genSenders)
+	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d slots=%d senders=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, g.slots, genSenders)
 
 	return g.save(dataDir)
 }
 
 // runGen: prefill for prefillFor, then one timed block per entry of sizes.
-func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath string, prefillFor time.Duration, prefillBatch int, sizes string) error {
+func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, kind string, prefillFor time.Duration, prefillBatch int, sizes string) error {
+	if kind != "token" && kind != "slots" {
+		return fmt.Errorf("--gen-kind %q: want token or slots", kind)
+	}
 	configBytes, err := os.ReadFile(configPath)
 	if err != nil {
 		return err
@@ -417,7 +468,7 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 	if handlers["/rpc"] == nil {
 		return errors.New("plugin has no /rpc handler")
 	}
-	g := &gen{vm: pl, rpc: handlers["/rpc"], signer: ethtypes.LatestSignerForChainID(big.NewInt(genChainID)), nonces: make([]uint64, genSenders)}
+	g := &gen{kind: kind, vm: pl, rpc: handlers["/rpc"], signer: ethtypes.LatestSignerForChainID(big.NewInt(genChainID)), nonces: make([]uint64, genSenders)}
 	for i := 0; i < genSenders; i++ {
 		g.keys = append(g.keys, genKey(i))
 	}
@@ -434,8 +485,8 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath str
 		if err := json.Unmarshal(raw, &st); err != nil {
 			return err
 		}
-		g.contract, g.holders, g.nonces, g.rng = st.Contract, st.Holders, st.Nonces, st.Rng
-		log.Printf("gen resumed: height=%d holders=%d senders=%d vm_pid=%d (prefill skipped)", last.Height(), g.holders, genSenders, pl.tracker.pid.Load())
+		g.kind, g.contract, g.slots, g.holders, g.nonces, g.rng = st.Kind, st.Contract, st.Slots, st.Holders, st.Nonces, st.Rng
+		log.Printf("gen resumed: kind=%s height=%d holders=%d slots=%d senders=%d vm_pid=%d (prefill skipped)", g.kind, last.Height(), g.holders, g.slots, genSenders, pl.tracker.pid.Load())
 	} else if last.Height() != 0 {
 		return fmt.Errorf("data dir at height %d without %s", last.Height(), genStatePath(dataDir))
 	} else {
