@@ -46,7 +46,7 @@ const (
 	selMint         = "40c10f19"
 	selMintMany     = "9579f5d1"
 	holdersPerMint  = 500 // mintMany holders per prefill tx (12.6 M gas, fits a 20 M block)
-	mintsPerBlock   = 20   // mintMany txs per prefill block (state growth)
+	mintsPerBlock   = 20  // mintMany txs per prefill block (state growth)
 	// slotWriter runtime: calldata start, count, salt; sstore(start+i, start+i+salt)
 	// for i in [0, count). Init code copies it and returns it. The Clear Street
 	// shape: a precompile-like tx that is nearly all state writes.
