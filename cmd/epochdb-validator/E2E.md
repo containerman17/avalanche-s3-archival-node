@@ -141,6 +141,35 @@ decode as a libevm block.
   limit: pool mostly drained). Verify p50 0.8 ms p99 41 ms; build p50 21 ms p99 891 ms; Go heap 15-175 MB, GC
   0.4%, RSS 0.23-1.1 GB (pool grew to 90k late in the run).
 
+## Memory: where 2-4.5 GB of plugin RSS went (branch rs-mem off rust 38a82fa)
+
+Evidence from live processes (slots workload, 50 sstores per tx, 2000-tx blocks of 100k slot writes on the
+--stress genesis; `epochdb_health` now reports jemalloc `heap-allocated`/`heap-resident`): the Go heap was 4-11 MB
+throughout, the engine's state (overlay 3-60 MB, dirty 75-86 MB) small, and the whole growth was live Rust heap,
+~8 MB per block, in three places:
+
+1. The store window memtable copied every state row of the live window (up to 1 GiB of raw log) into
+   `HashMap<Vec<u8>, Vec<(u64, Vec<u8>)>>`: measured 3.56x the raw log resident (450 MB log -> 1.6 GB). Fixed:
+   the memtable indexes rows in the log (key hash -> chained `(txnum, offset, len)` entries, 24 B each; reads
+   pread the record, the seal mmaps the log once and sorts) -> 0.58x (450 MB -> 262 MB); `window-max-bytes` default
+   1 GiB -> 128 MiB, so a window costs ~75 MB resident and one L0 seal per 128 MiB of rows (seals took 0.7-1.2 s).
+   Reads pay one pread per version walked (page cache); the e2e functional checks and the Go tests pass on it.
+2. `layered::Pending.parent` was a strong `Arc`: every verified block chained back to genesis and kept every
+   accepted block's write set (100k slots x ~150 B = 15 MB) and trie layer alive forever. Fixed: the parent is a
+   `Weak`; the tree owns a pending block until accept/reject, and once the parent is accepted (its writes are in the
+   backend) children read through to the backend.
+3. Verified blocks consensus never rejected (a built block superseded before it was proposed, a 100 ms build
+   retry on the same parent) stayed in the tree with their write sets; the node taking the RPC load built the most
+   and grew 5x faster than the others. Fixed: accept drops every verified block at or below the accepted height.
+   Also: the parsed-block cache (container + decoded txs, 5-10 MB per slots block) is swept on every accept
+   instead of every 256 blocks.
+
+Before/after at the same height on the same 3-node --stress L1 (node taking the RPC load, jemalloc allocated /
+RssAnon): height ~187: 1.32 GB / 2.0 GB before -> 140 MB / 415 MB after; height 431-453: 3.9 GB / 4.3 GB before
+-> (not reached after: the generator, built for 2 s blocks, stalls on sub-second ones) 191 blocks: 139 MB / 273 MB,
+flat across the three nodes (135-140 MB allocated). The compare tab's original observation (2.0-2.6 GB at 273
+blocks with a 410 MB window) is the sum of the three.
+
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and
