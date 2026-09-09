@@ -67,7 +67,7 @@ const chainGenesis = `{
     "allowFeeRecipients": false
   },
   "alloc": {"8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC": {"balance": "0x52B7D2DCC80CD2E4000000"}},
-  "nonce": "0x0", "timestamp": "%s", "extraData": "0x00", "gasLimit": "0x1312d00", "difficulty": "0x0",
+  "nonce": "0x0", "timestamp": "%s", "extraData": "0x00", "gasLimit": "0x%x", "difficulty": "0x0",
   "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
   "coinbase": "0x0000000000000000000000000000000000000000", "number": "0x0", "gasUsed": "0x0",
   "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
@@ -188,7 +188,7 @@ func main() {
 		Name: "epochdb",
 		Chains: []*tmpnet.Chain{{
 			VMID:    vmID,
-			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig, genesisTime)),
+			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig, genesisTime, uint64(gasLimit))),
 			Config:  fmt.Sprintf(chainConfig, minDelay),
 		}},
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
