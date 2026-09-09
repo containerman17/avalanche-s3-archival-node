@@ -813,33 +813,52 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		raws := g.traffic(genPresign)
 		log.Printf("gen presigned %d txs in %.1fs", len(raws), time.Since(start).Seconds())
 		start = time.Now()
-		for len(raws) > 0 {
+		// Pipelined: up to 8 batches of 500 in flight while the pool sits under
+		// the watermark, so admission is measured, not the submitter's round trips.
+		sem := make(chan struct{}, 8)
+		var wg sync.WaitGroup
+		var admitMu sync.Mutex
+		var submitErr error
+		var admitted, lastLogged int
+		admitStart := time.Now()
+		for len(raws) > 0 && submitErr == nil {
 			n, err := g.pending(ctx)
 			if err != nil {
 				return err
 			}
-			if n < uint64(genStream) {
-				k := min(genStream, len(raws))
-				t0 := time.Now()
-				if err := g.submit(ctx, raws[:k]); err != nil {
-					return err
-				}
-				log.Printf("gen stream: admitted %d txs in %s (%.0f tx/s), pool had %d", k, time.Since(t0).Round(time.Millisecond), float64(k)/time.Since(t0).Seconds(), n)
-				raws = raws[k:]
-				if len(raws) == 0 {
-					n, _ := g.pending(ctx)
-					log.Printf("gen stream: all txs submitted, pool has %d", n)
-				}
+			if n >= uint64(genStream) {
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			if h, err := g.rpcUint(ctx, "eth_blockNumber", "[]"); err == nil && h > g.head {
-				prev := g.head
-				if m, _, err := g.awaitBlock(ctx); err == nil {
-					blocks, txs, gas = blocks+m.height-prev, txs+m.txs, gas+m.gas
+			k := min(500, len(raws))
+			part := raws[:k]
+			raws = raws[k:]
+			sem <- struct{}{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				err := g.submitBatch(ctx, part)
+				admitMu.Lock()
+				defer admitMu.Unlock()
+				if err != nil && submitErr == nil {
+					submitErr = err
 				}
-			}
-			time.Sleep(20 * time.Millisecond)
+				admitted += len(part)
+				if admitted-lastLogged >= 20000 {
+					el := time.Since(admitStart)
+					log.Printf("gen stream: admitted %d txs in %s (%.0f tx/s)", admitted, el.Round(time.Millisecond), float64(admitted)/el.Seconds())
+					lastLogged = admitted
+				}
+			}()
 		}
+		wg.Wait()
+		if submitErr != nil {
+			return submitErr
+		}
+		el := time.Since(admitStart)
+		n, _ := g.pending(ctx)
+		log.Printf("gen stream: all %d txs submitted in %s (%.0f tx/s admitted), pool has %d", admitted, el.Round(time.Millisecond), float64(admitted)/el.Seconds(), n)
 		b, t, ga, err := g.drain(ctx)
 		if err != nil {
 			return err
