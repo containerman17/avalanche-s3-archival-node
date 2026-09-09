@@ -217,11 +217,11 @@ func (g *gen) sign(i int, to *common.Address, value *big.Int, gas uint64, data [
 // submit sends raw txs to the plugin's own eth_sendRawTransaction in batches
 // of 1000 (the server's batch limit).
 func (g *gen) submit(ctx context.Context, raws [][]byte) error {
-	for len(raws) > 1000 {
-		if err := g.submit(ctx, raws[:1000]); err != nil {
+	for len(raws) > 500 {
+		if err := g.submit(ctx, raws[:500]); err != nil {
 			return err
 		}
-		raws = raws[1000:]
+		raws = raws[500:]
 	}
 	var sb strings.Builder
 	sb.WriteByte('[')
@@ -334,36 +334,39 @@ func (g *gen) pending(ctx context.Context) (uint64, error) {
 // loadNonces (remote mode): the senders' chain nonces, so a rerun against a
 // used chain signs from where it left off.
 func (g *gen) loadNonces(ctx context.Context) error {
-	var sb strings.Builder
-	sb.WriteByte('[')
-	for i := range g.keys {
-		if i > 0 {
-			sb.WriteByte(',')
+	for lo := 0; lo < len(g.keys); lo += 500 { // stock's batch limit is under 1024
+		hi := min(lo+500, len(g.keys))
+		var sb strings.Builder
+		sb.WriteByte('[')
+		for i := lo; i < hi; i++ {
+			if i > lo {
+				sb.WriteByte(',')
+			}
+			fmt.Fprintf(&sb, `{"jsonrpc":"2.0","id":%d,"method":"eth_getTransactionCount","params":["%s","pending"]}`, i, crypto.PubkeyToAddress(g.keys[i].PublicKey).Hex())
 		}
-		fmt.Fprintf(&sb, `{"jsonrpc":"2.0","id":%d,"method":"eth_getTransactionCount","params":["%s","pending"]}`, i, crypto.PubkeyToAddress(g.keys[i].PublicKey).Hex())
-	}
-	sb.WriteByte(']')
-	req := httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(sb.String())).WithContext(ctx)
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	g.rpc.ServeHTTP(rec, req)
-	var results []struct {
-		ID     int             `json:"id"`
-		Result string          `json:"result"`
-		Error  json.RawMessage `json:"error"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &results); err != nil {
-		return fmt.Errorf("getTransactionCount batch: %w: %.200s", err, rec.Body.String())
-	}
-	for _, r := range results {
-		if len(r.Error) != 0 {
-			return fmt.Errorf("getTransactionCount: %s", r.Error)
+		sb.WriteByte(']')
+		req := httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(sb.String())).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		g.rpc.ServeHTTP(rec, req)
+		var results []struct {
+			ID     int             `json:"id"`
+			Result string          `json:"result"`
+			Error  json.RawMessage `json:"error"`
 		}
-		n, err := strconv.ParseUint(strings.TrimPrefix(r.Result, "0x"), 16, 64)
-		if err != nil {
-			return fmt.Errorf("getTransactionCount id %d: %w (%q)", r.ID, err, r.Result)
+		if err := json.Unmarshal(rec.Body.Bytes(), &results); err != nil {
+			return fmt.Errorf("getTransactionCount batch: %w: %.200s", err, rec.Body.String())
 		}
-		g.nonces[r.ID] = n
+		for _, r := range results {
+			if len(r.Error) != 0 {
+				return fmt.Errorf("getTransactionCount: %s", r.Error)
+			}
+			n, err := strconv.ParseUint(strings.TrimPrefix(r.Result, "0x"), 16, 64)
+			if err != nil {
+				return fmt.Errorf("getTransactionCount id %d: %w (%q)", r.ID, err, r.Result)
+			}
+			g.nonces[r.ID] = n
+		}
 	}
 	return nil
 }
