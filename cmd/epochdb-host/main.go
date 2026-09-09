@@ -59,6 +59,9 @@ import (
 	"github.com/containerman17/avalanche-s3-archival-node/fetch"
 )
 
+// blockLog prints one line per block with Verify and Accept wall (EPOCHDB_HOST_BLOCKLOG=1).
+var blockLog = os.Getenv("EPOCHDB_HOST_BLOCKLOG") != ""
+
 func main() {
 	fs := flag.NewFlagSet("epochdb-host", flag.ExitOnError)
 	chainSpec := fs.String("chain", "", "the L1's blockchainID")
@@ -78,16 +81,21 @@ func main() {
 	genBatch := fs.Int("gen-batch", 2000, "generator: txs submitted per prefill block")
 	genSizes := fs.String("gen-sizes", "100,1000,5000,20000", "generator: tx counts of the timed blocks")
 	genKind := fs.String("gen-kind", "token", "generator workload: token (ERC20-like) or slots (50 storage writes per tx)")
+	genCorpus := fs.String("gen-corpus", "", "generator: record every accepted block to this new EPCORP01 file (replay it with --corpus)")
 	fs.Parse(os.Args[1:])
 	if *genPrefill > 0 {
 		if err := os.MkdirAll(*dataDir, 0o755); err != nil {
 			log.Fatal(err)
 		}
-		id, err := genChain(*dataDir)
+		netID := map[string]uint32{"mainnet": constants.MainnetID, "fuji": constants.FujiID, "local": constants.LocalID}[*network]
+		if netID == 0 {
+			log.Fatalf("epochdb-host: unknown --network %q", *network)
+		}
+		id, err := genChain(*dataDir, netID)
 		if err != nil {
 			log.Fatalf("epochdb-host: gen chain: %v", err)
 		}
-		*chainSpec, *network = id, "local"
+		*chainSpec = id
 	}
 	if *chainSpec == "" || *vmPath == "" {
 		log.Fatal("epochdb-host: --chain and --vm are required")
@@ -142,7 +150,7 @@ func main() {
 		if *configPath == "" {
 			log.Fatal("epochdb-host: --gen-prefill requires --config")
 		}
-		if err := runGen(ctx, c, *vmPath, *dataDir, *configPath, *genKind, *genPrefill, *genBatch, *genSizes); err != nil && !errors.Is(err, context.Canceled) {
+		if err := runGen(ctx, c, *vmPath, *dataDir, *configPath, *genKind, *genPrefill, *genBatch, *genSizes, *genCorpus); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatalf("epochdb-host: gen: %v", err)
 		}
 		return
@@ -584,6 +592,9 @@ func (p *pipe) step(ctx context.Context, vm block.ChainVM, x parsed, b *bench, n
 	t3 := time.Now()
 	b.acceptNs.Add(int64(t3.Sub(t2)))
 	defer func() { b.tailNs.Add(int64(time.Since(t3))) }()
+	if blockLog {
+		log.Printf("bench block h=%d txs=%d gas=%d verify=%s accept=%s", h, x.txs, x.gas, t2.Sub(t1), t3.Sub(t2))
+	}
 	b.accepted(x.item)
 	// The tip is where the follower says it is. At it, the plugin
 	// goes to normal operation and the preference follows every

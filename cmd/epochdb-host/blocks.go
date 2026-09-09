@@ -20,7 +20,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
-	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/libevm/common"
 	ethtypes "github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
@@ -56,7 +56,7 @@ const (
 )
 
 // genChain writes chain.json for the private chain when it is absent.
-func genChain(dataDir string) (string, error) {
+func genChain(dataDir string, networkID uint32) (string, error) {
 	blockchainID := ids.ID(sha256.Sum256([]byte("epochdb-blockbench-chain")))
 	subnetID := ids.ID(sha256.Sum256([]byte("epochdb-blockbench-subnet")))
 	path := filepath.Join(dataDir, "chain.json")
@@ -93,7 +93,7 @@ func genChain(dataDir string) (string, error) {
 		return "", err
 	}
 	cached, err := json.Marshal(map[string]any{
-		"networkID": constants.LocalID, "blockchainID": blockchainID.String(), "subnetID": subnetID.String(),
+		"networkID": networkID, "blockchainID": blockchainID.String(), "subnetID": subnetID.String(),
 		"vmKind": "subnetevm", "genesisData": genesisJSON,
 	})
 	if err != nil {
@@ -139,7 +139,8 @@ type gen struct {
 	signer   ethtypes.Signer
 	keys     []*ecdsa.PrivateKey
 	nonces   []uint64
-	kind     string // "token" or "slots"
+	kind     string   // "token" or "slots"
+	corpus   *os.File // optional EPCORP01 recording of every accepted block
 	contract common.Address
 	holders  uint64 // token holders seeded by mintMany so far (recipients)
 	slots    uint64 // slots kind: slots written so far in the slot writer
@@ -344,12 +345,24 @@ func (g *gen) slotGrow() [][]byte {
 // Returns the block and the three wall durations.
 func (g *gen) mine(ctx context.Context) (*ethtypes.Block, [3]time.Duration, error) {
 	var d [3]time.Duration
-	t0 := time.Now()
-	blk, err := g.vm.vm.BuildBlock(ctx)
-	if err != nil {
+	// ACP-226 minimum block delay: on a network where Granite activates
+	// after genesis the delay is 2 s until the builder lowers it; wait it
+	// out rather than count it as build time.
+	var blk snowman.Block
+	var err error
+	for {
+		t0 := time.Now()
+		blk, err = g.vm.vm.BuildBlock(ctx)
+		d[0] = time.Since(t0)
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "minimum block delay not met") {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 		return nil, d, fmt.Errorf("BuildBlock: %w", err)
 	}
-	d[0] = time.Since(t0)
 	t1 := time.Now()
 	if err := blk.Verify(ctx); err != nil {
 		return nil, d, fmt.Errorf("Verify: %w", err)
@@ -366,6 +379,14 @@ func (g *gen) mine(ctx context.Context) (*ethtypes.Block, [3]time.Duration, erro
 	var eth ethtypes.Block
 	if err := rlp.DecodeBytes(blk.Bytes(), &eth); err != nil {
 		return nil, d, err
+	}
+	if g.corpus != nil {
+		var frame [12]byte
+		binary.BigEndian.PutUint64(frame[:8], eth.NumberU64())
+		binary.BigEndian.PutUint32(frame[8:], uint32(len(blk.Bytes())))
+		if _, err := g.corpus.Write(append(frame[:], blk.Bytes()...)); err != nil {
+			return nil, d, err
+		}
 	}
 	return &eth, d, nil
 }
@@ -442,7 +463,7 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 }
 
 // runGen: prefill for prefillFor, then one timed block per entry of sizes.
-func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, kind string, prefillFor time.Duration, prefillBatch int, sizes string) error {
+func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, kind string, prefillFor time.Duration, prefillBatch int, sizes, corpusOut string) error {
 	if kind != "token" && kind != "slots" {
 		return fmt.Errorf("--gen-kind %q: want token or slots", kind)
 	}
@@ -468,7 +489,18 @@ func runGen(ctx context.Context, c *chain.Chain, vmPath, dataDir, configPath, ki
 	if handlers["/rpc"] == nil {
 		return errors.New("plugin has no /rpc handler")
 	}
-	g := &gen{kind: kind, vm: pl, rpc: handlers["/rpc"], signer: ethtypes.LatestSignerForChainID(big.NewInt(genChainID)), nonces: make([]uint64, genSenders)}
+	var corpus *os.File
+	if corpusOut != "" {
+		corpus, err = os.OpenFile(corpusOut, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer corpus.Close()
+		if _, err := corpus.WriteString(corpusMagic); err != nil {
+			return err
+		}
+	}
+	g := &gen{kind: kind, corpus: corpus, vm: pl, rpc: handlers["/rpc"], signer: ethtypes.LatestSignerForChainID(big.NewInt(genChainID)), nonces: make([]uint64, genSenders)}
 	for i := 0; i < genSenders; i++ {
 		g.keys = append(g.keys, genKey(i))
 	}

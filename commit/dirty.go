@@ -370,6 +370,12 @@ func (d *Dirty) ApplyNodes(root common.Hash, changes []NodeChange) error {
 }
 
 func (d *Dirty) storage(j *job) (common.Hash, *trienode.NodeSet, error) {
+	if len(j.p.slots) >= fastMinSlots {
+		root, set, ok, err := d.fastStorage(j)
+		if err != nil || ok {
+			return root, set, err
+		}
+	}
 	t, err := trie.New(trie.StorageTrieID(d.root, j.hash, j.root), d)
 	if err != nil {
 		return common.Hash{}, nil, err
