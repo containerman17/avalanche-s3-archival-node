@@ -156,10 +156,10 @@ type gen struct {
 	kind     string   // "token" or "slots"
 	corpus   *os.File // optional EPCORP01 recording of every accepted block
 	contract common.Address
-	head     uint64 // remote mode: last height counted by awaitBlock
+	head     uint64    // remote mode: last height counted by awaitBlock
 	lastBlk  time.Time // remote mode: when awaitBlock last saw a new block
-	holders  uint64 // token holders seeded by mintMany so far (recipients)
-	slots    uint64 // slots kind: slots written so far in the slot writer
+	holders  uint64    // token holders seeded by mintMany so far (recipients)
+	slots    uint64    // slots kind: slots written so far in the slot writer
 	rng      uint64
 }
 
