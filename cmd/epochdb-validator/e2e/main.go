@@ -68,11 +68,40 @@ const chainGenesis = `{
 // calldata[0:32] into slot 0, and reverts when called with no calldata.
 var storeContract = ethcommon.Hex2Bytes("6012600c60003960126000f3" + "3615600c57600035600055005b60006000fd")
 
+var (
+	network *tmpnet.Network
+	keep    = flag.Bool("keep", false, "leave the network running")
+	logsDir = flag.String("logs", "", "copy every node's logs here and delete the network dir after the run (default: keep the network dir)")
+)
+
+// teardown stops the network and, with --logs, keeps only the logs.
+func teardown() {
+	if network == nil || *keep {
+		return
+	}
+	network.Stop(context.Background())
+	if *logsDir == "" {
+		return
+	}
+	dst := filepath.Join(*logsDir, filepath.Base(network.Dir))
+	for _, n := range network.Nodes {
+		os.CopyFS(filepath.Join(dst, n.NodeID.String()), os.DirFS(filepath.Join(n.DataDir, "logs")))
+	}
+	os.RemoveAll(network.Dir)
+	fmt.Println("logs kept at", dst)
+}
+
+// check exits on error, stopping the network first unless --keep.
 func check(err error, what string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL %s: %v\n", what, err)
-		os.Exit(1)
+		fail()
 	}
+}
+
+func fail() {
+	teardown()
+	os.Exit(1)
 }
 
 type node struct {
@@ -89,7 +118,6 @@ func main() {
 	load := flag.Duration("load", 0, "load phase duration (0 = skip)")
 	rate := flag.Int("rate", 300, "load phase tx/s")
 	nkeys := flag.Int("keys", 200, "load phase sender keys")
-	keep := flag.Bool("keep", false, "leave the network running")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
 		flag.Usage()
@@ -100,7 +128,7 @@ func main() {
 	log := tests.NewDefaultLogger("epochdb-e2e")
 
 	key := genesis.EWOQKey
-	network := tmpnet.NewDefaultNetwork("epochdb-validator-e2e")
+	network = tmpnet.NewDefaultNetwork("epochdb-validator-e2e")
 	network.Nodes = tmpnet.NewNodesOrPanic(5)
 	nodes := make([]*node, 5)
 	for i, n := range network.Nodes {
@@ -126,7 +154,8 @@ func main() {
 		Chains: []*tmpnet.Chain{{
 			VMID:    vmID,
 			Genesis: []byte(chainGenesis),
-			Config:  `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false}`,
+			Config: `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false,` +
+				`"eth-apis":["eth","eth-filter","net","web3","internal-eth","internal-blockchain","internal-transaction","internal-tx-pool"]}`,
 		}},
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
 	}}
@@ -140,9 +169,17 @@ func main() {
 		check(err, "dial "+n.rpc)
 		fmt.Printf("%s %s %s\n", n.kind, n.NodeID, n.rpc)
 	}
-	if !*keep {
-		defer func() { check(network.Stop(context.Background()), "stop") }()
+	// The chain's handlers mount after the node reports healthy: wait for them.
+	for _, n := range nodes {
+		for deadline := time.Now().Add(2 * time.Minute); ; time.Sleep(500 * time.Millisecond) {
+			if _, err := n.ec.ChainID(ctx); err == nil {
+				break
+			} else if time.Now().After(deadline) {
+				check(err, "chain rpc on "+n.kind)
+			}
+		}
 	}
+	defer teardown()
 
 	ethKey := key.ToECDSA()
 	d := &driver{ctx: ctx, nodes: nodes, chainID: big.NewInt(99999)}
@@ -197,7 +234,7 @@ func main() {
 	d.compareAll(1, head)
 	proposers := d.proposers(network.Dir, chainID)
 	fmt.Println("functional phase OK: head", head, "proposers", proposers)
-	if proposers["ours"] == 0 || proposers["stock"] == 0 {
+	if *ours != *stock && (proposers["ours"] == 0 || proposers["stock"] == 0) { // same dir = harness dry run
 		check(fmt.Errorf("both kinds must have built: %v", proposers), "proposers")
 	}
 	d.scanStockLogs(network.Dir, nodes)
@@ -307,11 +344,11 @@ func (d *driver) compareAll(from, to uint64) {
 			}
 			if blk != ref[0] {
 				fmt.Printf("DIVERGENCE block %d: %s\n%s\nvs %s\n%s\n", h, d.nodes[0].kind, ref[0], n.kind, blk)
-				os.Exit(1)
+				fail()
 			}
 			if rcp != ref[1] {
 				fmt.Printf("DIVERGENCE receipts %d: %s\n%s\nvs %s\n%s\n", h, d.nodes[0].kind, ref[1], n.kind, rcp)
-				os.Exit(1)
+				fail()
 			}
 		}
 	}
@@ -353,7 +390,7 @@ func (d *driver) scanStockLogs(dir string, nodes []*node) {
 				l := strings.ToLower(line)
 				if strings.Contains(l, "invalid block") || strings.Contains(l, "rejecting block") || strings.Contains(l, "failed to verify block") {
 					fmt.Printf("STOCK LOG %s: %s\n", filepath.Base(path), line)
-					os.Exit(1)
+					fail()
 				}
 			}
 		}
