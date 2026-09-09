@@ -256,6 +256,14 @@ func (g *gen) submit(ctx context.Context, raws [][]byte) error {
 // its predecessor at setup). Every tx reads owner/paused/fee/treasury, two
 // frozen flags, and two or three balances, and writes two or three slots.
 func (g *gen) traffic(n int) [][]byte {
+	if g.kind == "transfer" {
+		raws := make([][]byte, 0, n)
+		for i := 0; i < n; i++ {
+			to := holderAt(g.next() % genSenders)
+			raws = append(raws, g.sign(int(g.next()%uint64(len(g.keys))), &to, big.NewInt(1), 21_000, nil))
+		}
+		return raws
+	}
 	if g.kind == "slots" {
 		return g.slotTraffic(n)
 	}
@@ -284,6 +292,9 @@ func (g *gen) traffic(n int) [][]byte {
 // grow signs mintsPerBlock mintMany txs from the owner, each seeding
 // holdersPerMint fresh holders.
 func (g *gen) grow() [][]byte {
+	if g.kind == "transfer" {
+		return nil // plain value transfers need no contract and no holders
+	}
 	if g.kind == "slots" {
 		return g.slotGrow()
 	}
@@ -702,18 +713,20 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	if settle {
 		init = common.FromHex(settleBin)
 	}
-	g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), g.nonces[0])
-	if err := g.submit(ctx, [][]byte{g.sign(0, nil, nil, 2_000_000, init)}); err != nil {
-		return err
+	if g.kind != "transfer" {
+		g.contract = crypto.CreateAddress(crypto.PubkeyToAddress(g.keys[0].PublicKey), g.nonces[0])
+		if err := g.submit(ctx, [][]byte{g.sign(0, nil, nil, 2_000_000, init)}); err != nil {
+			return err
+		}
+		blk, d, err := g.mine(ctx)
+		if err != nil {
+			return err
+		}
+		if blk.txs != 1 || blk.gas == 0 {
+			return fmt.Errorf("deploy block has %d txs, gas %d", blk.txs, blk.gas)
+		}
+		log.Printf("gen deployed %s contract at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.kind, g.contract, blk.height, d[0], d[1], d[2], g.pid())
 	}
-	blk, d, err := g.mine(ctx)
-	if err != nil {
-		return err
-	}
-	if blk.txs != 1 || blk.gas == 0 {
-		return fmt.Errorf("deploy block has %d txs, gas %d", blk.txs, blk.gas)
-	}
-	log.Printf("gen deployed %s contract at %s height=%d build=%s verify=%s accept=%s vm_pid=%d", g.kind, g.contract, blk.height, d[0], d[1], d[2], g.pid())
 	if settle {
 		g.holders, g.slots = parties, secs
 		seed := g.settleSeed(parties, secs)
@@ -728,7 +741,7 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		} else {
 			log.Printf("gen seeded %d positions (%d parties x %d secs) in %d blocks, %d txs, %.1fs", parties*secs, parties, secs, b, txs, time.Since(t0).Seconds())
 		}
-	} else if g.kind != "slots" {
+	} else if g.kind != "slots" && g.kind != "transfer" {
 		setup := make([][]byte, 0, 2*genSenders)
 		for i := 0; i < genSenders; i++ {
 			to := crypto.PubkeyToAddress(g.keys[i].PublicKey)
@@ -753,7 +766,8 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		if err := g.submit(ctx, grow); err != nil {
 			return err
 		}
-		if blk, _, err = g.mine(ctx); err != nil {
+		blk, _, err := g.mine(ctx)
+		if err != nil {
 			return err
 		}
 		if blk.gas == 0 {
@@ -816,7 +830,7 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		blocks, txs, gas = blocks+b, txs+t, gas+ga
 	}
 	el := time.Since(start)
-	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d gas=%d mgas/s=%.1f holders=%d slots=%d senders=%d", el.Seconds(), blocks, txs, gas, float64(gas)/1e6/el.Seconds(), g.holders, g.slots, genSenders)
+	log.Printf("gen prefill done in %.1fs: blocks=%d txs=%d tx/s=%.0f gas=%d mgas/s=%.1f holders=%d slots=%d senders=%d", el.Seconds(), blocks, txs, float64(txs)/el.Seconds(), gas, float64(gas)/1e6/el.Seconds(), g.holders, g.slots, genSenders)
 	if settle {
 		log.Printf("gen settle: rows=%d rows/s=%.0f rows/block=%.0f gas/row=%.0f", txs*rowsPerTx, float64(txs*rowsPerTx)/el.Seconds(), float64(txs*rowsPerTx)/float64(max(blocks, 1)), float64(gas)/float64(max(txs*rowsPerTx, 1)))
 	}
