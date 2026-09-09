@@ -50,10 +50,14 @@ import (
 
 const subnetEVMID = "srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy"
 
-// chainGenesis: %s is the fee config; the default is subnet-evm's 20 M gas,
-// 2 s blocks; --stress raises the gas limit to 500 M with the target gas
-// scaled 100x and seeds the ACP-226 min block delay at 1 ms, so the engine,
-// not the schedule, bounds throughput.
+// chainGenesis: the first %s is the fee config, the second the genesis
+// timestamp. The default is subnet-evm's 20 M gas, 2 s blocks at a 1970
+// genesis; --stress raises the gas limit to 500 M with the target gas scaled
+// 100x and seeds the ACP-226 min block delay at 1 ms. The seed
+// (initialMinDelayMS) is written into the genesis header only when the
+// genesis time is Granite-active, so the stress genesis is stamped "now";
+// at a 1970 genesis the excess starts at ~2 s and moves 200 units per
+// block (~40k blocks to reach 1 ms), which paces every block at 2 s.
 const chainGenesis = `{
   "config": {
     "chainId": 99999, "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0,
@@ -63,7 +67,7 @@ const chainGenesis = `{
     "allowFeeRecipients": false
   },
   "alloc": {"8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC": {"balance": "0x52B7D2DCC80CD2E4000000"}},
-  "nonce": "0x0", "timestamp": "0x0", "extraData": "0x00", "gasLimit": "0x1312d00", "difficulty": "0x0",
+  "nonce": "0x0", "timestamp": "%s", "extraData": "0x00", "gasLimit": "0x1312d00", "difficulty": "0x0",
   "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
   "coinbase": "0x0000000000000000000000000000000000000000", "number": "0x0", "gasUsed": "0x0",
   "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
@@ -175,15 +179,16 @@ func main() {
 	network.DefaultRuntimeConfig = tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago}}
 	vmID, err := ids.FromString(subnetEVMID)
 	check(err, "vm id")
-	feeConfig, minDelay, gasLimit := feeConfigDefault, 2000, 20e6
+	feeConfig, minDelay, gasLimit, genesisTime := feeConfigDefault, 2000, 20e6, "0x0"
 	if *stress {
 		feeConfig, minDelay, gasLimit = feeConfigStress, 1, 500e6
+		genesisTime = fmt.Sprintf("0x%x", time.Now().Unix())
 	}
 	network.Subnets = []*tmpnet.Subnet{{
 		Name: "epochdb",
 		Chains: []*tmpnet.Chain{{
 			VMID:    vmID,
-			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig)),
+			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig, genesisTime)),
 			Config:  fmt.Sprintf(chainConfig, minDelay),
 		}},
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
@@ -378,6 +383,7 @@ func (d *driver) minHead() uint64 {
 // on every node at every height in [from, to].
 func (d *driver) compareAll(from, to uint64) {
 	txs, gas := 0, uint64(0)
+	var firstMS, lastMS uint64
 	for h := from; h <= to; h++ {
 		hex := fmt.Sprintf("0x%x", h)
 		var ref [2]string
@@ -387,13 +393,24 @@ func (d *driver) compareAll(from, to uint64) {
 			if i == 0 {
 				ref = [2]string{blk, rcp}
 				var b struct {
-					Transactions []json.RawMessage
-					GasUsed      string
+					Transactions          []json.RawMessage
+					GasUsed               string
+					TimestampMilliseconds string
+					Timestamp             string
 				}
 				json.Unmarshal([]byte(blk), &b)
 				txs += len(b.Transactions)
 				g, _ := strconv.ParseUint(strings.TrimPrefix(b.GasUsed, "0x"), 16, 64)
 				gas += g
+				ms, err := strconv.ParseUint(strings.TrimPrefix(b.TimestampMilliseconds, "0x"), 16, 64)
+				if err != nil {
+					sec, _ := strconv.ParseUint(strings.TrimPrefix(b.Timestamp, "0x"), 16, 64)
+					ms = sec * 1000
+				}
+				if h == from {
+					firstMS = ms
+				}
+				lastMS = ms
 				continue
 			}
 			if blk != ref[0] {
@@ -407,8 +424,8 @@ func (d *driver) compareAll(from, to uint64) {
 		}
 	}
 	n := float64(to - from + 1)
-	fmt.Printf("blocks %d..%d identical on %d nodes: %d txs, %.0f txs/block, %.1fM gas/block (%.0f%% of the %.0fM limit)\n",
-		from, to, len(d.nodes), txs, float64(txs)/n, float64(gas)/n/1e6, float64(gas)/n/d.gasLimit*100, d.gasLimit/1e6)
+	fmt.Printf("blocks %d..%d identical on %d nodes: %d txs, %.0f txs/block, %.1fM gas/block (%.0f%% of the %.0fM limit), %.0f ms between blocks\n",
+		from, to, len(d.nodes), txs, float64(txs)/n, float64(gas)/n/1e6, float64(gas)/n/d.gasLimit*100, d.gasLimit/1e6, float64(lastMS-firstMS)/max(n-1, 1))
 }
 
 // proposers counts ACCEPTED blocks per builder kind: our plugin logs
