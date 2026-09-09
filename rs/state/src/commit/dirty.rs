@@ -103,17 +103,15 @@ fn queue(acct: &mut HashMap<Hash, Pending>, key: &[u8], value: &[u8]) -> Result<
     Ok(())
 }
 
-fn storage(reader: &dyn NodeReader, owner: Hash, root: Hash, slots: &HashMap<Hash, Vec<u8>>) -> Result<(Hash, NodeSet)> {
-    let mut t = Trie::new(reader, owner, root);
-    for (k, v) in slots {
-        if v.is_empty() {
-            t.delete(k)?;
-        } else {
-            t.update(k, rlp::bytes(v))?;
-        }
-    }
-    Ok(t.commit())
+fn storage(reader: &dyn NodeReader, owner: Hash, root: Hash, slots: &HashMap<Hash, Vec<u8>>, workers: usize) -> Result<(Hash, NodeSet)> {
+    let t = Trie::new(reader, owner, root);
+    let ops: Vec<(Vec<u8>, Vec<u8>)> = slots.iter().map(|(k, v)| (k.to_vec(), if v.is_empty() { Vec::new() } else { rlp::bytes(v) })).collect();
+    t.commit_par(&ops, workers)
 }
+
+/// Dirty keys from which one trie is split by top nibble over the pool
+/// (below it the 16-way dispatch costs more than the hashing it spreads).
+const SPLIT_MIN_KEYS: usize = 4096;
 
 /// The new state root of `pending` applied over `root` as `reader` sees it,
 /// and every node set produced (storage tries first, the account trie last).
@@ -144,8 +142,14 @@ fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>,
         }
         jobs.push(j);
     }
-    let work: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| !j.p.del && !j.p.slots.is_empty()).map(|(i, _)| i).collect();
-    let results: Mutex<Vec<(usize, Result<(Hash, NodeSet)>)>> = Mutex::new(Vec::with_capacity(work.len()));
+    let (big, work): (Vec<usize>, Vec<usize>) = jobs.iter().enumerate().filter(|(_, j)| !j.p.del && !j.p.slots.is_empty()).map(|(i, _)| i).partition(|&i| workers > 1 && jobs[i].p.slots.len() >= SPLIT_MIN_KEYS);
+    let results: Mutex<Vec<(usize, Result<(Hash, NodeSet)>)>> = Mutex::new(Vec::with_capacity(work.len() + big.len()));
+    // A big trie is split by top nibble over the whole pool, one at a time.
+    for &i in &big {
+        let j = &jobs[i];
+        let r = storage(reader, j.hash, j.root, &j.p.slots, workers);
+        results.lock().unwrap().push((i, r));
+    }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let nworkers = workers.max(1).min(work.len().max(1));
     let slots: usize = work.iter().map(|&i| jobs[i].p.slots.len()).sum();
@@ -155,7 +159,7 @@ fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>,
         // fan out only when there is enough work to pay for the threads.
         for &i in &work {
             let j = &jobs[i];
-            let r = storage(reader, j.hash, j.root, &j.p.slots);
+            let r = storage(reader, j.hash, j.root, &j.p.slots, 1);
             results.lock().unwrap().push((i, r));
         }
     } else {
@@ -167,7 +171,7 @@ fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>,
                         break;
                     }
                     let j = &jobs[work[i]];
-                    let r = storage(reader, j.hash, j.root, &j.p.slots);
+                    let r = storage(reader, j.hash, j.root, &j.p.slots, 1);
                     results.lock().unwrap().push((work[i], r));
                 });
             }
@@ -181,13 +185,14 @@ fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>,
         jobs[i].root = root;
         sets.push(set);
     }
+    let mut ops = Vec::with_capacity(jobs.len());
     for j in &jobs {
         if j.p.del {
             // The account's retained storage nodes go stale here. Nothing
             // can reach them (a recreated account starts from the empty
             // root and rewrites every node it touches), so they are left
             // for the roll to drop.
-            acc.delete(&j.hash)?;
+            ops.push((j.hash.to_vec(), Vec::new()));
             continue;
         }
         let val = match &j.p.row {
@@ -197,9 +202,9 @@ fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>,
                 leaf_value(&cur.nonce, &cur.balance, &j.root, &cur.code)
             }
         };
-        acc.update(&j.hash, val)?;
+        ops.push((j.hash.to_vec(), val));
     }
-    let (root, set) = acc.commit();
+    let (root, set) = acc.commit_par(&ops, if ops.len() >= SPLIT_MIN_KEYS { workers } else { 1 })?;
     sets.push(set);
     Ok((root, sets))
 }

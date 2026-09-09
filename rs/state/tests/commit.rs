@@ -249,3 +249,100 @@ fn open_refuses_corrupt_footer() {
         assert!(File::open(&p).is_err(), "mutation {i}: opened");
     }
 }
+
+/// The split path (one trie's 16 subtries over the pool): a contract with
+/// enough dirty slots to split, and enough account writes to split the
+/// account trie, against a re-roll; then a second round over the retained
+/// nodes.
+#[test]
+fn dirty_split_matches_reroll() {
+    use state::commit::dirty::Dirty;
+    let mut rng = Rng::new(909);
+    let mut m = gen_state(&mut rng, 6000);
+    let mut big = [0u8; 20];
+    rng.fill(&mut big);
+    let mut a = Acct { nonce: 1, bal: 1, code: Some(vec![1]), ..Default::default() };
+    for _ in 0..20_000 {
+        a.slots.insert(rng.word(), rng.word());
+    }
+    m.insert(big, a);
+    let flat = Arc::new(flatten(&m));
+    let (_, _, f) = roll_tmp("split", &flat);
+    let mut d = Dirty::new(f.clone(), seek_fn(flat.clone()));
+    d.workers = 16;
+    for round in 0..2 {
+        // Slots: 3000 new, 1500 updates, 1500 deletes (unless the account
+        // mutation below deleted the contract in the previous round).
+        let existing: Vec<[u8; 32]> = m.get(&big).map(|a| a.slots.keys().copied().collect()).unwrap_or_default();
+        for i in 0..6000 * existing.is_empty().then_some(0).unwrap_or(1) {
+            let (s, v) = match i % 4 {
+                0 | 1 => (rng.word(), rng.word()),
+                2 => (existing[rng.below(existing.len())], rng.word()),
+                _ => (existing[rng.below(existing.len())], [0u8; 32]),
+            };
+            let a = m.get_mut(&big).unwrap();
+            if v == [0u8; 32] {
+                a.slots.remove(&s);
+            } else {
+                a.slots.insert(s, v);
+            }
+            d.apply(&slot_key(&big, &s), &trim_word(&v)).unwrap();
+        }
+        // Accounts: updates, deletes and new ones across the whole trie.
+        let ups = mutate(&mut m, &mut rng, &[0, 1, 2, 3], 5000);
+        for (k, v) in &ups {
+            d.apply(k, v).unwrap();
+        }
+        let got = d.root().unwrap();
+        let (want, _, _) = roll_tmp(&format!("split-r{round}"), &flatten(&m));
+        assert_eq!(hex(&got), hex(&want), "round {round}");
+    }
+}
+
+/// commit_par's fallback: the deletes leave the root branch one child, so
+/// the branch collapses and the serial path finishes.
+#[test]
+fn commit_par_collapses_root() {
+    use state::commit::dirty::Dirty;
+    use state::commit::trie::Trie;
+    let mut rng = Rng::new(5);
+    let mut m = Model::new();
+    let mut addr = [0u8; 20];
+    rng.fill(&mut addr);
+    // Three slots whose hashed keys start with three different nibbles.
+    let mut a = Acct { nonce: 1, bal: 1, code: Some(vec![1]), ..Default::default() };
+    let mut seen = std::collections::HashSet::new();
+    while a.slots.len() < 3 {
+        let s = rng.word();
+        let nib = slot_key(&addr, &s)[33] >> 4;
+        if seen.insert(nib) {
+            a.slots.insert(s, rng.word());
+        }
+    }
+    m.insert(addr, a);
+    let flat = Arc::new(flatten(&m));
+    let (_, _, f) = roll_tmp("collapse", &flat);
+    let owner: Hash = keccak256(&addr).try_into().unwrap();
+    let (root, ok) = f.storage_root(&owner);
+    assert!(ok);
+    let d = Dirty::new(f.clone(), seek_fn(flat.clone()));
+    let slots: Vec<[u8; 32]> = m[&addr].slots.keys().copied().collect();
+    for keep in 0..3 {
+        let ops: Vec<(Vec<u8>, Vec<u8>)> = slots.iter().enumerate().filter(|(i, _)| *i != keep).map(|(_, s)| (slot_key(&addr, s)[33..].to_vec(), Vec::new())).collect();
+        let (got, _) = Trie::new(&d, owner, root).commit_par(&ops, 16).unwrap();
+        let mut m2 = m.clone();
+        m2.get_mut(&addr).unwrap().slots.retain(|s, _| *s == slots[keep]);
+        let (_, _, f2) = roll_tmp(&format!("collapse-{keep}"), &flatten(&m2));
+        let flat2 = flatten(&m2);
+        // A one-slot root is a leaf: hash it as Dirty::leaf does.
+        let mut st = state::commit::roll::StackTrie::new();
+        st.update(&flat2[1].0[33..], &rlp::bytes(&flat2[1].1), &mut state::commit::roll::NoSink).unwrap();
+        let want = st.hash_root(&mut state::commit::roll::NoSink);
+        assert!(!f2.storage_root(&owner).1);
+        assert_eq!(hex(&got), hex(&want), "keep {keep}");
+    }
+    // All three gone: the empty root.
+    let ops: Vec<(Vec<u8>, Vec<u8>)> = slots.iter().map(|s| (slot_key(&addr, s)[33..].to_vec(), Vec::new())).collect();
+    let (got, _) = Trie::new(&d, owner, root).commit_par(&ops, 16).unwrap();
+    assert_eq!(got, EMPTY_ROOT);
+}
