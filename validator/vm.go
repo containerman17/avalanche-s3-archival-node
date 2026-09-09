@@ -33,6 +33,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"go.uber.org/zap"
 
 	"github.com/containerman17/avalanche-s3-archival-node/chain"
@@ -430,6 +431,7 @@ func newMetrics() *metrics {
 		crossings: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "epochdb_crossings_total", Help: "cgo calls into the engine"}, []string{"kind"}),
 		admitted:  prometheus.NewCounter(prometheus.CounterOpts{Name: "epochdb_txs_admitted_total", Help: "txs the pool promoted to pending"}),
 	}
-	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.admitted)
+	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.admitted,
+		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})) // heap, GC, RSS of the plugin process
 	return m
 }

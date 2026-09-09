@@ -1,0 +1,486 @@
+// Command e2e is the validator's oracle: a local tmpnet subnet with 5
+// validators, 3 running our plugin and 2 running stock subnet-evm, one
+// genesis, same VM id. It submits transfers, a contract deploy, calls, a
+// failing tx and a nonce gap through both node kinds, checks that blocks and
+// receipts agree on every node at every height and that both kinds
+// proposed, then runs a load phase and samples block fill, plugin RSS and
+// the Go side's heap/GC from /ext/metrics.
+//
+//	go run ./cmd/epochdb-validator/e2e --avalanchego ~/avalanchego/build/avalanchego \
+//	  --ours <plugin dir with srEXi...=epochdb-validator> --stock <plugin dir with stock subnet-evm> \
+//	  [--load 10m --rate 300 --keys 200] [--keep]
+//
+// tmpnet builds permissioned subnets (no ConvertSubnetToL1 helper), so the
+// "L1" is a 5-validator subnet; consensus, proposervm and the VM see no
+// difference for this test.
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"math/big"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/ava-labs/avalanchego/config"
+	"github.com/ava-labs/avalanchego/genesis"
+	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/tests"
+	"github.com/ava-labs/avalanchego/tests/fixture/tmpnet"
+	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
+	ethcommon "github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
+	"github.com/ava-labs/libevm/ethclient"
+	"github.com/ava-labs/libevm/params"
+)
+
+const subnetEVMID = "srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy"
+
+const chainGenesis = `{
+  "config": {
+    "chainId": 99999, "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0,
+    "byzantiumBlock": 0, "constantinopleBlock": 0, "petersburgBlock": 0, "istanbulBlock": 0, "muirGlacierBlock": 0,
+    "subnetEVMTimestamp": 0,
+    "feeConfig": {"gasLimit": 20000000, "minBaseFee": 1000000000, "targetGas": 100000000, "baseFeeChangeDenominator": 48,
+      "minBlockGasCost": 0, "maxBlockGasCost": 10000000, "targetBlockRate": 2, "blockGasCostStep": 500000},
+    "allowFeeRecipients": false
+  },
+  "alloc": {"8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC": {"balance": "0x52B7D2DCC80CD2E4000000"}},
+  "nonce": "0x0", "timestamp": "0x0", "extraData": "0x00", "gasLimit": "0x1312d00", "difficulty": "0x0",
+  "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "coinbase": "0x0000000000000000000000000000000000000000", "number": "0x0", "gasUsed": "0x0",
+  "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+}`
+
+// storeContract: init code returning an 18-byte runtime that SSTOREs
+// calldata[0:32] into slot 0, and reverts when called with no calldata.
+var storeContract = ethcommon.Hex2Bytes("6012600c60003960126000f3" + "3615600c57600035600055005b60006000fd")
+
+func check(err error, what string) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL %s: %v\n", what, err)
+		os.Exit(1)
+	}
+}
+
+type node struct {
+	*tmpnet.Node
+	kind string // ours | stock
+	rpc  string
+	ec   *ethclient.Client
+}
+
+func main() {
+	avago := flag.String("avalanchego", "", "avalanchego binary")
+	ours := flag.String("ours", "", "plugin dir holding our epochdb-validator as "+subnetEVMID)
+	stock := flag.String("stock", "", "plugin dir holding stock subnet-evm as "+subnetEVMID)
+	load := flag.Duration("load", 0, "load phase duration (0 = skip)")
+	rate := flag.Int("rate", 300, "load phase tx/s")
+	nkeys := flag.Int("keys", 200, "load phase sender keys")
+	keep := flag.Bool("keep", false, "leave the network running")
+	flag.Parse()
+	if *avago == "" || *ours == "" || *stock == "" {
+		flag.Usage()
+		os.Exit(2)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute+*load)
+	defer cancel()
+	log := tests.NewDefaultLogger("epochdb-e2e")
+
+	key := genesis.EWOQKey
+	network := tmpnet.NewDefaultNetwork("epochdb-validator-e2e")
+	network.Nodes = tmpnet.NewNodesOrPanic(5)
+	nodes := make([]*node, 5)
+	for i, n := range network.Nodes {
+		kind, dir := "ours", *ours
+		if i >= 3 {
+			kind, dir = "stock", *stock
+		}
+		n.RuntimeConfig = &tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago, PluginDir: dir}}
+		nodes[i] = &node{Node: n, kind: kind}
+	}
+	testGenesis, err := tmpnet.NewTestGenesis(2197052273, network.Nodes, []*secp256k1.PrivateKey{key})
+	check(err, "genesis")
+	network.Genesis = testGenesis
+	network.DefaultFlags = tmpnet.FlagsMap{config.MinStakeDurationKey: "2s"}
+	network.DefaultFlags.SetDefaults(tmpnet.DefaultE2EFlags())
+	network.DefaultFlags[config.LogLevelKey] = "info"
+	network.PreFundedKeys = []*secp256k1.PrivateKey{key}
+	network.DefaultRuntimeConfig = tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago}}
+	vmID, err := ids.FromString(subnetEVMID)
+	check(err, "vm id")
+	network.Subnets = []*tmpnet.Subnet{{
+		Name: "epochdb",
+		Chains: []*tmpnet.Chain{{
+			VMID:    vmID,
+			Genesis: []byte(chainGenesis),
+			Config:  `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false}`,
+		}},
+		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
+	}}
+
+	check(tmpnet.BootstrapNewNetwork(ctx, log, network, ""), "bootstrap")
+	chainID := network.Subnets[0].Chains[0].ChainID
+	fmt.Println("network:", network.Dir, "chain:", chainID)
+	for _, n := range nodes {
+		n.rpc = n.GetAccessibleURI() + "/ext/bc/" + chainID.String() + "/rpc"
+		n.ec, err = ethclient.Dial(n.rpc)
+		check(err, "dial "+n.rpc)
+		fmt.Printf("%s %s %s\n", n.kind, n.NodeID, n.rpc)
+	}
+	if !*keep {
+		defer func() { check(network.Stop(context.Background()), "stop") }()
+	}
+
+	ethKey := key.ToECDSA()
+	d := &driver{ctx: ctx, nodes: nodes, chainID: big.NewInt(99999)}
+	d.signer = types.LatestSignerForChainID(d.chainID)
+
+	// ---- functional phase: both node kinds submit, every node agrees ----
+	from := crypto.PubkeyToAddress(ethKey.PublicKey)
+	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000001")
+	nonce, err := nodes[0].ec.NonceAt(ctx, from, nil)
+	check(err, "nonce")
+	for i, n := range []*node{nodes[0], nodes[3], nodes[1], nodes[4]} {
+		r := d.send(n, ethKey, &nonce, &to, big.NewInt(int64(i+1)), nil)
+		fmt.Printf("transfer via %s: block %d status %d\n", n.kind, r.BlockNumber, r.Status)
+	}
+	r := d.send(nodes[3], ethKey, &nonce, nil, nil, storeContract)
+	contract := r.ContractAddress
+	fmt.Printf("deploy via stock: block %d status %d contract %s\n", r.BlockNumber, r.Status, contract)
+	val := ethcommon.LeftPadBytes([]byte{0x42}, 32)
+	r = d.send(nodes[0], ethKey, &nonce, &contract, nil, val)
+	fmt.Printf("call via ours: block %d status %d\n", r.BlockNumber, r.Status)
+	if r.Status != 1 {
+		check(fmt.Errorf("status %d", r.Status), "contract call")
+	}
+	r = d.send(nodes[4], ethKey, &nonce, &contract, nil, nil)
+	fmt.Printf("failing call via stock: block %d status %d\n", r.BlockNumber, r.Status)
+	if r.Status != 0 {
+		check(fmt.Errorf("status %d", r.Status), "failing call should fail")
+	}
+	// nonce gap: nonce+1 first (queued everywhere), then nonce (fills it).
+	gapTx := d.sign(ethKey, nonce+1, &to, big.NewInt(7), nil, 21000)
+	check(nodes[1].ec.SendTransaction(ctx, gapTx), "send gap tx")
+	time.Sleep(2 * time.Second)
+	if p, _ := d.pool(nodes[1]); p != 0 {
+		check(fmt.Errorf("gap tx pending on ours: %d", p), "nonce gap")
+	}
+	fill := d.sign(ethKey, nonce, &to, big.NewInt(8), nil, 21000)
+	check(nodes[3].ec.SendTransaction(ctx, fill), "send fill tx")
+	d.receipt(nodes[0], fill.Hash())
+	r = d.receipt(nodes[0], gapTx.Hash())
+	nonce += 2
+	fmt.Printf("nonce gap: gap tx mined in block %d\n", r.BlockNumber)
+
+	for _, n := range nodes {
+		got, err := n.ec.StorageAt(ctx, contract, ethcommon.Hash{}, nil)
+		check(err, "storage")
+		if !bytes.Equal(got, val) {
+			check(fmt.Errorf("%s: slot0=%x", n.kind, got), "storage divergence")
+		}
+	}
+	head, err := nodes[0].ec.BlockNumber(ctx)
+	check(err, "head")
+	d.compareAll(1, head)
+	proposers := d.proposers(network.Dir, chainID)
+	fmt.Println("functional phase OK: head", head, "proposers", proposers)
+	if proposers["ours"] == 0 || proposers["stock"] == 0 {
+		check(fmt.Errorf("both kinds must have built: %v", proposers), "proposers")
+	}
+	d.scanStockLogs(network.Dir, nodes)
+
+	// ---- load phase ----
+	if *load > 0 {
+		d.loadPhase(ethKey, &nonce, *nkeys, *rate, *load, *ours)
+		head2, err := nodes[0].ec.BlockNumber(ctx)
+		check(err, "head")
+		d.compareAll(head+1, head2)
+		proposers = d.proposers(network.Dir, chainID)
+		fmt.Println("load phase OK: head", head2, "proposers", proposers)
+		d.scanStockLogs(network.Dir, nodes)
+	}
+	if *keep {
+		fmt.Println("network kept running at", network.Dir)
+	}
+}
+
+type driver struct {
+	ctx     context.Context
+	nodes   []*node
+	chainID *big.Int
+	signer  types.Signer
+}
+
+func (d *driver) sign(key *ecdsa.PrivateKey, nonce uint64, to *ethcommon.Address, value *big.Int, data []byte, gas uint64) *types.Transaction {
+	return types.MustSignNewTx(key, d.signer, &types.DynamicFeeTx{
+		ChainID: d.chainID, Nonce: nonce, To: to, Value: value, Data: data, Gas: gas,
+		GasFeeCap: big.NewInt(50 * params.GWei), GasTipCap: big.NewInt(params.GWei),
+	})
+}
+
+// send submits one tx through n and waits for its receipt on n.
+func (d *driver) send(n *node, key *ecdsa.PrivateKey, nonce *uint64, to *ethcommon.Address, value *big.Int, data []byte) *types.Receipt {
+	gas := uint64(21000)
+	if len(data) > 0 {
+		gas = 200000
+	}
+	tx := d.sign(key, *nonce, to, value, data, gas)
+	check(n.ec.SendTransaction(d.ctx, tx), "send via "+n.kind)
+	*nonce++
+	return d.receipt(n, tx.Hash())
+}
+
+func (d *driver) receipt(n *node, h ethcommon.Hash) *types.Receipt {
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if r, err := n.ec.TransactionReceipt(d.ctx, h); err == nil {
+			return r
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	check(fmt.Errorf("tx %s", h), "receipt timeout on "+n.kind)
+	return nil
+}
+
+func (d *driver) pool(n *node) (pending, queued int) {
+	var res struct{ Pending, Queued string }
+	json.Unmarshal(rpcRaw(n.rpc, `{"jsonrpc":"2.0","id":1,"method":"txpool_status","params":[]}`), &res)
+	p, _ := strconv.ParseInt(strings.TrimPrefix(res.Pending, "0x"), 16, 64)
+	q, _ := strconv.ParseInt(strings.TrimPrefix(res.Queued, "0x"), 16, 64)
+	return int(p), int(q)
+}
+
+// rpcRaw posts one request and returns the raw "result" bytes.
+func rpcRaw(url, body string) json.RawMessage {
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	check(err, "rpc "+url)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || len(out.Error) > 0 {
+		check(fmt.Errorf("%s -> %s", body, raw), "rpc")
+	}
+	return out.Result
+}
+
+// canonical re-encodes JSON with sorted keys so two implementations'
+// formatting differences do not count as divergence.
+func canonical(raw json.RawMessage) string {
+	var v any
+	check(json.Unmarshal(raw, &v), "canonical")
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+// compareAll: eth_getBlockByNumber(full) and eth_getBlockReceipts must agree
+// on every node at every height in [from, to].
+func (d *driver) compareAll(from, to uint64) {
+	txs := 0
+	for h := from; h <= to; h++ {
+		hex := fmt.Sprintf("0x%x", h)
+		var ref [2]string
+		for i, n := range d.nodes {
+			blk := canonical(rpcRaw(n.rpc, `{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["`+hex+`",true]}`))
+			rcp := canonical(rpcRaw(n.rpc, `{"jsonrpc":"2.0","id":1,"method":"eth_getBlockReceipts","params":["`+hex+`"]}`))
+			if i == 0 {
+				ref = [2]string{blk, rcp}
+				var b struct{ Transactions []json.RawMessage }
+				json.Unmarshal([]byte(blk), &b)
+				txs += len(b.Transactions)
+				continue
+			}
+			if blk != ref[0] {
+				fmt.Printf("DIVERGENCE block %d: %s\n%s\nvs %s\n%s\n", h, d.nodes[0].kind, ref[0], n.kind, blk)
+				os.Exit(1)
+			}
+			if rcp != ref[1] {
+				fmt.Printf("DIVERGENCE receipts %d: %s\n%s\nvs %s\n%s\n", h, d.nodes[0].kind, ref[1], n.kind, rcp)
+				os.Exit(1)
+			}
+		}
+	}
+	fmt.Printf("blocks %d..%d identical on %d nodes (%d txs)\n", from, to, len(d.nodes), txs)
+}
+
+// proposers counts built blocks per node kind from the chain logs: ours logs
+// "validator: built", stock subnet-evm logs "Commit new mining work".
+func (d *driver) proposers(dir string, chainID ids.ID) map[string]int {
+	out := map[string]int{}
+	for _, n := range d.nodes {
+		path := filepath.Join(n.DataDir, "logs", chainID.String()+".log")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if n.kind == "ours" {
+			out[n.kind] += strings.Count(string(raw), "validator: built")
+		} else {
+			out[n.kind] += strings.Count(string(raw), "Commit new mining work")
+		}
+	}
+	return out
+}
+
+// scanStockLogs fails on any invalid-block rejection in a stock node's logs.
+func (d *driver) scanStockLogs(dir string, nodes []*node) {
+	for _, n := range nodes {
+		if n.kind != "stock" {
+			continue
+		}
+		matches, _ := filepath.Glob(filepath.Join(n.DataDir, "logs", "*.log"))
+		for _, path := range matches {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			for _, line := range strings.Split(string(raw), "\n") {
+				l := strings.ToLower(line)
+				if strings.Contains(l, "invalid block") || strings.Contains(l, "rejecting block") || strings.Contains(l, "failed to verify block") {
+					fmt.Printf("STOCK LOG %s: %s\n", filepath.Base(path), line)
+					os.Exit(1)
+				}
+			}
+		}
+	}
+	fmt.Println("stock logs: no invalid-block rejections")
+}
+
+// loadPhase funds nkeys senders, then sends transfers round-robin over all
+// nodes at `rate` tx/s for `dur`, sampling every 10 s.
+func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate int, dur time.Duration, oursDir string) {
+	keys := make([]*ecdsa.PrivateKey, nkeys)
+	nonces := make([]uint64, nkeys)
+	var last ethcommon.Hash
+	for i := range keys {
+		keys[i], _ = crypto.GenerateKey()
+		addr := crypto.PubkeyToAddress(keys[i].PublicKey)
+		tx := d.sign(funder, *nonce, &addr, new(big.Int).Mul(big.NewInt(params.Ether), big.NewInt(10)), nil, 21000)
+		check(d.nodes[i%len(d.nodes)].ec.SendTransaction(d.ctx, tx), "fund")
+		*nonce++
+		last = tx.Hash()
+	}
+	d.receipt(d.nodes[0], last)
+	fmt.Printf("funded %d senders\n", nkeys)
+
+	start := time.Now()
+	startHead, _ := d.nodes[0].ec.BlockNumber(d.ctx)
+	tick := time.NewTicker(time.Second / time.Duration(rate))
+	defer tick.Stop()
+	sample := time.NewTicker(10 * time.Second)
+	defer sample.Stop()
+	sent, failed := 0, 0
+	to := ethcommon.HexToAddress("0x2000000000000000000000000000000000000002")
+	i := 0
+	for time.Since(start) < dur {
+		select {
+		case <-tick.C:
+			k := i % nkeys
+			tx := d.sign(keys[k], nonces[k], &to, big.NewInt(1), nil, 21000)
+			if err := d.nodes[i%len(d.nodes)].ec.SendTransaction(d.ctx, tx); err != nil {
+				failed++
+				if failed%100 == 1 {
+					fmt.Println("send error:", err)
+				}
+			} else {
+				nonces[k]++
+				sent++
+			}
+			i++
+		case <-sample.C:
+			head, _ := d.nodes[0].ec.BlockNumber(d.ctx)
+			blk, _ := d.nodes[0].ec.BlockByNumber(d.ctx, new(big.Int).SetUint64(head))
+			ntx, gas := 0, uint64(0)
+			if blk != nil {
+				ntx, gas = len(blk.Transactions()), blk.GasUsed()
+			}
+			p, q := d.pool(d.nodes[0])
+			fmt.Printf("t=%3.0fs sent=%d failed=%d head=%d (+%d) lastBlock txs=%d gas=%d pool=%d/%d rss=%s go=%s\n",
+				time.Since(start).Seconds(), sent, failed, head, head-startHead, ntx, gas, p, q,
+				pluginRSS(oursDir), d.goStats())
+		}
+	}
+	fmt.Printf("load done: sent=%d failed=%d in %s (%.0f tx/s)\n", sent, failed, dur, float64(sent)/dur.Seconds())
+	time.Sleep(5 * time.Second)
+}
+
+// pluginRSS: VmRSS of every process whose exe lives under dir (our plugins).
+func pluginRSS(dir string) string {
+	out, err := exec.Command("pgrep", "-f", filepath.Join(dir, subnetEVMID)).Output()
+	if err != nil {
+		return "?"
+	}
+	var parts []string
+	for _, pid := range strings.Fields(string(out)) {
+		st, err := os.ReadFile("/proc/" + pid + "/status")
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(string(st), "\n") {
+			if strings.HasPrefix(l, "VmRSS:") {
+				kb, _ := strconv.Atoi(strings.Fields(l)[1])
+				parts = append(parts, fmt.Sprintf("%dMB", kb>>10))
+			}
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+// goStats pulls our plugin's Go heap and GC share plus verify/build p50 from
+// the first node's /ext/metrics.
+func (d *driver) goStats() string {
+	resp, err := http.Get(d.nodes[0].GetAccessibleURI() + "/ext/metrics")
+	if err != nil {
+		return "?"
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var heap, gcFrac, verifyCount, verifySum, buildCount, buildSum, xTotal float64
+	for _, l := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(l)
+		if len(f) != 2 || !strings.Contains(l, "epochdb") {
+			continue
+		}
+		v, _ := strconv.ParseFloat(f[1], 64)
+		switch {
+		case strings.HasSuffix(f[0], "go_memstats_heap_alloc_bytes"):
+			heap = v
+		case strings.Contains(f[0], "gc_cpu_fraction"):
+			gcFrac = v
+		case strings.HasSuffix(f[0], "epochdb_verify_seconds_count"):
+			verifyCount = v
+		case strings.HasSuffix(f[0], "epochdb_verify_seconds_sum"):
+			verifySum = v
+		case strings.HasSuffix(f[0], "epochdb_build_seconds_count"):
+			buildCount = v
+		case strings.HasSuffix(f[0], "epochdb_build_seconds_sum"):
+			buildSum = v
+		case strings.Contains(f[0], "epochdb_crossings_total"):
+			xTotal += v
+		}
+	}
+	avg := func(s, c float64) string {
+		if c == 0 {
+			return "-"
+		}
+		return fmt.Sprintf("%.1fms", s/c*1000)
+	}
+	return fmt.Sprintf("heap=%.0fMB gc=%.3f verify_avg=%s build_avg=%s crossings/block=%.1f",
+		heap/1e6, gcFrac, avg(verifySum, verifyCount), avg(buildSum, buildCount), xTotal/max(verifyCount, 1))
+}

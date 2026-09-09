@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -224,7 +225,10 @@ func TestLatencyByBlockSize(t *testing.T) {
 				x = append(x, fmt.Sprintf("%s=%d", crossingNames[i], d))
 			}
 		}
-		t.Logf("txs=%d height=%d build=%v verify=%v crossings: %s", n, blk.Height(), build, verify, strings.Join(x, " "))
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		t.Logf("txs=%d height=%d build=%v verify=%v crossings: %s | go heap=%dMB numGC=%d gcCPU=%.4f", n, blk.Height(), build, verify,
+			strings.Join(x, " "), ms.HeapAlloc>>20, ms.NumGC, ms.GCCPUFraction)
 	}
 }
 

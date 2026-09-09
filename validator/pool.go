@@ -187,6 +187,9 @@ func (a *accountCache) get(addr common.Address, root common.Hash, block ids.ID) 
 		}
 	}
 	raw, err := a.eng.accountState([]common.Address{addr}, block)
+	if err != nil && block != ids.Empty {
+		raw, err = a.eng.accountState([]common.Address{addr}, ids.Empty) // a rolled-past head: read the accepted one
+	}
 	if err != nil {
 		return types.StateAccount{}, err
 	}
