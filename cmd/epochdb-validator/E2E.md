@@ -256,6 +256,47 @@ the engine's skip costs only the decode now (0.6 us per candidate). (3) The Go p
 p50 per build at 184k pending; a pool-side cap on what a build asks for would need a Pending variant libevm does
 not have.
 
+## Blocks consensus still names (branch rs-getblock off rs-buildprof 8287607)
+
+The log line, twice on the compare tab's 2-validator --stress L1 at height ~280-285 and on every 2 s chain under load:
+
+```
+FATAL <... Chain> handler/handler.go:337 shutting down chain {"reason": "received an unexpected error",
+  "error": "rpc error: code = Unknown desc = not found while processing sync message: chits from NodeID-..."}
+runtime engine: received shutdown signal: terminated
+```
+
+Cause (confirmed on db5aa14 with `TestSiblingStaysRetrievableAfterAccept`, which fails there with `GetBlock(loser) =
+not found after the sibling's accept`, and on the network: 3 ours on the default 2 s genesis at 2000 tx/s, two of
+three nodes died at height 38 after 9 competing builds): the rs-mem memory fix made accept drop every verified
+block at or below the accepted height from the tree and sweep the parsed cache the same way, so a sibling that lost
+to the accepted block was gone from every lookup. Consensus still names it by id: avalanchego's rpcchainvm server
+calls `VM.GetBlock` before `Reject` (vm_server.go BlockReject), our `GetBlock` turned every engine error into
+`database.ErrNotFound`, the client passes a Go error from the server back as gRPC `Unknown`, and the snowman
+handler treats any error while processing a chits message as fatal. Only a `database.ErrNotFound` from the
+`GetBlock` enum path is tolerated, and only for blocks the engine never issued (chits: `issueFromByID` requests the
+block from the peer). Stock subnet-evm never loses a block consensus saw.
+
+Fix: the tree separates a block's bytes from its pending state. Accept still drops the pending state (write set,
+trie layer) of everything at or below the accepted height and reject still drops the rejected block's, but the
+blocks move to a FIFO map bounded to 1024 blocks or 64 MiB of block bytes (`DROPPED_MAX_*` in tree.rs; the
+decoded txs of a slots block roughly double what the bound counts) that `get_block` answers after the verified
+set and before the store. Verify of a dropped block is a clean "was rejected: a sibling at its height was
+accepted" error, reject of a dropped or unknown id is a no-op success, `epochdb_get_block` answers any block the
+tree or the parsed cache has. Go: `engine.getBlock` maps only `EPOCHDB_ENOTFOUND` to not-found, `VM.GetBlock`
+returns `database.ErrNotFound` for that alone and logs any other engine error with the id (`validator: GetBlock
+failed`) and returns it. Tests: tree.rs `accept_keeps_the_losers_retrievable_without_state` (two siblings plus a
+verified grandchild on the loser; get_block/meta for every id, verify of the loser errors, reject twice is a
+no-op, pending state gone) and `dropped_cache_is_bounded`; validator `TestSiblingStaysRetrievableAfterAccept`
+(two builds on one parent through the real cgo path).
+
+After, same shapes: 2 s genesis, 3 ours, 3 min at 2000 tx/s: 125 blocks accepted, 134 built (9 losing siblings
+kept and rejected), no FATAL, no `GetBlock failed`. --stress, 2 ours, 4 min at 4000 tx/s: 3147 blocks (~13/s),
+3147 built across the two nodes, 0 refused txs, identical on both nodes; plugin RSS 156 MB at height 144, 194-199
+MB at 1136, 205-207 MB at 2223, 206-231 MB at 3143 (flat; the rs-mem figure was ~270 MB at 191 blocks of heavier
+slots load); jemalloc from `epochdb_health` at height ~150: heap-allocated 31-35 MB, heap-resident 122-135 MB.
+The 2 s chain's 650-750 MB RSS is the Go pool holding a 250k-tx backlog (Go heap 278-454 MB), as in run 5.
+
 ## Memory: where 2-4.5 GB of plugin RSS went (branch rs-mem off rust 38a82fa)
 
 Evidence from live processes (slots workload, 50 sstores per tx, 2000-tx blocks of 100k slot writes on the
