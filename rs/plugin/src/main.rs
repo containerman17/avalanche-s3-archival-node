@@ -2,7 +2,7 @@
 //! runtime engine, serve, exit on Shutdown + SIGTERM); `--dump ...` = the
 //! in-process benchmark node (rs/node's bench, the A/B tool); --version
 //! prints the version line avalanchego's plugin check reads.
-use plugin::node_engine::NodeEngine;
+use chain::NodeEngine;
 use plugin::vm::{serve, Init};
 use plugin::VERSION;
 

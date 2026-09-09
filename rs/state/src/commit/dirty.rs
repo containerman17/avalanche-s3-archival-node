@@ -38,6 +38,172 @@ struct Pending {
     slots: HashMap<Hash, Vec<u8>>,
 }
 
+/// Contract writes queued for one root computation off a Dirty (`layer_root`).
+#[derive(Default)]
+pub struct Writes(HashMap<Hash, Pending>);
+
+impl Writes {
+    pub fn apply(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        queue(&mut self.0, key, value)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The trie nodes one pending block's root produced over its parent's state
+/// (a copy-on-write layer: reads fall through to the parents, then the Dirty).
+pub struct Layer {
+    pub parent_root: Hash,
+    pub root: Hash,
+    nodes: HashMap<(Hash, Vec<u8>), Vec<u8>>,
+}
+
+impl Layer {
+    pub fn nodes(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn bytes(&self) -> usize {
+        self.nodes.iter().map(|((_, p), b)| p.len() + b.len() + 40).sum()
+    }
+}
+
+/// Layers newest-last over the base Dirty.
+struct Stack<'a> {
+    layers: &'a [&'a Layer],
+    base: &'a Dirty,
+}
+
+impl NodeReader for Stack<'_> {
+    fn node(&self, owner: &Hash, path: &[u8]) -> Result<Cow<'_, [u8]>> {
+        for l in self.layers.iter().rev() {
+            if let Some(b) = l.nodes.get(&(*owner, path.to_vec())) {
+                return Ok(Cow::Borrowed(b));
+            }
+        }
+        self.base.node(owner, path)
+    }
+}
+
+fn queue(acct: &mut HashMap<Hash, Pending>, key: &[u8], value: &[u8]) -> Result<()> {
+    if key.len() == 33 && key[32] == 0 {
+        let p = acct.entry(key[..32].try_into().unwrap()).or_default();
+        if value.is_empty() {
+            *p = Pending { del: true, wiped: true, ..Default::default() };
+        } else {
+            p.row = Some(value.to_vec());
+            p.del = false;
+        }
+    } else if key.len() == 65 && key[32] == 1 {
+        let p = acct.entry(key[..32].try_into().unwrap()).or_default();
+        p.slots.insert(key[33..].try_into().unwrap(), value.to_vec());
+    } else {
+        return err(format!("commit: malformed key {}", hex(key)));
+    }
+    Ok(())
+}
+
+fn storage(reader: &dyn NodeReader, owner: Hash, root: Hash, slots: &HashMap<Hash, Vec<u8>>) -> Result<(Hash, NodeSet)> {
+    let mut t = Trie::new(reader, owner, root);
+    for (k, v) in slots {
+        if v.is_empty() {
+            t.delete(k)?;
+        } else {
+            t.update(k, rlp::bytes(v))?;
+        }
+    }
+    Ok(t.commit())
+}
+
+/// The new state root of `pending` applied over `root` as `reader` sees it,
+/// and every node set produced (storage tries first, the account trie last).
+/// Storage tries are hashed in parallel, the account trie after them.
+fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>, workers: usize) -> Result<(Hash, Vec<NodeSet>)> {
+    struct Job {
+        hash: Hash,
+        p: Pending,
+        cur: Option<super::LeafFields>,
+        root: Hash,
+    }
+    let mut acc = Trie::new(reader, ZERO, root);
+    let mut jobs = Vec::with_capacity(pending.len());
+    for (hash, p) in pending {
+        let mut j = Job { hash, p, cur: None, root: EMPTY_ROOT };
+        if !j.p.del {
+            if let Some(val) = acc.get(&hash)? {
+                j.cur = Some(parse_leaf(&val)?);
+            }
+            if j.cur.is_none() && j.p.row.is_none() {
+                return err(format!("commit: slots written for missing account {}", hex(&hash)));
+            }
+            if let Some(cur) = &j.cur {
+                if !j.p.wiped {
+                    j.root = cur.root;
+                }
+            }
+        }
+        jobs.push(j);
+    }
+    let work: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| !j.p.del && !j.p.slots.is_empty()).map(|(i, _)| i).collect();
+    let results: Mutex<Vec<(usize, Result<(Hash, NodeSet)>)>> = Mutex::new(Vec::with_capacity(work.len()));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let nworkers = workers.max(1).min(work.len().max(1));
+    let slots: usize = work.iter().map(|&i| jobs[i].p.slots.len()).sum();
+    if nworkers <= 1 || slots < PAR_MIN_SLOTS {
+        // ponytail: a scoped thread costs tens of microseconds to spawn and
+        // a per-block root has a handful of slots; hash them inline, and
+        // fan out only when there is enough work to pay for the threads.
+        for &i in &work {
+            let j = &jobs[i];
+            let r = storage(reader, j.hash, j.root, &j.p.slots);
+            results.lock().unwrap().push((i, r));
+        }
+    } else {
+        std::thread::scope(|s| {
+            for _ in 0..nworkers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= work.len() {
+                        break;
+                    }
+                    let j = &jobs[work[i]];
+                    let r = storage(reader, j.hash, j.root, &j.p.slots);
+                    results.lock().unwrap().push((work[i], r));
+                });
+            }
+        });
+    }
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|(i, _)| *i);
+    let mut sets = Vec::with_capacity(results.len() + 1);
+    for (i, r) in results {
+        let (root, set) = r?;
+        jobs[i].root = root;
+        sets.push(set);
+    }
+    for j in &jobs {
+        if j.p.del {
+            // The account's retained storage nodes go stale here. Nothing
+            // can reach them (a recreated account starts from the empty
+            // root and rewrites every node it touches), so they are left
+            // for the roll to drop.
+            acc.delete(&j.hash)?;
+            continue;
+        }
+        let val = match &j.p.row {
+            Some(row) => account_leaf(row, &j.root)?,
+            None => {
+                let cur = j.cur.as_ref().unwrap();
+                leaf_value(&cur.nonce, &cur.balance, &j.root, &cur.code)
+            }
+        };
+        acc.update(&j.hash, val)?;
+    }
+    let (root, set) = acc.commit();
+    sets.push(set);
+    Ok((root, sets))
+}
+
 pub struct Dirty {
     f: Arc<File>,
     seek: Arc<SeekFn>,
@@ -206,110 +372,14 @@ impl Dirty {
     /// Queues one contract write. Keys may come in any order; an empty
     /// value deletes, and deleting an account drops its slots.
     pub fn apply(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        if key.len() == 33 && key[32] == 0 {
-            let p = self.acct.entry(key[..32].try_into().unwrap()).or_default();
-            if value.is_empty() {
-                *p = Pending { del: true, wiped: true, ..Default::default() };
-            } else {
-                p.row = Some(value.to_vec());
-                p.del = false;
-            }
-        } else if key.len() == 65 && key[32] == 1 {
-            let p = self.acct.entry(key[..32].try_into().unwrap()).or_default();
-            p.slots.insert(key[33..].try_into().unwrap(), value.to_vec());
-        } else {
-            return err(format!("commit: malformed key {}", hex(key)));
-        }
-        Ok(())
+        queue(&mut self.acct, key, value)
     }
 
     /// Applies the queued writes and returns the new state root. Storage
     /// tries are hashed in parallel, the account trie after them.
     pub fn root(&mut self) -> Result<Hash> {
-        struct Job {
-            hash: Hash,
-            p: Pending,
-            cur: Option<super::LeafFields>,
-            root: Hash,
-        }
         let pending = std::mem::take(&mut self.acct);
-        let mut acc = Trie::new(self, ZERO, self.root);
-        let mut jobs = Vec::with_capacity(pending.len());
-        for (hash, p) in pending {
-            let mut j = Job { hash, p, cur: None, root: EMPTY_ROOT };
-            if !j.p.del {
-                if let Some(val) = acc.get(&hash)? {
-                    j.cur = Some(parse_leaf(&val)?);
-                }
-                if j.cur.is_none() && j.p.row.is_none() {
-                    return err(format!("commit: slots written for missing account {}", hex(&hash)));
-                }
-                if let Some(cur) = &j.cur {
-                    if !j.p.wiped {
-                        j.root = cur.root;
-                    }
-                }
-            }
-            jobs.push(j);
-        }
-        let work: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| !j.p.del && !j.p.slots.is_empty()).map(|(i, _)| i).collect();
-        let results: Mutex<Vec<(usize, Result<(Hash, NodeSet)>)>> = Mutex::new(Vec::with_capacity(work.len()));
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let me: &Dirty = self;
-        let nworkers = self.workers.max(1).min(work.len().max(1));
-        let slots: usize = work.iter().map(|&i| jobs[i].p.slots.len()).sum();
-        if nworkers <= 1 || slots < PAR_MIN_SLOTS {
-            // ponytail: a scoped thread costs tens of microseconds to spawn and
-            // a per-block root has a handful of slots; hash them inline, and
-            // fan out only when there is enough work to pay for the threads.
-            for &i in &work {
-                let j = &jobs[i];
-                let r = me.storage(j.hash, j.root, &j.p.slots);
-                results.lock().unwrap().push((i, r));
-            }
-        } else {
-            std::thread::scope(|s| {
-                for _ in 0..nworkers {
-                    s.spawn(|| loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= work.len() {
-                            break;
-                        }
-                        let j = &jobs[work[i]];
-                        let r = me.storage(j.hash, j.root, &j.p.slots);
-                        results.lock().unwrap().push((work[i], r));
-                    });
-                }
-            });
-        }
-        let mut results = results.into_inner().unwrap();
-        results.sort_by_key(|(i, _)| *i);
-        let mut sets = Vec::with_capacity(results.len() + 1);
-        for (i, r) in results {
-            let (root, set) = r?;
-            jobs[i].root = root;
-            sets.push(set);
-        }
-        for j in &jobs {
-            if j.p.del {
-                // The account's retained storage nodes go stale here. Nothing
-                // can reach them (a recreated account starts from the empty
-                // root and rewrites every node it touches), so they are left
-                // for the roll to drop.
-                acc.delete(&j.hash)?;
-                continue;
-            }
-            let val = match &j.p.row {
-                Some(row) => account_leaf(row, &j.root)?,
-                None => {
-                    let cur = j.cur.as_ref().unwrap();
-                    leaf_value(&cur.nonce, &cur.balance, &j.root, &cur.code)
-                }
-            };
-            acc.update(&j.hash, val)?;
-        }
-        let (root, set) = acc.commit();
-        sets.push(set);
+        let (root, sets) = compute(self, self.root, pending, self.workers)?;
         for set in &sets {
             self.merge(set);
         }
@@ -318,16 +388,35 @@ impl Dirty {
         Ok(root)
     }
 
-    fn storage(&self, owner: Hash, root: Hash, slots: &HashMap<Hash, Vec<u8>>) -> Result<(Hash, NodeSet)> {
-        let mut t = Trie::new(self, owner, root);
-        for (k, v) in slots {
-            if v.is_empty() {
-                t.delete(k)?;
-            } else {
-                t.update(k, rlp::bytes(v))?;
+    /// The root of `writes` applied on top of `parents` (newest last) over
+    /// this Dirty, as a `Layer` that holds only the nodes it produced: a
+    /// pending block's state root, siblings sharing everything below. Nothing
+    /// here changes; `absorb` folds the layer in once the block is accepted.
+    pub fn layer_root(&self, parents: &[&Layer], writes: Writes) -> Result<Layer> {
+        let base = parents.last().map_or(self.root, |l| l.root);
+        let stack = Stack { layers: parents, base: self };
+        let (root, sets) = compute(&stack, base, writes.0, self.workers)?;
+        let mut nodes = HashMap::new();
+        for set in sets {
+            for (path, blob) in set.nodes {
+                nodes.insert((set.owner, path), blob);
             }
         }
-        Ok(t.commit())
+        Ok(Layer { parent_root: base, root, nodes })
+    }
+
+    /// Folds an accepted layer in: its nodes and its root. The layer must
+    /// have been computed over this Dirty's current root.
+    pub fn absorb(&mut self, l: &Layer) -> Result<()> {
+        if l.parent_root != self.root {
+            return err(format!("commit: layer built over root {} absorbed into root {}", hex(&l.parent_root), hex(&self.root)));
+        }
+        for ((owner, path), blob) in &l.nodes {
+            self.put(owner, path, blob);
+        }
+        self.compact();
+        self.root = l.root;
+        Ok(())
     }
 
     fn merge(&mut self, set: &NodeSet) {

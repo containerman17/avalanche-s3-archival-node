@@ -37,7 +37,7 @@ use revm::bytecode::opcode;
 use revm::interpreter::interpreter_types::{InputsTr, Jumps, LoopControl};
 use revm::context::result::ResultAndState;
 use revm::DatabaseRef;
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use revm::{
     context::{
         result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction},
@@ -101,9 +101,54 @@ pub struct TxResult {
     pub gas_used: u64,
     pub cumulative_gas_used: u64,
     pub receipt: ReceiptEnvelope,
-    /// libevm callTracer JSON (default config), the store's trace row.
+    /// libevm callTracer JSON (default config), the store's trace row;
+    /// empty while `deferred` still holds the unrendered trace.
     pub trace_json: String,
+    /// The callTracer's arena, rendered off the execution thread
+    /// (`Executor::defer_call_trace`): `DeferredTrace::render` fills `trace_json`.
+    pub deferred: Option<Box<DeferredTrace>>,
     pub rows: Vec<StateRow>,
+}
+
+/// A tx's callTracer capture plus what the render needs from the executor.
+pub struct DeferredTrace {
+    tracer: TracingInspector,
+    errors: Vec<String>,
+    not_entered: bool,
+    gas_used: u64,
+    gas_limit: u64,
+    cfg: CallConfig,
+}
+
+impl std::fmt::Debug for DeferredTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DeferredTrace(gas_used={})", self.gas_used)
+    }
+}
+
+impl DeferredTrace {
+    pub fn render(self) -> Result<String> {
+        if self.not_entered {
+            let f = CallFrame { typ: "STOP".to_string(), gas_used: U256::from(self.gas_used), ..Default::default() };
+            return serde_json::to_string(&f).context("trace json");
+        }
+        let mut tracer = self.tracer;
+        tracer.set_transaction_gas_limit(self.gas_limit);
+        let mut f = tracer.into_geth_builder().geth_call_traces(self.cfg, self.gas_used);
+        prune_unentered(&mut f);
+        name_precompile_errors(&mut f, &mut self.errors.iter());
+        serde_json::to_string(&f).context("trace json")
+    }
+}
+
+/// `TxResult::render_deferred` on every tx of a block result.
+pub fn render_deferred(r: &mut BlockResult) -> Result<()> {
+    for t in &mut r.txs {
+        if let Some(d) = t.deferred.take() {
+            t.trace_json = d.render()?;
+        }
+    }
+    Ok(())
 }
 
 /// An eth_call / eth_estimateGas message.
@@ -152,6 +197,71 @@ pub struct BlockResult {
     pub tail: Vec<StateRow>,
     /// Code deployed in this block, by hash.
     pub code: Vec<(B256, Bytes)>,
+}
+
+/// ethparams.TxGas: the miner stops once less than this is left in the pool.
+pub const TX_GAS: u64 = 21_000;
+/// miner.targetTxsSize: the built block's tx bytes stay under this.
+pub const TARGET_TXS_SIZE: usize = 1800 * 1024;
+
+/// Why a build candidate was left out (the ABI's `skipped` codes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SkipReason {
+    Included = 0,
+    /// Nonce too low: skipped, the sender's later txs still considered (Shift).
+    NonceTooLow = 1,
+    /// The tx failed to apply (nonce too high, funds, intrinsic gas, fee cap, allow list, predicates): the sender was popped.
+    Invalid = 2,
+    /// An earlier tx of the sender was popped.
+    SenderPopped = 3,
+    /// The gas left in the pool is below the tx's gas limit: the sender was popped.
+    NoGas = 4,
+    /// The block's tx bytes would pass the 1800 KiB target: the sender was popped.
+    Size = 5,
+    /// The loop had stopped (under 21,000 gas left) before this candidate.
+    NotReached = 6,
+}
+
+pub struct BuildResult {
+    pub result: BlockResult,
+    /// Candidate indexes included, in block order.
+    pub included: Vec<usize>,
+    pub reasons: Vec<SkipReason>,
+    /// predicate.BlockResults bytes for header.Extra (Durango+); empty before.
+    pub predicate_bytes: Vec<u8>,
+}
+
+struct BlockCtx {
+    granite: bool,
+    tx_allow_list: bool,
+    warp_cfg: Option<PrecompileConfig>,
+    context_height: Option<u64>,
+    header_results: warp::BlockResults,
+}
+
+enum Mode<'a> {
+    Verify,
+    Build(&'a mut warp::BlockResults),
+}
+
+struct TxOut {
+    result: TxResult,
+    code: Vec<(B256, Bytes)>,
+}
+
+enum TxFail {
+    NonceTooLow(String),
+    Other(anyhow::Error),
+}
+
+impl TxFail {
+    fn into_anyhow(self, number: u64, i: usize, hash: B256) -> anyhow::Error {
+        match self {
+            TxFail::NonceTooLow(m) => anyhow!("block {number} tx {i} ({hash}): {m}"),
+            TxFail::Other(e) => anyhow!("block {number} tx {i} ({hash}): {e:#}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +723,10 @@ pub struct Executor<D: StateDb = Db> {
     pub t_trace: std::time::Duration,
     pub t_commit: std::time::Duration,
     pub trace: Trace,
+    /// Under `Trace::Call`, hand the capture out in `TxResult::deferred`
+    /// instead of rendering the JSON on this thread (the node's checker
+    /// thread renders it before the store write).
+    pub defer_call_trace: bool,
 }
 
 /// DatabaseRef over a `&mut Database` (the prestate render reads the pre-tx
@@ -667,6 +781,7 @@ impl<D: StateDb> Executor<D> {
             t_trace: Default::default(),
             t_commit: Default::default(),
             trace: Trace::Call(CallConfig::default()),
+            defer_call_trace: false,
         }
     }
 
@@ -737,6 +852,16 @@ impl<D: StateDb> Executor<D> {
         })
     }
 
+    /// The tx's callTracer capture, taken out of the inspector for a later render.
+    fn take_deferred(&mut self, gas_used: u64, gas_limit: u64) -> Option<Box<DeferredTrace>> {
+        let Trace::Call(cfg) = &self.trace else { return None };
+        let cfg = cfg.clone();
+        let insp = &mut self.evm.inspector;
+        let not_entered = insp.not_entered || insp.tracer.traces().nodes().first().is_some_and(|n| n.trace.status == Some(InstructionResult::CreateCollision));
+        let tracer = std::mem::replace(&mut insp.tracer, TracingInspector::new(TracingInspectorConfig::from_geth_call_config(&cfg)));
+        Some(Box::new(DeferredTrace { tracer, errors: std::mem::take(&mut self.evm.precompiles.errors), not_entered, gas_used, gas_limit, cfg }))
+    }
+
     /// Seeds db with what the genesis materialises: the alloc and every
     /// precompile enabled at genesis (trieAlloc in vmexec/genesis.go).
     pub fn with_db(cfg: Config, db: D) -> Result<Executor<D>> {
@@ -783,6 +908,11 @@ impl<D: StateDb> Executor<D> {
 
     pub fn db_mut(&mut self) -> &mut D {
         self.evm.ctx.db_mut()
+    }
+
+    /// The config and the db at once (disjoint borrows).
+    pub fn cfg_and_db(&mut self) -> (&Config, &mut D) {
+        (&self.cfg, self.evm.ctx.db_mut())
     }
 
     /// BLOCKHASH source: hashes of executed blocks, keyed by number.
@@ -934,130 +1064,254 @@ impl<D: StateDb> Executor<D> {
             return Ok(out);
         }
 
-        let enabled = self.set_block_env(h)?;
-        let durango = self.cfg.is_durango(time);
-        let granite = self.cfg.is_granite(time);
-        let tx_allow_list = enabled[2];
-        let warp_on = enabled[5];
-
-        // The header's predicate results (customheader.PredicateBytesFromExtra), and
-        // the proposervm context height the predicates were verified at
-        // (proposervm block.go: parent's height pre-Etna, own from Etna, the epoch's under Granite).
-        let header_results = if durango { warp::parse_block_results_opt(warp::predicate_bytes_from_extra(&h.extra)).map_err(|e| anyhow!("block {}: predicate results: {e}", h.number))? } else { Default::default() };
-        let context_height = if granite {
-            b.pvm.as_ref().and_then(|p| p.epoch_pchain_height)
-        } else if self.cfg.is_etna(time) {
-            this_pchain
-        } else {
-            self.prev_pchain_height
-        };
-        let warp_cfg = if warp_on { self.cfg.warp_config(time).cloned() } else { None };
-
+        let bc = self.block_ctx(h, b.pvm.as_ref().map(|p| p.pchain_height), b.pvm.as_ref().and_then(|p| p.epoch_pchain_height))?;
         let mut cumulative = 0u64;
         let mut receipts = Vec::with_capacity(b.txs.len());
         let mut bloom = Bloom::default();
         for (i, t) in b.txs.iter().enumerate() {
-            let sender = t.sender.ok_or_else(|| anyhow!("block {} tx {i}: sender not recovered", h.number))?;
-            let tx_env = TxEnv {
-                tx_type: t.tx_type,
-                caller: sender,
-                gas_limit: t.gas_limit,
-                gas_price: t.gas_price,
-                gas_priority_fee: if t.tx_type == 2 { Some(t.gas_tip) } else { None },
-                kind: match t.to {
-                    Some(a) => TxKind::Call(a),
-                    None => TxKind::Create,
-                },
-                value: t.value,
-                data: Bytes::from(t.input.clone()),
-                nonce: t.nonce,
-                chain_id: t.chain_id,
-                access_list: AccessList(
-                    t.access_list.iter().map(|a| AccessListItem { address: a.address, storage_keys: a.storage_keys.clone() }).collect(),
-                ),
-                ..Default::default()
-            };
-            if cumulative + t.gas_limit > h.gas_limit {
-                bail!("block {} tx {i}: gas limit reached (pool {}, tx {})", h.number, h.gas_limit - cumulative, t.gas_limit);
-            }
-            // preCheck: the sender must be on the tx allow list while it is active
-            // (an accepted block never carries an offender).
-            if tx_allow_list {
-                let role = read_state_no_warm(&mut self.evm.ctx, TX_ALLOW_LIST, allowlist::role_slot(sender));
-                if !allowlist::is_enabled(role) {
-                    bail!("block {} tx {i} ({}): cannot issue transaction from non-allow listed address: {sender}", h.number, t.hash);
-                }
-            }
-            // CheckTxPredicates: the warp entries of the access list are predicates,
-            // charged their PredicateGas and verified before execution.
-            let mut handler = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default();
-            let mut predicates: Vec<Vec<B256>> = Vec::new();
-            let mut failed: Vec<u8> = Vec::new();
-            if let Some(wc) = &warp_cfg {
-                let mut delta: i128 = 0;
-                for a in t.access_list.iter().filter(|a| a.address == WARP) {
-                    let pg = warp::predicate_gas(&a.storage_keys, granite).map_err(|e| anyhow!("block {} tx {i} ({}): {e}", h.number, t.hash))?;
-                    delta += pg as i128 - (2400 + 1900 * a.storage_keys.len() as i128);
-                    predicates.push(a.storage_keys.clone());
-                }
-                if !predicates.is_empty() {
-                    handler.predicate_gas_delta = delta;
-                    failed = header_results.get(&t.hash).and_then(|m| m.get(&WARP)).cloned().unwrap_or_default();
-                    match (&mut self.validator_state, context_height) {
-                        (Some(vs), Some(height)) => {
-                            let mut bad = Vec::new();
-                            for (pi, p) in predicates.iter().enumerate() {
-                                if warp::verify_predicate(vs.as_mut(), p, self.cfg.network_id, self.cfg.subnet_id, height, wc.quorum_numerator, wc.require_primary_network_signers).is_err() {
-                                    bad.push(pi);
-                                }
-                            }
-                            let ours = warp::bits_from_indices(&bad);
-                            if ours != failed {
-                                bail!("block {} tx {i} ({}): predicate results differ from the header (ours {:x?}, header {:x?}, pchain height {height})", h.number, t.hash, ours, failed);
-                            }
-                            self.predicates_verified += 1;
-                        }
-                        _ => self.predicates_trusted += 1,
-                    }
-                }
-            }
-            self.evm.precompiles.env.predicates = predicates;
-            self.evm.precompiles.env.failed = failed;
-            let t0 = std::time::Instant::now();
-            self.evm.ctx.set_tx(tx_env);
-            self.evm.inspector.reset();
-            self.evm.precompiles.errors.clear();
-            let res: ExecutionResult = handler
-                .inspect_run(&mut self.evm)
-                .map_err(|e| anyhow!("block {} tx {i} ({}): {e:?}", h.number, t.hash))?;
-            let t1 = std::time::Instant::now();
-            self.t_evm += t1 - t0;
-            let state = self.evm.ctx.journal_mut().finalize();
-
-            let gas_used = res.tx_gas_used();
-            cumulative += gas_used;
-            let status = res.is_success();
-            let trace_json = self.render_trace(&res, &state, gas_used, t.gas_limit)?;
-            let logs = res.into_logs();
-            let receipt = Receipt { status: Eip658Value::Eip658(status), cumulative_gas_used: cumulative, logs }.with_bloom();
-            bloom |= receipt.logs_bloom;
-            let tx_type = TxType::try_from(t.tx_type).map_err(|e| anyhow!("tx type {}: {e}", t.tx_type))?;
-            let receipt = ReceiptEnvelope::from_typed(tx_type, receipt);
-            let t2 = std::time::Instant::now();
-            self.t_trace += t2 - t1;
-
-            let (rows, code) = state_rows(&state);
-            out.code.extend(code);
-            self.commit(state);
-            self.t_commit += t2.elapsed();
-            receipts.push(receipt.clone());
-            out.txs.push(TxResult { hash: t.hash, status, gas_used, cumulative_gas_used: cumulative, receipt, trace_json, rows });
+            let o = self.apply_tx(h, i, t, &bc, cumulative, Mode::Verify).map_err(|e| e.into_anyhow(h.number, i, t.hash))?;
+            cumulative = o.result.cumulative_gas_used;
+            bloom |= o.result.receipt.logs_bloom();
+            receipts.push(o.result.receipt.clone());
+            out.code.extend(o.code);
+            out.txs.push(o.result);
         }
         out.gas_used = cumulative;
         out.bloom = bloom;
         out.receipts_root = alloy_trie::root::ordered_trie_root_with_encoder(&receipts, |r, buf| r.encode_2718(buf));
         self.prev_pchain_height = this_pchain;
         Ok(out)
+    }
+
+    /// The per-block context the txs share (set_block_env plus the predicate
+    /// rules); `this_pchain` / `epoch_pchain` are the proposervm heights.
+    fn block_ctx(&mut self, h: &block::Header, this_pchain: Option<u64>, epoch_pchain: Option<u64>) -> Result<BlockCtx> {
+        let time = h.time;
+        let enabled = self.set_block_env(h)?;
+        let durango = self.cfg.is_durango(time);
+        let granite = self.cfg.is_granite(time);
+        // The header's predicate results (customheader.PredicateBytesFromExtra), and
+        // the proposervm context height the predicates were verified at
+        // (proposervm block.go: parent's height pre-Etna, own from Etna, the epoch's under Granite).
+        let header_results = if durango { warp::parse_block_results_opt(warp::predicate_bytes_from_extra(&h.extra)).map_err(|e| anyhow!("block {}: predicate results: {e}", h.number))? } else { Default::default() };
+        let context_height = if granite {
+            epoch_pchain
+        } else if self.cfg.is_etna(time) {
+            this_pchain
+        } else {
+            self.prev_pchain_height
+        };
+        let warp_cfg = if enabled[5] { self.cfg.warp_config(time).cloned() } else { None };
+        Ok(BlockCtx { granite, tx_allow_list: enabled[2], warp_cfg, context_height, header_results })
+    }
+
+    /// One tx on the current state in the block context of `h` (core.ApplyTransaction):
+    /// preCheck, the predicate check, the EVM, the receipt, the rows, the commit.
+    /// An Err leaves the state as it was (revm discards the journal).
+    fn apply_tx(&mut self, h: &block::Header, i: usize, t: &block::Tx, bc: &BlockCtx, cumulative: u64, mode: Mode<'_>) -> std::result::Result<TxOut, TxFail> {
+        let sender = t.sender.ok_or_else(|| TxFail::Other(anyhow!("sender not recovered")))?;
+        let tx_env = TxEnv {
+            tx_type: t.tx_type,
+            caller: sender,
+            gas_limit: t.gas_limit,
+            gas_price: t.gas_price,
+            gas_priority_fee: if t.tx_type == 2 { Some(t.gas_tip) } else { None },
+            kind: match t.to {
+                Some(a) => TxKind::Call(a),
+                None => TxKind::Create,
+            },
+            value: t.value,
+            data: Bytes::from(t.input.clone()),
+            nonce: t.nonce,
+            chain_id: t.chain_id,
+            access_list: AccessList(
+                t.access_list.iter().map(|a| AccessListItem { address: a.address, storage_keys: a.storage_keys.clone() }).collect(),
+            ),
+            ..Default::default()
+        };
+        if cumulative + t.gas_limit > h.gas_limit {
+            return Err(TxFail::Other(anyhow!("gas limit reached (pool {}, tx {})", h.gas_limit - cumulative, t.gas_limit)));
+        }
+        // preCheck: the sender must be on the tx allow list while it is active
+        // (an accepted block never carries an offender).
+        if bc.tx_allow_list {
+            let role = read_state_no_warm(&mut self.evm.ctx, TX_ALLOW_LIST, allowlist::role_slot(sender));
+            if !allowlist::is_enabled(role) {
+                return Err(TxFail::Other(anyhow!("cannot issue transaction from non-allow listed address: {sender}")));
+            }
+        }
+        // CheckTxPredicates: the warp entries of the access list are predicates,
+        // charged their PredicateGas and verified before execution.
+        let mut handler = SevmHandler::<SevmEvm<D>, Err, EthFrame<EthInterpreter>>::default();
+        let mut predicates: Vec<Vec<B256>> = Vec::new();
+        let mut failed: Vec<u8> = Vec::new();
+        if let Some(wc) = &bc.warp_cfg {
+            let mut delta: i128 = 0;
+            for a in t.access_list.iter().filter(|a| a.address == WARP) {
+                let pg = warp::predicate_gas(&a.storage_keys, bc.granite).map_err(|e| TxFail::Other(anyhow!("{e}")))?;
+                delta += pg as i128 - (2400 + 1900 * a.storage_keys.len() as i128);
+                predicates.push(a.storage_keys.clone());
+            }
+            if !predicates.is_empty() {
+                handler.predicate_gas_delta = delta;
+                let ours = match (&mut self.validator_state, bc.context_height) {
+                    (Some(vs), Some(height)) => {
+                        let mut bad = Vec::new();
+                        for (pi, p) in predicates.iter().enumerate() {
+                            if warp::verify_predicate(vs.as_mut(), p, self.cfg.network_id, self.cfg.subnet_id, height, wc.quorum_numerator, wc.require_primary_network_signers).is_err() {
+                                bad.push(pi);
+                            }
+                        }
+                        Some(warp::bits_from_indices(&bad))
+                    }
+                    _ => None,
+                };
+                match mode {
+                    Mode::Verify => {
+                        failed = bc.header_results.get(&t.hash).and_then(|m| m.get(&WARP)).cloned().unwrap_or_default();
+                        match ours {
+                            Some(ours) if ours != failed => {
+                                return Err(TxFail::Other(anyhow!("predicate results differ from the header (ours {:x?}, header {:x?}, pchain height {:?})", ours, failed, bc.context_height)));
+                            }
+                            Some(_) => self.predicates_verified += 1,
+                            None => self.predicates_trusted += 1,
+                        }
+                    }
+                    Mode::Build(results) => {
+                        // The miner verifies every predicate itself; without a
+                        // validator state the tx cannot be built into a block.
+                        failed = ours.ok_or_else(|| TxFail::Other(anyhow!("warp predicates cannot be verified without a validator state (pchain height {:?})", bc.context_height)))?;
+                        self.predicates_verified += 1;
+                        results.insert(t.hash, [(WARP, failed.clone())].into_iter().collect());
+                    }
+                }
+            }
+        }
+        self.evm.precompiles.env.predicates = predicates;
+        self.evm.precompiles.env.failed = failed;
+        let t0 = std::time::Instant::now();
+        self.evm.ctx.set_tx(tx_env);
+        self.evm.inspector.reset();
+        self.evm.precompiles.errors.clear();
+        let res: ExecutionResult = match handler.inspect_run(&mut self.evm) {
+            Ok(r) => r,
+            Err(EVMError::Transaction(InvalidTransaction::NonceTooLow { tx, state })) => return Err(TxFail::NonceTooLow(format!("nonce too low: address {sender}, tx: {tx} state: {state}"))),
+            Err(e) => return Err(TxFail::Other(anyhow!("{e:?}"))),
+        };
+        let t1 = std::time::Instant::now();
+        self.t_evm += t1 - t0;
+        let state = self.evm.ctx.journal_mut().finalize();
+
+        let gas_used = res.tx_gas_used();
+        let cumulative = cumulative + gas_used;
+        let status = res.is_success();
+        let (trace_json, deferred) = if self.defer_call_trace && matches!(self.trace, Trace::Call(_)) {
+            (String::new(), self.take_deferred(gas_used, t.gas_limit))
+        } else {
+            (self.render_trace(&res, &state, gas_used, t.gas_limit).map_err(TxFail::Other)?, None)
+        };
+        let logs = res.into_logs();
+        let receipt = Receipt { status: Eip658Value::Eip658(status), cumulative_gas_used: cumulative, logs }.with_bloom();
+        let tx_type = TxType::try_from(t.tx_type).map_err(|e| TxFail::Other(anyhow!("tx type {}: {e}", t.tx_type)))?;
+        let receipt = ReceiptEnvelope::from_typed(tx_type, receipt);
+        let t2 = std::time::Instant::now();
+        self.t_trace += t2 - t1;
+
+        let (rows, code) = state_rows(&state);
+        self.commit(state);
+        self.t_commit += t2.elapsed();
+        let _ = i;
+        Ok(TxOut { result: TxResult { hash: t.hash, status, gas_used, cumulative_gas_used: cumulative, receipt, trace_json, deferred, rows }, code })
+    }
+
+    /// The miner's commitTransactions (miner/worker.go) over `candidates` in
+    /// the caller's order: a tx is included when it applies; a nonce-too-low
+    /// tx is skipped (Shift); any other failure, a tx that no longer fits the
+    /// gas pool or the 1800 KiB size target pops the sender (its later txs are
+    /// skipped); the loop stops when less than 21,000 gas is left. `h` is the
+    /// header template (gasLimit, baseFee, time, coinbase, number, extra =
+    /// the fee window); `parent_time` drives the activations as in
+    /// `execute_block`. The result carries the included txs' receipts in
+    /// order, the predicate results bytes for the header's extra, and a reason
+    /// per candidate.
+    pub fn build_block(&mut self, h: &block::Header, parent_time: u64, this_pchain: Option<u64>, epoch_pchain: Option<u64>, candidates: &[block::Tx]) -> Result<BuildResult> {
+        let time = h.time;
+        let mut out = BlockResult::default();
+        let acts: Vec<_> = self.cfg.activating(Some(parent_time), time).into_iter().cloned().collect();
+        for c in &acts {
+            let (rows, code) = self.activate(c, h.number)?;
+            out.tail.extend(rows);
+            out.code.extend(code);
+        }
+        let ups: Vec<_> = self.cfg.activating_state_upgrades(Some(parent_time), time).into_iter().cloned().collect();
+        for u in &ups {
+            let (rows, code) = self.apply_state_upgrade(u);
+            out.tail.extend(rows);
+            out.code.extend(code);
+        }
+        let durango = self.cfg.is_durango(time);
+        let bc = self.block_ctx(h, this_pchain, epoch_pchain)?;
+        let mut results: warp::BlockResults = Default::default();
+        let mut cumulative = 0u64;
+        let mut size = 0usize;
+        let mut receipts = Vec::new();
+        let mut bloom = Bloom::default();
+        let mut included = Vec::new();
+        let mut reasons = vec![SkipReason::NotReached; candidates.len()];
+        let mut popped: Vec<Address> = Vec::new();
+        for (i, t) in candidates.iter().enumerate() {
+            if h.gas_limit - cumulative < TX_GAS {
+                break;
+            }
+            let Some(sender) = t.sender else {
+                reasons[i] = SkipReason::Invalid;
+                continue;
+            };
+            if popped.contains(&sender) {
+                reasons[i] = SkipReason::SenderPopped;
+                continue;
+            }
+            if h.gas_limit - cumulative < t.gas_limit {
+                reasons[i] = SkipReason::NoGas;
+                popped.push(sender);
+                continue;
+            }
+            if size + t.raw.len() > TARGET_TXS_SIZE {
+                reasons[i] = SkipReason::Size;
+                popped.push(sender);
+                continue;
+            }
+            let applied = self.apply_tx(h, included.len(), t, &bc, cumulative, Mode::Build(&mut results));
+            if applied.is_err() {
+                // revm's discard_tx reverts the journal but keeps the accounts
+                // it loaded: the next tx (and the next block) would read them
+                // instead of the db. Drop them.
+                self.evm.ctx.journal_mut().clear();
+            }
+            match applied {
+                Ok(o) => {
+                    cumulative = o.result.cumulative_gas_used;
+                    size += t.raw.len();
+                    bloom |= o.result.receipt.logs_bloom();
+                    receipts.push(o.result.receipt.clone());
+                    out.code.extend(o.code);
+                    out.txs.push(o.result);
+                    included.push(i);
+                    reasons[i] = SkipReason::Included;
+                }
+                Err(TxFail::NonceTooLow(_)) => reasons[i] = SkipReason::NonceTooLow,
+                Err(TxFail::Other(_)) => {
+                    reasons[i] = SkipReason::Invalid;
+                    popped.push(sender);
+                }
+            }
+        }
+        out.gas_used = cumulative;
+        out.bloom = bloom;
+        out.receipts_root = if receipts.is_empty() { alloy_trie::EMPTY_ROOT_HASH } else { alloy_trie::root::ordered_trie_root_with_encoder(&receipts, |r, buf| r.encode_2718(buf)) };
+        self.prev_pchain_height = this_pchain;
+        let predicate_bytes = if durango { warp::encode_block_results(&results) } else { Vec::new() };
+        Ok(BuildResult { result: out, included, reasons, predicate_bytes })
     }
 
     /// The block context of h: spec, fee rules, active precompiles.

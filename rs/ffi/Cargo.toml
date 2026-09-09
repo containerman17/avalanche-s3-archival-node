@@ -1,0 +1,24 @@
+[package]
+name = "epochdb-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "epochdb_engine"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+chain = { package = "epochdb-chain", path = "../chain" }
+block = { package = "epochdb-block", path = "../block" }
+alloy-primitives = { version = "1.6", features = ["asm-keccak", "rlp"] }
+alloy-rlp = "0.3"
+bytes = "1"
+serde_json = "1"
+tikv-jemallocator = { version = "0.7", features = ["stats"], optional = true }
+
+[features]
+default = ["jemalloc"]
+# The engine's allocator; off (--no-default-features) for a valgrind run,
+# which cannot see jemalloc's prefixed allocations.
+jemalloc = ["tikv-jemallocator"]

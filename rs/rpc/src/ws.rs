@@ -426,7 +426,7 @@ mod tests {
 
     /// The Step genesis as block `height`, plus one receipt with one log.
     fn fixture(height: u64) -> (Arc<exec::Config>, Arc<Block>, Vec<u8>) {
-        let g = crate::genesis::tests::STEP_GENESIS.as_bytes();
+        let g = crate::genesis::STEP_GENESIS.as_bytes();
         let cfg = Arc::new(exec::Config::from_genesis(g, b"", 1).unwrap());
         let mut b = crate::genesis::block(&cfg, g).unwrap();
         b.height = height;

@@ -1,14 +1,9 @@
 //! epochdb-rs: a subnet-evm follower VM served over avalanchego's rpcchainvm
 //! (protocol 45), verbatim from the proto files under `proto/`.
-pub mod config;
 pub mod ghttp;
-pub mod dbstore;
-pub mod layered;
-pub mod node_engine;
-pub mod rpc;
-pub mod rpc_store;
-pub mod tree;
 pub mod vm;
+
+pub use chain::{config, node_engine, tree};
 
 /// The generated protobuf and gRPC code, one module per proto package.
 pub mod pb {

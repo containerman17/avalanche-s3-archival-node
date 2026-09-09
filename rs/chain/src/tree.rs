@@ -155,6 +155,17 @@ impl<E: Engine> Tree<E> {
         Ok(())
     }
 
+    /// The pending state of a verified (not yet accepted) block.
+    pub fn pending(&self, id: &Id) -> Option<Arc<E::Pending>> {
+        self.verified.lock().unwrap().get(id).map(|v| v.pending.clone())
+    }
+
+    /// A block the engine built (already executed): verified from here on.
+    pub fn insert_verified(&self, b: E::Block, pending: E::Pending) {
+        let m = self.engine.meta(&b);
+        self.verified.lock().unwrap().insert(m.id, Verified { block: Arc::new(b), pending: Arc::new(pending) });
+    }
+
     /// Reject drops the pending state; unknown ids are fine (already dropped).
     pub fn reject(&self, id: &Id) {
         self.verified.lock().unwrap().remove(id);
