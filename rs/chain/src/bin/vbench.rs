@@ -279,7 +279,7 @@ fn window(args: &[String]) -> Result<()> {
     }
     ex.set_block_hash(from - 1, parent_hash);
     let mut prev: Option<block::Block> = None;
-    let (mut ok, mut bad, mut executed, mut lat) = (0u64, 0u64, 0u64, Lat(Vec::new()));
+    let (mut ok, mut bad, mut executed, mut skipped, mut lat) = (0u64, 0u64, 0u64, 0u64, Lat(Vec::new()));
     for r in block::Dump::open(&dump)?.records(from, to) {
         let mut b = block::decode_container(r.container).map_err(|e| anyhow!("{e}"))?;
         for t in &mut b.txs {
@@ -301,8 +301,21 @@ fn window(args: &[String]) -> Result<()> {
                     let r = ex.build_block(&h, p.header.time, this_pchain, epoch, &b.txs).with_context(|| format!("build {}", b.height))?;
                     lat.add(t0);
                     if r.included.len() != b.txs.len() {
-                        eprintln!("vbench: window {}: build included {} of {} txs: {:?}", b.height, r.included.len(), b.txs.len(), r.reasons);
-                        bail!("block {} not reproducible: the state now differs", b.height);
+                        let predicates = b.txs.iter().any(|t| t.access_list.iter().any(|a| a.address == exec::precompile::WARP));
+                        eprintln!("vbench: window {}: build included {} of {} txs: {:?}{}", b.height, r.included.len(), b.txs.len(), r.reasons, if predicates { " (warp predicates: executed as is)" } else { "" });
+                        if !predicates || !r.included.is_empty() {
+                            bail!("block {} not reproducible: the state now differs", b.height);
+                        }
+                        // Nothing was committed (every tx popped): execute the block itself below.
+                        skipped += 1;
+                        let r = ex.execute_block(&b, parent_time).with_context(|| format!("block {}", b.height))?;
+                        if r.gas_used != b.header.gas_used || r.receipts_root != b.header.receipt_hash {
+                            bail!("block {}: execution differs from the header", b.height);
+                        }
+                        ex.set_block_hash(b.height, b.hash);
+                        parent_time = b.header.time;
+                        prev = Some(b);
+                        continue;
                     }
                     let txs: Vec<&block::Tx> = b.txs.iter().collect();
                     let gas: Vec<u64> = r.result.txs.iter().map(|t| t.gas_used).collect();
@@ -332,9 +345,12 @@ fn window(args: &[String]) -> Result<()> {
         }
         ex.set_block_hash(b.height, b.hash);
         parent_time = b.header.time;
+        if b.height % 25 == 0 {
+            eprintln!("vbench: window h={} ok={ok} bad={bad} executed={executed} rpc calls={}", b.height, ex.db().db.rpc.calls.borrow());
+        }
         prev = Some(b);
     }
-    eprintln!("vbench: window {from}..: rebuilt byte-identical (root copied) {ok}, mismatched {bad}, executed only {executed}; {}", lat.line("build (rpc state)"));
+    eprintln!("vbench: window {from}..: rpc calls {}; rebuilt byte-identical (root copied) {ok}, mismatched {bad}, executed only {executed} (first block) + {skipped} (warp predicates the build could not verify); {}", ex.db().db.rpc.calls.borrow(), lat.line("build (rpc state)"));
     if bad > 0 {
         bail!("{bad} rebuilt blocks differ");
     }
