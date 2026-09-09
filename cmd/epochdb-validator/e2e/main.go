@@ -89,6 +89,24 @@ const chainConfig = `{"log-level":"info","state-sync-enabled":false,"pruning-ena
 	`"min-delay-target":%d,` +
 	`"eth-apis":["eth","eth-filter","net","web3","internal-eth","internal-blockchain","internal-transaction","internal-tx-pool"]}`
 
+// mergeConfig overlays the JSON object in file (if any) onto the base config.
+func mergeConfig(base, file string) string {
+	if file == "" {
+		return base
+	}
+	var b, e map[string]any
+	check(json.Unmarshal([]byte(base), &b), "chain config")
+	raw, err := os.ReadFile(file)
+	check(err, "chain-config-extra")
+	check(json.Unmarshal(raw, &e), "chain-config-extra")
+	for k, v := range e {
+		b[k] = v
+	}
+	out, err := json.Marshal(b)
+	check(err, "chain config")
+	return string(out)
+}
+
 // storeContract: init code returning an 18-byte runtime that SSTOREs
 // calldata[0:32] into slot 0, and reverts when called with no calldata.
 var storeContract = ethcommon.Hex2Bytes("6012600c60003960126000f3" + "3615600c57600035600055005b60006000fd")
@@ -146,6 +164,7 @@ func main() {
 	workers := flag.Int("workers", 8, "load phase sender goroutines")
 	batch := flag.Int("batch", 200, "eth_sendRawTransaction per JSON-RPC batch")
 	stress := flag.Bool("stress", false, "stress genesis: 500 M gas limit, 1 ms min block delay")
+	chainExtra := flag.String("chain-config-extra", "", "JSON file merged into the chain config both plugin kinds receive (e.g. state-scheme, pool caps)")
 	oursN := flag.Int("ours-n", 3, "validators running our plugin")
 	stockN := flag.Int("stock-n", 2, "validators running the stock plugin")
 	flag.Parse()
@@ -189,7 +208,7 @@ func main() {
 		Chains: []*tmpnet.Chain{{
 			VMID:    vmID,
 			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig, genesisTime, uint64(gasLimit))),
-			Config:  fmt.Sprintf(chainConfig, minDelay),
+			Config:  mergeConfig(fmt.Sprintf(chainConfig, minDelay), *chainExtra),
 		}},
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
 	}}
