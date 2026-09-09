@@ -11,7 +11,7 @@
 //! the storage itself (the Go write set has the same shape).
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use alloy_primitives::{Address, Bytes, B256, U256};
 use exec::exec::{account_rlp, trimmed};
@@ -43,7 +43,12 @@ pub struct Pending {
     /// copy-on-write layer over the accepted Dirty), None when the root was
     /// not computed at verify.
     pub layer: Option<Arc<Layer>>,
-    pub parent: Option<Arc<Pending>>,
+    /// The parent block's pending state, WEAK: the tree owns a pending block
+    /// until it is accepted or rejected; once the parent is accepted (its
+    /// writes applied to the backend) it is dropped and reads fall through
+    /// to the backend. A strong pointer here chained every block back to
+    /// genesis and kept every accepted write set alive (7-15 MB per block).
+    pub parent: Option<Weak<Pending>>,
     map: HashMap<Vec<u8>, Vec<u8>>,
     owners: HashSet<B256>,
     pub code: Vec<(B256, Bytecode)>,
@@ -51,14 +56,18 @@ pub struct Pending {
 }
 
 impl Pending {
-    /// The layers from the oldest pending ancestor down to this block, for a
-    /// child's root; None when one of them was verified without a root.
-    pub fn layers(&self) -> Option<Vec<&Layer>> {
-        let mut out = Vec::new();
-        let mut p = Some(self);
+    fn parent(&self) -> Option<Arc<Pending>> {
+        self.parent.as_ref().and_then(Weak::upgrade)
+    }
+
+    /// The layers from the oldest still-pending ancestor down to this block,
+    /// for a child's root; None when one of them was verified without a root.
+    pub fn layers(&self) -> Option<Vec<Arc<Layer>>> {
+        let mut out = vec![self.layer.clone()?];
+        let mut p = self.parent();
         while let Some(x) = p {
-            out.push(&**x.layer.as_ref()?);
-            p = x.parent.as_deref();
+            out.push(x.layer.clone()?);
+            p = x.parent();
         }
         out.reverse();
         Some(out)
@@ -68,31 +77,31 @@ impl Pending {
     pub fn account(parent: Option<&Pending>, be: &mut Backend, addr: Address) -> Option<AccountInfo> {
         let key = acct_key(&be.addr_hash(addr));
         match parent.and_then(|p| p.get(&key)) {
-            Some(Some(v)) => Some(decode_account(v)),
+            Some(Some(v)) => Some(decode_account(&v)),
             Some(None) => None,
             None => be.get(&key).map(decode_account),
         }
     }
 
-    fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
+    fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
         if let Some(v) = self.map.get(key) {
-            return Some(if v.is_empty() { None } else { Some(v) });
+            return Some(if v.is_empty() { None } else { Some(v.clone()) });
         }
-        self.parent.as_ref().and_then(|p| p.get(key))
+        self.parent().and_then(|p| p.get(key))
     }
 
     fn code(&self, h: &B256) -> Option<Bytecode> {
         if let Some((_, c)) = self.code.iter().find(|(x, _)| x == h) {
             return Some(c.clone());
         }
-        self.parent.as_ref().and_then(|p| p.code(h))
+        self.parent().and_then(|p| p.code(h))
     }
 
     fn block_hash(&self, n: u64) -> Option<B256> {
         if self.number == n {
             return Some(self.hash);
         }
-        self.parent.as_ref().and_then(|p| p.block_hash(n))
+        self.parent().and_then(|p| p.block_hash(n))
     }
 
     /// Live slot keys under an account across the chain (gated by owners).
@@ -104,7 +113,7 @@ impl Pending {
                 }
             }
         }
-        if let Some(p) = &self.parent {
+        if let Some(p) = self.parent() {
             p.slot_keys(ah, out);
         }
     }
@@ -170,7 +179,7 @@ impl Layered {
             time,
             root: B256::ZERO,
             layer: None,
-            parent,
+            parent: parent.as_ref().map(Arc::downgrade),
             map: cur.map,
             owners: cur.owners,
             code: cur.code,
@@ -179,16 +188,16 @@ impl Layered {
     }
 
     /// The live value: cur, the pending chain, the backend.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(v) = self.cur.map.get(key) {
-            return if v.is_empty() { None } else { Some(v) };
+            return if v.is_empty() { None } else { Some(v.clone()) };
         }
         if let Some(p) = &self.parent {
             if let Some(v) = p.get(key) {
                 return v;
             }
         }
-        self.backend.get(key)
+        self.backend.get(key).map(|v| v.to_vec())
     }
 
     fn put(&mut self, key: &[u8], val: &[u8]) {
@@ -224,7 +233,7 @@ impl Database for Layered {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Infallible> {
         let ah = self.backend.addr_hash(address);
-        Ok(self.get(&acct_key(&ah)).map(decode_account))
+        Ok(self.get(&acct_key(&ah)).map(|v| decode_account(&v)))
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Infallible> {
@@ -240,7 +249,7 @@ impl Database for Layered {
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Infallible> {
         let ah = self.backend.addr_hash(address);
         let sh = self.backend.slot_hash(B256::from(index));
-        Ok(self.get(&slot_key(&ah, &sh)).map(U256::from_be_slice).unwrap_or(U256::ZERO))
+        Ok(self.get(&slot_key(&ah, &sh)).map(|v| U256::from_be_slice(&v)).unwrap_or(U256::ZERO))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Infallible> {

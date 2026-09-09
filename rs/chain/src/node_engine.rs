@@ -734,12 +734,13 @@ impl NodeEngine {
         for (k, v) in ws {
             w.apply(k, v)?;
         }
-        let parents: Vec<&Layer> = match parent {
+        let parents: Vec<Arc<Layer>> = match parent {
             Some(p) => p.layers().ok_or_else(|| anyhow!("parent {} was verified without a state root", p.number))?,
             None => Vec::new(),
         };
+        let refs: Vec<&Layer> = parents.iter().map(|a| &**a).collect();
         let d = dirty.lock().unwrap();
-        let l = d.layer_root(&parents, w)?;
+        let l = d.layer_root(&refs, w)?;
         tick(&self.stats.t_root, t0);
         Ok(l)
     }
