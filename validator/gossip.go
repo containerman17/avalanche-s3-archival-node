@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/config"
 	"github.com/ava-labs/avalanchego/ids"
@@ -50,12 +49,6 @@ func (gossipMarshaller) UnmarshalGossip(b []byte) (*gossipTx, error) {
 	}
 	return newGossipTx(b), nil
 }
-
-// pushTargetBytes: one push message (the SDK sends one per Gossip call; its
-// 20 KiB default was ~180 transfers per tick). 64 KiB = ~580 transfers.
-const pushTargetBytes = 64 << 10
-
-const pushTick = 25 * time.Millisecond
 
 // How many pool txs one Iterate walks (pull responses stop at the SDK's
 // response size target long before; the bloom reset re-adds this many).

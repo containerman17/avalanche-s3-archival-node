@@ -99,6 +99,7 @@ var (
 	keep     = flag.Bool("keep", false, "leave the network running")
 	logsDir  = flag.String("logs", "", "copy every node's logs here and delete the network dir after the run (default: keep the network dir)")
 	rpcNodes = flag.Int("rpc-nodes", 0, "load phase: post to the first N nodes only, the rest get every tx by gossip (0 = all nodes)")
+	extra    = flag.String("chain-config-extra", "", "JSON object merged into every node's chain config, e.g. '{\"push-gossip-frequency\":\"25ms\",\"push-gossip-target-bytes\":65536}' (needs --node-flags throttler-inbound-bandwidth-refill-rate=33554432,throttler-inbound-bandwidth-max-burst-size=67108864)")
 )
 
 // teardown stops the network and, with --logs, keeps only the logs.
@@ -200,7 +201,7 @@ func main() {
 		Chains: []*tmpnet.Chain{{
 			VMID:    vmID,
 			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig, genesisTime, uint64(gasLimit))),
-			Config:  fmt.Sprintf(chainConfig, *slots, minDelay),
+			Config:  withExtra(fmt.Sprintf(chainConfig, *slots, minDelay), *extra),
 		}},
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
 	}}
@@ -838,3 +839,19 @@ func quantiles(b []bucket) (p50, p99 float64) {
 }
 
 func isInf(f float64) bool { return f > 1e300 }
+
+// withExtra merges the --chain-config-extra object into the chain config.
+func withExtra(base, extra string) string {
+	if extra == "" {
+		return base
+	}
+	var m, e map[string]any
+	check(json.Unmarshal([]byte(base), &m), "chain config")
+	check(json.Unmarshal([]byte(extra), &e), "--chain-config-extra")
+	for k, v := range e {
+		m[k] = v
+	}
+	out, err := json.Marshal(m)
+	check(err, "chain config")
+	return string(out)
+}

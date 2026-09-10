@@ -49,16 +49,17 @@ var (
 
 // VM is the ChainVM. Zero value, then Initialize.
 type VM struct {
-	eng    *engine
-	config *params.ChainConfig
-	cfg    config.Config
-	ctx    *snow.Context
-	net    *p2p.Network
-	push   *gossip.PushGossiper[*gossipTx]
-	set    *gossipSet
-	ingest ingestStats
-	b      *builder
-	m      *metrics
+	eng        *engine
+	config     *params.ChainConfig
+	cfg        config.Config
+	ctx        *snow.Context
+	net        *p2p.Network
+	push       *gossip.PushGossiper[*gossipTx]
+	set        *gossipSet
+	ingest     ingestStats
+	pushTarget int // push-gossip-target-bytes (0 = the SDK default)
+	b          *builder
+	m          *metrics
 
 	mu        sync.Mutex
 	head      *types.Header // the accepted head's header (Accept decodes it once)
@@ -95,10 +96,18 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	vm.eng, vm.config, vm.cfg, vm.ctx = eng, chainConfig, cfg, chainCtx
 	// "pprof-addr" in the chain config (e.g. "127.0.0.1:0") serves Go pprof
 	// there; the bound address is logged (avalanchego passes the plugin no env).
+	// "push-gossip-target-bytes": one push gossip message per push-gossip-frequency
+	// tick (the SDK's 20 KiB default, ~180 transfers, is 1.8k tx/s at 100 ms;
+	// 65536 at "25ms" carried 20k tx/s to each peer, but needs the node's
+	// throttler-inbound-bandwidth-refill-rate raised above the 512 KiB/s
+	// default, or consensus messages queue behind the gossip and the chain stalls).
 	var dbg struct {
-		Pprof string `json:"pprof-addr"`
+		Pprof      string `json:"pprof-addr"`
+		PushTarget int    `json:"push-gossip-target-bytes"`
 	}
-	if json.Unmarshal(configBytes, &dbg) == nil && dbg.Pprof != "" {
+	_ = json.Unmarshal(configBytes, &dbg)
+	vm.pushTarget = dbg.PushTarget
+	if dbg.Pprof != "" {
 		if l, err := net.Listen("tcp", dbg.Pprof); err == nil {
 			chainCtx.Log.Info("validator: pprof", zap.Stringer("addr", l.Addr()))
 			go http.Serve(l, nil)
@@ -192,7 +201,7 @@ func (vm *VM) startGossip() error {
 	handler, pull, push, err := gossip.NewSystem(vm.ctx.NodeID, vm.net, validators, set, gossipMarshaller{},
 		gossip.SystemConfig{
 			Log: vm.ctx.Log, Registry: vm.m.reg, Namespace: "eth_tx_gossip",
-			RequestPeriod: vm.cfg.PullGossipFrequency.Duration, TargetMessageSize: pushTargetBytes,
+			RequestPeriod: vm.cfg.PullGossipFrequency.Duration, TargetMessageSize: vm.pushTarget,
 			PushGossipParams: gossip.BranchingFactor{
 				StakePercentage: vm.cfg.PushGossipPercentStake, Validators: vm.cfg.PushGossipNumValidators, Peers: vm.cfg.PushGossipNumPeers,
 			},
@@ -213,19 +222,17 @@ func (vm *VM) startGossip() error {
 	return nil
 }
 
-// pushLoop: every push period, the pool's newly admitted txs (one crossing)
-// go to the push gossiper and the bloom filter, then ONE push round of at
-// most pushTargetBytes: the round size and the tick bound what a node sends
-// each peer (64 KiB per 25 ms = 2.6 MB/s, ~23k transfers/s; the SDK's 20 KiB
-// per 100 ms carried 1.8k tx/s). push-gossip-frequency below 25 ms is
-// honoured. Draining everything at once is NOT an option: one round per 64
-// KiB of new bytes shipped a 400k-tx pool in one tick (44 MB per peer) and
-// avalanchego dropped the peer connections (health: disconnectedValidators,
-// the chain stalled). The peer's inbound bandwidth throttle must allow the
-// rate: throttler-inbound-bandwidth-refill-rate (512 KiB/s default).
+// pushLoop: every push-gossip-frequency tick, the pool's newly admitted txs
+// (one crossing) go to the push gossiper and the bloom filter, then ONE push
+// round of at most push-gossip-target-bytes: the round size and the tick
+// bound what a node sends each peer. Draining everything at once is NOT an
+// option: one round per 64 KiB of new bytes shipped a 400k-tx pool in one
+// tick (44 MB per peer), consensus messages queued behind it and the chain
+// stalled ("block processing too long"); the same happens at a steady rate
+// above the peer's inbound bandwidth throttle.
 func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duration) {
-	if period <= 0 || period > pushTick {
-		period = pushTick
+	if period <= 0 {
+		period = 100 * time.Millisecond
 	}
 	t := time.NewTicker(period)
 	defer t.Stop()
