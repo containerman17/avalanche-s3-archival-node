@@ -989,3 +989,25 @@ verification or consensus changed; the policy only delays when WE propose. Recom
 8000, "build-fill-wait-ms": 150`, or `"build-fill-adaptive": true` with the same floor and wait.
 `TestBuildFillPolicy` covers the three cases (lone tx waits ~wait, repeated parent takes the gap, target reached adds
 no wait).
+
+Local proof (3 all-ours --stress validators on this 16-thread box, the go-pipeline recipe: `e2e --ours-n 3 --stock-n 0
+--stress --load 60s --rate 40000 --keys 1024 --workers 8 --batch 1000 --chain-config-extra '{"push-gossip-frequency":
+"25ms","push-gossip-target-bytes":262144[,"build-fill-target":8000,"build-fill-wait-ms":150]}' --node-flags
+throttler-inbound-bandwidth-refill-rate=33554432,throttler-inbound-bandwidth-max-burst-size=67108864`), load heights
+9.., per node (own blocks = the blocks that node proposed):
+
+| policy | wakes / built per node | blocks/s | txs/block | mined/s | own blocks included p50 / min | fillWaited p50 / p90 / max (blocks > 0) | free at build p50 | in flight after accept p50 |
+|---|---|---|---|---|---|---|---|---|
+| off (309b0d5) | 40/40, 50/50, 56/56 | 1.76 | 14,305 | 25.2k | 16,029 / 24-100 | 0 / 0 / 0 (0 of 146) | 181k-204k | 3 |
+| target 8000, wait 150 ms | 52/53, 54/53, 52/52 | 1.72 | 14,209 | 24.4k | 16,029 / 24-100 | 0 / 0-5 ms / 30-125 ms (8 of 158) | 76k-144k | 3 |
+
+Reading: this box cannot show the fleet's regime. The pool here holds 76k-200k free txs at every build (37k tx/s
+offered into 600 ms CPU-bound 16k-tx blocks), so the 8000 target is met at once and the policy engaged on 8 of 158
+blocks, at the load's edges (the first blocks and the tail, where the pool drained; the max hold was 125 ms, under
+the 150 ms cap: never a stall), for the same blocks/s, txs/block and mined/s within run noise (blocks identical on the
+3 nodes both runs; the off run's 81,556 refused sends are the generator hitting the pool caps at 373k pending, not the
+proposer). What it proves: the policy costs nothing when the pool is deep, holds a thin parent at most `wait`, and
+the repeated-parent gap is untouched (0 gap cuts, 0 engine-empty). The fleet's 4-5k-tx blocks at 16k in flight are
+where `free < 8000` at a fresh parent is the norm, and only the fleet run shows whether holding 150 ms brings the
+included count back to ~8k and mined/s above 37.5k; if the hold is too short there, raise `build-fill-wait-ms` before
+the target, and `build-fill-adaptive` tracks the last block instead of a fixed number.
