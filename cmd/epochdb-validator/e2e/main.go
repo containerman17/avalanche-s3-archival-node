@@ -167,6 +167,7 @@ func main() {
 	chainExtra := flag.String("chain-config-extra", "", "JSON file merged into the chain config both plugin kinds receive (e.g. state-scheme, pool caps)")
 	oursN := flag.Int("ours-n", 3, "validators running our plugin")
 	stockN := flag.Int("stock-n", 2, "validators running the stock plugin")
+	rpcN := flag.Int("rpc-n", 0, "non-validator nodes running our plugin (printed as kind rpc), for submitting load to a validator and a non-validator at once")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
 		flag.Usage()
@@ -178,11 +179,13 @@ func main() {
 
 	key := genesis.EWOQKey
 	network = tmpnet.NewDefaultNetwork("epochdb-validator-e2e")
-	network.Nodes = tmpnet.NewNodesOrPanic(*oursN + *stockN)
+	network.Nodes = tmpnet.NewNodesOrPanic(*oursN + *stockN + *rpcN)
 	nodes := make([]*node, len(network.Nodes))
 	for i, n := range network.Nodes {
 		kind, dir := "ours", *ours
-		if i >= *oursN {
+		if i >= *oursN+*stockN {
+			kind, dir = "rpc", *ours
+		} else if i >= *oursN {
 			kind, dir = "stock", *stock
 		}
 		n.RuntimeConfig = &tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago, PluginDir: dir}}
@@ -210,7 +213,7 @@ func main() {
 			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig, genesisTime, uint64(gasLimit))),
 			Config:  mergeConfig(fmt.Sprintf(chainConfig, minDelay), *chainExtra),
 		}},
-		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
+		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes[:*oursN+*stockN]...),
 	}}
 
 	bootCtx, bootCancel := context.WithTimeout(ctx, 2*time.Minute)
