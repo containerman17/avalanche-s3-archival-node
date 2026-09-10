@@ -821,6 +821,7 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		var submitErr error
 		var admitted, lastLogged int
 		admitStart := time.Now()
+		streamHead := g.head // blocks mined during the stream count too, not only the drain tail
 		for len(raws) > 0 && submitErr == nil {
 			n, err := g.pending(ctx)
 			if err != nil {
@@ -862,6 +863,9 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 		b, t, ga, err := g.drain(ctx)
 		if err != nil {
 			return err
+		}
+		if mined := g.head - streamHead; mined > b {
+			b = mined
 		}
 		blocks, txs, gas = blocks+b, txs+t, gas+ga
 		prefillFor = 0
