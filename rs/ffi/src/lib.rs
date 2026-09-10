@@ -590,12 +590,13 @@ pub unsafe extern "C" fn epochdb_pool_nonce(e: *mut epochdb_engine, addr: *const
 }
 
 /// Blocks until the pool holds an executable tx that a build on `parent_id`
-/// would include (`out` = 1) or `timeout_ms` passes (`out` = 0): the txs of
-/// the unaccepted chain under `parent_id` are held, not free (they leave the
-/// pool at accept). `parent_id` null or zero or the head: every executable
-/// tx counts. Returns at once when one already does.
+/// would include (`out` = how many such FREE txs it holds) or `timeout_ms`
+/// passes (`out` = 0): the txs of the unaccepted chain under `parent_id` are
+/// held, not free (they leave the pool at accept). `parent_id` null or zero
+/// or the head: every executable tx counts. Returns at once when one
+/// already does.
 #[no_mangle]
-pub unsafe extern "C" fn epochdb_pool_wait(e: *mut epochdb_engine, parent_id: *const u8, timeout_ms: u64, out: *mut u8) -> c_int {
+pub unsafe extern "C" fn epochdb_pool_wait(e: *mut epochdb_engine, parent_id: *const u8, timeout_ms: u64, out: *mut u64) -> c_int {
     if e.is_null() || out.is_null() {
         return EPOCHDB_EINVAL;
     }
@@ -603,7 +604,7 @@ pub unsafe extern "C" fn epochdb_pool_wait(e: *mut epochdb_engine, parent_id: *c
     en.guard(|| {
         let chain = id32(parent_id).map_or_else(Vec::new, |pid| en.pending_chain(&pid));
         let skip = chain::node_engine::held_nonces(chain.iter().flat_map(|b| b.txs.iter()));
-        *out = en.tree.engine.txpool.wait_free(std::time::Duration::from_millis(timeout_ms), &skip) as u8;
+        *out = en.tree.engine.txpool.wait_free_count(std::time::Duration::from_millis(timeout_ms), &skip) as u64;
         Ok(EPOCHDB_OK)
     })
 }

@@ -81,8 +81,8 @@ int   epochdb_pool_content(epochdb_engine*, const uint8_t* addr /* 20 bytes, or 
       // out: RLP list of envelopes, pending (address order, then nonce) then queued
 int   epochdb_pool_nonce(epochdb_engine*, const uint8_t addr[20], uint64_t* out);  // state nonce + executable txs;
       // EPOCHDB_ENOTFOUND when the pool holds nothing of the address (the caller uses the state's nonce)
-int   epochdb_pool_wait(epochdb_engine*, const uint8_t* parent_id, uint64_t timeout_ms, uint8_t* out); // blocks until a FREE executable tx (not held by the unaccepted chain under parent_id; null/zero/head = any)
-      // is pending (out 1) or the timeout passes (out 0); returns at once when one already is
+int   epochdb_pool_wait(epochdb_engine*, const uint8_t* parent_id, uint64_t timeout_ms, uint64_t* out); // blocks until a FREE executable tx (not held by the unaccepted chain under parent_id; null/zero/head = any)
+      // is pending (out = how many free ones the pool holds) or the timeout passes (out 0); returns at once when one already is
 int   epochdb_pool_drain_gossip(epochdb_engine*, epochdb_buf* out);                  // RLP [[envelopes...], [hashes...]]:
       // every tx admitted since the previous call (local and remote), oldest first, and every tx hash that left the
       // pool since then (mined, replaced, dropped), both under one pool lock; empty buffer = neither

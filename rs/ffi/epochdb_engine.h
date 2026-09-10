@@ -217,10 +217,14 @@ int epochdb_pool_content(struct epochdb_engine *e,
 int epochdb_pool_nonce(struct epochdb_engine *e, const uint8_t *addr, uint64_t *out);
 
 /**
- * Blocks until the pool holds an executable tx (`out` = 1) or `timeout_ms`
- * passes (`out` = 0). Returns at once when it already does.
+ * Blocks until the pool holds an executable tx that a build on `parent_id`
+ * would include (`out` = how many such FREE txs it holds) or `timeout_ms`
+ * passes (`out` = 0): the txs of the unaccepted chain under `parent_id` are
+ * held, not free (they leave the pool at accept). `parent_id` null or zero
+ * or the head: every executable tx counts. Returns at once when one
+ * already does.
  */
-int epochdb_pool_wait(struct epochdb_engine *e, const uint8_t *parent_id, uint64_t timeout_ms, uint8_t *out);
+int epochdb_pool_wait(struct epochdb_engine *e, const uint8_t *parent_id, uint64_t timeout_ms, uint64_t *out);
 
 /**
  * Every tx admitted (locally or from gossip) since the previous call, as

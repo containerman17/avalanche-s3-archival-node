@@ -306,12 +306,12 @@ func (e *engine) poolNonce(addr common.Address) (uint64, bool) {
 // poolWait blocks until the pool holds an executable tx a build on parent
 // would include (the unaccepted chain under parent holds its txs until
 // accept; ids.Empty or the head = any executable tx) or the timeout passes;
-// true when it does.
-func (e *engine) poolWait(parent ids.ID, timeout time.Duration) bool {
+// returns how many such free txs the pool holds (0 = timeout).
+func (e *engine) poolWait(parent ids.ID, timeout time.Duration) uint64 {
 	e.crossings[xPool].Add(1)
-	var out C.uint8_t
+	var out C.uint64_t
 	C.epochdb_pool_wait(e.p, c32(parent), C.uint64_t(timeout/time.Millisecond), &out)
-	return out != 0
+	return uint64(out)
 }
 
 // poolDrainGossip: every tx admitted since the previous call, and every tx

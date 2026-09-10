@@ -32,6 +32,24 @@ const retryDelay = 100 * time.Millisecond
 // wait then restarts against the new preferred chain).
 const poolWaitSlice = 50 * time.Millisecond
 
+// fillPoll: how often the fill policy re-reads the free-tx count while it
+// holds a build back (one pool crossing per poll).
+const fillPoll = 5 * time.Millisecond
+
+// fillPolicy: the chain config's build-fill-* keys. On a FRESH preferred
+// parent (not the one we last built on) the proposer waits until the pool
+// holds `target` free executable txs, or `wait` has passed since the parent
+// became preferred, before it proposes; more smaller blocks lose at a fixed
+// poll cost per block (fleet round 5: blocks/s 4 -> 5-6 and mined/s -29%).
+// adaptive: the target is the last block's included count, floored at
+// `target` (a block the gas/bytes limits cut already is that size, so the
+// cap is implicit). Zero target or zero wait = off.
+type fillPolicy struct {
+	target   uint64
+	wait     time.Duration
+	adaptive bool
+}
+
 // buildStats: every WaitForEvent wake and what became of it. A wake that
 // yields no block is logged as `validator: build-skip {reason}`:
 //   - proposervm-window: PendingTxs was returned but no BuildBlock reached
@@ -77,6 +95,14 @@ type builder struct {
 	// proposervm may drop that call above the VM).
 	wakeUnbuilt bool
 	stats       buildStats
+	fill        fillPolicy
+	// prefAt: when the preference last moved (the fill wait's clock).
+	prefAt time.Time
+	// lastIncluded: the last built block's tx count (the adaptive target);
+	// lastFillWait / lastFree: the last wake's fill wait and the free count
+	// it woke with, for the built line.
+	lastIncluded, lastFree uint64
+	lastFillWait           time.Duration
 	// pref is closed (and replaced) by every SetPreference: a wait on the
 	// retry gap or the Granite delay re-evaluates against the new parent at
 	// once, without relying on the engine's WaitForEvent cancellation alone.
@@ -84,7 +110,7 @@ type builder struct {
 }
 
 func newBuilder(eng *engine, log logging.Logger) *builder {
-	b := &builder{eng: eng, log: log, pref: make(chan struct{})}
+	b := &builder{eng: eng, log: log, pref: make(chan struct{}), prefAt: time.Now()}
 	b.cond = lock.NewCond(&b.mu)
 	return b
 }
@@ -94,6 +120,7 @@ func (b *builder) preferenceChanged() {
 	b.mu.Lock()
 	close(b.pref)
 	b.pref = make(chan struct{})
+	b.prefAt = time.Now()
 	b.mu.Unlock()
 }
 
@@ -104,10 +131,24 @@ func (b *builder) setNormalOp() {
 	b.mu.Unlock()
 }
 
-func (b *builder) built(parent ethcommon.Hash) {
+func (b *builder) built(parent ethcommon.Hash, included uint64) {
 	b.mu.Lock()
 	b.lastBuildTime, b.lastBuildParent = time.Now(), parent
+	if included > 0 {
+		b.lastIncluded = included
+	}
 	b.mu.Unlock()
+}
+
+// fillTarget: the free-tx count a fresh parent waits for (0 = no wait).
+func (b *builder) fillTarget() uint64 {
+	if b.fill.wait <= 0 {
+		return 0
+	}
+	if b.fill.adaptive {
+		return max(b.fill.target, b.lastIncluded)
+	}
+	return b.fill.target
 }
 
 // buildCalled: BuildBlock reached the VM (pairs the last wake).
@@ -142,19 +183,38 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 		b.log.Info("validator: build-skip", zap.String("reason", "proposervm-window"), zap.Uint64("head", h.Number.Uint64()), zap.Stringer("preferred", preferred))
 	}
 	t0 := time.Now()
-	var gap time.Duration
+	var gap, fillWaited time.Duration
+	var free uint64
 	for {
 		// Only FREE executable txs count: the preferred chain's txs stay in
 		// the pool until accept, and a build on it skips them.
-		for !b.eng.poolWait(preferred, poolWaitSlice) {
+		for free = b.eng.poolWait(preferred, poolWaitSlice); free == 0; free = b.eng.poolWait(preferred, poolWaitSlice) {
 			if err := ctx.Err(); err != nil {
 				return 0, err
 			}
 			h, preferred = state()
 		}
 		b.mu.Lock()
-		lastTime, lastParent, pref := b.lastBuildTime, b.lastBuildParent, b.pref
+		lastTime, lastParent, pref, prefAt, target := b.lastBuildTime, b.lastBuildParent, b.pref, b.prefAt, b.fillTarget()
 		b.mu.Unlock()
+
+		// Fill policy: a fresh parent holds the build until the pool has
+		// `target` free txs or the wait since the preference moved is up. A
+		// preference change resets the clock (prefAt) and re-evaluates; a
+		// repeated parent skips this and takes the retry gap below.
+		if lastParent != ethcommon.Hash(preferred) && free < target {
+			if left := time.Until(prefAt.Add(b.fill.wait)); left > 0 {
+				select {
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				case <-pref:
+					h, preferred = state()
+				case <-time.After(min(left, fillPoll)):
+				}
+				fillWaited += min(left, fillPoll)
+				continue
+			}
+		}
 
 		// The retry gap applies to a REPEATED build on the same preferred
 		// parent (our block is out and consensus has not moved yet). A new
@@ -194,8 +254,10 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 	b.stats.wakes.Add(1)
 	b.mu.Lock()
 	b.wakeUnbuilt = true
+	b.lastFillWait, b.lastFree = fillWaited, free
 	b.mu.Unlock()
-	b.log.Info("validator: wake", zap.Uint64("head", h.Number.Uint64()), zap.Stringer("preferred", preferred), zap.Duration("poolWait", time.Since(t0)-max(gap, 0)), zap.Duration("gap", max(gap, 0)))
+	b.log.Info("validator: wake", zap.Uint64("head", h.Number.Uint64()), zap.Stringer("preferred", preferred), zap.Duration("poolWait", time.Since(t0)-max(gap, 0)-fillWaited),
+		zap.Duration("gap", max(gap, 0)), zap.Duration("fillWaited", fillWaited), zap.Uint64("free", free))
 	return common.PendingTxs, nil
 }
 
@@ -252,7 +314,7 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	// that consensus has not accepted yet. Without it WaitForEvent fired
 	// again at once while the pool still held the skipped txs (K7 on the
 	// settle run: 11595 engine builds for 175 blocks).
-	vm.b.built(parent.Hash())
+	vm.b.built(parent.Hash(), out.included)
 	if out.included == 0 {
 		vm.m.buildEmpty.Inc()
 		vm.b.stats.engineEmpty.Add(1)
@@ -272,7 +334,11 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		}
 	}
 	pending, queued := vm.eng.poolStatus() // what the pool holds right after the build (its txs stay until accept)
+	vm.b.mu.Lock()
+	fillWaited, freeAtBuild := vm.b.lastFillWait, vm.b.lastFree
+	vm.b.mu.Unlock()
 	fields := []zap.Field{zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
+		zap.Duration("fillWaited", fillWaited), zap.Uint64("freeAtBuild", freeAtBuild),
 		zap.Int("candidates", len(out.skipped)), zap.Uint64("pending", pending), zap.Uint64("queued", queued), zap.Uint64("gasUsed", out.gasUsed),
 		zap.Int("skipNonceLow", skips[1]), zap.Int("skipFailed", skips[2]), zap.Int("skipPopped", skips[3]),
 		zap.Int("skipNoGas", skips[4]), zap.Int("skipSize", skips[5]), zap.Int("skipNotReached", skips[6]),

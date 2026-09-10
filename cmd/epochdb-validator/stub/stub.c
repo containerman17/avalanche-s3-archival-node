@@ -124,7 +124,7 @@ int epochdb_pool_content(epochdb_engine *e, const uint8_t *addr, size_t limit, e
   (void)e; (void)addr; (void)limit; *out = dup((const uint8_t *)"\xc0", 1); return 0;
 }
 int epochdb_pool_nonce(epochdb_engine *e, const uint8_t *addr, uint64_t *out) { (void)e; (void)addr; *out = 0; return -3; }
-int epochdb_pool_wait(epochdb_engine *e, const uint8_t *parent_id, uint64_t timeout_ms, uint8_t *out) { (void)e; (void)parent_id; (void)timeout_ms; *out = 1; return 0; }
+int epochdb_pool_wait(epochdb_engine *e, const uint8_t *parent_id, uint64_t timeout_ms, uint64_t *out) { (void)e; (void)parent_id; (void)timeout_ms; *out = 1; return 0; }
 int epochdb_pool_drain_gossip(epochdb_engine *e, epochdb_buf *out) { (void)e; *out = dup(NULL, 0); return 0; }
 int epochdb_last_error(const epochdb_engine *e, epochdb_buf *out) {
   (void)e; *out = dup((const uint8_t *)"stub error", 10); return 0;

@@ -646,9 +646,16 @@ impl Pool {
     /// `candidates` takes it) does not already hold, or `timeout` passes;
     /// true when it does. A build on that chain would include something.
     pub fn wait_free(&self, timeout: Duration, skip: &HashMap<Address, u64>) -> bool {
+        self.wait_free_count(timeout, skip) > 0
+    }
+
+    /// `wait_free`, answering HOW MANY free executable txs the pool holds
+    /// (0 = the timeout passed). One lock, so the builder's fill policy
+    /// costs one crossing per check.
+    pub fn wait_free_count(&self, timeout: Duration, skip: &HashMap<Address, u64>) -> usize {
         let g = self.inner.lock().unwrap();
         let (g, _) = self.cv.wait_timeout_while(g, timeout, |g| !g.has_free(skip)).unwrap();
-        g.has_free(skip)
+        g.free_count(skip)
     }
 
     /// The senders the pool already recovered for `hashes` (admission
@@ -701,6 +708,21 @@ impl Inner {
             let a = &self.accounts[&k.sender];
             skip.get(&k.sender).map_or(a.nonce, |n| (*n).max(a.nonce)) < a.nonce + a.exec as u64
         })
+    }
+
+    /// Executable txs past what `skip` holds per sender: what a build on
+    /// that chain has to take from. O(senders with executable txs).
+    fn free_count(&self, skip: &HashMap<Address, u64>) -> usize {
+        if skip.is_empty() {
+            return self.pending;
+        }
+        self.heads
+            .iter()
+            .map(|k| {
+                let a = &self.accounts[&k.sender];
+                (a.nonce + a.exec as u64).saturating_sub(skip.get(&k.sender).map_or(a.nonce, |n| (*n).max(a.nonce))) as usize
+            })
+            .sum()
     }
 
     /// Removes one tx by hash (the account is re-settled by the caller).
@@ -1147,6 +1169,10 @@ mod tests {
         let some = HashMap::from([(addr_of(&a), 2u64), (addr_of(&b), 1u64)]);
         assert!(p.wait_free(Duration::from_millis(1), &some));
         assert!(p.wait_free(Duration::from_millis(1), &HashMap::new()));
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &some), 1);
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::from([(addr_of(&a), 1u64)])), 3);
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::new()), 4);
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &all), 0);
     }
 
     #[test]

@@ -101,14 +101,21 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	// 65536 at "25ms" carried 20k tx/s to each peer, but needs the node's
 	// throttler-inbound-bandwidth-refill-rate raised above the 512 KiB/s
 	// default, or consensus messages queue behind the gossip and the chain stalls).
+	// "build-fill-target" / "build-fill-wait-ms" / "build-fill-adaptive": the
+	// proposer's fill policy (fillPolicy in build.go); all zero = build at the
+	// first free tx, like subnet-evm.
 	var dbg struct {
-		Pprof      string `json:"pprof-addr"`
-		PushTarget int    `json:"push-gossip-target-bytes"`
-		Direct     string `json:"rpc-direct-addr"`
-		Public     bool   `json:"rpc-direct-allow-public"`
+		Pprof        string `json:"pprof-addr"`
+		PushTarget   int    `json:"push-gossip-target-bytes"`
+		Direct       string `json:"rpc-direct-addr"`
+		Public       bool   `json:"rpc-direct-allow-public"`
+		FillTarget   uint64 `json:"build-fill-target"`
+		FillWaitMS   uint64 `json:"build-fill-wait-ms"`
+		FillAdaptive bool   `json:"build-fill-adaptive"`
 	}
 	_ = json.Unmarshal(configBytes, &dbg)
 	vm.pushTarget = dbg.PushTarget
+	fill := fillPolicy{target: dbg.FillTarget, wait: time.Duration(dbg.FillWaitMS) * time.Millisecond, adaptive: dbg.FillAdaptive}
 	// "rpc-direct-addr" (e.g. "127.0.0.1:0"): MEASUREMENT ONLY, off by default.
 	// A plain net/http server inside the plugin process serving the same /rpc
 	// handler without avalanchego's HTTP server -> gRPC ghttp hop, so a
@@ -155,6 +162,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	}
 	vm.bg, vm.cancel = context.WithCancel(context.Background())
 	vm.b = newBuilder(eng, chainCtx.Log)
+	vm.b.fill = fill
 
 	chainCtx.Log.Info("validator: engine open", zap.Stringer("chain", chainCtx.ChainID),
 		zap.Stringer("chainId", chainConfig.ChainID), zap.Uint64("height", head.Number.Uint64()), zap.String("data", chainCtx.ChainDataDir))

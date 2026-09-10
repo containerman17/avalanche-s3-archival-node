@@ -966,3 +966,26 @@ BuildBlock) is (a), now countable as `skipProposervmWindow` without debug logs. 
 of 14k-tx blocks, not the wake, paces it; the fleet's 4k-tx / 30-50 ms regime needs the fleet run for the before/after
 on accepted -> next built. Nothing in verification or consensus changed; proposervm's window rules are untouched.
 `go test -count=1 ./validator/` (real and `-tags epochdb_stub`), `cargo test -p epochdb-chain` pass.
+
+## Block fill policy: hold a fresh parent until the block is worth a poll (branch go-fill off rust 6847dd0, 2026-09-11 JST)
+
+Fleet round 5 (16-vCPU validators, go-pipeline): the proposer built at the first free tx; blocks shrank (5121 vs 7808
+included at 16k in flight), blocks/s rose 4 -> 5-6 and mined/s FELL 29% because polls per block stayed at 22. More
+smaller blocks lose at a fixed poll cost per block. Chain config keys (read by the Go shell like the gossip keys):
+
+| key | default | means |
+|---|---|---|
+| `build-fill-target` | 0 | free executable txs the pool must hold before we propose on a FRESH preferred parent (0 = off) |
+| `build-fill-wait-ms` | 0 | longest hold since the parent became preferred; then we propose with what there is (0 = off) |
+| `build-fill-adaptive` | false | target = the last block's included count, floored at `build-fill-target` (a block the gas/bytes limits cut is that size already, so the cap is implicit) |
+
+Semantics (`fillPolicy` in `validator/build.go`, inside `waitForEvent` after the free-tx wait): fresh parent = not the
+parent we last built on. If free < target and the wait since the preference moved is not up, re-check every 5 ms
+(`epochdb_pool_wait` now returns the free COUNT, one crossing per check) or at once on a preference change, which also
+resets the clock. A repeated build on the same parent keeps the 100 ms retry gap and never fill-waits. A lone tx is
+therefore mined within `build-fill-wait-ms` of the preference move, or at once when the parent has been preferred
+longer than that (idle chain). The `built` and `wake` lines carry `fillWaited` and `freeAtBuild`. Nothing in
+verification or consensus changed; the policy only delays when WE propose. Recommended fleet start: `"build-fill-target":
+8000, "build-fill-wait-ms": 150`, or `"build-fill-adaptive": true` with the same floor and wait.
+`TestBuildFillPolicy` covers the three cases (lone tx waits ~wait, repeated parent takes the gap, target reached adds
+no wait).
