@@ -592,9 +592,10 @@ pub unsafe extern "C" fn epochdb_pool_nonce(e: *mut epochdb_engine, addr: *const
 /// Blocks until the pool holds an executable tx that a build on `parent_id`
 /// would include (`out` = how many such FREE txs it holds) or `timeout_ms`
 /// passes (`out` = 0): the txs of the unaccepted chain under `parent_id` are
-/// held, not free (they leave the pool at accept). `parent_id` null or zero
-/// or the head: every executable tx counts. Returns at once when one
-/// already does.
+/// held, not free (they leave the pool at accept), and a tx whose fee cap
+/// is under the base fee a block on `parent_id` pays now is not free either
+/// (the build leaves it out). `parent_id` null or zero: the head. Returns
+/// at once when one already does.
 #[no_mangle]
 pub unsafe extern "C" fn epochdb_pool_wait(e: *mut epochdb_engine, parent_id: *const u8, timeout_ms: u64, out: *mut u64) -> c_int {
     if e.is_null() || out.is_null() {
@@ -602,9 +603,18 @@ pub unsafe extern "C" fn epochdb_pool_wait(e: *mut epochdb_engine, parent_id: *c
     }
     let en = &*e;
     en.guard(|| {
-        let chain = id32(parent_id).map_or_else(Vec::new, |pid| en.pending_chain(&pid));
+        let t0 = std::time::Instant::now();
+        let pid = id32(parent_id).unwrap_or([0u8; 32]);
+        let chain = en.pending_chain(&pid);
         let skip = chain::node_engine::held_nonces(chain.iter().flat_map(|b| b.txs.iter()));
-        *out = en.tree.engine.txpool.wait_free_count(std::time::Duration::from_millis(timeout_ms), &skip) as u64;
+        let parent = chain.first().cloned().unwrap_or_else(|| en.tree.engine.last_accepted());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let base_fee = en.tree.engine.txpool.next_base_fee(&parent.header, now);
+        let prep = t0.elapsed();
+        if prep > std::time::Duration::from_millis(50) {
+            eprintln!("epochdb-rs: pool_wait: the pending chain ({} blocks) took {prep:.1?} before the wait", chain.len());
+        }
+        *out = en.tree.engine.txpool.wait_free_count(std::time::Duration::from_millis(timeout_ms), &skip, base_fee) as u64;
         Ok(EPOCHDB_OK)
     })
 }

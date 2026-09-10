@@ -1011,3 +1011,74 @@ the repeated-parent gap is untouched (0 gap cuts, 0 engine-empty). The fleet's 4
 where `free < 8000` at a fresh parent is the norm, and only the fleet run shows whether holding 150 ms brings the
 included count back to ~8k and mined/s above 37.5k; if the hold is too short there, raise `build-fill-wait-ms` before
 the target, and `build-fill-adaptive` tracks the last block instead of a fixed number.
+
+## Pool lock starvation, empty builds and the 7500-tx cap (branch go-stall off rust dce2af4, 2026-09-11 JST)
+
+Fleet round 7 (5 x 16-vCPU validators, fill 8000 / 150 ms, account slots 4096 / global 131072, 64k in flight): accept
+gaps of 18-19 s on every node with the chain frozen at 1090 and the proposer's `wake` line at `poolWait 18.1 s, free
+7337` (13.8 s and 9.0 s on two others); engine-empty builds with `candidates 0` while the pool held 32k pending and
+10-16k free (13-22 per node per run, 60 in the ERC20 run, each with the 99 ms retry gap); ERC20 blocks of exactly
+7500 txs = 325 M gas of a 500 M limit.
+
+Instrumentation (kept): every pool lock acquisition goes through `Pool::lock(who)`, which prints
+`epochdb-rs: pool: <who> waited N for the lock` / `<who> held the lock N` when either passes 50 ms (`SLOW_LOCK`);
+`wait_free_count` prints its lock wait, predicate time and free_count time when the call overruns its slice;
+`epochdb_pool_wait` prints when the pending-chain lookup (the tree lock, held by verify and accept) took over 50 ms.
+
+Local before (dce2af4 + the timers, 3 all-ours --stress nodes, `e2e --load 90s --rate 40000 --keys 1024 --workers 8
+--batch 1000 --account-slots 4096`, fill 8000/150, gossip 25 ms / 262144, global slots 131072, 16k-tx blocks, pool
+190k-509k): `add-insert held the lock` 87-113 times per node, p50 58 ms, max 153 ms (one 1000-tx JSON-RPC batch);
+`on_accept held` p50 59 ms, max 123 ms; every other caller waited 60-80 ms p50, up to 285 ms (`add-filter`,
+`add-need`, `drain_gossip`, `status`, `candidates`, `on_accept`); the wait's own predicate was 2 us over 1 check and
+free_count 200 us over 1024 skip senders; the pending-chain lookup never passed 50 ms. No multi-second wait here.
+
+(1) Root cause of the insert hold: `Inner::insert` ended in `settle(sender)`, which rescans EVERY tx of the sender
+(the drop pass: nonce below, unpayable, over-gas; then the executable prefix from the state nonce), so one insert cost
+O(the sender's depth) and a 1000-tx batch of 1024 senders 400 deep cost ~800k BTreeMap steps under the lock. The
+fleet's deeper senders (account slots 4096) and four RPC connections re-taking the lock back to back starve the
+builder's `wait_free_count` (std's mutex is unfair: a thread that just released and re-locks wins) for as long as the
+batches keep coming: the 9-18 s `poolWait`, ending with free 7-12k as soon as one acquisition got through. Fix:
+`insert` calls `promote(sender)`, which extends the prefix from its current end over the now-contiguous nonces and
+refreshes the head key, O(txs promoted); a replacement inside the prefix moves its cost in place. `settle` (drop pass
++ `promote`) stays for the paths where the sender's state moved: `on_accept` (per touched sender) and the full-pool
+eviction. `on_accept` stays O(block): 16k `remove_hash` (hash map + priced BTreeSet removals) plus the touched
+senders' settle, 58 ms p50 per 16k-tx block here, once per block.
+
+(2) Root cause of the empty builds: `wait_free_count` and `candidates` used the same skip set (the unaccepted chain's
+held nonces) but `candidates` also leaves out a sender whose head cannot pay the block's base fee (`eff()` None when
+fee cap < base fee) and the free count did not, so a base fee above the txs' fee caps (a burst of 300 M gas blocks on
+a fee window tuned for far less) made the wait fire, the build include nothing, and the retry gap tick every 100 ms
+until the base fee decayed (the 2.2-2.6 s accept gaps). Fix: `epochdb_pool_wait` prices the block a build on the
+preferred parent would pay now (`Pool::next_base_fee` = `rpc::fee::next_base_fee` with the accepted head's fee
+config, kept in `pool::Head.fee`, and the parent header) and `has_free` / `free_count` count a sender only when its
+first free tx pays it (`free_of`), the same rule `candidates` starts a sender with. A later build pays the same or
+less (the window shifts with time), so a wake never has less than it was promised.
+
+(3) Root cause of 7500: `candidates` cut the list when the summed DECLARED gas limits reached 1.5x the block gas
+limit; ERC20 transfers sent with a 100k limit use 43k, so 750 M / 100k = 7500 candidates, executed to 322 M gas,
+and the block stopped there with the pool full. Fix: the budget counts each tx's intrinsic gas (`intrinsic_gas`, a
+lower bound of what it uses), so a list cut at 1.5x the gas limit always fills the block; the byte cap
+(1.125 x the size target) is unchanged. `gas_budget_counts_intrinsic_gas_not_the_declared_limit`: 100 senders
+declaring 100k for 21k transfers, budget 1.5 M: 72 candidates, not 15.
+
+Local after (all three fixes, same recipe with `--keys 256 --load 180s` and the fleet's `tx-pool-global-queue` 1024, so
+the pool sat at 60-117k pending like the fleet's 36-59k, 14.3-14.6k txs/block, heights 9..356 in 3m07s), per node:
+
+| | before (dce2af4, 90 s, 1024 keys) | after (go-stall, 180 s, 256 keys) |
+|---|---|---|
+| `add-insert held the lock` > 50 ms | 87 / 111 / 113 (p50 58 ms, max 153 ms) | 0 / 0 / 0 |
+| other callers waited > 50 ms (add-filter + add-need + drain_gossip + status) | 1012 / 1225 / 1170 | 59 / 91 / 48 |
+| `on_accept held` > 50 ms | 44 / 34 / 40 (max 123 ms) | 29 / 39 / 37 (max 108 ms; O(block), once per 16k-tx block) |
+| `wake` poolWait, load heights | p50 8-15 ms, p90 69-120 ms | p50 5 ms, p90 35-69 ms, max 137 ms (the two 215 / 249 ms are heads 9 and 11, the functional phase's near-empty pool) |
+| engine-empty / any build-skip | 0 / 0 | 0 / 0 (137 + 106 + 104 wakes = 356 blocks) |
+| accept gaps | p99 4.7-5.0 s, max 6.6 s, sum of gaps > 2 s 34-35 s per 100 s | p99 2.0-3.4 s, max 3.0-4.2 s, sum 10-25 s per 187 s |
+
+The accept gaps left are this shared 16-thread box verifying 16k-tx blocks (verify p99 450 ms, three nodes plus the
+generator), not the pool: no pool wait passed 140 ms in the load phase and no lock was held over 112 ms. The 7500
+cap cannot show with 21k transfers (declared = intrinsic); the unit test carries the ERC20 shape. Not reproduced here:
+a 16 s freeze with `blks_processing 0` on every node at the same height. One candidate the fleet logs can settle that
+this box cannot: a roll (`epochdb-rs: roll N start` / `roll N done ... total=`), whose `finish_roll` (overlay replay
+into Dirty, the store sync, `flush_dirty`'s root) runs inside Accept under the engine mutex AND the tree lock that
+`epochdb_pool_wait` takes for the pending chain, at the same height on every node (the 2 GB budget fills at the same
+rate everywhere). Grep the round-7 plugin logs around height 1090 for `epochdb-rs: roll`. `cargo test -p
+epochdb-chain`, `go test -count=1 ./validator/` pass.

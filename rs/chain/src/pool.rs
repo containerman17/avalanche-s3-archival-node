@@ -25,7 +25,8 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256, U256};
@@ -47,6 +48,38 @@ const SEEN_MAX: usize = 200_000;
 /// An emptied sender account (the cached nonce and balance) is kept this long
 /// after its last tx.
 const EMPTY_IDLE: Duration = Duration::from_secs(60);
+/// A pool lock waited for or held longer than this is printed with its
+/// caller (the builder's wait sits behind the same lock).
+const SLOW_LOCK: Duration = Duration::from_millis(50);
+
+/// The pool lock with a hold timer (`Pool::lock`).
+struct Held<'a> {
+    g: MutexGuard<'a, Inner>,
+    who: &'static str,
+    since: Instant,
+}
+
+impl Deref for Held<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.g
+    }
+}
+
+impl DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.g
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let held = self.since.elapsed();
+        if held > SLOW_LOCK {
+            eprintln!("epochdb-rs: pool: {} held the lock {held:.1?}", self.who);
+        }
+    }
+}
 
 /// The per-tx admission result (the ABI's codes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,14 +221,20 @@ fn go_duration(s: &str) -> Option<Duration> {
     Some(Duration::from_secs_f64(total))
 }
 
-/// The head-dependent rules: the block gas limit and the fee config's
-/// minimum base fee (both from `GetFeeConfigAt(head)`), the head's time
-/// (fork rules).
-#[derive(Clone, Copy, Debug, Default)]
+/// The head-dependent rules: the block gas limit and the fee config (both
+/// from `GetFeeConfigAt(head)`; the config also prices the next block's
+/// base fee for the free-tx wait), the head's time (fork rules).
+#[derive(Clone, Debug)]
 pub struct Head {
     pub gas_limit: u64,
-    pub min_base_fee: u128,
+    pub fee: exec::config::FeeConfig,
     pub time: u64,
+}
+
+impl Head {
+    fn min_base_fee(&self) -> u128 {
+        self.fee.min_base_fee.saturating_to()
+    }
 }
 
 struct Entry {
@@ -335,13 +374,24 @@ fn validate(t: &Tx, head: &Head, cfg: &Config, chain: &exec::Config, local: bool
     if !local && t.gas_tip < cfg.price_limit {
         return Err((Code::Underpriced, "transaction underpriced"));
     }
-    if t.gas_price < head.min_base_fee {
+    if t.gas_price < head.min_base_fee() {
         return Err((Code::Underpriced, "transaction underpriced"));
     }
     Ok(())
 }
 
 impl Pool {
+    /// The lock, timed: a wait or a hold over SLOW_LOCK is printed with `who`.
+    fn lock(&self, who: &'static str) -> Held<'_> {
+        let t = Instant::now();
+        let g = self.inner.lock().unwrap();
+        let waited = t.elapsed();
+        if waited > SLOW_LOCK {
+            eprintln!("epochdb-rs: pool: {who} waited {waited:.1?} for the lock");
+        }
+        Held { g, who, since: Instant::now() }
+    }
+
     pub fn new(cfg: Config, chain: Arc<exec::Config>, head: Head) -> Pool {
         Pool {
             chain,
@@ -387,10 +437,10 @@ impl Pool {
         let local = local && self.cfg.locals;
         let mut out: Vec<Added> = raws.iter().map(|r| Added { code: Code::Known, message: "already known", hash: alloy_primitives::keccak256(r) }).collect();
         let (head, fresh) = {
-            let g = self.inner.lock().unwrap();
+            let g = self.lock("add-filter");
             let mut in_batch = HashSet::with_capacity(out.len());
             let fresh: Vec<(usize, Bytes)> = out.iter().enumerate().filter(|(_, a)| !g.by_hash.contains_key(&a.hash) && !g.seen.contains(&a.hash) && in_batch.insert(a.hash)).map(|(i, _)| (i, std::mem::take(&mut raws[i]))).collect();
-            (g.head, fresh)
+            (g.head.clone(), fresh)
         };
         self.dup.fetch_add((out.len() - fresh.len()) as u64, Ordering::Relaxed);
         if fresh.is_empty() {
@@ -431,7 +481,7 @@ impl Pool {
         let now = Instant::now();
         loop {
             let (gen, need) = {
-                let g = self.inner.lock().unwrap();
+                let g = self.lock("add-need");
                 let mut need: Vec<Address> = Vec::new();
                 let mut seen = HashSet::new();
                 for (_, t) in &txs {
@@ -443,7 +493,7 @@ impl Pool {
                 (g.gen, need)
             };
             let states = if need.is_empty() { Vec::new() } else { read(&need) };
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.lock("add-insert");
             if g.gen != gen {
                 continue; // a head landed in between: the states may be stale
             }
@@ -469,7 +519,7 @@ impl Pool {
     /// A block was accepted: its txs leave, the senders it touched are
     /// re-read (nonce, balance) and re-settled, the head rules move.
     pub fn on_accept(&self, block_txs: &[Tx], head: Head, read: &mut dyn FnMut(&[Address]) -> Vec<(u64, U256)>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock("on_accept");
         g.gen += 1;
         g.head = head;
         let mut touched: Vec<Address> = Vec::new();
@@ -515,9 +565,14 @@ impl Pool {
 
     /// The build's candidates: the executable heads by effective tip
     /// (min(tip cap, fee cap - base fee)) desc then arrival, each sender's
-    /// txs in nonce order behind its head, until the summed gas limits
-    /// reach `gas_budget` or the summed sizes reach `max_bytes`; a sender
-    /// whose head cannot pay the base fee is left out. `skip` (sender -> the
+    /// txs in nonce order behind its head, until the summed INTRINSIC gas
+    /// reaches `gas_budget` or the summed sizes reach `max_bytes`; a sender
+    /// whose head cannot pay the base fee is left out. Intrinsic gas, not
+    /// the declared limit: a tx uses at least that much, so a list cut at
+    /// 1.5x the block gas limit always fills the block, while the declared
+    /// limits cut it short when senders over-declare (ERC20 transfers sent
+    /// with a 100k limit use 43k: the fleet's blocks stopped at exactly
+    /// 7500 txs = 750 M declared of a 500 M block). `skip` (sender -> the
     /// nonce after its txs in the pending parent chain) starts a sender past
     /// what the block's unaccepted ancestors already hold. Exact miner
     /// order from the tip-cap index: a head whose effective tip is below its
@@ -540,7 +595,8 @@ impl Pool {
                 Some(self.cmp(o))
             }
         }
-        let g = self.inner.lock().unwrap();
+        let g = self.lock("candidates");
+        let durango = self.chain.is_durango(g.head.time);
         let eff = |e: &Entry| -> Option<u128> {
             if e.tx.gas_price < base_fee {
                 return None;
@@ -571,7 +627,7 @@ impl Pool {
             let acct = &g.accounts[&c.sender];
             let e = &acct.txs[&c.nonce];
             out.push((*e.tx).clone());
-            gas += e.tx.gas_limit;
+            gas += intrinsic_gas(&e.tx, durango).unwrap_or(e.tx.gas_limit);
             size += e.tx.raw.len();
             if gas >= gas_budget || size >= max_bytes {
                 break;
@@ -589,24 +645,24 @@ impl Pool {
 
     /// (pending, queued).
     pub fn status(&self) -> (usize, usize) {
-        let g = self.inner.lock().unwrap();
+        let g = self.lock("status");
         (g.pending, g.total - g.pending)
     }
 
     pub fn has(&self, hash: &B256) -> bool {
-        self.inner.lock().unwrap().by_hash.contains_key(hash)
+        self.lock("has").by_hash.contains_key(hash)
     }
 
     /// The pool's nonce for `addr`: the state nonce plus the executable
     /// txs; None when the pool holds nothing of the address.
     pub fn pending_nonce(&self, addr: Address) -> Option<u64> {
-        self.inner.lock().unwrap().accounts.get(&addr).map(|a| a.nonce + a.exec as u64)
+        self.lock("pending_nonce").accounts.get(&addr).map(|a| a.nonce + a.exec as u64)
     }
 
     /// (pending, queued) txs of one address, or of every address (address
     /// order, then nonce), at most `limit` of each half (0 = all).
     pub fn content(&self, addr: Option<Address>, limit: usize) -> (Vec<Arc<Tx>>, Vec<Arc<Tx>>) {
-        let g = self.inner.lock().unwrap();
+        let g = self.lock("content");
         let limit = if limit == 0 { usize::MAX } else { limit };
         let mut pending = Vec::new();
         let mut queued = Vec::new();
@@ -638,24 +694,53 @@ impl Pool {
     /// Blocks until the pool holds an executable tx or `timeout` passes;
     /// true when it does.
     pub fn wait(&self, timeout: Duration) -> bool {
-        self.wait_free(timeout, &HashMap::new())
+        self.wait_free(timeout, &HashMap::new(), 0)
     }
 
     /// Blocks until the pool holds an executable tx that `skip` (sender ->
     /// the nonce after its txs in the unaccepted preferred chain, as
-    /// `candidates` takes it) does not already hold, or `timeout` passes;
-    /// true when it does. A build on that chain would include something.
-    pub fn wait_free(&self, timeout: Duration, skip: &HashMap<Address, u64>) -> bool {
-        self.wait_free_count(timeout, skip) > 0
+    /// `candidates` takes it) does not already hold and whose fee cap pays
+    /// `base_fee`, or `timeout` passes; true when it does. A build on that
+    /// chain at that base fee would include something.
+    pub fn wait_free(&self, timeout: Duration, skip: &HashMap<Address, u64>, base_fee: u128) -> bool {
+        self.wait_free_count(timeout, skip, base_fee) > 0
+    }
+
+    /// The base fee a block on `parent` built at `timestamp` pays, by the
+    /// accepted head's fee config (what `candidates` filters by; the wait
+    /// prices it ahead of the build, and a later build pays no more).
+    pub fn next_base_fee(&self, parent: &block::Header, timestamp: u64) -> u128 {
+        let fee = self.lock("next_base_fee").head.fee.clone();
+        rpc::fee::next_base_fee(&fee, parent, timestamp).map_or(0, |b| b.saturating_to())
     }
 
     /// `wait_free`, answering HOW MANY free executable txs the pool holds
-    /// (0 = the timeout passed). One lock, so the builder's fill policy
-    /// costs one crossing per check.
-    pub fn wait_free_count(&self, timeout: Duration, skip: &HashMap<Address, u64>) -> usize {
+    /// (0 = the timeout passed): the same senders and skip set `candidates`
+    /// takes, so a wake always has something to build. One lock, so the
+    /// builder's fill policy costs one crossing per check.
+    pub fn wait_free_count(&self, timeout: Duration, skip: &HashMap<Address, u64>, base_fee: u128) -> usize {
+        let t0 = Instant::now();
         let g = self.inner.lock().unwrap();
-        let (g, _) = self.cv.wait_timeout_while(g, timeout, |g| !g.has_free(skip)).unwrap();
-        g.free_count(skip)
+        let waited = t0.elapsed();
+        let (mut pred_ns, mut checks) = (0u64, 0u32);
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, timeout, |g| {
+                let t = Instant::now();
+                let r = !g.has_free(skip, base_fee);
+                pred_ns += t.elapsed().as_nanos() as u64;
+                checks += 1;
+                r
+            })
+            .unwrap();
+        let t = Instant::now();
+        let n = g.free_count(skip, base_fee);
+        let count = t.elapsed();
+        drop(g);
+        if waited > SLOW_LOCK || Duration::from_nanos(pred_ns) > SLOW_LOCK || count > SLOW_LOCK || t0.elapsed() > timeout + SLOW_LOCK {
+            eprintln!("epochdb-rs: pool: wait took {:.1?} (timeout {timeout:?}): lock wait {waited:.1?}, predicate {:.1?} over {checks} checks, free_count {count:.1?}, skip {} senders, free {n}", t0.elapsed(), Duration::from_nanos(pred_ns), skip.len());
+        }
+        n
     }
 
     /// The senders the pool already recovered for `hashes` (admission
@@ -663,7 +748,7 @@ impl Pool {
     /// peer's block is mostly the pool's own txs, so its parse recovers only
     /// the rest.
     pub fn senders(&self, hashes: &[B256]) -> Vec<Option<Address>> {
-        let g = self.inner.lock().unwrap();
+        let g = self.lock("senders");
         hashes.iter().map(|h| g.by_hash.get(h).map(|(a, _)| *a)).collect()
     }
 
@@ -672,18 +757,18 @@ impl Pool {
     /// pool since then; both under one lock, so a tx admitted and dropped
     /// between two drains shows in both lists of the same drain.
     pub fn drain_gossip(&self) -> (Vec<Arc<Tx>>, Vec<B256>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock("drain_gossip");
         (g.gossip.drain(..).collect(), g.gone.drain(..).collect())
     }
 
     /// Drops the queued txs of senders idle for longer than the lifetime
     /// (legacypool's heartbeat rule; senders with executable txs are kept).
     pub fn expire(&self, now: Instant) {
-        self.inner.lock().unwrap().expire(now, self.cfg.lifetime);
+        self.lock("expire").expire(now, self.cfg.lifetime);
     }
 
     pub fn gen(&self) -> u64 {
-        self.inner.lock().unwrap().gen
+        self.lock("gen").gen
     }
 }
 
@@ -697,32 +782,38 @@ fn gone_push(gone: &mut VecDeque<B256>, hash: B256) {
 }
 
 impl Inner {
-    /// An executable tx exists past what `skip` holds per sender (empty
-    /// `skip`: any executable tx). O(senders with executable txs) when the
-    /// preferred chain holds everything, one comparison otherwise.
-    fn has_free(&self, skip: &HashMap<Address, u64>) -> bool {
-        if skip.is_empty() {
-            return self.pending > 0;
+    /// A sender's executable txs past what `skip` holds of it, when its
+    /// first free tx pays `base_fee` (as `candidates` starts a sender: a
+    /// head under the base fee is left out, and a run shares its fee cap).
+    fn free_of(&self, k: &HeadKey, skip: &HashMap<Address, u64>, base_fee: u128) -> usize {
+        let a = &self.accounts[&k.sender];
+        let first = skip.get(&k.sender).map_or(a.nonce, |n| (*n).max(a.nonce));
+        let end = a.nonce + a.exec as u64;
+        if first >= end || a.txs[&first].tx.gas_price < base_fee {
+            return 0;
         }
-        self.heads.iter().any(|k| {
-            let a = &self.accounts[&k.sender];
-            skip.get(&k.sender).map_or(a.nonce, |n| (*n).max(a.nonce)) < a.nonce + a.exec as u64
-        })
+        (end - first) as usize
     }
 
-    /// Executable txs past what `skip` holds per sender: what a build on
-    /// that chain has to take from. O(senders with executable txs).
-    fn free_count(&self, skip: &HashMap<Address, u64>) -> usize {
-        if skip.is_empty() {
+    /// An executable tx exists past what `skip` holds per sender at
+    /// `base_fee` (empty `skip`, zero fee: any executable tx). O(senders
+    /// with executable txs) when the preferred chain holds everything, one
+    /// comparison otherwise.
+    fn has_free(&self, skip: &HashMap<Address, u64>, base_fee: u128) -> bool {
+        if skip.is_empty() && base_fee == 0 {
+            return self.pending > 0;
+        }
+        self.heads.iter().any(|k| self.free_of(k, skip, base_fee) > 0)
+    }
+
+    /// Executable txs past what `skip` holds per sender at `base_fee`: what
+    /// a build on that chain has to take from. O(senders with executable
+    /// txs).
+    fn free_count(&self, skip: &HashMap<Address, u64>, base_fee: u128) -> usize {
+        if skip.is_empty() && base_fee == 0 {
             return self.pending;
         }
-        self.heads
-            .iter()
-            .map(|k| {
-                let a = &self.accounts[&k.sender];
-                (a.nonce + a.exec as u64).saturating_sub(skip.get(&k.sender).map_or(a.nonce, |n| (*n).max(a.nonce))) as usize
-            })
-            .sum()
+        self.heads.iter().map(|k| self.free_of(k, skip, base_fee)).sum()
     }
 
     /// Removes one tx by hash (the account is re-settled by the caller).
@@ -749,15 +840,16 @@ impl Inner {
         true
     }
 
-    /// Recomputes the sender's executable prefix from its state nonce:
-    /// mined (nonce below), unpayable and over-gas txs go, the prefix is
-    /// the contiguous run from the nonce, the head key follows.
+    /// Recomputes the sender's executable prefix from its state nonce after
+    /// its state moved (a head change, an eviction): mined (nonce below),
+    /// unpayable and over-gas txs go, the prefix is rebuilt by `promote`.
+    /// O(the sender's txs): not for the insert path (`promote` alone).
     fn settle(&mut self, sender: &Address) {
-        let head = self.head;
+        let gas_limit = self.head.gas_limit;
         let Some(acct) = self.accounts.get_mut(sender) else { return };
         let mut drop: Vec<(u64, B256, u128, u64)> = Vec::new();
         for (n, e) in &acct.txs {
-            if *n < acct.nonce || e.cost > acct.balance || e.tx.gas_limit > head.gas_limit {
+            if *n < acct.nonce || e.cost > acct.balance || e.tx.gas_limit > gas_limit {
                 drop.push((*n, e.tx.hash, e.tx.gas_tip, e.seq));
             }
         }
@@ -768,10 +860,24 @@ impl Inner {
             self.priced.remove(&PricedKey { tip, seq: Reverse(seq), hash });
             self.total -= 1;
         }
+        self.pending -= acct.exec;
+        acct.exec = 0;
+        acct.exec_cost = U256::ZERO;
+        self.promote(sender);
+    }
+
+    /// Extends the sender's executable prefix over the now-contiguous
+    /// nonces past its end and refreshes its head key. O(txs promoted):
+    /// one insert of a 4000-deep sender costs one step, where a full
+    /// `settle` per insert held the lock 60-150 ms per 1000-tx batch
+    /// (fleet round 7: the builder's pool wait starved for 9-18 s behind
+    /// four RPC connections of those batches).
+    fn promote(&mut self, sender: &Address) {
+        let Some(acct) = self.accounts.get_mut(sender) else { return };
         let was = acct.exec;
-        let mut exec = 0usize;
-        let mut cost = U256::ZERO;
-        for (n, e) in &acct.txs {
+        let mut exec = acct.exec;
+        let mut cost = acct.exec_cost;
+        for (n, e) in acct.txs.range(acct.nonce + exec as u64..) {
             if *n != acct.nonce + exec as u64 {
                 break;
             }
@@ -866,10 +972,8 @@ impl Inner {
             self.priced.remove(&PricedKey { tip: o.tx.gas_tip, seq: Reverse(o.seq), hash: o.tx.hash });
             self.total -= 1;
             if tx.nonce < acct.nonce + acct.exec as u64 {
-                // Replacing inside the prefix: settle recounts it below.
-                self.pending -= acct.exec;
-                acct.exec = 0;
-                acct.exec_cost = U256::ZERO;
+                // Replacing inside the prefix: the prefix stays, its cost moves.
+                acct.exec_cost = acct.exec_cost - o.cost + cost;
             }
         }
         if !acct.local {
@@ -879,7 +983,7 @@ impl Inner {
         acct.txs.insert(tx.nonce, Entry { tx: tx.clone(), seq, cost });
         self.total += 1;
         let before = self.pending;
-        self.settle(&sender);
+        self.promote(&sender);
         if self.pending > before || replacing {
             *promoted = true;
         }
@@ -922,7 +1026,7 @@ mod tests {
     }
 
     fn head() -> Head {
-        Head { gas_limit: 20_000_000, min_base_fee: 1_000_000_000, time: 1_700_000_000 }
+        Head { gas_limit: 20_000_000, fee: chain().fee_config.clone(), time: 1_700_000_000 }
     }
 
     struct Key(SecretKey);
@@ -1118,6 +1222,18 @@ mod tests {
         assert_eq!(p.candidates(GWEI, 10_000_000, 100, &HashMap::new()).len(), 1);
     }
 
+    /// The budget counts intrinsic gas, not the declared limit: 100 senders
+    /// declaring 100k for a 21k transfer are all offered to a 1.5 x 1 M
+    /// budget (15 by declared gas; the block's execution is the real cut).
+    #[test]
+    fn gas_budget_counts_intrinsic_gas_not_the_declared_limit() {
+        let p = pool(Config { account_slots: 100, global_slots: 1000, ..Default::default() });
+        let st = state(0, 10 * ETH);
+        let raws: Vec<Bytes> = (0..100u32).map(|i| sign_full(&Key(SecretKey::from_slice(&keccak256(i.to_be_bytes()).0).unwrap()), 0, GWEI, 50 * GWEI, 100_000, 1, Some(Address::from([9; 20])), &[])).collect();
+        assert!(p.add(raws, false, &st).iter().all(|a| a.code == Code::Ok));
+        assert_eq!(p.candidates(GWEI, 1_500_000, 1 << 20, &HashMap::new()).len(), 72); // 1.5 M / 21 k, not 15
+    }
+
     #[test]
     fn accept_touches_only_its_senders_and_rejected_blocks_re_include() {
         let p = pool(Config { account_slots: 100, global_slots: 1000, ..Default::default() });
@@ -1165,14 +1281,20 @@ mod tests {
         // wait_free follows candidates: a chain holding everything leaves
         // nothing to wake for; one free tx does.
         let all = HashMap::from([(addr_of(&a), 3u64), (addr_of(&b), 1u64)]);
-        assert!(!p.wait_free(Duration::from_millis(1), &all));
+        assert!(!p.wait_free(Duration::from_millis(1), &all, 0));
         let some = HashMap::from([(addr_of(&a), 2u64), (addr_of(&b), 1u64)]);
-        assert!(p.wait_free(Duration::from_millis(1), &some));
-        assert!(p.wait_free(Duration::from_millis(1), &HashMap::new()));
-        assert_eq!(p.wait_free_count(Duration::from_millis(1), &some), 1);
-        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::from([(addr_of(&a), 1u64)])), 3);
-        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::new()), 4);
-        assert_eq!(p.wait_free_count(Duration::from_millis(1), &all), 0);
+        assert!(p.wait_free(Duration::from_millis(1), &some, 0));
+        assert!(p.wait_free(Duration::from_millis(1), &HashMap::new(), 0));
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &some, 0), 1);
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::from([(addr_of(&a), 1u64)]), 0), 3);
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::new(), 0), 4);
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &all, 0), 0);
+        // The fee filter follows candidates: a base fee over every cap (50 gwei)
+        // leaves nothing free although the pool holds 4 executable txs.
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::new(), 50 * GWEI), 4);
+        assert_eq!(p.wait_free_count(Duration::from_millis(1), &HashMap::new(), 50 * GWEI + 1), 0);
+        assert!(p.candidates(50 * GWEI + 1, 10_000_000, 1 << 20, &HashMap::new()).is_empty());
+        assert!(!p.wait_free(Duration::from_millis(1), &HashMap::new(), 51 * GWEI));
     }
 
     #[test]

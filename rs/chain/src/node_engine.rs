@@ -703,7 +703,7 @@ impl NodeEngine {
             let fc = build::fee_config_at(&cfg, head.header.time, |slot| g.head_storage(exec::precompile::FEE_MANAGER, slot));
             let pc = pool::Config::from_json(conf);
             eprintln!("epochdb-rs: pool: price-limit={} bump={}% account-slots={} global-slots={} account-queue={} global-queue={} lifetime={:?} locals={} unprotected={} ingest-threads={}", pc.price_limit, pc.price_bump, pc.account_slots, pc.global_slots, pc.account_queue, pc.global_queue, pc.lifetime, pc.locals, pc.allow_unprotected, pc.ingest_threads);
-            Arc::new(Pool::new(pc, cfg.clone(), pool::Head { gas_limit: head.header.gas_limit, min_base_fee: fc.min_base_fee.saturating_to(), time: head.header.time }))
+            Arc::new(Pool::new(pc, cfg.clone(), pool::Head { gas_limit: head.header.gas_limit, fee: fc, time: head.header.time }))
         };
         let head = Arc::new(Mutex::new(head));
         let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), db_reads.clone(), recent.clone(), cfg.clone()));
@@ -1312,7 +1312,7 @@ impl NodeEngine {
         // The pool: mined txs out, the block's senders and recipients re-read
         // at the new head, the head rules (gas limit, min base fee) refreshed.
         let fc = build::fee_config_at(&self.cfg, b.header.time, |slot| inner.head_storage(exec::precompile::FEE_MANAGER, slot));
-        self.txpool.on_accept(&b.txs, pool::Head { gas_limit: b.header.gas_limit, min_base_fee: fc.min_base_fee.saturating_to(), time: b.header.time }, &mut |addrs| {
+        self.txpool.on_accept(&b.txs, pool::Head { gas_limit: b.header.gas_limit, fee: fc, time: b.header.time }, &mut |addrs| {
             addrs.iter().map(|a| inner.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
         });
         *self.head.lock().unwrap() = b.clone();
