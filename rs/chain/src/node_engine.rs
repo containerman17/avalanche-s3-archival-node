@@ -422,7 +422,7 @@ impl NodeEngine {
         // `block-size-target-kib`: the miner's cut on tx bytes per built block
         // (subnet-evm's 1800 KiB); a 16k-transfer block is ~1.1 MB zstd on the
         // wire against avalanchego's 2 MiB message limit, so there is room.
-        let block_size_target = (conf_u64(&conf, "block-size-target-kib").unwrap_or(1800) as usize) << 10;
+        let block_size_target = block_size_target_from(&conf);
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let workers = cpus.saturating_sub(2).max(1);
         let data = PathBuf::from(&init.chain_data_dir);
@@ -656,7 +656,7 @@ impl NodeEngine {
         );
         let mut ex = Executor::open(cfg.clone(), fw);
         ex.defer_call_trace = true;
-        ex.block_size_target = (conf_u64(&conf, "block-size-target-kib").unwrap_or(1800) as usize) << 10;
+        ex.block_size_target = block_size_target_from(&conf);
         let ex = Ex::Firewood(ex);
         eprintln!(
             "epochdb-rs: chainId={} data={} state-engine=firewood cache={}MB revisions={} kv-cache={}MB commit-every={FW_COMMIT_EVERY} window-max-bytes={} shutdown-grace={}s workers={workers}",
@@ -1310,6 +1310,22 @@ pub fn id_hex(id: &Id) -> String {
 
 /// A numeric config value: a JSON number, or a string holding one (the hosts
 /// merge `EPOCHDB_*` variables in as strings).
+/// `block-size-target-kib` clamped to what avalanchego can ship: the raw
+/// container (proposervm wrapper + block RLP) must stay under the 2 MiB
+/// `constants.DefaultMaxMessageSize`, checked BEFORE compression and not a node
+/// flag; 1900 KiB of tx bytes leaves room for the header and the wrapper.
+/// A 2700 KiB target built 23k-tx blocks the sender refused ("msg too large to
+/// be compressed") and consensus stalled.
+pub const BLOCK_SIZE_TARGET_MAX_KIB: u64 = 1900;
+
+fn block_size_target_from(conf: &serde_json::Value) -> usize {
+    let kib = conf_u64(conf, "block-size-target-kib").unwrap_or(1800);
+    if kib > BLOCK_SIZE_TARGET_MAX_KIB {
+        eprintln!("epochdb-rs: block-size-target-kib {kib} exceeds avalanchego's 2 MiB message limit, clamped to {BLOCK_SIZE_TARGET_MAX_KIB}");
+    }
+    (kib.min(BLOCK_SIZE_TARGET_MAX_KIB) as usize) << 10
+}
+
 fn conf_u64(conf: &serde_json::Value, key: &str) -> Option<u64> {
     match conf.get(key)? {
         serde_json::Value::Number(n) => n.as_u64(),
@@ -1345,6 +1361,9 @@ mod tests {
     fn conf_u64_reads_numbers_and_strings() {
         let c: serde_json::Value = serde_json::from_str(r#"{"roll-every-blocks":200000,"roll-budget-mb":"8","roll-every-secs":true}"#).unwrap();
         assert_eq!(conf_u64(&c, "roll-every-blocks"), Some(200000));
+        let big: serde_json::Value = serde_json::from_str(r#"{"block-size-target-kib":2700}"#).unwrap();
+        assert_eq!(block_size_target_from(&big), 1900 << 10);
+        assert_eq!(block_size_target_from(&c), 1800 << 10);
         assert_eq!(conf_u64(&c, "roll-budget-mb"), Some(8));
         assert_eq!(conf_u64(&c, "roll-every-secs"), None);
         assert_eq!(conf_u64(&c, "missing"), None);
