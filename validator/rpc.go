@@ -3,10 +3,13 @@ package validator
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
+	"sync"
 
 	ethcommon "github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
@@ -40,28 +43,57 @@ func (vm *VM) serveRPC(w http.ResponseWriter, r *http.Request) {
 			w.Write(rpcError(nil, -32700, "parse error"))
 			return
 		}
+		parsed := make([]*rpcReq, len(reqs))
 		split := false
-		for _, raw := range reqs {
-			if _, ok := vm.poolMethod(raw); ok {
-				split = true
-				break
-			}
+		for i, raw := range reqs {
+			parsed[i], _ = vm.poolMethod(raw)
+			split = split || parsed[i] != nil
 		}
 		if !split {
 			vm.forward(w, body)
 			return
+		}
+		// Every eth_sendRawTransaction of the batch goes to the pool in one
+		// call (one lock, one promotion round); each element keeps its own
+		// answer, in order, and one bad element refuses only itself.
+		resps := make([][]byte, len(reqs))
+		var txs []*types.Transaction
+		var at []int
+		for i, req := range parsed {
+			if req == nil || req.Method != "eth_sendRawTransaction" {
+				continue
+			}
+			tx, err := decodeRawTx(req)
+			if err != nil {
+				resps[i] = rpcError(req.ID, -32602, err.Error())
+				continue
+			}
+			txs = append(txs, tx)
+			at = append(at, i)
+		}
+		for j, err := range vm.admit(txs) {
+			if err != nil {
+				resps[at[j]] = rpcError(parsed[at[j]].ID, -32000, err.Error())
+			} else {
+				resps[at[j]] = rpcResult(parsed[at[j]].ID, txs[j].Hash())
+			}
 		}
 		w.Write([]byte{'['})
 		for i, raw := range reqs {
 			if i > 0 {
 				w.Write([]byte{','})
 			}
-			if req, ok := vm.poolMethod(raw); ok {
-				w.Write(vm.answerPool(req))
-			} else if resp, err := vm.eng.rpc(raw); err == nil {
-				w.Write(resp)
-			} else {
-				w.Write(rpcError(nil, -32603, err.Error()))
+			switch {
+			case resps[i] != nil:
+				w.Write(resps[i])
+			case parsed[i] != nil:
+				w.Write(vm.answerPool(parsed[i]))
+			default:
+				if resp, err := vm.eng.rpc(raw); err == nil {
+					w.Write(resp)
+				} else {
+					w.Write(rpcError(nil, -32603, err.Error()))
+				}
 			}
 		}
 		w.Write([]byte{']'})
@@ -107,22 +139,12 @@ func (vm *VM) answerPool(req *rpcReq) []byte {
 	}
 	switch req.Method {
 	case "eth_sendRawTransaction":
-		var raw hexutil.Bytes
-		if len(req.Params) != 1 || json.Unmarshal(req.Params[0], &raw) != nil {
-			return rpcError(req.ID, -32602, "invalid params")
-		}
-		tx := new(types.Transaction)
-		if err := tx.UnmarshalBinary(raw); err != nil {
+		tx, err := decodeRawTx(req)
+		if err != nil {
 			return rpcError(req.ID, -32602, err.Error())
 		}
-		// Remote, not local: locals bypass the pool's per-account and global
-		// caps, and a flood through RPC then grows the queue (and the Go heap)
-		// without bound. Remote admission gives the sender "txpool is full".
-		if err := vm.pool.Add([]*types.Transaction{tx}, false, false)[0]; err != nil {
+		if err := vm.admit([]*types.Transaction{tx})[0]; err != nil {
 			return rpcError(req.ID, -32000, err.Error())
-		}
-		if vm.push != nil {
-			vm.push.Add(&gossipTx{tx: tx})
 		}
 		return rpcResult(req.ID, tx.Hash())
 	case "eth_sendTransaction":
@@ -155,6 +177,73 @@ func (vm *VM) answerPool(req *rpcReq) []byte {
 		return rpcResult(req.ID, out)
 	}
 	return rpcError(req.ID, -32601, "method not found")
+}
+
+func decodeRawTx(req *rpcReq) (*types.Transaction, error) {
+	var raw hexutil.Bytes
+	if len(req.Params) != 1 || json.Unmarshal(req.Params[0], &raw) != nil {
+		return nil, errors.New("invalid params")
+	}
+	tx := new(types.Transaction)
+	return tx, tx.UnmarshalBinary(raw)
+}
+
+// admit hands txs to the pool in one call: the senders are recovered here
+// in parallel (the pool's own recovery, once per tx on the caller's
+// goroutine, is then a cache hit), their accounts read in one crossing (the
+// pool reads each sender under its lock otherwise), then one pool.Add (one
+// lock, one promotion round; sync=false: the round runs on the reorg loop,
+// which merges the rounds of concurrent calls) and one push.
+//
+// Remote, not local: locals bypass the pool's per-account and global caps,
+// and a flood through RPC then grows the queue (and the Go heap) without
+// bound. Remote admission gives the sender "txpool is full".
+func (vm *VM) admit(txs []*types.Transaction) []error {
+	if len(txs) == 0 {
+		return nil
+	}
+	vm.chain.acct.warm(recoverSenders(vm.signer, txs))
+	errs := vm.pool.Add(txs, false, false)
+	if vm.push != nil {
+		ok := make([]*gossipTx, 0, len(txs))
+		for i, err := range errs {
+			if err == nil {
+				ok = append(ok, &gossipTx{tx: txs[i]})
+			}
+		}
+		if len(ok) > 0 {
+			vm.push.Add(ok...)
+		}
+	}
+	return errs
+}
+
+// recoverSenders: types.Sender of every tx (cached in the tx), in parallel
+// from 32 txs up; a tx whose signature does not recover gets the zero
+// address (the pool reports it).
+func recoverSenders(signer types.Signer, txs []*types.Transaction) []ethcommon.Address {
+	out := make([]ethcommon.Address, len(txs))
+	work := func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			out[i], _ = types.Sender(signer, txs[i])
+		}
+	}
+	n := min(runtime.GOMAXPROCS(0), (len(txs)+31)/32)
+	if n <= 1 {
+		work(0, len(txs))
+		return out
+	}
+	step := (len(txs) + n - 1) / n
+	var wg sync.WaitGroup
+	for lo := 0; lo < len(txs); lo += step {
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			work(lo, hi)
+		}(lo, min(lo+step, len(txs)))
+	}
+	wg.Wait()
+	return out
 }
 
 // txpool_content shape: address -> nonce -> tx. ponytail: txs are the

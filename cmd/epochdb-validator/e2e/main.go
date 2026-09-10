@@ -85,7 +85,7 @@ const feeConfigStress = `"feeConfig": {"gasLimit": 500000000, "minBaseFee": 1000
 // queued and the global caps hold a load run's backlog; "min-delay-target"
 // is the ACP-226 delay each validator votes for (stock and ours read it).
 const chainConfig = `{"log-level":"info","state-sync-enabled":false,"pruning-enabled":false,"pprof-addr":"127.0.0.1:0",` +
-	`"tx-pool-account-slots":1000,"tx-pool-global-slots":200000,"tx-pool-account-queue":2000,"tx-pool-global-queue":400000,` +
+	`"tx-pool-account-slots":%d,"tx-pool-global-slots":200000,"tx-pool-account-queue":2000,"tx-pool-global-queue":400000,` +
 	`"min-delay-target":%d,` +
 	`"eth-apis":["eth","eth-filter","net","web3","internal-eth","internal-blockchain","internal-transaction","internal-tx-pool"]}`
 
@@ -148,6 +148,7 @@ func main() {
 	stress := flag.Bool("stress", false, "stress genesis: 500 M gas limit, 1 ms min block delay")
 	oursN := flag.Int("ours-n", 3, "validators running our plugin")
 	stockN := flag.Int("stock-n", 2, "validators running the stock plugin")
+	slots := flag.Int("account-slots", 1000, "tx-pool-account-slots of the chain config (pending txs per sender; the pool's depth is keys x this)")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
 		flag.Usage()
@@ -189,7 +190,7 @@ func main() {
 		Chains: []*tmpnet.Chain{{
 			VMID:    vmID,
 			Genesis: []byte(fmt.Sprintf(chainGenesis, feeConfig, genesisTime, uint64(gasLimit))),
-			Config:  fmt.Sprintf(chainConfig, minDelay),
+			Config:  fmt.Sprintf(chainConfig, *slots, minDelay),
 		}},
 		ValidatorIDs: tmpnet.NodesToIDs(network.Nodes...),
 	}}
@@ -525,7 +526,13 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 					nonces[k]++
 					k = (k + 1) % len(mine)
 				}
-				n := d.nodes[(w+iter)%len(d.nodes)]
+				// A worker sticks to one node (a client does): with the nodes
+				// alternating per batch, every second nonce of a key had to
+				// cross by gossip before the key was executable, and once
+				// admission outran gossip the queue hit its cap and
+				// truncateQueue broke the sequences for good (400k queued,
+				// 2000 pending, blocks of 2000 then 3 txs).
+				n := d.nodes[w%len(d.nodes)]
 				bad := map[int]bool{}
 				for i, r := range batchPost(n.rpc, reqs) {
 					if r.Error != nil {
