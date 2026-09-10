@@ -297,7 +297,7 @@ func (vm *VM) HealthCheck(context.Context) (interface{}, error) {
 		AddMS uint64 `json:"pool-add-ms"`
 	}
 	_ = json.Unmarshal(raw, &eh)
-	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued, "ingest": vm.ingest.health(eh.AddMS)}, nil
+	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued, "ingest": vm.ingest.health(eh.AddMS), "build": vm.b.stats.health()}, nil
 }
 
 func (vm *VM) Connected(ctx context.Context, id ids.NodeID, v *version.Application) error {
@@ -336,8 +336,12 @@ func (vm *VM) WaitForEvent(ctx context.Context) (common.Message, error) {
 
 func (vm *VM) SetPreference(_ context.Context, id ids.ID) error {
 	vm.mu.Lock()
+	changed := vm.preferred != id
 	vm.preferred = id
 	vm.mu.Unlock()
+	if changed {
+		vm.b.preferenceChanged()
+	}
 	return nil
 }
 

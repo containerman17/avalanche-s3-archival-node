@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/graft/evm/constants"
@@ -27,8 +28,37 @@ import (
 const retryDelay = 100 * time.Millisecond
 
 // poolWaitSlice: how long one epochdb_pool_wait blocks before the caller's
-// context is checked again.
-const poolWaitSlice = 200 * time.Millisecond
+// context is checked again (a preference change cancels the context; the
+// wait then restarts against the new preferred chain).
+const poolWaitSlice = 50 * time.Millisecond
+
+// buildStats: every WaitForEvent wake and what became of it. A wake that
+// yields no block is logged as `validator: build-skip {reason}`:
+//   - proposervm-window: PendingTxs was returned but no BuildBlock reached
+//     the VM before the next WaitForEvent (proposervm dropped it: not this
+//     node's slot for the preferred parent, avalanchego's "build block
+//     dropped" debug line, snowman's blks_built_failed counter);
+//   - engine-empty: epochdb_build included no tx (every candidate held by
+//     the parent chain or skipped);
+//   - engine-error: epochdb_build failed;
+//   - retry-gap-wait / min-delay-wait: the wait was cut short by a
+//     preference change (the wake never fired; `waited` is the time lost).
+type buildStats struct {
+	wakes, builds, built                                           atomic.Uint64
+	proposervmWindow, engineEmpty, engineError, gapWait, delayWait atomic.Uint64
+}
+
+func (s *buildStats) fields() []zap.Field {
+	return []zap.Field{zap.Uint64("wakes", s.wakes.Load()), zap.Uint64("builds", s.builds.Load()), zap.Uint64("blocks", s.built.Load()),
+		zap.Uint64("skipProposervmWindow", s.proposervmWindow.Load()), zap.Uint64("skipEngineEmpty", s.engineEmpty.Load()),
+		zap.Uint64("skipEngineError", s.engineError.Load()), zap.Uint64("skipRetryGapWait", s.gapWait.Load()), zap.Uint64("skipMinDelayWait", s.delayWait.Load())}
+}
+
+func (s *buildStats) health() map[string]uint64 {
+	return map[string]uint64{"wakes": s.wakes.Load(), "builds": s.builds.Load(), "blocks": s.built.Load(),
+		"skip-proposervm-window": s.proposervmWindow.Load(), "skip-engine-empty": s.engineEmpty.Load(), "skip-engine-error": s.engineError.Load(),
+		"skip-retry-gap-wait": s.gapWait.Load(), "skip-min-delay-wait": s.delayWait.Load()}
+}
 
 // builder decides WHEN to build (subnet-evm's blockBuilder rules): the
 // engine's pool has executable txs (epochdb_pool_wait blocks on it), and the
@@ -42,12 +72,29 @@ type builder struct {
 	normalOp        bool
 	lastBuildTime   time.Time
 	lastBuildParent ethcommon.Hash
+	// wakeUnbuilt: the last wake's PendingTxs has not reached BuildBlock yet
+	// (the snowman engine turns one wake into at most one BuildBlock, and
+	// proposervm may drop that call above the VM).
+	wakeUnbuilt bool
+	stats       buildStats
+	// pref is closed (and replaced) by every SetPreference: a wait on the
+	// retry gap or the Granite delay re-evaluates against the new parent at
+	// once, without relying on the engine's WaitForEvent cancellation alone.
+	pref chan struct{}
 }
 
 func newBuilder(eng *engine, log logging.Logger) *builder {
-	b := &builder{eng: eng, log: log}
+	b := &builder{eng: eng, log: log, pref: make(chan struct{})}
 	b.cond = lock.NewCond(&b.mu)
 	return b
+}
+
+// preferenceChanged wakes a waitForEvent sitting in a timing wait.
+func (b *builder) preferenceChanged() {
+	b.mu.Lock()
+	close(b.pref)
+	b.pref = make(chan struct{})
+	b.mu.Unlock()
 }
 
 func (b *builder) setNormalOp() {
@@ -63,6 +110,14 @@ func (b *builder) built(parent ethcommon.Hash) {
 	b.mu.Unlock()
 }
 
+// buildCalled: BuildBlock reached the VM (pairs the last wake).
+func (b *builder) buildCalled() {
+	b.stats.builds.Add(1)
+	b.mu.Lock()
+	b.wakeUnbuilt = false
+	b.mu.Unlock()
+}
+
 // waitForEvent: NormalOp, then the pool holds an executable tx (the wait
 // lives in the engine; the pool's head moves inside Accept, so a mined tx
 // never counts as pending here), then the timing rules. `state` is the
@@ -75,37 +130,72 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 			return 0, err
 		}
 	}
+	unbuilt := b.wakeUnbuilt
+	b.wakeUnbuilt = false
 	b.mu.Unlock()
-	t0 := time.Now()
-	for !b.eng.poolWait(poolWaitSlice) {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-	}
-	b.mu.Lock()
-	lastTime, lastParent := b.lastBuildTime, b.lastBuildParent
-	b.mu.Unlock()
-
 	h, preferred := state()
-	// The retry gap applies to a REPEATED build on the same preferred parent
-	// (our block is out and consensus has not moved yet). A new preferred
-	// block, ours or a peer's, builds at once: the engine's candidates skip
-	// the txs of the unaccepted ancestors, so nothing is re-offered.
-	var next time.Time
-	if lastParent == ethcommon.Hash(preferred) {
-		next = lastTime.Add(retryDelay)
-	} else if preferred == ids.ID(h.Hash()) {
-		next = minNextBlockTime(h) // Granite: the wait lives here, not in BuildBlock
+	if unbuilt {
+		// A new subscription with the previous wake never built: proposervm
+		// dropped the BuildBlock (the ChangeNotifier re-subscribes after
+		// every BuildBlock attempt, dropped or not).
+		b.stats.proposervmWindow.Add(1)
+		b.log.Info("validator: build-skip", zap.String("reason", "proposervm-window"), zap.Uint64("head", h.Number.Uint64()), zap.Stringer("preferred", preferred))
 	}
-	gap := time.Until(next)
-	if gap > 0 {
+	t0 := time.Now()
+	var gap time.Duration
+	for {
+		// Only FREE executable txs count: the preferred chain's txs stay in
+		// the pool until accept, and a build on it skips them.
+		for !b.eng.poolWait(preferred, poolWaitSlice) {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			h, preferred = state()
+		}
+		b.mu.Lock()
+		lastTime, lastParent, pref := b.lastBuildTime, b.lastBuildParent, b.pref
+		b.mu.Unlock()
+
+		// The retry gap applies to a REPEATED build on the same preferred
+		// parent (our block is out and consensus has not moved yet). A new
+		// preferred block, ours or a peer's, builds at once: the engine's
+		// candidates skip the txs of the unaccepted ancestors, so nothing is
+		// re-offered. Both waits end when the preference moves (SetPreference
+		// closes pref; the ChangeNotifier also cancels this WaitForEvent) and
+		// the loop re-evaluates against the new parent.
+		var next time.Time
+		reason, counter := "", (*atomic.Uint64)(nil)
+		if lastParent == ethcommon.Hash(preferred) {
+			next, reason, counter = lastTime.Add(retryDelay), "retry-gap-wait", &b.stats.gapWait
+		} else if preferred == ids.ID(h.Hash()) {
+			next, reason, counter = minNextBlockTime(h), "min-delay-wait", &b.stats.delayWait // Granite: the wait lives here, not in BuildBlock
+		}
+		gap = time.Until(next)
+		if gap <= 0 {
+			break
+		}
+		cut := func(by string) {
+			counter.Add(1)
+			b.log.Info("validator: build-skip", zap.String("reason", reason), zap.String("by", by), zap.Uint64("head", h.Number.Uint64()),
+				zap.Stringer("preferred", preferred), zap.Duration("gap", gap), zap.Duration("waited", gap-time.Until(next)))
+		}
 		select {
 		case <-ctx.Done():
+			cut("cancel")
 			return 0, ctx.Err()
+		case <-pref:
+			cut("preference")
+			h, preferred = state()
+			continue
 		case <-time.After(gap):
 		}
+		break
 	}
-	b.log.Info("validator: wake", zap.Uint64("head", h.Number.Uint64()), zap.Duration("poolWait", time.Since(t0)-max(gap, 0)), zap.Duration("gap", max(gap, 0)))
+	b.stats.wakes.Add(1)
+	b.mu.Lock()
+	b.wakeUnbuilt = true
+	b.mu.Unlock()
+	b.log.Info("validator: wake", zap.Uint64("head", h.Number.Uint64()), zap.Stringer("preferred", preferred), zap.Duration("poolWait", time.Since(t0)-max(gap, 0)), zap.Duration("gap", max(gap, 0)))
 	return common.PendingTxs, nil
 }
 
@@ -128,6 +218,7 @@ var errNoTxs = errors.New("validator: no transactions to build with")
 // pending block.
 func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	start := time.Now()
+	vm.b.buildCalled()
 	head, headID := vm.current()
 	vm.mu.Lock()
 	parentID := vm.preferred
@@ -152,6 +243,8 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	ph.lap("head") // header lookups, the Granite wait
 	out, err := vm.buildOnce(parentID, tsMS, pchainHeight, &ph)
 	if err != nil {
+		vm.b.stats.engineError.Add(1)
+		vm.ctx.Log.Warn("validator: build-skip", zap.String("reason", "engine-error"), zap.Uint64("height", parent.Number.Uint64()+1), zap.Error(err))
 		return nil, err
 	}
 	// built() before the empty check: an all-skipped build (every candidate
@@ -162,8 +255,12 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	vm.b.built(parent.Hash())
 	if out.included == 0 {
 		vm.m.buildEmpty.Inc()
+		vm.b.stats.engineEmpty.Add(1)
+		vm.ctx.Log.Info("validator: build-skip", zap.String("reason", "engine-empty"), zap.Uint64("height", parent.Number.Uint64()+1),
+			zap.Int("candidates", len(out.skipped)), zap.Duration("took", time.Since(start)))
 		return nil, errNoTxs
 	}
+	vm.b.stats.built.Add(1)
 	vm.m.buildTxs.Observe(float64(out.included))
 	vm.mu.Lock()
 	vm.built[out.id] = time.Now()
@@ -181,6 +278,7 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		zap.Int("skipNoGas", skips[4]), zap.Int("skipSize", skips[5]), zap.Int("skipNotReached", skips[6]),
 		zap.Uint64("poolDup", vm.eng.poolDup()), zap.String("ingest", vm.ingest.summary()),
 		zap.Duration("took", time.Since(start))}
+	fields = append(fields, vm.b.stats.fields()...)
 	fields = append(fields, ph.fields()...)
 	vm.ctx.Log.Info("validator: built", fields...)
 	return &Block{vm: vm, raw: out.block, id: out.id, parent: parentID, height: parent.Number.Uint64() + 1, time: tsMS / 1000}, nil

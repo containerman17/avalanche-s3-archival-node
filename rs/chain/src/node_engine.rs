@@ -1024,6 +1024,20 @@ impl Engine for NodeEngine {
     }
 }
 
+/// `Pool::candidates` skip set for a build on an unaccepted chain: sender ->
+/// the nonce after its txs in `txs` (the chain's txs; the pool still holds
+/// them until accept, so a build must not offer them again).
+pub fn held_nonces<'a>(txs: impl Iterator<Item = &'a block::Tx>) -> HashMap<Address, u64> {
+    let mut skip: HashMap<Address, u64> = HashMap::new();
+    for t in txs {
+        if let Some(a) = t.sender {
+            let e = skip.entry(a).or_insert(0);
+            *e = (*e).max(t.nonce + 1);
+        }
+    }
+    skip
+}
+
 impl NodeEngine {
     /// Recovers the senders of `txs` that have none, on the pool when the
     /// block is big enough for the dispatch to pay (33 us per recovery, so a
@@ -1187,14 +1201,7 @@ impl NodeEngine {
             None => {
                 let base_fee: u128 = h.base_fee.unwrap_or_default().saturating_to();
                 let target = ex.block_size_target;
-                let mut skip: HashMap<Address, u64> = HashMap::new();
-                for t in parent_txs {
-                    if let Some(a) = t.sender {
-                        let e = skip.entry(a).or_insert(0);
-                        *e = (*e).max(t.nonce + 1);
-                    }
-                }
-                self.txpool.candidates(base_fee, h.gas_limit + h.gas_limit / 2, target + target / 8, &skip)
+                self.txpool.candidates(base_fee, h.gas_limit + h.gas_limit / 2, target + target / 8, &held_nonces(parent_txs.iter().copied()))
             }
         };
         self.recover_senders(&mut candidates);

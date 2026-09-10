@@ -303,12 +303,14 @@ func (e *engine) poolNonce(addr common.Address) (uint64, bool) {
 	return uint64(n), rc == 0
 }
 
-// poolWait blocks until the pool holds an executable tx or the timeout
-// passes; true when it does.
-func (e *engine) poolWait(timeout time.Duration) bool {
+// poolWait blocks until the pool holds an executable tx a build on parent
+// would include (the unaccepted chain under parent holds its txs until
+// accept; ids.Empty or the head = any executable tx) or the timeout passes;
+// true when it does.
+func (e *engine) poolWait(parent ids.ID, timeout time.Duration) bool {
 	e.crossings[xPool].Add(1)
 	var out C.uint8_t
-	C.epochdb_pool_wait(e.p, C.uint64_t(timeout/time.Millisecond), &out)
+	C.epochdb_pool_wait(e.p, c32(parent), C.uint64_t(timeout/time.Millisecond), &out)
 	return out != 0
 }
 

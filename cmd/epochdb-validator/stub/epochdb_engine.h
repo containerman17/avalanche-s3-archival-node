@@ -220,7 +220,7 @@ int epochdb_pool_nonce(struct epochdb_engine *e, const uint8_t *addr, uint64_t *
  * Blocks until the pool holds an executable tx (`out` = 1) or `timeout_ms`
  * passes (`out` = 0). Returns at once when it already does.
  */
-int epochdb_pool_wait(struct epochdb_engine *e, uint64_t timeout_ms, uint8_t *out);
+int epochdb_pool_wait(struct epochdb_engine *e, const uint8_t *parent_id, uint64_t timeout_ms, uint8_t *out);
 
 /**
  * Every tx admitted (locally or from gossip) since the previous call, as

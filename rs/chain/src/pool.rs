@@ -638,9 +638,17 @@ impl Pool {
     /// Blocks until the pool holds an executable tx or `timeout` passes;
     /// true when it does.
     pub fn wait(&self, timeout: Duration) -> bool {
+        self.wait_free(timeout, &HashMap::new())
+    }
+
+    /// Blocks until the pool holds an executable tx that `skip` (sender ->
+    /// the nonce after its txs in the unaccepted preferred chain, as
+    /// `candidates` takes it) does not already hold, or `timeout` passes;
+    /// true when it does. A build on that chain would include something.
+    pub fn wait_free(&self, timeout: Duration, skip: &HashMap<Address, u64>) -> bool {
         let g = self.inner.lock().unwrap();
-        let (g, _) = self.cv.wait_timeout_while(g, timeout, |g| g.pending == 0).unwrap();
-        g.pending > 0
+        let (g, _) = self.cv.wait_timeout_while(g, timeout, |g| !g.has_free(skip)).unwrap();
+        g.has_free(skip)
     }
 
     /// The senders the pool already recovered for `hashes` (admission
@@ -682,6 +690,19 @@ fn gone_push(gone: &mut VecDeque<B256>, hash: B256) {
 }
 
 impl Inner {
+    /// An executable tx exists past what `skip` holds per sender (empty
+    /// `skip`: any executable tx). O(senders with executable txs) when the
+    /// preferred chain holds everything, one comparison otherwise.
+    fn has_free(&self, skip: &HashMap<Address, u64>) -> bool {
+        if skip.is_empty() {
+            return self.pending > 0;
+        }
+        self.heads.iter().any(|k| {
+            let a = &self.accounts[&k.sender];
+            skip.get(&k.sender).map_or(a.nonce, |n| (*n).max(a.nonce)) < a.nonce + a.exec as u64
+        })
+    }
+
     /// Removes one tx by hash (the account is re-settled by the caller).
     fn remove_hash(&mut self, hash: &B256) -> bool {
         let Some((sender, nonce)) = self.by_hash.remove(hash) else { return false };
@@ -1119,6 +1140,13 @@ mod tests {
         // A stale skip (below the state nonce) changes nothing.
         let skip = HashMap::from([(addr_of(&a), 0u64)]);
         assert_eq!(p.candidates(GWEI, 10_000_000, 1 << 20, &skip).len(), 4);
+        // wait_free follows candidates: a chain holding everything leaves
+        // nothing to wake for; one free tx does.
+        let all = HashMap::from([(addr_of(&a), 3u64), (addr_of(&b), 1u64)]);
+        assert!(!p.wait_free(Duration::from_millis(1), &all));
+        let some = HashMap::from([(addr_of(&a), 2u64), (addr_of(&b), 1u64)]);
+        assert!(p.wait_free(Duration::from_millis(1), &some));
+        assert!(p.wait_free(Duration::from_millis(1), &HashMap::new()));
     }
 
     #[test]
