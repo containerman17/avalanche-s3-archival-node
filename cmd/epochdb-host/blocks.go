@@ -807,7 +807,7 @@ func (g *gen) setupAndPrefill(ctx context.Context, dataDir string, prefillFor ti
 	// Prefill.
 	start := time.Now()
 	var blocks, txs, gas uint64
-	if genPresign > 0 && g.vm == nil && len(g.grow()) == 0 {
+	if genPresign > 0 && g.vm == nil { // the first grow block (if the kind has one) already ran above
 		// Presigned stream: sign everything first, then keep the pool topped
 		// up so the chain never starves and signing is outside the window.
 		raws := g.traffic(genPresign)
