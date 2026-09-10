@@ -15,7 +15,8 @@ go test ./validator/                                              # in-process t
 go test -tags epochdb_stub ./validator/                            # the same plumbing against the canned C stub
 go build -o $P/ours/srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy ./cmd/epochdb-validator   # $P/stock holds stock subnet-evm
 go run ./cmd/epochdb-validator/e2e --avalanchego ~/avalanchego/build/avalanchego --ours $P/ours --stock $P/stock \
-   [--ours-n 3 --stock-n 2] [--load 10m --rate 300 --keys 200 --workers 8 --batch 200] [--stress] [--logs DIR] [--keep]
+   [--ours-n 3 --stock-n 2] [--load 10m --rate 300 --keys 200 --workers 8 --batch 200] [--stress] [--account-slots 1000] [--logs DIR] [--keep]
+go run ./cmd/epochdb-validator/admitload --rpc <node>/ext/bc/<chain>/rpc --keys 1024 --batch 500 --workers 8 --dur 30s   # admission rate at one node
 ```
 
 The harness: 5 nodes (per-node plugin dir), a subnet-evm genesis with ewoq funded (chainId 99999, 20 M gas, 2 s
@@ -361,6 +362,84 @@ blocks with a 410 MB window) is the sum of the three.
   parent while the pool sits at the accepted head, so that parent's txs are candidates the engine skips.
 - Generator side (epochdb-host `drain`/`awaitBlock`, other worktree): when no block comes and `pending()` reads 0,
   return instead of failing; the count it saw was a stale one.
+
+## Admission: one pool call per JSON-RPC batch (branch go-admit off rust 18ecf06)
+
+Why a 2-node --stress network mined 4.4-5.3k tx/s while the engine builds a 16k-tx block in 211 ms: `answerPool`
+called `pool.Add([]{tx})` once per `eth_sendRawTransaction`, and every call recovered the sender, took legacypool's
+global lock, read the sender through the account cache and requested a promotion round; a single issuer topped out
+at ~7.8k tx/s on ours and on stock alike. Now `serveRPC` collects the batch's sends, decodes them, recovers the senders
+on all cores (`recoverSenders`; `types.Sender` caches in the tx so the pool's own recovery outside its lock is a hit),
+reads the senders' accounts in one crossing (`accountCache.warm`), then one `pool.Add(txs, false, false)` (one lock,
+one promotion round: `sync=false` leaves the round to the reorg loop, which merges the rounds of concurrent calls)
+and one `push.Add(txs...)`. Answers keep the batch's order and one bad element refuses itself only
+(`TestBatchAdmission`). The inbound gossip door (`gossipSet.Add`) stays per tx: the gossip SDK calls it per element.
+
+Found on the way, fixed first (fda567f): `poolChain` kept a 16-entry root -> block id map and evicted a random
+entry per accept; a reset lagging a few heads (four accepts in 25 ms) could ask `StateAt` for an evicted root,
+libevm logged `Failed to reset txpool state` and kept its old nonce view (6k txs mined, then no landings for 15 s).
+`StateAt` now returns the head reader for any root (the engine has no readable state for a rolled-past block anyway,
+the head's nonces are what the next reset would serve) and the account cache is keyed by address only: a lagging
+reset also stops crossing once per account (3841 single-account crossings under the pool lock at 1024 senders, a
+27 s reset when the engine was busy, builder and admitters waiting). `TestResetAtLaggedHead`; health `poolErrors`.
+
+Admission directly (`go run ./cmd/epochdb-validator/admitload --keys 1024 --batch 500 --workers 8 --dur 30s` at node
+0 of a 2-node all-ours --stress network from `e2e --keep`, presigned 21k-gas transfers, machine shared):
+
+| | before (18ecf06) | after (37dbd3f) | after + libevm cached sender |
+|---|---|---|---|
+| admitted tx/s over 30 s | 6,794 | 12,421 (17,679 in the first 5 s, pool shallow) | 18,438 (35,117 in the first 5 s) |
+| batch of 500: p50 / p99 | 506 ms / 1.15 s | 214 ms / 985 ms | 35 ms / 1.95 s |
+| refused | 0 | 0 | 0 |
+| pool at the end | 459 pending (chain kept up) | 189k pending (chain did not) | 419k pending |
+| `pool.Add` of 1000 pre-warmed txs, in-process | 46 ms | 46 ms | 6-14 ms (box load) |
+
+Chain level (`e2e --ours-n 2 --stock-n 0 --stress --load 2m --rate 40000 --keys 1024 --workers 8 --batch 250`,
+workers sticky per node, node 0's `/ext/metrics` at the end):
+
+| | before | after | after, `--account-slots 64` |
+|---|---|---|---|
+| offered (0 refused) | 9,067 tx/s (admission-bound) | 16,069 tx/s | 20,812 tx/s |
+| mined | 1,089,024 txs = 9.07k tx/s | 1,097,626 = 9.1k tx/s | 803,971 = 6.7k tx/s |
+| block fill / interval | 520 txs, 59 ms | 8,643 txs (16k and 2k alternating), 836 ms | 7,882 txs, 851 ms |
+| engine build p50 / p99 | 6.9 / 38.8 ms | 42.9 / 340 ms | 35.4 / 194 ms |
+| engine verify p50 / p99 | 0.8 / 16.4 ms | 0.9 / 188 ms | 0.8 / 184 ms |
+| pool at the end | 1.3k pending | 408k pending | 65k pending + 400k queued |
+| Go heap / GC / RSS | 25 MB / 0.7% / 280 MB | 700 MB / 1.4% / 1.5 GB | 1.2 GB / 1.4% / 3.1 GB |
+
+Before, admission was the ceiling: the generator got 9k tx/s in and the chain mined all of it with the pool drained.
+After, the chain still mines ~9.1k tx/s and the surplus deepens the pool: legacypool's reset walks every pending
+account (1-1.7 s per head at 150-250k pending, 4 s at 400k), the builder waits for it (`hasPending` is false while
+the head moves), so blocks come every ~0.8 s; `Pending()` at 400k took 3.6 s. A smaller per-account cap alone moves
+the surplus into the queue (2000 per account, 400k global) with the same reset cost; both caps have to be low enough
+that admission refuses (`txpool is full`) for the engine to set the pace. (An earlier run with the generator
+alternating nodes per batch made every second nonce of a key cross by gossip; once admission outran gossip the queue
+hit 400k, `truncateQueue` evicted the oldest queued txs and broke the sequences for good: 2000 pending, blocks of
+2000 then 3 txs, 63k txs mined in 2 min. A client sends a key's txs to one node; the generator now does too.)
+
+Where the next admission ceiling is (Go pprof, 15 s at ~15k tx/s, 33.6 s of CPU): `pool.Add` of 1000 presigned,
+pre-recovered, pre-warmed txs takes 46 ms under the lock (`TestAdmitBatchCost`, in-process: 46 us per tx, a 21k
+tx/s ceiling per node). About 30 us of that is libevm's `ValidateTransactionWithState`
+(`core/txpool/validation.go:203`) calling `signer.Sender(tx)`, which bypasses the tx's cached sender and recovers the
+secp256k1 key a second time, under the lock (upstream geth calls `types.Sender(signer, tx)` there); that is a
+one-line fix in the libevm fork the module replaces to. Landed in the fork as `containerman17/cached-sender`
+c05bef53c (`types.Sender(signer, tx)` at validation.go:203; go.mod's replace now resolves to it): `pool.Add` of
+1000 = 6-14 ms (7-14 us per tx, the box shared), and the same admitload run admitted 35,117 tx/s over the first 5 s
+(batch of 500 p50 35 ms) before the pool deepened past 135k, 18,438 tx/s over 31 s (p99 1.95 s; 419k pending at the
+end, 0 refused). Its profile is the pool's depth: `runReorg` 11.6 s of 15 s, 10.7 s of it `pricedList.Reheap`
+(`SetBaseFee` at every head re-heaps the whole pool: O(n log n) `EffectiveGasTip` big.Int compares), the rest
+parallel recovery outside the lock. So after this commit and that fix the ceiling per node is the pool's depth, not
+admission: legacypool's per-head `Reheap` and the O(pending) reset grow with what the chain has not mined yet, and
+the pool caps (`tx-pool-account-slots` x senders, `tx-pool-account-queue`, the global slots and queue) must be small
+enough that admission refuses (`txpool is full`) instead of queueing; with the e2e's raised caps (1000/2000 per
+account, 200k/400k global) the 16-20k tx/s offered here piled up 400k txs and the chain mined 9.1k tx/s. Without the
+fork fix the next costs under the lock are the second recovery (30 us), the priced heap push (~5 us per tx) and the
+same `Reheap` and reset. Sender recovery
+on the Go side is 47% of the plugin's CPU at 15k tx/s (16 s per 225k txs, ~70 us each in libevm's cgo secp256k1)
+but runs on all cores outside the lock (6-9 ms per 1000), so moving it into the engine (`epochdb_recover_senders`)
+would save CPU, not serial time; not built. JSON decode, gossip and the account crossings do not show (warm crosses
+once per batch of new senders, 0.1-1 ms). Batch size: 500 measured; the path has no per-batch count cap (16 MB body),
+so 1000 halves the per-batch fixed costs (lock handshake, promotion request, HTTP/gRPC).
 
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 

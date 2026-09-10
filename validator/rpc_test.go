@@ -72,9 +72,9 @@ func TestBatchAdmission(t *testing.T) {
 // TestAdmitBatchCost (-v): the cost of one pool.Add of 1000 presigned
 // transfers from 1000 senders, senders recovered and accounts warmed first,
 // so what remains is legacypool under its lock: 46 ms (46 us per tx, a
-// 21k tx/s ceiling), of which ~30 us is libevm's
-// ValidateTransactionWithState recovering the sender AGAIN via
-// signer.Sender (uncached) under the lock; the fix is types.Sender there.
+// 21k tx/s ceiling) while libevm's ValidateTransactionWithState recovered
+// the sender AGAIN via signer.Sender (uncached) under the lock; 6-14 ms with
+// the fork's cached types.Sender there (E2E.md, Admission).
 func TestAdmitBatchCost(t *testing.T) {
 	if !realEngine {
 		t.Skip("stub engine")
