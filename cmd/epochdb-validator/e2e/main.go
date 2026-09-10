@@ -197,6 +197,12 @@ func main() {
 	network.DefaultFlags = tmpnet.FlagsMap{config.MinStakeDurationKey: "2s"}
 	network.DefaultFlags.SetDefaults(tmpnet.DefaultE2EFlags())
 	network.DefaultFlags[config.LogLevelKey] = "info"
+	// Big blocks: avalanchego's per-peer inbound bandwidth throttle (512 KiB/s
+	// refill, 2 MiB burst) makes a 1.8 MB block wait seconds for refill and
+	// consensus accept in bursts. Same requirement as the benchmark fleet's
+	// node-config.json.
+	network.DefaultFlags[config.InboundThrottlerBandwidthRefillRateKey] = "67108864"
+	network.DefaultFlags[config.InboundThrottlerBandwidthMaxBurstSizeKey] = "134217728"
 	network.PreFundedKeys = []*secp256k1.PrivateKey{key}
 	network.DefaultRuntimeConfig = tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago}}
 	vmID, err := ids.FromString(subnetEVMID)
