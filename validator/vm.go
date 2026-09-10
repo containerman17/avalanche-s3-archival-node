@@ -497,7 +497,12 @@ func (b *Block) Accept(context.Context) error {
 	}
 	vm.mu.Unlock()
 	fields := make([]zap.Field, 0, nCrossing+5)
-	fields = append(fields, zap.Uint64("height", b.height), zap.Uint64("gasUsed", h.GasUsed), zap.Duration("took", time.Since(start)))
+	fields = append(fields, zap.Uint64("height", b.height), zap.Uint64("gasUsed", h.GasUsed), zap.Uint64("gasLimit", h.GasLimit), zap.Duration("took", time.Since(start)))
+	if h.BaseFee != nil {
+		// The base fee decides which pending txs are buildable next: a fixed-price client
+		// falls below it after a run of over-target blocks and the pool goes quiet.
+		fields = append(fields, zap.String("baseFee", h.BaseFee.String()))
+	}
 	if self {
 		fields = append(fields, zap.String("proposer", "self"), zap.Duration("buildToAccept", start.Sub(builtAt)))
 	}

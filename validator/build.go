@@ -188,11 +188,26 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 	for {
 		// Only FREE executable txs count: the preferred chain's txs stay in
 		// the pool until accept, and a build on it skips them.
+		quietSince := time.Time{}
 		for free = b.eng.poolWait(preferred, poolWaitSlice); free == 0; free = b.eng.poolWait(preferred, poolWaitSlice) {
 			if err := ctx.Err(); err != nil {
 				return 0, err
 			}
 			h, preferred = state()
+			// pending > 0 with free == 0 for a second means every pending tx is either
+			// held by the preferred chain or cannot pay the next block's base fee
+			// (a fixed-price client after over-target blocks); say so, once per second.
+			if pending, queued := b.eng.poolStatus(); pending+queued > 0 {
+				if quietSince.IsZero() {
+					quietSince = time.Now()
+				} else if since := time.Since(quietSince); since >= time.Second {
+					b.log.Warn("validator: pool quiet: pending txs but none buildable on the preferred block (underpriced for the next base fee, or all held by the preferred chain)",
+						zap.Uint64("head", h.Number.Uint64()), zap.Uint64("pending", pending), zap.Uint64("queued", queued), zap.Duration("for", since))
+					quietSince = time.Now()
+				}
+			} else {
+				quietSince = time.Time{}
+			}
 		}
 		b.mu.Lock()
 		lastTime, lastParent, pref, prefAt, target := b.lastBuildTime, b.lastBuildParent, b.pref, b.prefAt, b.fillTarget()
