@@ -502,8 +502,9 @@ Deviations from libevm (each deliberate):
 4. Per-account caps refuse the newcomer ("txpool is full") instead of admitting and dropping the sender's highest
    nonce later: the queue cap (`tx-pool-account-queue`) always, the pending cap (`tx-pool-account-slots`) only while
    the global pending set is at `tx-pool-global-slots` (as legacypool's `truncatePending`, which trims other offenders).
-5. Eviction picks the cheapest remote tx by tip cap (legacypool: effective tip at the current base fee, and its
-   `ErrFutureReplacePending` and `changesSinceReorg` throttle are not reproduced).
+5. Eviction picks the cheapest remote tx by tip cap (legacypool: effective tip at the current base fee; its
+   `changesSinceReorg` throttle is not reproduced). `ErrFutureReplacePending` IS reproduced since go-gap: a queued
+   (gapped) arrival never evicts an executable tx, it is refused "future transaction tries to replace pending" (code 9).
 6. Unpayable and over-gas txs of a sender are dropped when that sender is next touched by a block (its own tx, or a
    value transfer to it), not at every head; base-fee changes never drop anything (legacypool keeps them too, the
    miner filter skips them).
@@ -1082,3 +1083,45 @@ into Dirty, the store sync, `flush_dirty`'s root) runs inside Accept under the e
 `epochdb_pool_wait` takes for the pending chain, at the same height on every node (the 2 GB budget fills at the same
 rate everywhere). Grep the round-7 plugin logs around height 1090 for `epochdb-rs: roll`. `cargo test -p
 epochdb-chain`, `go test -count=1 ./validator/` pass.
+
+## Run 10: the re-pricing client's pending-0 / queued-N stall (branch go-gap off rust 1c9d734, 2026-09-11 JST)
+
+The fleet (round 9) saw 30-53k QUEUED txs with ZERO executable on every node for 10-18 s under a client that re-reads
+`eth_gasPrice` every second and prices at 1.5x it: every sender's next nonce simply absent. Reproduced locally with a
+new `e2e --gas-ramp 1.5` (the generator re-reads `SuggestGasPrice` from node 0 once a second and signs every tx with
+fee cap = tip = ramp x that price): 3 all-ours `--stress` nodes, the fleet's pool caps (`--account-slots 4096`,
+`--chain-config-extra` global-slots/global-queue 131072, account-queue 4096), 8 workers x 500-tx batches, ~40k tx/s
+offered, 3 min. The stall reproduces: `validator: pool quiet ... pending 0, queued` up to 142029 fired 1090 times
+across the nodes, acceptance p99 13-16 s (max 22 s), blocks stayed full when they came (12926 tx/block avg). The
+client's `eth_gasPrice` ran 4.5 -> 6.75 -> 10.1 gwei over the run while base fee sat at the 1 gwei floor: the runaway
+oracle loop the fleet noted, client-side, not touched.
+
+Two mechanisms, both surfaced by the new diagnostic (`epochdb_pool_gaps`: per stuck sender the pool nonce, the state
+nonce, the lowest queued nonce, and each gap nonce's fate from a nonce-keyed per-sender ring; `pool-removed` in health
+counts removals by reason):
+
+1. A QUEUED arrival evicting an executable head. In a full pool the globally cheapest tx (lowest tip) is, under a
+   client whose later nonces are pricier, some sender's oldest = its executable head. A gapped newcomer evicting it
+   manufactured a permanent nonce gap, and each further gapped arrival knocked out one more head: pending collapses.
+   libevm refuses this (`ErrFutureReplacePending`); `pool.rs` did not. FIXED (ea1ee21, merged): a gapped arrival whose
+   victim is executable is refused "future transaction tries to replace pending" (code 9, stricter than before, never
+   looser). The client saw this message 158 times in the run; `pool-removed.evicted-full` still reached 154182 (the
+   allowed evictions of other senders' cheapest heads by an executable newcomer, exactly as libevm).
+
+2. The dominant remaining cause, and NOT ours to change: a sender's next needed nonce, priced BELOW a full pool's
+   cheapest tx, is refused "transaction underpriced" (the client's 705 underpriced errors). Under the re-pricing ramp
+   a sender's oldest (lowest) nonce carries its lowest price, so at the global cap it is the one tx the full pool will
+   not admit, while the sender's pricier higher nonces evict cheaper txs and pile up queued: pending 0, queued N. This
+   is legacypool-faithful (a full pool rejects an underpriced newcomer, `ErrUnderpriced`), so admission keeps it;
+   loosening it would drop below libevm. It heals on re-send once the pool drains (the round-9 control at constant
+   price: 46k resubmits, no stall), because the same bytes are re-evaluated (nothing remembers a rejected hash; the
+   `seen` ring holds only mined hashes). The unit test `gap_report_retains_the_low_nonce_under_churn` reproduces the
+   lockout and the ring retention; `queued_arrival_never_evicts_an_executable_head` covers the fix.
+
+Answers to the audit (pool.rs at 1c9d734): (a) no price ordering within a sender's sequence, replacement compares only
+the same nonce (fee cap AND tip > old and >= old x 1.10); (b) a hash rejected for a transient reason and re-sent
+unchanged is re-evaluated (the filter skips only `by_hash` and the mined-only `seen` ring), not swallowed; (c)
+eviction picks the lowest-tip remote tx regardless of nonce, so a lower nonce WAS droppable while higher ones stayed,
+now blocked for a gapped newcomer (fix 1); (d) the cost check spans the executable run plus the newcomer minus any tx
+it replaces, so a rising-price sequence is refused Funds, not silently gapped; (e) `promote` has no price test, a
+cheaper next nonce still promotes. `cargo test -p epochdb-chain` (28), `go test -count=1 ./validator/` pass.

@@ -99,6 +99,7 @@ var (
 	keep     = flag.Bool("keep", false, "leave the network running")
 	logsDir  = flag.String("logs", "", "copy every node's logs here and delete the network dir after the run (default: keep the network dir)")
 	rpcNodes = flag.Int("rpc-nodes", 0, "load phase: post to the first N nodes only, the rest get every tx by gossip (0 = all nodes)")
+	gasRamp  = flag.Float64("gas-ramp", 0, "load phase: re-read eth_gasPrice from the first node every second and price every tx at this multiple of it (fee cap = tip, a legacy-style client); 0 = fixed 50 gwei cap / 1 gwei tip")
 	extra    = flag.String("chain-config-extra", "", "JSON object merged into every node's chain config, e.g. '{\"push-gossip-frequency\":\"25ms\",\"push-gossip-target-bytes\":65536}' (needs --node-flags throttler-inbound-bandwidth-refill-rate=33554432,throttler-inbound-bandwidth-max-burst-size=67108864)")
 )
 
@@ -312,12 +313,18 @@ type driver struct {
 	chainID  *big.Int
 	signer   types.Signer
 	gasLimit float64
+	// The load phase's price (wei) when --gas-ramp is set; 0 = the fixed default.
+	price atomic.Int64
 }
 
 func (d *driver) sign(key *ecdsa.PrivateKey, nonce uint64, to *ethcommon.Address, value *big.Int, data []byte, gas uint64) *types.Transaction {
+	cap, tip := big.NewInt(50*params.GWei), big.NewInt(params.GWei)
+	if p := d.price.Load(); p > 0 {
+		cap, tip = big.NewInt(p), big.NewInt(p)
+	}
 	return types.MustSignNewTx(key, d.signer, &types.DynamicFeeTx{
 		ChainID: d.chainID, Nonce: nonce, To: to, Value: value, Data: data, Gas: gas,
-		GasFeeCap: big.NewInt(50 * params.GWei), GasTipCap: big.NewInt(params.GWei),
+		GasFeeCap: cap, GasTipCap: tip,
 	})
 }
 
@@ -515,6 +522,18 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 	var sent, failed atomic.Int64
 	start := time.Now()
 	deadline := start.Add(dur)
+	if *gasRamp > 0 {
+		// The fleet's re-pricing client: eth_gasPrice x ramp, once a second.
+		go func() {
+			for time.Now().Before(deadline) {
+				if gp, err := d.nodes[0].ec.SuggestGasPrice(d.ctx); err == nil {
+					p, _ := new(big.Float).Mul(new(big.Float).SetInt(gp), big.NewFloat(*gasRamp)).Int64()
+					d.price.Store(p)
+				}
+				time.Sleep(time.Second)
+			}
+		}()
+	}
 	to := ethcommon.HexToAddress("0x2000000000000000000000000000000000000002")
 	perBatch := time.Duration(float64(batch) / (float64(rate) / float64(workers)) * float64(time.Second))
 	var wg sync.WaitGroup
@@ -589,8 +608,8 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 				ntx, gas = len(blk.Transactions()), blk.GasUsed()
 			}
 			p, q := d.pool(d.nodes[0])
-			fmt.Printf("t=%3.0fs sent=%d failed=%d head=%d (+%d) lastBlock txs=%d gas=%.1fM pool=%d/%d rss=%s go=%s\n",
-				time.Since(start).Seconds(), sent.Load(), failed.Load(), head, head-startHead, ntx, float64(gas)/1e6, p, q,
+			fmt.Printf("t=%3.0fs sent=%d failed=%d head=%d (+%d) lastBlock txs=%d gas=%.1fM pool=%d/%d price=%.2fgwei rss=%s go=%s\n",
+				time.Since(start).Seconds(), sent.Load(), failed.Load(), head, head-startHead, ntx, float64(gas)/1e6, p, q, float64(d.price.Load())/1e9,
 				pluginRSS(oursDir), d.goStats())
 		}
 	}

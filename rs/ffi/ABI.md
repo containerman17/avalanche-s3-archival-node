@@ -76,6 +76,8 @@ int   epochdb_pool_add(epochdb_engine*, const uint8_t* txs, size_t /* RLP list o
       // with `local-txs-enabled` (exempt from the price limit and from eviction).
 int   epochdb_pool_status(epochdb_engine*, uint64_t* pending, uint64_t* queued);
 int   epochdb_pool_has(epochdb_engine*, const uint8_t hash[32], uint8_t* out);      // 1 when the pool holds it
+int   epochdb_pool_gaps(epochdb_engine*, epochdb_buf* out);   // UTF-8: up to 3 senders with queued txs and no executable one
+                                                                // (pool nonce, state nonce, lowest queued, what became of the gap nonces)
 int   epochdb_pool_content(epochdb_engine*, const uint8_t* addr /* 20 bytes, or NULL = every address */,
                            size_t limit /* per half, 0 = all */, epochdb_buf* out);
       // out: RLP list of envelopes, pending (address order, then nonce) then queued
