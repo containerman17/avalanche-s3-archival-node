@@ -1,14 +1,10 @@
 package validator
 
 import (
-	"bytes"
-	"container/heap"
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/graft/evm/constants"
@@ -20,11 +16,8 @@ import (
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/utils/lock"
 	ethcommon "github.com/ava-labs/libevm/common"
-	"github.com/ava-labs/libevm/core"
-	"github.com/ava-labs/libevm/core/txpool"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
-	"github.com/holiman/uint256"
 	"go.uber.org/zap"
 )
 
@@ -32,46 +25,27 @@ import (
 // same parent.
 const retryDelay = 100 * time.Millisecond
 
-// builder decides WHEN to build (subnet-evm's blockBuilder rules): the pool
-// has executable txs, and the timing rules (retry delay, Granite minimum
-// block delay) allow it. The pool's reset after a head change is async; a
-// build that races it hands the engine a few already-mined txs, which it
-// skips (code 1).
+// poolWaitSlice: how long one epochdb_pool_wait blocks before the caller's
+// context is checked again.
+const poolWaitSlice = 200 * time.Millisecond
+
+// builder decides WHEN to build (subnet-evm's blockBuilder rules): the
+// engine's pool has executable txs (epochdb_pool_wait blocks on it), and the
+// timing rules (retry delay, Granite minimum block delay) allow it.
 type builder struct {
-	pool  *txpool.TxPool
-	chain *poolChain
-	mu    sync.Mutex
-	cond  *lock.Cond
+	eng  *engine
+	mu   sync.Mutex
+	cond *lock.Cond
 
 	normalOp        bool
 	lastBuildTime   time.Time
 	lastBuildParent ethcommon.Hash
-	admitted        atomic.Uint64
 }
 
-func newBuilder(pool *txpool.TxPool, chain *poolChain) *builder {
-	b := &builder{pool: pool, chain: chain}
+func newBuilder(eng *engine) *builder {
+	b := &builder{eng: eng}
 	b.cond = lock.NewCond(&b.mu)
 	return b
-}
-
-// run wakes waitForEvent on every promotion (new txs, or a reset after a
-// head change) and counts admitted txs.
-func (b *builder) run(ctx context.Context) {
-	txs := make(chan core.NewTxsEvent, 16)
-	sub := b.pool.SubscribeTransactions(txs, true)
-	defer sub.Unsubscribe()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-txs:
-			b.admitted.Add(uint64(len(ev.Txs)))
-			b.mu.Lock()
-			b.cond.Broadcast()
-			b.mu.Unlock()
-		}
-	}
 }
 
 func (b *builder) setNormalOp() {
@@ -87,22 +61,33 @@ func (b *builder) built(parent ethcommon.Hash) {
 	b.mu.Unlock()
 }
 
-func (b *builder) waitForEvent(ctx context.Context, head *types.Header) (common.Message, error) {
+// waitForEvent: NormalOp, then the pool holds an executable tx (the wait
+// lives in the engine; the pool's head moves inside Accept, so a mined tx
+// never counts as pending here), then the timing rules.
+func (b *builder) waitForEvent(ctx context.Context, head func() *types.Header) (common.Message, error) {
 	b.mu.Lock()
-	for !b.normalOp || !b.hasPending() {
+	for !b.normalOp {
 		if err := b.cond.Wait(ctx); err != nil {
 			b.mu.Unlock()
 			return 0, err
 		}
 	}
+	b.mu.Unlock()
+	for !b.eng.poolWait(poolWaitSlice) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+	b.mu.Lock()
 	lastTime, lastParent := b.lastBuildTime, b.lastBuildParent
 	b.mu.Unlock()
 
+	h := head()
 	var next time.Time
-	if lastParent == head.Hash() && !lastTime.IsZero() {
+	if lastParent == h.Hash() && !lastTime.IsZero() {
 		next = lastTime.Add(retryDelay) // a retry on the same parent: the block was not accepted
 	} else {
-		next = minNextBlockTime(head) // Granite: the wait lives here, not in BuildBlock
+		next = minNextBlockTime(h) // Granite: the wait lives here, not in BuildBlock
 	}
 	if d := time.Until(next); d > 0 {
 		select {
@@ -112,20 +97,6 @@ func (b *builder) waitForEvent(ctx context.Context, head *types.Header) (common.
 		}
 	}
 	return common.PendingTxs, nil
-}
-
-// hasPending: the pool is on the accepted head and holds an executable tx.
-// While the head moves the count still holds the mined txs (chain.onMoved
-// wakes us when the reset lands). Stats is O(accounts); Pending would copy
-// every pending tx, and pool.Sync FORCES a full reset (it is the
-// simulator's hook), which under a 100k-tx pool starved every other pool
-// user and stalled the chain (E2E.md run 3).
-func (b *builder) hasPending() bool {
-	if !b.chain.isSettled() {
-		return false
-	}
-	pending, _ := b.pool.Stats()
-	return pending > 0
 }
 
 // minNextBlockTime: Granite's minimum delay after the parent (ACP-226).
@@ -139,21 +110,15 @@ func minNextBlockTime(parent *types.Header) time.Time {
 
 var errNoTxs = errors.New("validator: no transactions to build with")
 
-// The miner's block size target (subnet-evm: 1800 KiB of tx bytes), with
-// slack: candidates past it can only be popped by the engine (skip code 5).
-const (
-	maxCandidateBytes = 1800*1024 + 1800*1024/8
-	skipSize          = 5
-)
-
-// buildBlock selects candidates from the pool by effective tip and nonce
-// (the miner's order), capped at 1.5x the gas limit, and hands them to the
-// engine in one crossing (two when the limit is not filled and the pool has
-// more). The engine executes, builds the header (base fee, gas cost, fee
-// window, Granite times) and keeps the result as a verified pending block.
+// buildBlock: one engine crossing. The engine takes the candidates from its
+// pool (effective tip order, per-sender nonce order, 1.5x the gas limit and
+// the miner's size target as the cut), executes them with the miner's skip
+// semantics, builds the header (base fee, gas cost, fee window, Granite
+// times), computes the state root and keeps the result as a verified
+// pending block.
 func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	start := time.Now()
-	head, headID := vm.chain.current()
+	head, headID := vm.current()
 	vm.mu.Lock()
 	parentID := vm.preferred
 	vm.mu.Unlock()
@@ -173,47 +138,11 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	}
 	now := customheader.GetNextTimestamp(parent, time.Now())
 	tsMS := uint64(now.UnixMilli())
-	extra := sevmparams.GetExtra(vm.config)
-	feeConfig := extra.FeeConfig
-	baseFee, err := customheader.BaseFee(extra, feeConfig, parent, tsMS)
-	if err != nil {
-		return nil, err
-	}
-	gasLimit, err := customheader.GasLimit(extra, feeConfig, parent, tsMS)
-	if err != nil {
-		return nil, err
-	}
-
-	filter := txpool.PendingFilter{OnlyPlainTxs: true}
-	if baseFee != nil {
-		filter.BaseFee = uint256.MustFromBig(baseFee)
-	}
 	var ph phases
-	ph.lap("head") // header lookups, fee math, the Granite wait
-	pending := vm.pool.Pending(filter)
-	ph.lap("pending")
-	order := newByPriceAndNonce(pending, baseFee)
-	ph.lap("order")
-	budget := gasLimit + gasLimit/2
-	txs, gas, size := order.take(nil, budget, maxCandidateBytes)
-	ph.lap("take")
-	if len(txs) == 0 {
-		return nil, errNoTxs
-	}
-	out, err := vm.buildOnce(parentID, tsMS, pchainHeight, txs, &ph)
+	ph.lap("head") // header lookups, the Granite wait
+	out, err := vm.buildOnce(parentID, tsMS, pchainHeight, &ph)
 	if err != nil {
 		return nil, err
-	}
-	rounds := 1
-	// A second round only when the engine ran out of candidates for gas, not
-	// for size: a size-popped candidate (code 5) means the block is full.
-	if out.needsMore && !order.empty() && size < maxCandidateBytes && !bytes.Contains(out.skipped, []byte{skipSize}) {
-		txs, _, _ = order.take(txs, gas+budget, maxCandidateBytes)
-		ph.lap("take2")
-		if out, err = vm.buildOnce(parentID, tsMS, pchainHeight, txs, &ph); err != nil {
-			return nil, err
-		}
-		rounds++
 	}
 	// built() before the empty check: an all-skipped build (every candidate
 	// already mined, or invalid) gets the same 100 ms retry gap as a block
@@ -236,7 +165,7 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		}
 	}
 	fields := []zap.Field{zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
-		zap.Int("candidates", len(txs)), zap.Int("pendingAccounts", len(pending)), zap.Int("rounds", rounds), zap.Uint64("gasUsed", out.gasUsed),
+		zap.Int("candidates", len(out.skipped)), zap.Uint64("gasUsed", out.gasUsed),
 		zap.Int("skipNonceLow", skips[1]), zap.Int("skipFailed", skips[2]), zap.Int("skipPopped", skips[3]),
 		zap.Int("skipNoGas", skips[4]), zap.Int("skipSize", skips[5]), zap.Int("skipNotReached", skips[6]),
 		zap.Duration("took", time.Since(start))}
@@ -276,23 +205,12 @@ func (p *phases) fields() []zap.Field {
 	return out
 }
 
-// buildOnce: one engine crossing; epochdb_build_seconds is this call alone
-// (BuildBlock's wall time also holds the Granite min-delay wait).
-func (vm *VM) buildOnce(parent ids.ID, tsMS, pchainHeight uint64, txs types.Transactions, ph *phases) (buildOut, error) {
-	raw, err := rlp.EncodeToBytes(txs)
-	if err != nil {
-		return buildOut{}, err
-	}
-	// The pool recovered every sender at admission (cached in the tx), so the
-	// engine does not recover again: that was 83% of its build time.
-	senders := make([]byte, 0, 20*len(txs))
-	for _, tx := range txs {
-		from, _ := types.Sender(vm.signer, tx) // an error leaves zeros: the engine recovers that one
-		senders = append(senders, from[:]...)
-	}
-	ph.lap("rlp")
+// buildOnce: one engine crossing with no candidates (the engine's pool
+// supplies them); epochdb_build_seconds is this call alone (BuildBlock's
+// wall time also holds the Granite min-delay wait).
+func (vm *VM) buildOnce(parent ids.ID, tsMS, pchainHeight uint64, ph *phases) (buildOut, error) {
 	start := time.Now()
-	out, err := vm.eng.build(parent, tsMS, vm.coinbase(), pchainHeight, raw, senders)
+	out, err := vm.eng.build(parent, tsMS, vm.coinbase(), pchainHeight, nil, nil)
 	vm.m.build.Observe(time.Since(start).Seconds())
 	ph.lap("cgo")
 	if err == nil {
@@ -334,95 +252,4 @@ func (vm *VM) headerOf(id ids.ID) (*types.Header, error) {
 		return nil, err
 	}
 	return h, nil
-}
-
-// byPriceAndNonce is the miner's transactionsByPriceAndNonce: a heap of each
-// sender's next tx keyed by effective tip (min(tipCap, feeCap - baseFee)),
-// ties by arrival time; per-sender lists stay in nonce order.
-type byPriceAndNonce struct {
-	txs     map[ethcommon.Address][]*txpool.LazyTransaction
-	heads   tipHeap
-	baseFee *uint256.Int
-}
-
-type tipHead struct {
-	tx   *txpool.LazyTransaction
-	from ethcommon.Address
-	fee  *uint256.Int
-}
-
-type tipHeap []*tipHead
-
-func (h tipHeap) Len() int { return len(h) }
-func (h tipHeap) Less(i, j int) bool {
-	if c := h[i].fee.Cmp(h[j].fee); c != 0 {
-		return c > 0
-	}
-	return h[i].tx.Time.Before(h[j].tx.Time)
-}
-func (h tipHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *tipHeap) Push(x interface{}) { *h = append(*h, x.(*tipHead)) }
-func (h *tipHeap) Pop() interface{} {
-	old := *h
-	x := old[len(old)-1]
-	*h = old[:len(old)-1]
-	return x
-}
-
-func newByPriceAndNonce(txs map[ethcommon.Address][]*txpool.LazyTransaction, baseFee *big.Int) *byPriceAndNonce {
-	o := &byPriceAndNonce{txs: txs, heads: make(tipHeap, 0, len(txs))}
-	if baseFee != nil {
-		o.baseFee = uint256.MustFromBig(baseFee)
-	}
-	for from, list := range txs {
-		if h := o.head(from, list[0]); h != nil {
-			o.heads = append(o.heads, h)
-			o.txs[from] = list[1:]
-		}
-	}
-	heap.Init(&o.heads)
-	return o
-}
-
-func (o *byPriceAndNonce) head(from ethcommon.Address, tx *txpool.LazyTransaction) *tipHead {
-	fee := new(uint256.Int).Set(tx.GasTipCap)
-	if o.baseFee != nil {
-		if tx.GasFeeCap.Cmp(o.baseFee) < 0 {
-			return nil // cannot pay the base fee
-		}
-		if cap := new(uint256.Int).Sub(tx.GasFeeCap, o.baseFee); cap.Cmp(fee) < 0 {
-			fee = cap
-		}
-	}
-	return &tipHead{tx: tx, from: from, fee: fee}
-}
-
-func (o *byPriceAndNonce) empty() bool { return len(o.heads) == 0 }
-
-// take appends resolved txs in order to dst until the summed gas limits
-// reach budget or the summed sizes reach maxBytes; a sender whose next tx
-// cannot pay the base fee is dropped.
-func (o *byPriceAndNonce) take(dst types.Transactions, budget uint64, maxBytes uint64) (types.Transactions, uint64, uint64) {
-	var gas, size uint64
-	for _, tx := range dst {
-		size += tx.Size()
-	}
-	for len(o.heads) > 0 && gas < budget && size < maxBytes {
-		h := o.heads[0]
-		if tx := h.tx.Resolve(); tx != nil {
-			dst = append(dst, tx)
-			gas += h.tx.Gas
-			size += tx.Size()
-		}
-		if rest := o.txs[h.from]; len(rest) > 0 {
-			if nh := o.head(h.from, rest[0]); nh != nil {
-				o.txs[h.from] = rest[1:]
-				o.heads[0] = nh
-				heap.Fix(&o.heads, 0)
-				continue
-			}
-		}
-		heap.Pop(&o.heads)
-	}
-	return dst, gas, size
 }

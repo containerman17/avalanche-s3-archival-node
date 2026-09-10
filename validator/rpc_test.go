@@ -18,9 +18,9 @@ import (
 )
 
 // TestBatchAdmission: a JSON-RPC batch admits every eth_sendRawTransaction
-// in one pool call; the answers keep the batch's order, a bad element
-// (garbage bytes, a tx the sender cannot pay) refuses itself only, and the
-// non-pool elements of the same batch are still answered.
+// in one pool call inside the engine; the answers keep the batch's order, a
+// bad element (garbage bytes, a tx the sender cannot pay) refuses itself
+// only, and the other elements of the same batch are still answered.
 func TestBatchAdmission(t *testing.T) {
 	if !realEngine {
 		t.Skip("stub engine")
@@ -61,20 +61,31 @@ func TestBatchAdmission(t *testing.T) {
 	if resps[1].Error == nil || resps[2].Error == nil {
 		t.Fatalf("garbage and unpayable elements must be refused: %v %v", resps[1].Error, resps[2].Error)
 	}
-	if p, q := h.vm.pool.Stats(); p != 2 || q != 0 {
+	if p, q := h.vm.eng.poolStatus(); p != 2 || q != 0 {
 		t.Fatalf("pool pending=%d queued=%d, want 2/0", p, q)
 	}
 	var st struct{ Pending hexutil.Uint }
 	json.Unmarshal(resps[5].Result, &st)
-	t.Logf("txpool_status inside the batch saw pending=%d (the promotion round is asynchronous)", st.Pending)
+	if st.Pending != 2 {
+		t.Fatalf("txpool_status inside the batch saw pending=%d, want 2 (admission is synchronous)", st.Pending)
+	}
+	for _, want := range []string{"insufficient funds", "typed transaction too short"} {
+		found := false
+		for _, r := range resps {
+			if r.Error != nil && strings.Contains(r.Error.Message, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("no refusal mentions %q", want)
+		}
+	}
 }
 
-// TestAdmitBatchCost (-v): the cost of one pool.Add of 1000 presigned
-// transfers from 1000 senders, senders recovered and accounts warmed first,
-// so what remains is legacypool under its lock: 46 ms (46 us per tx, a
-// 21k tx/s ceiling) while libevm's ValidateTransactionWithState recovered
-// the sender AGAIN via signer.Sender (uncached) under the lock; 6-14 ms with
-// the fork's cached types.Sender there (E2E.md, Admission).
+// TestAdmitBatchCost (-v): the cost of one epochdb_pool_add of 1000
+// presigned transfers from 1000 senders (decode, recovery and the stateless
+// checks in parallel, one state read, the pool lock), against libevm's
+// 46 ms (6-14 ms with its cached sender) for the same batch.
 func TestAdmitBatchCost(t *testing.T) {
 	if !realEngine {
 		t.Skip("stub engine")
@@ -88,27 +99,26 @@ func TestAdmitBatchCost(t *testing.T) {
 		h.transfer(crypto.PubkeyToAddress(keys[i].PublicKey), new(big.Int).Mul(big.NewInt(params.Ether), big.NewInt(100)))
 	}
 	h.buildAccept()
-	h.vm.chain.settle()
 	to := ethcommon.HexToAddress("0x100000000000000000000000000000000000000a")
 	for r := 0; r < rounds; r++ {
-		txs := make([]*types.Transaction, nkeys)
+		raws := make([][]byte, nkeys)
 		for k := range keys {
-			txs[k] = types.MustSignNewTx(keys[k], h.signer, &types.DynamicFeeTx{ChainID: h.vm.config.ChainID, Nonce: uint64(r), To: &to, Value: big.NewInt(1), Gas: 21000,
+			tx := types.MustSignNewTx(keys[k], h.signer, &types.DynamicFeeTx{ChainID: h.vm.config.ChainID, Nonce: uint64(r), To: &to, Value: big.NewInt(1), Gas: 21000,
 				GasFeeCap: big.NewInt(50 * params.GWei), GasTipCap: big.NewInt(params.GWei)})
+			raws[k], _ = tx.MarshalBinary()
 		}
 		t0 := time.Now()
-		senders := recoverSenders(h.signer, txs)
-		t1 := time.Now()
-		h.vm.chain.acct.warm(senders)
-		t2 := time.Now()
-		errs := h.vm.pool.Add(txs, false, false)
-		t3 := time.Now()
-		for _, err := range errs {
-			if err != nil {
+		res, err := h.vm.eng.poolAdd(raws, false)
+		took := time.Since(t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, x := range res {
+			if err := x.err(); err != nil {
 				t.Fatal(err)
 			}
 		}
-		p, _ := h.vm.pool.Stats()
-		t.Logf("round %d: recover(parallel) %v, warm %v, pool.Add(1000) %v, pending=%d", r, t1.Sub(t0), t2.Sub(t1), t3.Sub(t2), p)
+		p, _ := h.vm.eng.poolStatus()
+		t.Logf("round %d: epochdb_pool_add(1000) %v (%.1f us/tx), pending=%d", r, took, float64(took.Microseconds())/nkeys, p)
 	}
 }

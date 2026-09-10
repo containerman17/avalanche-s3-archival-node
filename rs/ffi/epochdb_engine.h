@@ -162,8 +162,9 @@ int epochdb_get_block(struct epochdb_engine *e, const uint8_t *id, struct epochd
  * Builds a block on `parent_id` (zero or the head's id = the accepted head;
  * else a verified block) at `timestamp_ms` (Unix milliseconds) from `txs`
  * in the miner's order, with their senders (`senders`: 20 bytes each, or
- * null: the engine recovers them); the result is a verified pending block
- * whose later verify is a lookup. See ABI.md for the semantics.
+ * null: the engine recovers them), or, with `txs` null / empty, from the
+ * engine's own pool; the result is a verified pending block whose later
+ * verify is a lookup. See ABI.md for the semantics.
  */
 int epochdb_build(struct epochdb_engine *e,
                   const uint8_t *parent_id,
@@ -175,6 +176,57 @@ int epochdb_build(struct epochdb_engine *e,
                   const uint8_t *senders,
                   size_t senders_len,
                   struct epochdb_build_out *out);
+
+/**
+ * Admits `txs` (an RLP list of tx envelopes) into the pool; `local` != 0
+ * marks them local (only with `local-txs-enabled`). `out`: 33 bytes per
+ * input, a code (0 ok, 1 known, 2 replaced, 3 underpriced, 4 nonce too
+ * low, 5 insufficient funds, 6 over the block gas limit, 7 intrinsic gas,
+ * 8 invalid signature / chain id, 9 pool full, 10 other) then the hash.
+ */
+int epochdb_pool_add(struct epochdb_engine *e,
+                     const uint8_t *txs,
+                     size_t len,
+                     uint8_t local,
+                     struct epochdb_buf *out);
+
+/**
+ * The pool's (pending, queued) counts.
+ */
+int epochdb_pool_status(struct epochdb_engine *e, uint64_t *pending, uint64_t *queued);
+
+/**
+ * `out` = 1 when the pool holds the tx with `hash`.
+ */
+int epochdb_pool_has(struct epochdb_engine *e, const uint8_t *hash, uint8_t *out);
+
+/**
+ * The pool's txs as an RLP list of envelopes, pending (address then nonce
+ * order) then queued, of one address (`addr`: 20 bytes) or of all (null);
+ * at most `limit` of each half (0 = all).
+ */
+int epochdb_pool_content(struct epochdb_engine *e,
+                         const uint8_t *addr,
+                         size_t limit,
+                         struct epochdb_buf *out);
+
+/**
+ * The pool's nonce for `addr` (its state nonce plus its executable txs);
+ * EPOCHDB_ENOTFOUND when the pool holds nothing of it (use the state's).
+ */
+int epochdb_pool_nonce(struct epochdb_engine *e, const uint8_t *addr, uint64_t *out);
+
+/**
+ * Blocks until the pool holds an executable tx (`out` = 1) or `timeout_ms`
+ * passes (`out` = 0). Returns at once when it already does.
+ */
+int epochdb_pool_wait(struct epochdb_engine *e, uint64_t timeout_ms, uint8_t *out);
+
+/**
+ * Every tx admitted (locally or from gossip) since the previous call, as
+ * an RLP list of envelopes, oldest first: what the push gossiper forwards.
+ */
+int epochdb_pool_drain_gossip(struct epochdb_engine *e, struct epochdb_buf *out);
 
 /**
  * nonce (u64 LE) and balance (32 bytes BE) of `n` addresses at the state of

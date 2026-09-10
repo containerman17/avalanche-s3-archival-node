@@ -51,6 +51,7 @@ use crate::layered::{Layered, Payload};
 use alloy_primitives::{Address, U256};
 use exec::exec::SkipReason;
 use crate::dbstore::{BlockStore, DbStore, Record};
+use crate::pool::{self, Pool};
 use crate::tree::{hex, Engine, Error, Id, Meta};
 
 
@@ -272,6 +273,43 @@ pub struct NodeEngine {
     /// `min-delay-target` (ms, the subnet-evm config key): the ACP-226 delay
     /// excess a built block moves toward; None keeps the parent's.
     pub desired_delay_excess: Option<u64>,
+    pub cfg: Arc<Config>,
+    /// The transaction pool: admission validates against the head state
+    /// here, accept moves it, build takes from it (pool.rs).
+    pub txpool: Arc<Pool>,
+}
+
+/// The pool behind the RPC's eth_sendRawTransaction / txpool_ methods.
+pub struct PoolRpc {
+    pub pool: Arc<Pool>,
+    pub inner: Arc<Mutex<Inner>>,
+}
+
+/// (nonce, balance) of `addrs` at the accepted head.
+fn head_accounts(inner: &Mutex<Inner>, addrs: &[Address]) -> Vec<(u64, U256)> {
+    let mut g = inner.lock().unwrap();
+    addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
+}
+
+impl PoolRpc {
+    pub fn add(&self, raws: Vec<Bytes>, local: bool) -> Vec<pool::Added> {
+        self.pool.add(raws, local, &|addrs| head_accounts(&self.inner, addrs))
+    }
+}
+
+impl rpc::Mempool for PoolRpc {
+    fn add(&self, raws: Vec<alloy_primitives::Bytes>, local: bool) -> Vec<rpc::PoolAdd> {
+        PoolRpc::add(self, raws.into_iter().map(|b| b.0).collect(), local).into_iter().map(|a| rpc::PoolAdd { code: a.code as u8, message: a.message, hash: a.hash }).collect()
+    }
+    fn status(&self) -> (usize, usize) {
+        self.pool.status()
+    }
+    fn content(&self, addr: Option<Address>) -> (Vec<Arc<block::Tx>>, Vec<Arc<block::Tx>>) {
+        self.pool.content(addr, 0)
+    }
+    fn pending_nonce(&self, addr: Address) -> Option<u64> {
+        self.pool.pending_nonce(addr)
+    }
 }
 
 /// The checker thread: Dirty apply + root per block (a mismatch kills the
@@ -651,12 +689,23 @@ impl NodeEngine {
             std::thread::spawn(move || checker(check_rx, root_check, store, recent, stats, flush_tx))
         };
         let inner = Arc::new(Mutex::new(Inner { ex, roller, roll_budget: sync_roll }));
+        let cfg = Arc::new(cfg);
+        let pool = {
+            let mut g = inner.lock().unwrap();
+            let fc = build::fee_config_at(&cfg, head.header.time, |slot| g.head_storage(exec::precompile::FEE_MANAGER, slot));
+            let pc = pool::Config::from_json(conf);
+            eprintln!("epochdb-rs: pool: price-limit={} bump={}% account-slots={} global-slots={} account-queue={} global-queue={} lifetime={:?} locals={} unprotected={}", pc.price_limit, pc.price_bump, pc.account_slots, pc.global_slots, pc.account_queue, pc.global_queue, pc.lifetime, pc.locals, pc.allow_unprotected);
+            Arc::new(Pool::new(pc, cfg.clone(), pool::Head { gas_limit: head.header.gas_limit, min_base_fee: fc.min_base_fee.saturating_to(), time: head.header.time }))
+        };
         let head = Arc::new(Mutex::new(head));
-        let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), db_reads.clone(), recent.clone(), Arc::new(cfg.clone())));
+        let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), db_reads.clone(), recent.clone(), cfg.clone()));
         let chain_config = serde_json::from_slice::<serde_json::Value>(&init.genesis_bytes).ok().and_then(|g| g.get("config").cloned()).unwrap_or_default();
         let upgrades = serde_json::from_slice::<serde_json::Value>(&init.upgrade_bytes).ok();
-        let rpc = rpc::Server::new(rpc_store.clone(), Arc::new(cfg.clone()), genesis.clone(), chain_config, upgrades);
+        let rpc = rpc::Server::new(rpc_store.clone(), cfg.clone(), genesis.clone(), chain_config, upgrades);
+        let _ = rpc.mempool.set(Arc::new(PoolRpc { pool: pool.clone(), inner: inner.clone() }));
         Ok(NodeEngine {
+            cfg: cfg.clone(),
+            txpool: pool,
             chain_id: cfg.chain_id,
             genesis,
             inner,
@@ -780,6 +829,12 @@ impl NodeEngine {
 
     pub fn meta_of(b: &Block) -> Meta {
         Meta { id: b.hash.0, parent: b.header.parent_hash.0, height: b.height, timestamp: b.header.time }
+    }
+
+    /// Admits tx envelopes into the pool (the ABI's epochdb_pool_add; the
+    /// RPC's eth_sendRawTransaction goes through the same PoolRpc).
+    pub fn pool_add(&self, raws: Vec<Bytes>, local: bool) -> Vec<pool::Added> {
+        self.txpool.add(raws, local, &|addrs| head_accounts(&self.inner, addrs))
     }
 }
 
@@ -1064,7 +1119,9 @@ impl NodeEngine {
     /// order; the result is a verified block (its Pending carries the root).
     /// `pchain_height` is the proposervm context height for the predicates
     /// (own height from Etna, the epoch's under Granite).
-    pub fn build(&self, parent: Option<&Arc<Pending>>, parent_hdr: &block::Header, params: &build::Params, pchain_height: Option<u64>, mut candidates: Vec<block::Tx>) -> Result<BuildOut, Error> {
+    /// `candidates` None: the pool's, by effective tip at the block's base fee,
+    /// up to 1.5x the gas limit and the miner's size target plus slack.
+    pub fn build(&self, parent: Option<&Arc<Pending>>, parent_hdr: &block::Header, params: &build::Params, pchain_height: Option<u64>, candidates: Option<Vec<block::Tx>>) -> Result<BuildOut, Error> {
         if !self.normal.load(Ordering::Relaxed) {
             return Err("build needs NormalOp (SetState 2)".into());
         }
@@ -1089,6 +1146,14 @@ impl NodeEngine {
         };
         let mut t = t0;
         lap(0, &mut t);
+        let mut candidates = match candidates {
+            Some(c) => c,
+            None => {
+                let base_fee: u128 = h.base_fee.unwrap_or_default().saturating_to();
+                let target = exec::exec::TARGET_TXS_SIZE;
+                self.txpool.candidates(base_fee, h.gas_limit + h.gas_limit / 2, target + target / 8)
+            }
+        };
         self.recover_senders(&mut candidates);
         lap(1, &mut t);
         let r = match ex.build_block(&h, parent_hdr.time, pchain_height, pchain_height, &candidates) {
@@ -1190,6 +1255,12 @@ impl NodeEngine {
             }
             _ => unreachable!("pending block of the other engine"),
         }
+        // The pool: mined txs out, the block's senders and recipients re-read
+        // at the new head, the head rules (gas limit, min base fee) refreshed.
+        let fc = build::fee_config_at(&self.cfg, b.header.time, |slot| inner.head_storage(exec::precompile::FEE_MANAGER, slot));
+        self.txpool.on_accept(&b.txs, pool::Head { gas_limit: b.header.gas_limit, min_base_fee: fc.min_base_fee.saturating_to(), time: b.header.time }, &mut |addrs| {
+            addrs.iter().map(|a| inner.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
+        });
         *self.head.lock().unwrap() = b.clone();
         self.recent.lock().unwrap().insert(b.hash.0, b.clone());
         self.stats.executed.fetch_add(1, Ordering::Relaxed);

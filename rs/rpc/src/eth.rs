@@ -262,9 +262,11 @@ impl Server {
         let n = self.block_number(params.get(1)).map_err(|e| if e.code == -32602 { bad_arg(1, e) } else { e })?;
         let mut st = self.store.state_at(n)?;
         let acct = st.account(addr)?;
+        // The pending tag: the pool's nonce (state nonce + its executable txs) when it holds the address.
+        let pool_nonce = if method == "eth_getTransactionCount" && params.get(1).and_then(Value::as_str) == Some("pending") { self.mempool.get().and_then(|p| p.pending_nonce(addr)) } else { None };
         Ok(match method {
             "eth_getBalance" => json!(qty256(acct.map(|a| a.balance).unwrap_or_default())),
-            "eth_getTransactionCount" => json!(qty(acct.map(|a| a.nonce).unwrap_or(0))),
+            "eth_getTransactionCount" => json!(qty(pool_nonce.unwrap_or_else(|| acct.map(|a| a.nonce).unwrap_or(0)))),
             _ => json!(match acct {
                 Some(a) if a.code_hash != alloy_primitives::KECCAK256_EMPTY && a.code_hash != B256::ZERO => hex(&st.code(a.code_hash)?.unwrap_or_default()),
                 _ => "0x".to_string(),

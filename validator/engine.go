@@ -19,6 +19,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/rlp"
 )
 
 // engine is the cgo edge: one method per ABI function, every payload passed
@@ -40,11 +41,12 @@ const (
 	xAccount
 	xHeader
 	xRPC
+	xPool
 	xOther
 	nCrossing
 )
 
-var crossingNames = [nCrossing]string{"parse", "verify", "accept", "reject", "build", "account", "header", "rpc", "other"}
+var crossingNames = [nCrossing]string{"parse", "verify", "accept", "reject", "build", "account", "header", "rpc", "pool", "other"}
 
 func cptr(b []byte) *C.uint8_t {
 	if len(b) == 0 {
@@ -189,7 +191,8 @@ var enginePhaseNames = [nEnginePhase + 1]string{"decode", "template", "recover",
 const nEnginePhase = 10
 
 // build: txs is the RLP list of candidate tx envelopes in the miner's order,
-// senders their recovered senders (20 bytes each; nil = the engine recovers).
+// senders their recovered senders (20 bytes each; nil = the engine recovers);
+// txs nil = the engine takes the candidates from its own pool.
 func (e *engine) build(parent ids.ID, timestampMS uint64, coinbase common.Address, pchainHeight uint64, txs, senders []byte) (buildOut, error) {
 	e.crossings[xBuild].Add(1)
 	var out C.epochdb_build_out
@@ -212,6 +215,129 @@ func (e *engine) build(parent ids.ID, timestampMS uint64, coinbase common.Addres
 	}
 	o.phaseNS[nEnginePhase] = time.Since(t)
 	return o, nil
+}
+
+// poolResult: one epochdb_pool_add answer.
+type poolResult struct {
+	code byte
+	hash common.Hash
+}
+
+// Pool admission codes (ABI.md).
+const (
+	poolOK       = 0
+	poolKnown    = 1
+	poolReplaced = 2
+)
+
+var poolCodeText = [...]string{"ok", "already known", "replaced", "transaction underpriced", "nonce too low", "insufficient funds for gas * price + value",
+	"exceeds block gas limit", "intrinsic gas too low", "invalid sender", "txpool is full", "invalid transaction"}
+
+func (r poolResult) ok() bool { return r.code == poolOK || r.code == poolReplaced }
+func (r poolResult) err() error {
+	if r.ok() {
+		return nil
+	}
+	if int(r.code) < len(poolCodeText) {
+		return errors.New(poolCodeText[r.code])
+	}
+	return fmt.Errorf("pool code %d", r.code)
+}
+
+// poolAdd admits tx envelopes (MarshalBinary form) in one crossing.
+func (e *engine) poolAdd(txs [][]byte, local bool) ([]poolResult, error) {
+	e.crossings[xPool].Add(1)
+	raw, err := rlp.EncodeToBytes(txs)
+	if err != nil {
+		return nil, err
+	}
+	var b C.epochdb_buf
+	var l C.uint8_t
+	if local {
+		l = 1
+	}
+	if err := e.err("epochdb_pool_add", C.epochdb_pool_add(e.p, cptr(raw), C.size_t(len(raw)), l, &b)); err != nil {
+		return nil, err
+	}
+	out := take(&b)
+	if len(out) != 33*len(txs) {
+		return nil, fmt.Errorf("epochdb_pool_add: %d bytes for %d txs", len(out), len(txs))
+	}
+	res := make([]poolResult, len(txs))
+	for i := range res {
+		res[i].code = out[i*33]
+		copy(res[i].hash[:], out[i*33+1:i*33+33])
+	}
+	return res, nil
+}
+
+func (e *engine) poolStatus() (pending, queued uint64) {
+	e.crossings[xPool].Add(1)
+	var p, q C.uint64_t
+	C.epochdb_pool_status(e.p, &p, &q)
+	return uint64(p), uint64(q)
+}
+
+func (e *engine) poolHas(hash ids.ID) bool {
+	e.crossings[xPool].Add(1)
+	var out C.uint8_t
+	C.epochdb_pool_has(e.p, c32(hash), &out)
+	return out != 0
+}
+
+// poolContent: the pool's tx envelopes, pending then queued, of one address
+// or of all (nil); limit per half (0 = all).
+func (e *engine) poolContent(addr *common.Address, limit int) ([][]byte, error) {
+	e.crossings[xPool].Add(1)
+	var b C.epochdb_buf
+	var a *C.uint8_t
+	if addr != nil {
+		a = (*C.uint8_t)(unsafe.Pointer(&addr[0]))
+	}
+	if err := e.err("epochdb_pool_content", C.epochdb_pool_content(e.p, a, C.size_t(limit), &b)); err != nil {
+		return nil, err
+	}
+	return decodeEnvelopes(take(&b))
+}
+
+// poolNonce: the pool's nonce for addr (state nonce + executable txs); ok
+// is false when the pool holds nothing of the address.
+func (e *engine) poolNonce(addr common.Address) (uint64, bool) {
+	e.crossings[xPool].Add(1)
+	var n C.uint64_t
+	rc := C.epochdb_pool_nonce(e.p, (*C.uint8_t)(unsafe.Pointer(&addr[0])), &n)
+	return uint64(n), rc == 0
+}
+
+// poolWait blocks until the pool holds an executable tx or the timeout
+// passes; true when it does.
+func (e *engine) poolWait(timeout time.Duration) bool {
+	e.crossings[xPool].Add(1)
+	var out C.uint8_t
+	C.epochdb_pool_wait(e.p, C.uint64_t(timeout/time.Millisecond), &out)
+	return out != 0
+}
+
+// poolDrainGossip: every tx admitted since the previous call.
+func (e *engine) poolDrainGossip() ([][]byte, error) {
+	e.crossings[xPool].Add(1)
+	var b C.epochdb_buf
+	if err := e.err("epochdb_pool_drain_gossip", C.epochdb_pool_drain_gossip(e.p, &b)); err != nil {
+		return nil, err
+	}
+	return decodeEnvelopes(take(&b))
+}
+
+// decodeEnvelopes: the pool's RLP list of byte strings (empty buffer = none).
+func decodeEnvelopes(raw []byte) ([][]byte, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var out [][]byte
+	if err := rlp.DecodeBytes(raw, &out); err != nil {
+		return nil, fmt.Errorf("pool envelopes: %w", err)
+	}
+	return out, nil
 }
 
 // accountState reads nonce + balance of n addresses at a block's state in

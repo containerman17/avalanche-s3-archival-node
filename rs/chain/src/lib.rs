@@ -7,6 +7,7 @@ pub mod config;
 pub mod dbstore;
 pub mod layered;
 pub mod node_engine;
+pub mod pool;
 pub mod rpc_store;
 pub mod synth;
 pub mod tree;

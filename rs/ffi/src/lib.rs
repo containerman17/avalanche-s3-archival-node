@@ -399,8 +399,9 @@ fn decode_candidates(b: &[u8], senders: &[u8]) -> Result<Vec<block::Tx>, String>
 /// Builds a block on `parent_id` (zero or the head's id = the accepted head;
 /// else a verified block) at `timestamp_ms` (Unix milliseconds) from `txs`
 /// in the miner's order, with their senders (`senders`: 20 bytes each, or
-/// null: the engine recovers them); the result is a verified pending block
-/// whose later verify is a lookup. See ABI.md for the semantics.
+/// null: the engine recovers them), or, with `txs` null / empty, from the
+/// engine's own pool; the result is a verified pending block whose later
+/// verify is a lookup. See ABI.md for the semantics.
 #[no_mangle]
 pub unsafe extern "C" fn epochdb_build(
     e: *mut epochdb_engine,
@@ -423,7 +424,8 @@ pub unsafe extern "C" fn epochdb_build(
             return Err((EPOCHDB_EINVAL, "null argument".to_string()));
         };
         let t0 = std::time::Instant::now();
-        let candidates = decode_candidates(raw, snd).map_err(ferr)?;
+        // No candidates handed in: the engine takes them from its pool.
+        let candidates = if raw.is_empty() { None } else { Some(decode_candidates(raw, snd).map_err(ferr)?) };
         let t1 = std::time::Instant::now();
         let (parent, pb) = en.parent(&pid)?;
         let params = Params { timestamp_ms, coinbase: Address::from_slice(cb), desired_min_delay_excess: en.tree.engine.desired_delay_excess };
@@ -446,6 +448,155 @@ pub unsafe extern "C" fn epochdb_build(
             phase_ns,
         };
         (*out).phase_ns[9] = t3.elapsed().as_nanos() as u64;
+        Ok(EPOCHDB_OK)
+    })
+}
+
+/// An RLP list of byte strings, one tx envelope each (the pool's wire form
+/// in both directions: what MarshalBinary / UnmarshalBinary handle).
+fn decode_envelopes(b: &[u8]) -> Result<Vec<Bytes>, String> {
+    use alloy_rlp::Header as H;
+    let mut p = b;
+    let h = H::decode(&mut p).map_err(|e| e.to_string())?;
+    if !h.list || h.payload_length != p.len() {
+        return Err("envelopes: not one RLP list".into());
+    }
+    let mut out = Vec::new();
+    while !p.is_empty() {
+        let s = H::decode_bytes(&mut p, false).map_err(|e| e.to_string())?;
+        out.push(Bytes::copy_from_slice(s));
+    }
+    Ok(out)
+}
+
+fn encode_envelopes<'a>(txs: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut list = Vec::new();
+    for t in txs {
+        alloy_rlp::Header { list: false, payload_length: t.len() }.encode(&mut list);
+        list.extend_from_slice(t);
+    }
+    let mut out = Vec::with_capacity(list.len() + 9);
+    alloy_rlp::Header { list: true, payload_length: list.len() }.encode(&mut out);
+    out.extend_from_slice(&list);
+    out
+}
+
+/// Admits `txs` (an RLP list of tx envelopes) into the pool; `local` != 0
+/// marks them local (only with `local-txs-enabled`). `out`: 33 bytes per
+/// input, a code (0 ok, 1 known, 2 replaced, 3 underpriced, 4 nonce too
+/// low, 5 insufficient funds, 6 over the block gas limit, 7 intrinsic gas,
+/// 8 invalid signature / chain id, 9 pool full, 10 other) then the hash.
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_add(e: *mut epochdb_engine, txs: *const u8, len: usize, local: u8, out: *mut epochdb_buf) -> c_int {
+    if e.is_null() || out.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        let raw = slice(txs, len).ok_or((EPOCHDB_EINVAL, "null txs".to_string()))?;
+        let raws = decode_envelopes(raw).map_err(ferr)?;
+        let res = en.tree.engine.pool_add(raws, local != 0);
+        let mut v = Vec::with_capacity(33 * res.len());
+        for a in res {
+            v.push(a.code as u8);
+            v.extend_from_slice(a.hash.as_slice());
+        }
+        *out = buf(v);
+        Ok(EPOCHDB_OK)
+    })
+}
+
+/// The pool's (pending, queued) counts.
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_status(e: *mut epochdb_engine, pending: *mut u64, queued: *mut u64) -> c_int {
+    if e.is_null() || pending.is_null() || queued.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        let (p, q) = en.tree.engine.txpool.status();
+        *pending = p as u64;
+        *queued = q as u64;
+        Ok(EPOCHDB_OK)
+    })
+}
+
+/// `out` = 1 when the pool holds the tx with `hash`.
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_has(e: *mut epochdb_engine, hash: *const u8, out: *mut u8) -> c_int {
+    if e.is_null() || out.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        let h = id32(hash).ok_or((EPOCHDB_EINVAL, "null hash".to_string()))?;
+        *out = en.tree.engine.txpool.has(&B256::from(h)) as u8;
+        Ok(EPOCHDB_OK)
+    })
+}
+
+/// The pool's txs as an RLP list of envelopes, pending (address then nonce
+/// order) then queued, of one address (`addr`: 20 bytes) or of all (null);
+/// at most `limit` of each half (0 = all).
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_content(e: *mut epochdb_engine, addr: *const u8, limit: usize, out: *mut epochdb_buf) -> c_int {
+    if e.is_null() || out.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        let a = if addr.is_null() { None } else { Some(Address::from_slice(slice(addr, 20).unwrap())) };
+        let (p, q) = en.tree.engine.txpool.content(a, limit);
+        *out = buf(encode_envelopes(p.iter().chain(q.iter()).map(|t| &t.raw[..])));
+        Ok(EPOCHDB_OK)
+    })
+}
+
+/// The pool's nonce for `addr` (its state nonce plus its executable txs);
+/// EPOCHDB_ENOTFOUND when the pool holds nothing of it (use the state's).
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_nonce(e: *mut epochdb_engine, addr: *const u8, out: *mut u64) -> c_int {
+    if e.is_null() || out.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        let a = slice(addr, 20).ok_or((EPOCHDB_EINVAL, "null address".to_string()))?;
+        match en.tree.engine.txpool.pending_nonce(Address::from_slice(a)) {
+            Some(n) => {
+                *out = n;
+                Ok(EPOCHDB_OK)
+            }
+            None => Err((EPOCHDB_ENOTFOUND, "address not in the pool".to_string())),
+        }
+    })
+}
+
+/// Blocks until the pool holds an executable tx (`out` = 1) or `timeout_ms`
+/// passes (`out` = 0). Returns at once when it already does.
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_wait(e: *mut epochdb_engine, timeout_ms: u64, out: *mut u8) -> c_int {
+    if e.is_null() || out.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        *out = en.tree.engine.txpool.wait(std::time::Duration::from_millis(timeout_ms)) as u8;
+        Ok(EPOCHDB_OK)
+    })
+}
+
+/// Every tx admitted (locally or from gossip) since the previous call, as
+/// an RLP list of envelopes, oldest first: what the push gossiper forwards.
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_drain_gossip(e: *mut epochdb_engine, out: *mut epochdb_buf) -> c_int {
+    if e.is_null() || out.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        let txs = en.tree.engine.txpool.drain_gossip();
+        *out = buf(if txs.is_empty() { Vec::new() } else { encode_envelopes(txs.iter().map(|t| &t.raw[..])) });
         Ok(EPOCHDB_OK)
     })
 }

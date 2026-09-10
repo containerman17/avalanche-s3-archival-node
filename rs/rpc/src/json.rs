@@ -148,6 +148,45 @@ pub fn tx_json(b: &Block, i: usize) -> Result<Value, RpcError> {
     Ok(v)
 }
 
+/// newRPCPendingTransaction: a pool tx (no block fields; gasPrice is the
+/// fee cap, there is no base fee yet).
+pub fn pending_tx_json(t: &Tx) -> Value {
+    let mut v = json!({
+        "blockHash": Value::Null,
+        "blockNumber": Value::Null,
+        "from": t.sender.unwrap_or_default(),
+        "gas": qty(t.gas_limit),
+        "gasPrice": qty128(t.gas_price),
+        "hash": t.hash,
+        "input": hex(&t.input),
+        "nonce": qty(t.nonce),
+        "to": t.to,
+        "transactionIndex": Value::Null,
+        "value": qty256(t.value),
+        "type": qty(t.tx_type as u64),
+        "v": qty(t.v),
+        "r": qty256(t.r),
+        "s": qty256(t.s),
+    });
+    match t.tx_type {
+        0 => {
+            if let Some(c) = t.chain_id.filter(|c| *c != 0) {
+                v["chainId"] = json!(qty(c));
+            }
+        }
+        _ => {
+            v["accessList"] = json!(t.access_list.iter().map(|a| json!({"address": a.address, "storageKeys": a.storage_keys})).collect::<Vec<_>>());
+            v["chainId"] = json!(qty(t.chain_id.unwrap_or(0)));
+            v["yParity"] = json!(qty(t.v.min(1)));
+            if t.tx_type == 2 {
+                v["maxFeePerGas"] = json!(qty128(t.gas_price));
+                v["maxPriorityFeePerGas"] = json!(qty128(t.gas_tip));
+            }
+        }
+    }
+    v
+}
+
 pub fn bad_sender(t: &Tx, h: u64) -> RpcError {
     format!("sender of tx {} in block {h} does not recover (corrupt container, or this node's chain id is not the one it was signed for)", t.hash).into()
 }

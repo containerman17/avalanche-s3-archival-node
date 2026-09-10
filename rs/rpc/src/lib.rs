@@ -120,6 +120,29 @@ pub fn invalid(m: impl Into<String>) -> RpcError {
     RpcError { code: -32602, message: m.into(), data: None }
 }
 
+/// One admission answer of the mempool: the ABI's code (0 ok, 2 replaced,
+/// anything else refused with `message`), and the tx hash.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolAdd {
+    pub code: u8,
+    pub message: &'static str,
+    pub hash: B256,
+}
+
+/// The transaction pool behind eth_sendRawTransaction, txpool_*,
+/// eth_pendingTransactions and the "pending" nonce (the validator's engine
+/// sets it; the archive read server has none and refuses submissions).
+pub trait Mempool: Send + Sync {
+    /// Admits tx envelopes (MarshalBinary form), one answer per input.
+    fn add(&self, raws: Vec<Bytes>, local: bool) -> Vec<PoolAdd>;
+    /// (pending, queued).
+    fn status(&self) -> (usize, usize);
+    /// (pending, queued) txs of one address or of all, address then nonce order.
+    fn content(&self, addr: Option<Address>) -> (Vec<Arc<block::Tx>>, Vec<Arc<block::Tx>>);
+    /// The state nonce plus the executable txs; None when the pool holds nothing of the address.
+    fn pending_nonce(&self, addr: Address) -> Option<u64>;
+}
+
 /// subnet-evm's ErrUnfinalizedData: a height past the accepted head.
 pub fn unfinalized() -> RpcError {
     "cannot query unfinalized data".into()
@@ -143,6 +166,14 @@ pub const MAX_BATCH: usize = 1000;
 pub const MAX_REQUEST_BYTES: usize = 10 << 20;
 
 /// The server: one chain's store plus the chain config the executor runs with.
+/// The hash, or libevm's refusal text.
+fn pool_answer(a: PoolAdd) -> RpcResult {
+    match a.code {
+        0 | 2 => Ok(json!(a.hash)),
+        _ => Err(a.message.into()),
+    }
+}
+
 pub struct Server {
     pub store: Arc<dyn Store>,
     pub cfg: Arc<exec::Config>,
@@ -153,12 +184,60 @@ pub struct Server {
     pub(crate) iface721: Mutex<alloy_primitives::map::HashMap<Address, String>>,
     /// Accepted heads for eth_subscribe (ws.rs); `publish` feeds it.
     pub heads: tokio::sync::broadcast::Sender<Arc<ws::Head>>,
+    /// The validator's pool, set once after construction; unset = no mempool.
+    pub mempool: std::sync::OnceLock<Arc<dyn Mempool>>,
 }
 
 impl Server {
     pub fn new(store: Arc<dyn Store>, cfg: Arc<exec::Config>, genesis: Arc<Block>, chain_config: Value, upgrades: Option<Value>) -> Server {
         let chain_config = stock_chain_config(&cfg, chain_config, upgrades);
-        Server { store, cfg, genesis, chain_config, filters: Mutex::new(Default::default()), iface721: Mutex::new(Default::default()), heads: tokio::sync::broadcast::channel(ws::QUEUE).0 }
+        Server { store, cfg, genesis, chain_config, filters: Mutex::new(Default::default()), iface721: Mutex::new(Default::default()), heads: tokio::sync::broadcast::channel(ws::QUEUE).0, mempool: std::sync::OnceLock::new() }
+    }
+
+    /// The pool's RPC methods (dispatch routes them here when a mempool is set).
+    fn pool_method(&self, pool: &dyn Mempool, method: &str, params: &[Value]) -> RpcResult {
+        match method {
+            "eth_sendRawTransaction" => {
+                let raw = json::parse_bytes(params.first().filter(|v| !v.is_null()).ok_or_else(|| missing_arg(0))?).map_err(|e| bad_arg(0, e))?;
+                pool_answer(pool.add(vec![raw], false)[0])
+            }
+            "txpool_status" => {
+                let (p, q) = pool.status();
+                Ok(json!({"pending": json::qty(p as u64), "queued": json::qty(q as u64)}))
+            }
+            "txpool_content" | "txpool_contentFrom" | "txpool_inspect" => {
+                let addr = if method == "txpool_contentFrom" { Some(json::parse_addr(params.first()).map_err(|e| bad_arg(0, e))?) } else { None };
+                let (p, q) = pool.content(addr);
+                let render = |t: &block::Tx| -> Value {
+                    if method == "txpool_inspect" {
+                        json!(format!("{}: {} wei + {} gas x {} wei", t.to.map_or("contract creation".to_string(), |a| a.to_string()), t.value, t.gas_limit, t.gas_price))
+                    } else {
+                        json::pending_tx_json(t)
+                    }
+                };
+                let group = |txs: Vec<Arc<block::Tx>>| -> Value {
+                    if addr.is_some() {
+                        let mut m = serde_json::Map::new();
+                        for t in txs {
+                            m.insert(t.nonce.to_string(), render(&t));
+                        }
+                        return Value::Object(m);
+                    }
+                    let mut m = serde_json::Map::new();
+                    for t in txs {
+                        let by = m.entry(t.sender.unwrap_or_default().to_string()).or_insert_with(|| json!({}));
+                        by[t.nonce.to_string()] = render(&t);
+                    }
+                    Value::Object(m)
+                };
+                Ok(json!({"pending": group(p), "queued": group(q)}))
+            }
+            "eth_pendingTransactions" => {
+                let (p, _) = pool.content(None);
+                Ok(Value::Array(p.iter().map(|t| json::pending_tx_json(t)).collect()))
+            }
+            _ => Err(RpcError { code: -32601, message: format!("the method {method} does not exist/is not available"), data: None }),
+        }
     }
 
     /// The accept path's hook: one accepted block with its receipts (the
@@ -255,6 +334,7 @@ impl Server {
             "eth_coinbase" | "eth_etherbase" => Ok(json!("0x0100000000000000000000000000000000000000")),
             "eth_getUncleCountByBlockNumber" | "eth_getUncleCountByBlockHash" => Ok(json!("0x0")),
             "eth_getUncleByBlockNumberAndIndex" | "eth_getUncleByBlockHashAndIndex" => Ok(Value::Null),
+            m if self.mempool.get().is_some() && matches!(m, "eth_sendRawTransaction" | "txpool_status" | "txpool_content" | "txpool_contentFrom" | "txpool_inspect" | "eth_pendingTransactions") => self.pool_method(self.mempool.get().unwrap().as_ref(), m, params),
             "eth_pendingTransactions" => Ok(json!([])),
             "eth_getProof" => Err("eth_getProof unsupported by design: epochdb stores no tries".into()),
             "debug_getBadBlocks" => Ok(json!([])),
@@ -311,6 +391,32 @@ impl Server {
         id.map(|id| reply(Some(id), res))
     }
 
+    /// The batch's eth_sendRawTransaction elements with a decodable
+    /// parameter, admitted together: index in the batch -> the answer.
+    fn pre_admit(&self, rs: &[Value]) -> std::collections::HashMap<usize, PoolAdd> {
+        let mut out = std::collections::HashMap::new();
+        let Some(pool) = self.mempool.get() else { return out };
+        let mut raws = Vec::new();
+        let mut at = Vec::new();
+        for (i, r) in rs.iter().enumerate() {
+            if r.get("method").and_then(Value::as_str) != Some("eth_sendRawTransaction") {
+                continue;
+            }
+            let Some(p) = r.get("params").and_then(Value::as_array).and_then(|a| a.first()) else { continue };
+            if let Ok(raw) = json::parse_bytes(p) {
+                raws.push(raw);
+                at.push(i);
+            }
+        }
+        if raws.is_empty() {
+            return out;
+        }
+        for (i, a) in at.into_iter().zip(pool.add(raws, false)) {
+            out.insert(i, a);
+        }
+        out
+    }
+
     /// One HTTP body in, one body out (single or batch).
     pub fn handle(&self, body: &[u8]) -> Vec<u8> {
         self.handle_with(body, &mut |_, _| None)
@@ -333,9 +439,17 @@ impl Server {
                 if rs.len() > MAX_BATCH {
                     return reply(None, Err(RpcError { code: -32600, message: format!("batch of {} requests exceeds the limit of {MAX_BATCH}", rs.len()), data: None })).to_string().into_bytes();
                 }
+                // Every eth_sendRawTransaction of the batch goes to the pool in one
+                // call (one lock, one state read, senders recovered in parallel).
+                let pre = self.pre_admit(rs);
                 let replies: Vec<Value> = rs
                     .iter()
-                    .filter_map(|r| match r {
+                    .enumerate()
+                    .filter_map(|(i, r)| match r {
+                        Value::Object(_) if pre.get(&i).is_some() => {
+                            let res = pre[&i];
+                            self.one(r, &mut |m, _| if m == "eth_sendRawTransaction" { Some(pool_answer(res)) } else { None })
+                        }
                         Value::Object(_) => self.one(r, hook),
                         _ => Some(reply(None, Err(RpcError { code: -32600, message: "invalid request: not an object".into(), data: None }))),
                     })

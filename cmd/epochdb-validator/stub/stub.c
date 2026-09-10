@@ -87,6 +87,10 @@ int epochdb_build(epochdb_engine *e, const uint8_t parent[32], uint64_t ts, cons
                   uint64_t pch, const uint8_t *txs, size_t n, const uint8_t *senders, size_t senders_len, epochdb_build_out *out) {
   (void)ts; (void)cb; (void)pch; (void)senders; (void)senders_len;
   blk *p = find(e, parent); uint64_t h = p ? p->height + 1 : e->height + 1;
+  static uint64_t built; uint8_t synth[16];
+  if (n == 0) { /* pool mode: a canned one-tx block, distinct per call */
+    memcpy(synth, &ts, 8); memcpy(synth + 8, &built, 8); built++; txs = synth; n = sizeof synth;
+  }
   blk *b = add(e, txs, n, parent, h); if (!b) return -1;
   memset(out, 0, sizeof *out);
   out->block_bytes = dup(b->raw, b->len); memcpy(out->id, b->id, 32);
@@ -110,7 +114,19 @@ int epochdb_rpc(epochdb_engine *e, const uint8_t *body, size_t n, epochdb_buf *o
 int epochdb_health(epochdb_engine *e, epochdb_buf *out) {
   (void)e; *out = dup((const uint8_t *)"{\"stub\":true}", 13); return 0;
 }
-int epochdb_last_error(epochdb_engine *e, epochdb_buf *out) {
+/* The pool: nothing is held; wait says "pending" so the build path runs. */
+int epochdb_pool_add(epochdb_engine *e, const uint8_t *txs, size_t n, uint8_t local, epochdb_buf *out) {
+  (void)e; (void)txs; (void)n; (void)local; (void)out; return -1;
+}
+int epochdb_pool_status(epochdb_engine *e, uint64_t *p, uint64_t *q) { (void)e; *p = 0; *q = 0; return 0; }
+int epochdb_pool_has(epochdb_engine *e, const uint8_t *hash, uint8_t *out) { (void)e; (void)hash; *out = 0; return 0; }
+int epochdb_pool_content(epochdb_engine *e, const uint8_t *addr, size_t limit, epochdb_buf *out) {
+  (void)e; (void)addr; (void)limit; *out = dup((const uint8_t *)"\xc0", 1); return 0;
+}
+int epochdb_pool_nonce(epochdb_engine *e, const uint8_t *addr, uint64_t *out) { (void)e; (void)addr; *out = 0; return -3; }
+int epochdb_pool_wait(epochdb_engine *e, uint64_t timeout_ms, uint8_t *out) { (void)e; (void)timeout_ms; *out = 1; return 0; }
+int epochdb_pool_drain_gossip(epochdb_engine *e, epochdb_buf *out) { (void)e; *out = dup(NULL, 0); return 0; }
+int epochdb_last_error(const epochdb_engine *e, epochdb_buf *out) {
   (void)e; *out = dup((const uint8_t *)"stub error", 10); return 0;
 }
 void epochdb_buf_free(epochdb_buf *b) { free(b->ptr); b->ptr = NULL; b->len = 0; }

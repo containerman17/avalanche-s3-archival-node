@@ -25,6 +25,7 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/params"
+	"github.com/holiman/uint256"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -117,8 +118,12 @@ func (h *harness) transfer(to ethcommon.Address, value *big.Int) ethcommon.Hash 
 	})
 	h.nonce++
 	raw, _ := tx.MarshalBinary()
+	res := h.call("eth_sendRawTransaction", hexutil.Bytes(raw))
+	if !realEngine {
+		return tx.Hash() // the stub's rpc echoes the request
+	}
 	var hash ethcommon.Hash
-	if err := json.Unmarshal(h.call("eth_sendRawTransaction", hexutil.Bytes(raw)), &hash); err != nil {
+	if err := json.Unmarshal(res, &hash); err != nil {
 		h.t.Fatal(err)
 	}
 	return hash
@@ -160,12 +165,14 @@ func TestBuildVerifyAccept(t *testing.T) {
 	for i := 0; i < n; i++ {
 		h.transfer(to, big.NewInt(1))
 	}
-	var pending hexutil.Uint64
-	if err := json.Unmarshal(h.call("eth_getTransactionCount", h.addr, "pending"), &pending); err != nil {
-		t.Fatal(err)
-	}
-	if pending != n {
-		t.Fatalf("pending nonce %d, want %d", pending, n)
+	if realEngine {
+		var pending hexutil.Uint64
+		if err := json.Unmarshal(h.call("eth_getTransactionCount", h.addr, "pending"), &pending); err != nil {
+			t.Fatal(err)
+		}
+		if pending != n {
+			t.Fatalf("pending nonce %d, want %d", pending, n)
+		}
 	}
 	blk, build, verify := h.buildAccept()
 	t.Logf("block %d: build %v verify %v crossings %v", blk.Height(), build, verify, h.vm.eng.snapshot())
@@ -193,9 +200,8 @@ func TestBuildVerifyAccept(t *testing.T) {
 	if num != 1 {
 		t.Fatalf("eth_blockNumber %d", num)
 	}
-	// The pool demoted the included txs once its reset landed: nothing pending.
-	h.vm.chain.settle()
-	if p, q := h.vm.pool.Stats(); p+q != 0 {
+	// Accept moved the pool: nothing pending.
+	if p, q := h.vm.eng.poolStatus(); p+q != 0 {
 		t.Fatalf("pool still holds %d pending %d queued", p, q)
 	}
 	got, err := h.vm.GetBlock(context.Background(), blk.ID())
@@ -246,14 +252,15 @@ func histSum(h prometheus.Histogram) float64 {
 
 func TestRPCForward(t *testing.T) {
 	h := newHarness(t)
-	res := h.call("eth_chainId")
-	if realEngine {
+	if !realEngine {
+		stubSet(1, []byte(`[{"jsonrpc":"2.0","id":1,"result":{"pending":"0x0","queued":"0x0"}},{"jsonrpc":"2.0","id":2,"result":"0x1869f"}]`))
+	} else {
 		var id hexutil.Big
-		if err := json.Unmarshal(res, &id); err != nil || id.ToInt().Int64() != 99999 {
-			t.Fatalf("eth_chainId = %s (%v)", res, err)
+		if res := h.call("eth_chainId"); json.Unmarshal(res, &id) != nil || id.ToInt().Int64() != 99999 {
+			t.Fatalf("eth_chainId = %s", res)
 		}
 	}
-	// A batch without pool methods is forwarded whole; with one it is split.
+	// A batch with a pool method and an engine method is answered whole by the engine.
 	rec := httptest.NewRecorder()
 	h.rpc.ServeHTTP(rec, httptest.NewRequest("POST", "/rpc", strings.NewReader(
 		`[{"jsonrpc":"2.0","id":1,"method":"txpool_status","params":[]},{"jsonrpc":"2.0","id":2,"method":"eth_chainId","params":[]}]`)))
@@ -293,9 +300,9 @@ func TestAccountStateAtOldID(t *testing.T) {
 }
 
 // TestPoolDrainsUnderChurn: many senders, nonces arriving out of order and
-// through both doors (RPC = remote admission, gossip set = remote), blocks
-// built while the pool's reset lags; after the last block every tx is
-// mined and the pool is empty. Logs engine nonce vs pool nonce per round.
+// through both doors (RPC and the gossip set), a block per round; after the
+// last block every tx is mined and the pool is empty. Logs engine nonce vs
+// pool nonce per round.
 func TestPoolDrainsUnderChurn(t *testing.T) {
 	if !realEngine {
 		t.Skip("stub engine")
@@ -312,7 +319,7 @@ func TestPoolDrainsUnderChurn(t *testing.T) {
 	}
 	h.buildAccept()
 	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000004")
-	set, err := newGossipSet(h.vm.pool, prometheus.NewRegistry())
+	set, err := newGossipSet(h.vm.eng, prometheus.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +334,8 @@ func TestPoolDrainsUnderChurn(t *testing.T) {
 			}
 			nonces[k] += perRound
 			// highest nonce first (queued), the rest through the gossip door and RPC
-			if err := set.Add(&gossipTx{tx: txs[perRound-1]}); err != nil {
+			raw, _ := txs[perRound-1].MarshalBinary()
+			if err := set.Add(newGossipTx(raw)); err != nil {
 				t.Fatalf("round %d key %d: gossip add: %v", r, k, err)
 			}
 			for j := 0; j < perRound-1; j++ {
@@ -337,8 +345,7 @@ func TestPoolDrainsUnderChurn(t *testing.T) {
 			sent += perRound
 		}
 		blk, _, _ := h.buildAccept()
-		h.vm.chain.settle()
-		p, q := h.vm.pool.Stats()
+		p, q := h.vm.eng.poolStatus()
 		raw, err := h.vm.eng.accountState(addrs[:3], ids.Empty)
 		if err != nil {
 			t.Fatal(err)
@@ -346,20 +353,19 @@ func TestPoolDrainsUnderChurn(t *testing.T) {
 		var view []string
 		for i := 0; i < 3; i++ {
 			acc := decodeAccount(raw[i*40 : i*40+40])
-			view = append(view, fmt.Sprintf("%d:engine=%d pool=%d", i, acc.Nonce, h.vm.pool.Nonce(addrs[i])))
+			pn, _ := h.vm.eng.poolNonce(addrs[i])
+			view = append(view, fmt.Sprintf("%d:engine=%d pool=%d", i, acc.Nonce, pn))
 		}
 		t.Logf("round %d: block %d, pool pending=%d queued=%d, nonces %s", r, blk.Height(), p, q, strings.Join(view, " "))
 	}
 	// Drain whatever the last block left (the gas budget can split a round).
 	for i := 0; i < 5; i++ {
-		h.vm.chain.settle()
-		if p, q := h.vm.pool.Stats(); p+q == 0 {
+		if p, q := h.vm.eng.poolStatus(); p+q == 0 {
 			break
 		}
 		h.buildAccept()
 	}
-	h.vm.chain.settle()
-	if p, q := h.vm.pool.Stats(); p+q != 0 {
+	if p, q := h.vm.eng.poolStatus(); p+q != 0 {
 		t.Fatalf("pool did not drain: pending=%d queued=%d", p, q)
 	}
 	var nonce hexutil.Uint64
@@ -367,27 +373,16 @@ func TestPoolDrainsUnderChurn(t *testing.T) {
 	if uint64(nonce) != rounds*perRound {
 		t.Fatalf("sender 0 nonce %d, want %d", nonce, rounds*perRound)
 	}
-	t.Logf("%d txs from %d senders mined, account read errors %d", sent, nkeys, h.vm.chain.acct.errs.Load())
+	t.Logf("%d txs from %d senders mined", sent, nkeys)
 }
 
-// TestPoolChainGetBlock: the pool's reorg path (a coalesced head event
-// skips heights) walks blocks through GetBlock; the engine's bytes must
-// decode as a libevm block with the right number.
-func TestPoolChainGetBlock(t *testing.T) {
-	if !realEngine {
-		t.Skip("stub engine")
+// decodeAccount: one epochdb_account_state entry (u64 LE nonce, 32-byte BE balance).
+func decodeAccount(b []byte) types.StateAccount {
+	var nonce uint64
+	for i := 7; i >= 0; i-- {
+		nonce = nonce<<8 | uint64(b[i])
 	}
-	h := newHarness(t)
-	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000005")
-	h.transfer(to, big.NewInt(1))
-	b1, _, _ := h.buildAccept()
-	blk := h.vm.chain.GetBlock(ethcommon.Hash(b1.ID()), 1)
-	if blk == nil || blk.NumberU64() != 1 || len(blk.Transactions()) != 1 {
-		t.Fatalf("GetBlock(1) = %v", blk)
-	}
-	if h.vm.chain.GetBlock(ethcommon.Hash(b1.ID()), 2) != nil {
-		t.Fatal("GetBlock with a wrong number must be nil")
-	}
+	return types.StateAccount{Nonce: nonce, Balance: new(uint256.Int).SetBytes32(b[8:40])}
 }
 
 // stressGenesis is testGenesis with a 500 M gas limit in BOTH the fee config

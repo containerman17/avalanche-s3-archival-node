@@ -1,9 +1,9 @@
 // Package validator is the Go shell of the epochdb validator: an avalanchego
-// block.ChainVM that owns the mempool (subnet-evm's legacy txpool), tx gossip
-// (avalanchego's p2p gossip SDK, subnet-evm's codec) and BuildBlock
-// orchestration, and drives the Rust engine (rs/ffi, libepochdb_engine.a)
-// over a block-granular C ABI for everything else: parse, verify, accept,
-// build, state reads, JSON-RPC. No Go execution, no Go state, no Go trie.
+// block.ChainVM that owns tx gossip (avalanchego's p2p gossip SDK,
+// subnet-evm's wire format) and BuildBlock orchestration, and drives the Rust
+// engine (rs/ffi, libepochdb_engine.a) over a block-granular C ABI for
+// everything else: parse, verify, accept, build, the mempool, JSON-RPC. No Go
+// execution, no Go state, no Go trie, no Go pool.
 package validator
 
 import (
@@ -11,8 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	slog "golang.org/x/exp/slog"
-	"math/big"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -21,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/database"
@@ -34,10 +31,7 @@ import (
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
 	"github.com/ava-labs/avalanchego/version"
-	"github.com/ava-labs/libevm/core/txpool"
-	"github.com/ava-labs/libevm/core/txpool/legacypool"
 	"github.com/ava-labs/libevm/core/types"
-	ethlog "github.com/ava-labs/libevm/log"
 	"github.com/ava-labs/libevm/params"
 	"github.com/ava-labs/libevm/rlp"
 	"github.com/prometheus/client_golang/prometheus"
@@ -57,18 +51,17 @@ var (
 type VM struct {
 	eng    *engine
 	config *params.ChainConfig
-	signer types.Signer
 	cfg    config.Config
 	ctx    *snow.Context
-	chain  *poolChain
-	pool   *txpool.TxPool
 	net    *p2p.Network
 	push   *gossip.PushGossiper[*gossipTx]
+	set    *gossipSet
 	b      *builder
 	m      *metrics
-	drops  *dropLogHandler
 
 	mu          sync.Mutex
+	head        *types.Header // the accepted head's header (Accept decodes it once)
+	headID      ids.ID
 	preferred   ids.ID
 	lastBuilt   ids.ID            // the id of the last block we built (Accept logs "proposer": "self")
 	lastBuiltAt time.Time         // when buildBlock returned it (Accept logs the consensus latency)
@@ -100,7 +93,6 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.eng, vm.config, vm.cfg, vm.ctx = eng, chainConfig, cfg, chainCtx
-	vm.signer = types.LatestSigner(chainConfig)
 	// "pprof-addr" in the chain config (e.g. "127.0.0.1:0") serves Go pprof
 	// there; the bound address is logged (avalanchego passes the plugin no env).
 	var dbg struct {
@@ -112,13 +104,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 			go http.Serve(l, nil)
 		}
 	}
-	vm.m = newMetrics()
-	// libevm's pool logs through its own logger: Warn and up go to stderr
-	// (avalanchego relays it into the chain log); the Trace lines that name a
-	// removed tx and why are counted per reason instead (Accept logs the
-	// counts of its reset, epochdb_pool_removed_total keeps the totals).
-	vm.drops = &dropLogHandler{Handler: ethlog.NewTerminalHandlerWithLevel(os.Stderr, ethlog.LevelWarn, false), removed: vm.m.poolRemoved}
-	ethlog.SetDefault(ethlog.NewLogger(vm.drops))
+	vm.m = newMetrics(eng)
 	if chainCtx.Metrics != nil {
 		if err := chainCtx.Metrics.Register("epochdb", vm.m.reg); err != nil {
 			eng.close()
@@ -136,25 +122,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		eng.close()
 		return err
 	}
-	vm.chain = newPoolChain(eng, chainConfig, head, headID, chainCtx.Log)
-	vm.preferred = headID
-
-	legacy := legacypool.New(legacypool.Config{
-		Locals: cfg.PriorityRegossipAddresses, PriceLimit: cfg.TxPoolPriceLimit, PriceBump: cfg.TxPoolPriceBump,
-		AccountSlots: cfg.TxPoolAccountSlots, GlobalSlots: cfg.TxPoolGlobalSlots,
-		AccountQueue: cfg.TxPoolAccountQueue, GlobalQueue: cfg.TxPoolGlobalQueue,
-		Lifetime: cfg.TxPoolLifetime.Duration, Rejournal: time.Hour,
-	}, vm.chain)
-	vm.pool, err = txpool.New(cfg.TxPoolPriceLimit, vm.chain, []txpool.SubPool{legacy})
-	if err != nil {
-		eng.close()
-		return fmt.Errorf("validator: txpool: %w", err)
-	}
-	vm.chain.sub, vm.chain.counts = legacy, vm.drops.counts // setHead resets it on every accepted head
-	// ponytail: libevm's pool has no SetMinFee; a tx under the chain's min
-	// base fee sits in the pool until it expires, the build filter never
-	// selects it. Add the check in serveRPC/gossipSet.Add if it matters.
-	vm.pool.SetGasTip(big.NewInt(0))
+	vm.head, vm.headID, vm.preferred = head, headID, headID
 
 	vm.net, err = p2p.NewNetwork(chainCtx.Log, appSender, vm.m.reg, "p2p")
 	if err != nil {
@@ -162,10 +130,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.bg, vm.cancel = context.WithCancel(context.Background())
-	vm.b = newBuilder(vm.pool, vm.chain)
-	vm.chain.onMoved = func() { vm.b.mu.Lock(); vm.b.cond.Broadcast(); vm.b.mu.Unlock() }
-	vm.wg.Add(1)
-	go func() { defer vm.wg.Done(); vm.b.run(vm.bg) }()
+	vm.b = newBuilder(eng)
 
 	chainCtx.Log.Info("validator: engine open", zap.Stringer("chain", chainCtx.ChainID),
 		zap.Stringer("chainId", chainConfig.ChainID), zap.Uint64("height", head.Number.Uint64()), zap.String("data", chainCtx.ChainDataDir))
@@ -183,6 +148,13 @@ func (vm *VM) headHeader() (*types.Header, error) {
 		return nil, fmt.Errorf("validator: decode head header: %w", err)
 	}
 	return h, nil
+}
+
+// current: the accepted head's header and id.
+func (vm *VM) current() (*types.Header, ids.ID) {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	return vm.head, vm.headID
 }
 
 // SetState: the engine takes 1 = bootstrapping (roots checked one block
@@ -205,12 +177,16 @@ func (vm *VM) SetState(_ context.Context, st snow.State) error {
 }
 
 // startGossip wires subnet-evm's tx gossip (same codec as a stock node) over
-// avalanchego's p2p gossip SDK: pull + push gossipers, the bloom-backed set.
+// avalanchego's p2p gossip SDK: pull + push gossipers, the bloom-backed set
+// over the engine's pool. Inbound push messages are admitted per message
+// (one crossing), the pool's new txs are drained into the push gossiper on
+// every push tick.
 func (vm *VM) startGossip() error {
-	set, err := newGossipSet(vm.pool, vm.m.reg)
+	set, err := newGossipSet(vm.eng, vm.m.reg)
 	if err != nil {
 		return err
 	}
+	vm.set = set
 	validators := p2p.NewValidators(vm.ctx.Log, vm.ctx.SubnetID, vm.ctx.ValidatorState, time.Minute)
 	handler, pull, push, err := gossip.NewSystem(vm.ctx.NodeID, vm.net, validators, set, gossipMarshaller{},
 		gossip.SystemConfig{
@@ -225,16 +201,46 @@ func (vm *VM) startGossip() error {
 	if err != nil {
 		return err
 	}
-	if err := vm.net.AddHandler(p2p.TxGossipHandlerID, handler); err != nil {
+	if err := vm.net.AddHandler(p2p.TxGossipHandlerID, &txHandler{Handler: handler, set: set, log: vm.ctx.Log}); err != nil {
 		return err
 	}
 	vm.push = push
 	vm.b.setNormalOp()
-	vm.wg.Add(3)
-	go func() { defer vm.wg.Done(); set.subscribe(vm.bg) }()
-	go func() { defer vm.wg.Done(); gossip.Every(vm.bg, vm.ctx.Log, push, vm.cfg.PushGossipFrequency.Duration) }()
+	vm.wg.Add(2)
+	go func() { defer vm.wg.Done(); vm.pushLoop(push, vm.cfg.PushGossipFrequency.Duration) }()
 	go func() { defer vm.wg.Done(); gossip.Every(vm.bg, vm.ctx.Log, pull, vm.cfg.PullGossipFrequency.Duration) }()
 	return nil
+}
+
+// pushLoop: every push period, the pool's newly admitted txs (one crossing)
+// go to the push gossiper and the bloom filter, then one push round.
+func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duration) {
+	if period <= 0 {
+		period = 100 * time.Millisecond
+	}
+	t := time.NewTicker(period)
+	defer t.Stop()
+	for {
+		select {
+		case <-vm.bg.Done():
+			return
+		case <-t.C:
+		}
+		raws, err := vm.eng.poolDrainGossip()
+		if err != nil {
+			vm.ctx.Log.Warn("validator: pool drain failed", zap.Error(err))
+		} else if len(raws) > 0 {
+			txs := make([]*gossipTx, len(raws))
+			for i, r := range raws {
+				txs[i] = newGossipTx(r)
+			}
+			vm.set.added(txs)
+			push.Add(txs...)
+		}
+		if err := push.Gossip(vm.bg); err != nil && vm.bg.Err() == nil {
+			vm.ctx.Log.Warn("validator: push gossip failed", zap.Error(err))
+		}
+	}
 }
 
 func (vm *VM) Shutdown(context.Context) error {
@@ -244,8 +250,6 @@ func (vm *VM) Shutdown(context.Context) error {
 	vm.closeOnce.Do(func() {
 		vm.cancel()
 		vm.wg.Wait()
-		vm.chain.settle() // the last reset lands before the pool closes under it
-		vm.pool.Close()
 		vm.eng.close()
 	})
 	return nil
@@ -258,9 +262,8 @@ func (vm *VM) HealthCheck(context.Context) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	pending, queued := vm.pool.Stats()
-	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued, "removed": vm.drops.counts(),
-		"poolErrors": vm.drops.errors.Load(), "settled": vm.chain.isSettled()}, nil
+	pending, queued := vm.eng.poolStatus()
+	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued}, nil
 }
 
 func (vm *VM) Connected(ctx context.Context, id ids.NodeID, v *version.Application) error {
@@ -290,7 +293,7 @@ func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
 func (vm *VM) NewHTTPHandler(context.Context) (http.Handler, error) { return nil, nil }
 
 func (vm *VM) WaitForEvent(ctx context.Context) (common.Message, error) {
-	return vm.b.waitForEvent(ctx, vm.chain.CurrentBlock())
+	return vm.b.waitForEvent(ctx, func() *types.Header { h, _ := vm.current(); return h })
 }
 
 func (vm *VM) SetPreference(_ context.Context, id ids.ID) error {
@@ -390,30 +393,27 @@ func (b *Block) verify(pchainHeight uint64) error {
 	return nil
 }
 
-// Accept applies the pending state in the engine, then moves the pool's head
-// (one header crossing, one batched account refresh) and logs the block's
-// crossings.
+// Accept applies the pending state in the engine (which moves its pool for
+// the block's senders in the same call), decodes the new head header (one
+// crossing) and logs the block's crossings.
 func (b *Block) Accept(context.Context) error {
 	if b.height == 0 {
 		return nil
 	}
 	vm := b.vm
 	start := time.Now()
-	vm.chain.headMoving() // before the engine flips its height: the pool is "moving" to anyone who sees the new block
 	if err := vm.eng.accept(b.id); err != nil {
-		vm.chain.headMoved()
 		return err
 	}
 	h, err := vm.headHeader()
 	if err != nil {
-		vm.chain.headMoved()
 		return err
 	}
-	vm.chain.setHead(h, b.id) // its reset goroutine calls headMoved
 	vm.m.accept.Observe(time.Since(start).Seconds())
 
 	now := vm.eng.snapshot()
 	vm.mu.Lock()
+	vm.head, vm.headID = h, b.id
 	prev := vm.lastX
 	vm.lastX = now
 	self := vm.lastBuilt == b.id
@@ -433,7 +433,8 @@ func (b *Block) Accept(context.Context) error {
 			fields = append(fields, zap.Uint64("x_"+crossingNames[i], d))
 		}
 	}
-	fields = append(fields, zap.Uint64("x_total", total), zap.Uint64("account_errors", vm.chain.acct.errs.Load()))
+	pending, queued := vm.eng.poolStatus()
+	fields = append(fields, zap.Uint64("x_total", total), zap.Uint64("pending", pending), zap.Uint64("queued", queued))
 	vm.ctx.Log.Info("validator: accepted", fields...)
 	return nil
 }
@@ -451,34 +452,29 @@ type metrics struct {
 	verify, build, accept prometheus.Histogram
 	verifyTxs, buildTxs   prometheus.Histogram
 	crossings             *prometheus.CounterVec
-	admitted              prometheus.Counter
-	poolRemoved           *prometheus.CounterVec
 	buildEmpty            prometheus.Counter
 }
 
-func newMetrics() *metrics {
+func newMetrics(eng *engine) *metrics {
 	ms := func(name, help string) prometheus.Histogram {
 		return prometheus.NewHistogram(prometheus.HistogramOpts{Name: name, Help: help,
 			Buckets: []float64{.001, .002, .005, .01, .02, .05, .1, .2, .5, 1, 2, 5}})
 	}
 	n := func(name, help string) prometheus.Histogram {
 		return prometheus.NewHistogram(prometheus.HistogramOpts{Name: name, Help: help,
-			Buckets: []float64{0, 10, 50, 100, 200, 500, 1000, 2000, 5000}})
+			Buckets: []float64{0, 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000}})
 	}
 	m := &metrics{
-		reg:       prometheus.NewRegistry(),
-		verify:    ms("epochdb_verify_seconds", "engine verify (execution + state root inline)"),
-		build:     ms("epochdb_build_seconds", "the engine's build call (execution, header, state root)"),
-		accept:    ms("epochdb_accept_seconds", "engine accept + pool head move"),
-		verifyTxs: n("epochdb_verify_txs", "txs per verified block"),
-		buildTxs:  n("epochdb_build_txs", "txs per built block"),
-		crossings: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "epochdb_crossings_total", Help: "cgo calls into the engine"}, []string{"kind"}),
-		admitted:  prometheus.NewCounter(prometheus.CounterOpts{Name: "epochdb_txs_admitted_total", Help: "txs the pool promoted to pending"}),
-		poolRemoved: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "epochdb_pool_removed_total",
-			Help: "txs the pool removed at a reset, by libevm's reason (old = mined; unpayable, cap-exceeding, fairness-exceeding, invalidated = dropped)"}, []string{"reason"}),
+		reg:        prometheus.NewRegistry(),
+		verify:     ms("epochdb_verify_seconds", "engine verify (execution + state root inline)"),
+		build:      ms("epochdb_build_seconds", "the engine's build call (candidates from the pool, execution, header, state root)"),
+		accept:     ms("epochdb_accept_seconds", "engine accept (state + pool head move) + head header"),
+		verifyTxs:  n("epochdb_verify_txs", "txs per verified block"),
+		buildTxs:   n("epochdb_build_txs", "txs per built block"),
+		crossings:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "epochdb_crossings_total", Help: "cgo calls into the engine"}, []string{"kind"}),
 		buildEmpty: prometheus.NewCounter(prometheus.CounterOpts{Name: "epochdb_build_empty_total", Help: "BuildBlock calls whose every candidate the engine skipped (no block)"}),
 	}
-	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.admitted, m.poolRemoved, m.buildEmpty)
+	m.reg.MustRegister(m.verify, m.build, m.accept, m.verifyTxs, m.buildTxs, m.crossings, m.buildEmpty)
 	// The Go heap, GC share and RSS of the plugin process. (The stock Go and
 	// process collectors do not survive the rpcchainvm gatherer, so: gauges.)
 	gauge := func(name, help string, f func() float64) {
@@ -491,6 +487,8 @@ func newMetrics() *metrics {
 			return runtimeMetric("/cpu/classes/gc/total:cpu-seconds") / max(runtimeMetric("/cpu/classes/total:cpu-seconds"), 1e-9)
 		})
 	gauge("epochdb_process_rss_bytes", "resident set size of the plugin process", processRSS)
+	gauge("epochdb_pool_pending", "executable txs in the engine's pool", func() float64 { p, _ := eng.poolStatus(); return float64(p) })
+	gauge("epochdb_pool_queued", "non-executable txs in the engine's pool", func() float64 { _, q := eng.poolStatus(); return float64(q) })
 	return m
 }
 
@@ -517,78 +515,4 @@ func processRSS() float64 {
 	}
 	pages, _ := strconv.ParseFloat(f[1], 64)
 	return pages * float64(os.Getpagesize())
-}
-
-// dropLogHandler forwards libevm records at Warn and above to its Handler
-// and counts, instead of printing, the Trace records that say the pool
-// removed a tx ("Removed old pending transaction", "Removed unpayable queued
-// transactions" count=N, ...): under load the per-tx lines are thousands
-// per block (a 500-line cap was gone 5 s into the settle run), the counts
-// per reason per reset are what a run needs.
-type dropLogHandler struct {
-	slog.Handler
-	removed *prometheus.CounterVec
-	errors  atomic.Uint64 // records at Error: libevm's pool never returns these ("Failed to reset txpool state" keeps its old state)
-	mu      sync.Mutex
-	n       map[string]uint64
-}
-
-func (h *dropLogHandler) Enabled(context.Context, slog.Level) bool { return true }
-
-func (h *dropLogHandler) Handle(ctx context.Context, r slog.Record) error {
-	if reason, n := removalReason(r); reason != "" && n > 0 {
-		h.mu.Lock()
-		if h.n == nil {
-			h.n = map[string]uint64{}
-		}
-		h.n[reason] += n
-		h.mu.Unlock()
-		if h.removed != nil {
-			h.removed.WithLabelValues(reason).Add(float64(n))
-		}
-	}
-	if r.Level < slog.LevelWarn {
-		return nil
-	}
-	if r.Level >= slog.LevelError {
-		h.errors.Add(1)
-	}
-	return h.Handler.Handle(ctx, r)
-}
-
-// counts: removals so far by reason (a copy).
-func (h *dropLogHandler) counts() map[string]uint64 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make(map[string]uint64, len(h.n))
-	for k, v := range h.n {
-		out[k] = v
-	}
-	return out
-}
-
-// removalReason maps legacypool's removal lines to a reason and a count:
-// "Removed <reason> pending transaction" hash=.. (one tx), "Removed <reason>
-// queued transactions" count=N, "Demoting invalidated transaction" (a nonce
-// gap in a pending list, should never happen).
-func removalReason(r slog.Record) (string, uint64) {
-	m := r.Message
-	switch {
-	case strings.HasPrefix(m, "Removed "):
-		m = strings.TrimPrefix(m, "Removed ")
-	case strings.HasPrefix(m, "Demoting invalidated"):
-		return "invalidated", 1
-	default:
-		return "", 0
-	}
-	reason, _, _ := strings.Cut(m, " ")
-	n := uint64(1)
-	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "count" {
-			n = uint64(a.Value.Int64())
-			return false
-		}
-		return true
-	})
-	return reason, n
 }

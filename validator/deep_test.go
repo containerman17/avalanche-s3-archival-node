@@ -15,10 +15,10 @@ import (
 	"github.com/ava-labs/libevm/params"
 )
 
-// TestAcceptCostDeepPool (EPOCHDB_DEEP=1): Accept's cost and the pool
-// reset's landing time per block with 100k+ txs pending (the reset walks
-// every pending account: demote, then promote the dirty ones; 570 ms at
-// 104k pending, which is why it stays off the Accept path).
+// TestAcceptCostDeepPool (EPOCHDB_DEEP=1): Accept's cost per block with
+// 100k+ txs pending. The pool's head move is inside epochdb_accept and
+// touches the block's senders only (libevm's reset walked every pending
+// account: 570 ms at 104k pending).
 func TestAcceptCostDeepPool(t *testing.T) {
 	if !realEngine || os.Getenv("EPOCHDB_DEEP") == "" {
 		t.Skip("real engine + EPOCHDB_DEEP=1")
@@ -35,18 +35,23 @@ func TestAcceptCostDeepPool(t *testing.T) {
 	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000007")
 	t0 := time.Now()
 	for n := 0; n < perKey; n++ {
-		txs := make([]*types.Transaction, nkeys)
+		raws := make([][]byte, nkeys)
 		for k := range keys {
-			txs[k] = types.MustSignNewTx(keys[k], h.signer, &types.DynamicFeeTx{ChainID: h.vm.config.ChainID, Nonce: uint64(n), To: &to, Value: big.NewInt(1), Gas: 21000,
+			tx := types.MustSignNewTx(keys[k], h.signer, &types.DynamicFeeTx{ChainID: h.vm.config.ChainID, Nonce: uint64(n), To: &to, Value: big.NewInt(1), Gas: 21000,
 				GasFeeCap: big.NewInt(50 * params.GWei), GasTipCap: big.NewInt(params.GWei)})
+			raws[k], _ = tx.MarshalBinary()
 		}
-		for _, err := range h.vm.pool.Add(txs, false, false) {
-			if err != nil {
+		res, err := h.vm.eng.poolAdd(raws, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, x := range res {
+			if err := x.err(); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	p, q := h.vm.pool.Stats()
+	p, q := h.vm.eng.poolStatus()
 	t.Logf("admitted %d txs in %v: pending=%d queued=%d", nkeys*perKey, time.Since(t0), p, q)
 	for i := 0; i < 3; i++ {
 		ctx := context.Background()
@@ -67,10 +72,8 @@ func TestAcceptCostDeepPool(t *testing.T) {
 			t.Fatal(err)
 		}
 		accept := time.Since(ta)
-		h.vm.chain.settle()
-		settled := time.Since(ta)
-		p, q := h.vm.pool.Stats()
-		fmt.Printf("DEEP block %d: txs=%d Accept=%v (engine accept + head + refresh, metric %v) pool settled after %v; pending after=%d queued=%d\n",
-			blk.Height(), len(blk.(*Block).raw)/110, accept, time.Duration((histSum(h.vm.m.accept)-accBefore)*float64(time.Second)), settled, p, q)
+		p, q := h.vm.eng.poolStatus()
+		fmt.Printf("DEEP block %d: txs=%d Accept=%v (engine accept incl. the pool's head move + head header, metric %v); pending after=%d queued=%d\n",
+			blk.Height(), len(blk.(*Block).raw)/110, accept, time.Duration((histSum(h.vm.m.accept)-accBefore)*float64(time.Second)), p, q)
 	}
 }
