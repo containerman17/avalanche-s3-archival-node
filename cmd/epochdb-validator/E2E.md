@@ -720,6 +720,110 @@ adds no idle time between heights at 2 validators: the proposervm's 5 s slot wai
 cut short by the proposer's block. The box is the other bound: at 60k offered the two plugins and the generator use
 13-16 of 16 threads (admission recovers every tx once per node, 46k tx/s x 40 us = 1.8 cores per node).
 
+## Ingest dedup, the small-batch floor and push gossip capacity (branch rs-ingest off rust e6cdf12, 2026-09-11 JST)
+
+The 5-validator EC2 profile of e6cdf12 (c7a.8xlarge, compare tab) said blocks were small (173 txs p50) because the
+pool held only 700-1000 pending while 8-16k txs were in flight: ingest did not keep up, 45% of a plugin's cycles were
+libsecp256k1 recovery. Cause: `Pool::add` decoded and RECOVERED every tx before any hash check, and every tx reaches
+a node once by RPC and ~4x by push gossip.
+
+Changes (each its own commit on `rs-ingest`):
+
+1. `Pool::add` (84474a0): the hash (keccak of the envelope) comes first; one brief lock partitions the batch into
+   known (pending in `by_hash`, mined in the last 200k txs kept in a `seen` ring filled by `on_accept`, or repeated
+   inside the batch) and new; the lock is released; only the new txs are decoded, validated and recovered, on the
+   pool's OWN rayon pool (`ingest-threads`, default min(cores / 2, 8)) instead of the global one, so ingest no longer
+   shares threads with verify and build (the engine's main pool takes `workers`, default cores - 2; on a box running
+   N plugins set `workers` = vCPU / N and `ingest-threads` = workers / 2). Known txs answer code 1 without a
+   recovery. Counters in `epochdb_health`: `pool-dup` (txs answered Known by hash), `pool-recovered`, `pool-lock-ms`
+   (lock held for the admission pass), `pool-add-ms` (wall inside add); the built line carries `poolDup`. In
+   process (`cargo test -p epochdb-chain --lib ingest_dedup -- --nocapture`): `pool.add(1000)` new 8.1 ms, the same
+   1000 again 0.40 ms, a stream with every tx 5 times interleaved 2.5 ms per 1000 with exactly 1000 recoveries in
+   all; the admission lock 1.1 ms total for 6000 txs.
+   Byzantine-safety rule kept: a recovery is skipped only when the keccak of the FULL signed envelope matches a tx
+   we recovered ourselves (`by_hash`, the pool's own admissions, also what `Pool::senders` hands to block parse) or a
+   tx of a block WE accepted after our own verify (`seen`, which answers "already known" only and never marks a tx
+   verified). Per-tx results stay independent, verify is untouched, no consensus parameter changed.
+2. Per-batch ingest timing on the RPC door (4ccbc8c): health `ingest-batches / -txs / -read-ms / -rpc-ms
+   (the epochdb_rpc crossing: JSON + hex decode and pool.add) / -add-ms (= pool-add-ms) / -decode-ms (rpc minus add)
+   / -rpc-p50-ms / -rpc-p99-ms / -inflight / -concurrency-max`, one `ingest=` field on the built line. Nothing on
+   the Go side serializes batches: no mutex around the cgo call, ghttp `HandleSimple` runs per gRPC stream; the shared
+   points are the pool lock (1-5 us per tx) and the engine's execution mutex for the state read of unseen senders.
+3. The small-batch floor (114700e). EC2 with the client's 64 connections per node sliced the stream into ~6-tx
+   bodies: `pool.add` cost ~0.75 ms per call (125 us per tx, against 8 us at 1000 per batch). The pool has no such
+   floor (`small_batch_wall`: 1 tx 46 us, 6 txs 240 us = one inline libsecp256k1 recovery each, 64 txs 1.0 ms, 1000
+   txs 7.9 ms; 6 known txs 2 us). The floor was `head_accounts`: a sender whose last tx was mined had its pool account
+   pruned, so its next tx read (nonce, balance) under the engine's execution mutex, which verify and build hold for
+   most of a busy height. Emptied sender accounts are now KEPT as the sender's state cache (re-read on every block
+   that touches them like any held sender, swept after 60 s idle). `TestAdmitSmallBatches` through the engine: 6
+   new senders 268 us, 6 cached senders after a block 258 us, 6 known 7 us. What remains per new tx is the recovery
+   (~40 us of CPU on this box, parallel across the caller goroutines); a brand-new sender still costs one engine
+   read per batch.
+4. Push gossip capacity (7ae2314 -> 0d39cc2 -> e0cf7ad). The SDK's `PushGossiper` sends ONE message of
+   `TargetMessageSize` (20 KiB, ~180 transfers) per `Gossip` call and the push loop called it once per 100 ms: 1.8k
+   tx/s from a node to its peers whatever its pool held, so a node fed by gossip alone built 175-tx blocks. Three
+   lessons, in order: (a) 7ae2314 called Gossip once per 64 KiB of newly drained bytes: the first tick after the RPC
+   node filled its pool shipped 400k txs (44 MB per peer) at once, consensus messages queued behind the gossip,
+   avalanchego's health said "block processing too long: 1m7s > 30s" (no disconnect) and the 3-node chain stalled at
+   height 24 for the rest of the run. (b) 0d39cc2, one 64 KiB round per 25 ms tick (2.6 MB/s per peer), stalled the
+   same way at avalanchego's DEFAULT per-peer inbound bandwidth throttle (`throttler-inbound-bandwidth-refill-rate`
+   512 KiB/s, burst 2 MiB): a steady rate above the throttle delays every message from that peer, consensus included.
+   With the throttle raised (refill 32 MiB/s, burst 64 MiB) the same plugin mined 1,429,733 txs in 60 s with RPC into
+   one node. (c) e0cf7ad: the plugin cannot see the node's throttle, so the DEFAULT is the SDK's rate (20 KiB per
+   `push-gossip-frequency` 100 ms, stock behaviour, safe at default flags) and the fast rate is a chain config choice.
+   The Go bloom prefilter of inbound push messages (84474a0) is removed: a bloom filter answers Has for 1.00% of txs
+   it never saw at target size (`TestGossipBloomFalsePositives`), 5% before a reset, which would silently drop
+   first-time txs; the pool's exact hash check answers duplicates at 0.4 us each. With 5 equal validators
+   `Top(0.9)` takes all five (0.8 < 0.9 pulls the fifth) and `Validators: 100` samples the rest.
+
+   DEPLOYMENT RULE: to raise gossip past ~4k transfers/s per peer set BOTH, on every validator: chain config
+   `"push-gossip-frequency":"25ms","push-gossip-target-bytes":65536` (2.6 MB/s per peer at most, ~23k transfers/s)
+   AND node flags `throttler-inbound-bandwidth-refill-rate=33554432 throttler-inbound-bandwidth-max-burst-size=67108864`.
+   The gossip keys without the node flags stall the chain. The e2e runs that shape with
+   `--chain-config-extra '{"push-gossip-frequency":"25ms","push-gossip-target-bytes":65536}' --node-flags throttler-inbound-bandwidth-refill-rate=33554432,throttler-inbound-bandwidth-max-burst-size=67108864`
+   and takes `--rpc-nodes N` to feed the load to the first N nodes only.
+5. `rpc-direct-addr` (bf3b6dc, 20a233a): MEASUREMENT ONLY, off by default, no harness sets it. A plain net/http
+   server inside the plugin process serving the same `/rpc` handler without avalanchego's HTTP server -> gRPC ghttp
+   hop, to split a client's round trip (EC2: ~24 ms per 5-tx request, of which 0.1 ms in the plugin handler) into
+   the hop and the plugin. It bypasses avalanchego's HTTP auth, API throttling and TLS: it binds loopback or private
+   (RFC 1918 / link-local) addresses only unless `rpc-direct-allow-public: true` is set too, and logs a WARN saying
+   so every time it is on. Never on a production node.
+
+Measurements, 3 all-ours validators on this box (16 threads shared, so accept gaps > 2 s summed 40-55 s of every 70 s
+span in the fan-out runs and the box, not the plugin, bounds them; the before/after pairs are like for like),
+`e2e --ours-n 3 --stock-n 0 --stress --load 60s --rate 40000 --keys 1024 --workers 8 --batch 1000`:
+
+| run | mined (load blocks) | txs/block | ms between blocks | peers' blocks / pending at build | plugin CPU (peak min) |
+|---|---|---|---|---|---|
+| before e6cdf12, fan-out (a worker per node) | 680,717 | 11,159 | 1022 | all three 16,029 at 94-217k pending | 2.1-2.4 cores each |
+| 84474a0, fan-out | 634,672 | 10,578 | 777 | all three 16,029 at 145-300k pending; poolDup 288-616k per node | 1.9-2.3 cores each |
+| before e6cdf12, RPC into ONE node | 390,088 | 4,816 | 791 | peers 179 txs at 179 pending; peers recovered 280k each | RPC node 3.7, peers 1.0 |
+| 4ccbc8c, RPC into one node | 392,395 | 3,964 | 616 | peers 178 txs at 179 pending; RPC node poolDup 117k, peers 8-26k | 3.2 / 0.9 / 0.9 |
+| 0d39cc2 or e0cf7ad + gossip keys, default node flags | STALL at height 24-25 | | | consensus starved behind gossip | |
+| 0d39cc2, raised node throttle | 1,429,733 | 6,499 | 306 | peers 1,140-1,150 txs (max 16,029) at 2.3-3.4k pending; each peer recovered 1.39M | 3.5 / 2.8 / 2.8 |
+| e0cf7ad + gossip keys, raised node throttle | 1,375,449 | 5,707 | 274 | peers ~1,150 txs; each peer recovered 1.32M | |
+
+Dedup counters, RPC-into-one shape (e0cf7ad + keys, 60 s): RPC node pool-recovered 1.99M (every RPC tx once, incl.
+the 1.3M a full pool then refused), pool-dup 2.47M (gossip echoes of its own txs), pool-lock-ms 23.7 s over 4.5M
+txs = 5 us per tx under the lock at 600k pending; peers pool-recovered 1.32M, pool-dup 1.25M, lock 1.4-1.6 s (1.1 us
+per tx). perf on the RPC node (20 s during load, 199 Hz): libsecp256k1 72% of cycles before, 69% after (that node
+recovers every RPC tx once by design and the duplicates it no longer recovers were the gossip echoes; the saving
+shows on the peers as CPU per tx admitted), keccak 3%, rayon 1.3% -> 0.6%, `Inner::settle` 6.5% -> 8.3% (it walks
+the sender's whole BTreeMap per insert, O(txs per sender) at 580 pending per sender: the next pool cost).
+
+EC2 scaling control (compare tab, 5 validators, 1000-tx batches, 4ccbc8c): client fanning every tx to every node
+31.7k mined/s, RPC into ONE node 20.2k, round-robin one node per tx 13.2k; node count x mined/s stayed ~43-53k
+box-wide with the fan-out client, which smells like the client's total send rate, so the single-entry-node number is
+the one that matters. The earlier 1.9k single-entry run was the entry node choking on 6-tx batches (item 3), not
+push gossip.
+
+Open items: a full pool still decodes and recovers txs it then refuses (the RPC node recovered 1.3M refused txs
+here; refusing on size before the recovery needs the tip, i.e. the decode but not the recovery: reorder validate ->
+cap check -> recover); two concurrent adds of the same new tx both recover it (an in-flight set); `Inner::settle`
+per insert; a brand-new sender's state read still takes the engine's execution mutex once per batch (a lock-free
+head snapshot, or batching the reads of concurrent calls); the gossip rate is a manual pairing of a chain config
+key with a node flag, the plugin cannot check the node's throttle.
+
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and
