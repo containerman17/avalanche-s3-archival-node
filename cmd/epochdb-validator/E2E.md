@@ -529,7 +529,41 @@ Compatibility (3 ours + 2 stock, `e2e --load 2m --rate 300 --keys 200`, commit 6
 ours and vice versa (functional phase incl. the nonce gap filled from stock), no invalid-block lines in the stock logs,
 0 refused; ours: Go heap 11 MB, GC 0.000, RSS 142 MB, verify p50 2.2 ms, build p50 3.4 ms.
 
-MEASUREMENTS_PLACEHOLDER
+Measurements (b3eb879 + the pool status in the built line; 2 all-ours validators on this box, 16 cores, the compare
+tab idle; `e2e --ours-n 2 --stock-n 0 --keys 1024 --workers 8 --batch 1000`, generator workers sticky per node):
+
+| run | offered / admitted | mined | blocks | build p50 / p99 | peer verify p50 / p99 | Go heap / GC / RSS |
+|---|---|---|---|---|---|---|
+| admitload at one node, --stress (1024 senders, 8 x 1000-tx batches, 30 s) | 78,848 tx/s admitted over the first 5 s, 54,230 over the next 5 s, then the 600k cap (200k slots + 400k queue) refused; 26.5k tx/s over 30 s incl. the refused stretch; batch of 1000 p50 46 ms p99 182 ms | | head +18 in 30 s (the other node got only what gossip carried, 1.8k tx/s, and built 180-tx blocks) | | | RSS 1.7 GB at 486k pending |
+| --stress, 60k offered, 2 min | 17.6k tx/s accepted by the RPC (pool full after 20 s, the rest "txpool is full") | 1,197,074 txs = 10.0k tx/s | 90 blocks, 13,301 txs/block avg (full blocks 16,029 = the 1800 KiB target), 1,382 ms apart | 130 / 480 ms | 0.8 / 193 ms (n=104) | 315 MB / 0.3% / 2.0 GB |
+| --stress, 32k offered, 2 min | 15.8k tx/s accepted | 796,624 = 6.6k tx/s | 79 blocks, 10,084 txs/block, 1,277 ms apart | 108 / 450 ms | 0.9 / 189 ms | 388 MB / 0.2% / 2.7 GB |
+| default genesis (20 M gas, 2 s ACP-226 delay), 60k offered, 2 min | 9.1k tx/s accepted | 60,048 = 500 tx/s | 73 blocks, 823 txs/block, 2,010 ms apart (the genesis paces at 2 s; not a pool number) | 12 / 78 ms | 0.8 / 16 ms | 338 MB / 0.2% / 1.1 GB |
+
+Admission is no longer the ceiling (78.8k tx/s at one node vs the 35k of go-admit's first seconds and libevm's 18k over
+30 s), and neither is the pool's head move (Accept incl. the pool: 32 ms avg over 159 accepts of 16k-tx blocks) nor
+the engine (build 130 ms, peer verify 190 ms for a 16k-tx block). The chain mines ~10k tx/s because acceptance is
+BURSTY: both nodes extend a shared chain of up to 10 unaccepted blocks (each built on the preferred block within
+100-250 ms of the previous one), then consensus accepts the whole chain within a second and nothing is accepted for
+6-16 s (`buildToAccept` 6.3 / 8.2 / 10.6 / 16.1 s on 16k-tx blocks; accept-gap analysis of the 32k run: p50 80 ms,
+p90 4.5 s, max 24.9 s, the 27 gaps over 2 s sum to 238 s of the 257 s; avalanchego's chain health check fired "block
+processing too long: 30.6 s > 30 s"). The pool is not involved: `pending` in the built line stays 100-500k, candidates
+are 18k every build, skipNonceLow is 0. Candidates for the cause, to be settled with a consensus-debug run (not done,
+the box was shared): the snowman poll cadence with 1.8 MB blocks (each PushQuery answer waits for the peer's parse +
+verify under ctx.Lock, 250-400 ms, times the virtuous commit threshold, so a 10-deep chain finalizes at once), the
+proposervm's 5 s proposer windows (`errProposerWindowNotStarted`; ACP-226's 1 ms delay does not remove them), and the
+2 MiB per-node at-large inbound throttle against 1.85 MB blocks. The generator itself adds noise once the pool is full:
+every refused 1000-tx batch makes it re-read the pending nonce of up to 128 keys (x_rpc 200k per node per run).
+
+Where the next ceilings are, in order: (1) consensus finalization latency of heavy blocks (above); (2) the per-block VM
+path serialized under ctx.Lock on each node: build 130 + peer verify 190 + parse ~50 (16k recoveries on rayon) +
+accept 32 ms = ~400 ms per 16k-tx block = 40k tx/s if consensus kept up; execution is 8-12 us per transfer in both
+build and verify; (3) the miner's 1800 KiB size target caps a block at 16,029 transfers (336.6 M of 500 M gas), a
+subnet-evm rule we keep; (4) gossip: the push gossiper carries ~1.8k tx/s to the peer (20 KiB per 100 ms tick), so a
+node that receives no RPC load builds 180-tx blocks; the per-tx `Has` crossings of the push gossiper (x_pool 15-80k
+per block interval at 600k pending) are microseconds each but the largest crossing count; (5) memory: 600k pooled txs
+= 1.7-2.7 GB RSS (the pool keeps each tx decoded plus its envelope; the parsed-block cache holds the unaccepted chain),
+and the gossip SDK's push tracking is the Go heap (300-450 MB). The 50k target needs (1) and (2) fixed: with the block
+cap at 16k txs, 50k tx/s is 3.1 blocks/s, i.e. a build + peer verify + accept + finalization round under 320 ms.
 
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 

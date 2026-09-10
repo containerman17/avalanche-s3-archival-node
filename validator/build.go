@@ -173,8 +173,9 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 			skips[c]++
 		}
 	}
+	pending, queued := vm.eng.poolStatus() // what the pool holds right after the build (its txs stay until accept)
 	fields := []zap.Field{zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
-		zap.Int("candidates", len(out.skipped)), zap.Uint64("gasUsed", out.gasUsed),
+		zap.Int("candidates", len(out.skipped)), zap.Uint64("pending", pending), zap.Uint64("queued", queued), zap.Uint64("gasUsed", out.gasUsed),
 		zap.Int("skipNonceLow", skips[1]), zap.Int("skipFailed", skips[2]), zap.Int("skipPopped", skips[3]),
 		zap.Int("skipNoGas", skips[4]), zap.Int("skipSize", skips[5]), zap.Int("skipNotReached", skips[6]),
 		zap.Duration("took", time.Since(start))}
