@@ -44,6 +44,9 @@ const SWEEP_EVERY: Duration = Duration::from_secs(30);
 /// Mined tx hashes remembered, so a gossip copy of a just-mined tx is Known
 /// without a decode (200k = ~12 full 16k-tx blocks).
 const SEEN_MAX: usize = 200_000;
+/// An emptied sender account (the cached nonce and balance) is kept this long
+/// after its last tx.
+const EMPTY_IDLE: Duration = Duration::from_secs(60);
 
 /// The per-tx admission result (the ABI's codes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,15 +447,10 @@ impl Pool {
                 g.accounts.entry(*a).or_insert_with(|| Account { txs: BTreeMap::new(), nonce, balance, exec: 0, exec_cost: U256::ZERO, head_key: None, beat: now, local });
             }
             let mut promoted = false;
-            let senders: Vec<Address> = txs.iter().map(|(_, t)| t.sender.unwrap()).collect();
             for (i, t) in txs.drain(..) {
                 let (code, message) = g.insert(t, local, &self.cfg, now, &mut promoted);
                 out[i].code = code;
                 out[i].message = message;
-            }
-            // A sender left with no tx (every one refused, or its last one evicted) holds no slot.
-            for a in senders {
-                g.prune(&a);
             }
             drop(g);
             self.lock_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -499,7 +497,6 @@ impl Pool {
                     acct.balance = balance;
                 }
                 g.settle(a);
-                g.prune(a);
             }
         }
         let now = Instant::now();
@@ -693,8 +690,7 @@ impl Inner {
 
     /// Recomputes the sender's executable prefix from its state nonce:
     /// mined (nonce below), unpayable and over-gas txs go, the prefix is
-    /// the contiguous run from the nonce, the head key follows. An emptied
-    /// sender is removed.
+    /// the contiguous run from the nonce, the head key follows.
     fn settle(&mut self, sender: &Address) {
         let head = self.head;
         let Some(acct) = self.accounts.get_mut(sender) else { return };
@@ -791,9 +787,6 @@ impl Inner {
                 self.remove_hash(&cheapest.hash);
                 if let Some(a) = victim {
                     self.settle(&a);
-                    if a != sender {
-                        self.prune(&a);
-                    }
                 }
             }
         }
@@ -834,15 +827,14 @@ impl Inner {
         if replacing { (Code::Replaced, "") } else { (Code::Ok, "") }
     }
 
-    /// Drops an account that holds no tx.
-    fn prune(&mut self, a: &Address) {
-        if self.accounts.get(a).is_some_and(|x| x.txs.is_empty()) {
-            self.accounts.remove(a);
-        }
-    }
-
+    /// The lifetime rule, and the sender cache's bound: an account left with
+    /// no tx (mined, refused, evicted) is KEPT, its nonce and balance re-read
+    /// on every block that touches it like any held sender, so the sender's
+    /// next tx admits without the engine's state read (and its execution
+    /// mutex, held by verify and build for most of a busy height); empties
+    /// idle for EMPTY_IDLE go here.
     fn expire(&mut self, now: Instant, lifetime: Duration) {
-        let idle: Vec<Address> = self.accounts.iter().filter(|(_, a)| a.exec == 0 && now.duration_since(a.beat) > lifetime).map(|(a, _)| *a).collect();
+        let idle: Vec<Address> = self.accounts.iter().filter(|(_, a)| (a.exec == 0 && now.duration_since(a.beat) > lifetime) || (a.txs.is_empty() && now.duration_since(a.beat) > EMPTY_IDLE)).map(|(a, _)| *a).collect();
         for a in idle {
             let hashes: Vec<B256> = self.accounts[&a].txs.values().map(|e| e.tx.hash).collect();
             for h in hashes {
@@ -1087,7 +1079,7 @@ mod tests {
         // A head that says a's nonce is 5: its remaining tx is old and goes.
         p.on_accept(&mined, head(), &mut state(5, 10 * ETH));
         assert_eq!(p.status(), (1, 0));
-        assert_eq!(p.pending_nonce(addr_of(&a)), None);
+        assert_eq!(p.pending_nonce(addr_of(&a)), Some(5)); // the emptied account stays as the sender cache
         // A balance drop makes b's tx unpayable at the next touch.
         let bt = p.candidates(GWEI, 10_000_000, 1 << 20, &HashMap::new());
         p.on_accept(&bt, head(), &mut state(0, 0));
@@ -1164,6 +1156,36 @@ mod tests {
         assert!(r.iter().all(|a| a.code == Code::Known));
         assert_eq!(p.recovered.load(Ordering::Relaxed), 1000);
         eprintln!("pool.add(1000): new {new_ms:.2} ms, same again {same_ms:.2} ms, 5x interleaved {dup5_ms:.2} ms per 1000 (lock {:.2} ms total)", p.lock_ns.load(Ordering::Relaxed) as f64 / 1e6);
+    }
+
+    /// The per-call floor: small batches are the real-world shape (a wallet or
+    /// gateway sends one tx per request). `--nocapture` prints us per call.
+    #[test]
+    fn small_batch_wall() {
+        let p = pool(Config { account_slots: 100, global_slots: 100_000, ..Default::default() });
+        let st = state(0, 10 * ETH);
+        let keys: Vec<Key> = (0..1100u32).map(|i| Key(SecretKey::from_slice(&keccak256(i.to_be_bytes()).0).unwrap())).collect();
+        let raw = |k: usize, nonce: u64| sign(&keys[k], nonce, GWEI, 50 * GWEI, 1);
+        let mut line = String::new();
+        let mut base = 0;
+        for n in [1usize, 6, 64, 1000] {
+            let first: Vec<Bytes> = (base..base + n).map(|k| raw(k, 0)).collect();
+            let again: Vec<Bytes> = (base..base + n).map(|k| raw(k, 1)).collect();
+            base += n;
+            let t = Instant::now();
+            assert!(p.add(first.clone(), false, &st).iter().all(|a| a.code == Code::Ok));
+            let new_us = t.elapsed().as_secs_f64() * 1e6;
+            let t = Instant::now();
+            assert!(p.add(again, false, &st).iter().all(|a| a.code == Code::Ok));
+            let cached_us = t.elapsed().as_secs_f64() * 1e6;
+            let t = Instant::now();
+            assert!(p.add(first, false, &st).iter().all(|a| a.code == Code::Known));
+            let known_us = t.elapsed().as_secs_f64() * 1e6;
+            line += &format!("{n}: new senders {new_us:.0} us, cached senders {cached_us:.0} us, known {known_us:.0} us; ");
+            let mined = p.candidates(GWEI, u64::MAX, usize::MAX, &HashMap::new());
+            p.on_accept(&mined, head(), &mut state(2, 10 * ETH));
+        }
+        eprintln!("pool.add per call: {line}");
     }
 
     #[test]

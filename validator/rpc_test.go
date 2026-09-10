@@ -122,3 +122,56 @@ func TestAdmitBatchCost(t *testing.T) {
 		t.Logf("round %d: epochdb_pool_add(1000) %v (%.1f us/tx), pending=%d", r, took, float64(took.Microseconds())/nkeys, p)
 	}
 }
+
+// Small batches are the real-world shape (a wallet or a gateway sends one tx
+// per request; the EC2 client's 64 connections per node sliced the stream to
+// ~6 txs per body). Per call through the engine: 6 txs of senders the pool
+// never saw (one engine state read), 6 more of the same senders (the pool
+// keeps an emptied sender's nonce and balance, no state read), the same 6
+// again (Known by hash: no decode, no recovery).
+func TestAdmitSmallBatches(t *testing.T) {
+	if !realEngine {
+		t.Skip("stub engine")
+	}
+	h := newHarnessWith(t, stressGenesis(), `{"tx-pool-account-slots": 1000}`)
+	const n = 6
+	keys := make([]*ecdsa.PrivateKey, n)
+	for i := range keys {
+		keys[i], _ = crypto.GenerateKey()
+		h.transfer(crypto.PubkeyToAddress(keys[i].PublicKey), new(big.Int).Mul(big.NewInt(params.Ether), big.NewInt(100)))
+	}
+	h.buildAccept()
+	to := ethcommon.HexToAddress("0x100000000000000000000000000000000000000a")
+	batch := func(nonce uint64) [][]byte {
+		raws := make([][]byte, n)
+		for k := range keys {
+			tx := types.MustSignNewTx(keys[k], h.signer, &types.DynamicFeeTx{ChainID: h.vm.config.ChainID, Nonce: nonce, To: &to, Value: big.NewInt(1), Gas: 21000,
+				GasFeeCap: big.NewInt(50 * params.GWei), GasTipCap: big.NewInt(params.GWei)})
+			raws[k], _ = tx.MarshalBinary()
+		}
+		return raws
+	}
+	add := func(name string, raws [][]byte, want uint8) time.Duration {
+		t0 := time.Now()
+		res, err := h.vm.eng.poolAdd(raws, false)
+		took := time.Since(t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range res {
+			if r.code != want {
+				t.Fatalf("%s: code %d, want %d", name, r.code, want)
+			}
+		}
+		t.Logf("%s: epochdb_pool_add(%d) %v", name, n, took)
+		return took
+	}
+	first := batch(0)
+	add("new senders", first, 0)
+	h.buildAccept() // mines them: the senders' accounts are now empty, and kept
+	add("cached senders after a block", batch(1), 0)
+	known := add("known", batch(1), 1)
+	if known > 50*time.Microsecond {
+		t.Errorf("6 known txs took %v, want under 50 us", known)
+	}
+}
