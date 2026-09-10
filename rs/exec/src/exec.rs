@@ -727,6 +727,9 @@ pub struct Executor<D: StateDb = Db> {
     /// instead of rendering the JSON on this thread (the node's checker
     /// thread renders it before the store write).
     pub defer_call_trace: bool,
+    /// The miner's block size target in bytes of tx RLP (subnet-evm: 1800 KiB);
+    /// config key `block-size-target-kib` in the node.
+    pub block_size_target: usize,
 }
 
 /// DatabaseRef over a `&mut Database` (the prestate render reads the pre-tx
@@ -782,6 +785,7 @@ impl<D: StateDb> Executor<D> {
             t_commit: Default::default(),
             trace: Trace::Call(CallConfig::default()),
             defer_call_trace: false,
+            block_size_target: TARGET_TXS_SIZE,
         }
     }
 
@@ -1276,7 +1280,7 @@ impl<D: StateDb> Executor<D> {
                 popped.push(sender);
                 continue;
             }
-            if size + t.raw.len() > TARGET_TXS_SIZE {
+            if size + t.raw.len() > self.block_size_target {
                 reasons[i] = SkipReason::Size;
                 popped.push(sender);
                 continue;

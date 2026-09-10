@@ -419,6 +419,10 @@ impl NodeEngine {
         let every_blocks = conf_u64(&conf, "roll-every-blocks").unwrap_or(ROLL_EVERY_BLOCKS);
         let every_secs = conf_u64(&conf, "roll-every-secs").unwrap_or(ROLL_EVERY_SECS);
         let grace = std::time::Duration::from_secs(conf_u64(&conf, "shutdown-grace-secs").unwrap_or(SHUTDOWN_GRACE_SECS));
+        // `block-size-target-kib`: the miner's cut on tx bytes per built block
+        // (subnet-evm's 1800 KiB); a 16k-transfer block is ~1.1 MB zstd on the
+        // wire against avalanchego's 2 MiB message limit, so there is room.
+        let block_size_target = (conf_u64(&conf, "block-size-target-kib").unwrap_or(1800) as usize) << 10;
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let workers = cpus.saturating_sub(2).max(1);
         let data = PathBuf::from(&init.chain_data_dir);
@@ -544,6 +548,7 @@ impl NodeEngine {
         let mut ex = Executor::open(cfg.clone(), Layered::new(be));
         // The callTracer JSON is rendered on the checker thread, off the verify path.
         ex.defer_call_trace = true;
+        ex.block_size_target = block_size_target;
         let ex = Ex::Native(ex);
         eprintln!(
             "epochdb-rs: chainId={} data={} roll-budget={}MB (tip {}MB) roll-every={every_blocks} blocks / {every_secs}s window-max-bytes={} shutdown-grace={}s workers={workers} dirty-workers={cpus}",
@@ -651,6 +656,7 @@ impl NodeEngine {
         );
         let mut ex = Executor::open(cfg.clone(), fw);
         ex.defer_call_trace = true;
+        ex.block_size_target = (conf_u64(&conf, "block-size-target-kib").unwrap_or(1800) as usize) << 10;
         let ex = Ex::Firewood(ex);
         eprintln!(
             "epochdb-rs: chainId={} data={} state-engine=firewood cache={}MB revisions={} kv-cache={}MB commit-every={FW_COMMIT_EVERY} window-max-bytes={} shutdown-grace={}s workers={workers}",
@@ -1152,7 +1158,7 @@ impl NodeEngine {
             Some(c) => c,
             None => {
                 let base_fee: u128 = h.base_fee.unwrap_or_default().saturating_to();
-                let target = exec::exec::TARGET_TXS_SIZE;
+                let target = ex.block_size_target;
                 let mut skip: HashMap<Address, u64> = HashMap::new();
                 for t in parent_txs {
                     if let Some(a) = t.sender {
