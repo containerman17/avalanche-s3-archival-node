@@ -271,6 +271,8 @@ pub struct Pool {
     pub recovered: AtomicU64,
     /// Nanoseconds `add` held the pool lock for its admission pass.
     pub lock_ns: AtomicU64,
+    /// Nanoseconds inside `add` in all (decode, recovery, state read, lock).
+    pub add_ns: AtomicU64,
 }
 
 /// tx.Cost(): None on overflow (refused as unpayable).
@@ -356,6 +358,7 @@ impl Pool {
             dup: AtomicU64::new(0),
             recovered: AtomicU64::new(0),
             lock_ns: AtomicU64::new(0),
+            add_ns: AtomicU64::new(0),
             cfg,
         }
     }
@@ -365,7 +368,14 @@ impl Pool {
     /// a decode or a recovery. `read` answers (nonce, balance) at the
     /// accepted head for senders the pool does not hold yet; it runs outside
     /// the pool lock and is retried when a head change lands in between.
-    pub fn add(&self, mut raws: Vec<Bytes>, local: bool, read: &dyn Fn(&[Address]) -> Vec<(u64, U256)>) -> Vec<Added> {
+    pub fn add(&self, raws: Vec<Bytes>, local: bool, read: &dyn Fn(&[Address]) -> Vec<(u64, U256)>) -> Vec<Added> {
+        let t0 = Instant::now();
+        let out = self.add_inner(raws, local, read);
+        self.add_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        out
+    }
+
+    fn add_inner(&self, mut raws: Vec<Bytes>, local: bool, read: &dyn Fn(&[Address]) -> Vec<(u64, U256)>) -> Vec<Added> {
         let local = local && self.cfg.locals;
         let mut out: Vec<Added> = raws.iter().map(|r| Added { code: Code::Known, message: "already known", hash: alloy_primitives::keccak256(r) }).collect();
         let (head, fresh) = {

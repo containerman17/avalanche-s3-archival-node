@@ -179,7 +179,7 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 		zap.Int("candidates", len(out.skipped)), zap.Uint64("pending", pending), zap.Uint64("queued", queued), zap.Uint64("gasUsed", out.gasUsed),
 		zap.Int("skipNonceLow", skips[1]), zap.Int("skipFailed", skips[2]), zap.Int("skipPopped", skips[3]),
 		zap.Int("skipNoGas", skips[4]), zap.Int("skipSize", skips[5]), zap.Int("skipNotReached", skips[6]),
-		zap.Uint64("poolDup", vm.eng.poolDup()), zap.Uint64("gossipKnown", vm.gossipKnown()),
+		zap.Uint64("poolDup", vm.eng.poolDup()), zap.Uint64("gossipKnown", vm.gossipKnown()), zap.String("ingest", vm.ingest.summary()),
 		zap.Duration("took", time.Since(start))}
 	fields = append(fields, ph.fields()...)
 	vm.ctx.Log.Info("validator: built", fields...)

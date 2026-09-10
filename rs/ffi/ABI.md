@@ -90,7 +90,7 @@ int   epochdb_account_state(epochdb_engine*, const uint8_t* addrs /* 20*n */, si
       // out: n x { uint64 nonce LE, uint8 balance[32] BE } at the given block's state (pending allowed)
 int   epochdb_head_header(epochdb_engine*, epochdb_buf* header_rlp);   // accepted head header (base fee etc. for the pool)
 int   epochdb_rpc(epochdb_engine*, const uint8_t* body, size_t, epochdb_buf* response);   // JSON-RPC, single or batch
-int   epochdb_health(epochdb_engine*, epochdb_buf* json);   // {"height","root-checked","normal-op","pool-dup" (txs answered Known by hash, no recovery),"pool-recovered","pool-lock-ms"}
+int   epochdb_health(epochdb_engine*, epochdb_buf* json);   // {"height","root-checked","normal-op","pool-dup" (txs answered Known by hash, no recovery),"pool-recovered","pool-lock-ms","pool-add-ms"}
 void  epochdb_buf_free(epochdb_buf*);
 ```
 

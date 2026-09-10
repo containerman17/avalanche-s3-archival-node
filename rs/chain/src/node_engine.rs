@@ -935,7 +935,7 @@ impl Engine for NodeEngine {
     fn health(&self) -> Result<serde_json::Value, Error> {
         let h = self.head.lock().unwrap().height;
         Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal(),
-            "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed), "pool-lock-ms": self.txpool.lock_ns.load(Ordering::Relaxed) / 1_000_000}))
+            "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed), "pool-lock-ms": self.txpool.lock_ns.load(Ordering::Relaxed) / 1_000_000, "pool-add-ms": self.txpool.add_ns.load(Ordering::Relaxed) / 1_000_000}))
     }
 
     /// Bootstrapping = the catch-up budget; NormalOp = the tip budget and

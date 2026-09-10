@@ -56,6 +56,7 @@ type VM struct {
 	net    *p2p.Network
 	push   *gossip.PushGossiper[*gossipTx]
 	set    *gossipSet
+	ingest ingestStats
 	b      *builder
 	m      *metrics
 
@@ -263,7 +264,11 @@ func (vm *VM) HealthCheck(context.Context) (interface{}, error) {
 		return nil, err
 	}
 	pending, queued := vm.eng.poolStatus()
-	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued}, nil
+	var eh struct {
+		AddMS uint64 `json:"pool-add-ms"`
+	}
+	_ = json.Unmarshal(raw, &eh)
+	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued, "ingest": vm.ingest.health(eh.AddMS)}, nil
 }
 
 func (vm *VM) Connected(ctx context.Context, id ids.NodeID, v *version.Application) error {
