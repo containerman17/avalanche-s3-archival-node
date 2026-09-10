@@ -214,11 +214,15 @@ func (vm *VM) startGossip() error {
 }
 
 // pushLoop: every push period, the pool's newly admitted txs (one crossing)
-// go to the push gossiper and the bloom filter, then as many push rounds as
-// their bytes need (the SDK sends at most pushTargetBytes per round), so a
-// node taking the RPC load ships everything new to its peers within a tick.
-// The tick is 25 ms; push-gossip-frequency below that is honoured (subnet-evm's
-// 100 ms default is not: at 20 KiB per round it carried 1.8k tx/s).
+// go to the push gossiper and the bloom filter, then ONE push round of at
+// most pushTargetBytes: the round size and the tick bound what a node sends
+// each peer (64 KiB per 25 ms = 2.6 MB/s, ~23k transfers/s; the SDK's 20 KiB
+// per 100 ms carried 1.8k tx/s). push-gossip-frequency below 25 ms is
+// honoured. Draining everything at once is NOT an option: one round per 64
+// KiB of new bytes shipped a 400k-tx pool in one tick (44 MB per peer) and
+// avalanchego dropped the peer connections (health: disconnectedValidators,
+// the chain stalled). The peer's inbound bandwidth throttle must allow the
+// rate: throttler-inbound-bandwidth-refill-rate (512 KiB/s default).
 func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duration) {
 	if period <= 0 || period > pushTick {
 		period = pushTick
@@ -231,7 +235,6 @@ func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duratio
 			return
 		case <-t.C:
 		}
-		rounds := 0 // new bytes this tick, then the Gossip calls they need
 		raws, err := vm.eng.poolDrainGossip()
 		if err != nil {
 			vm.ctx.Log.Warn("validator: pool drain failed", zap.Error(err))
@@ -239,15 +242,12 @@ func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duratio
 			txs := make([]*gossipTx, len(raws))
 			for i, r := range raws {
 				txs[i] = newGossipTx(r)
-				rounds += len(r)
 			}
 			vm.set.added(txs)
 			push.Add(txs...)
 		}
-		for rounds = rounds/pushTargetBytes + 1; rounds > 0; rounds-- {
-			if err := push.Gossip(vm.bg); err != nil && vm.bg.Err() == nil {
-				vm.ctx.Log.Warn("validator: push gossip failed", zap.Error(err))
-			}
+		if err := push.Gossip(vm.bg); err != nil && vm.bg.Err() == nil {
+			vm.ctx.Log.Warn("validator: push gossip failed", zap.Error(err))
 		}
 	}
 }

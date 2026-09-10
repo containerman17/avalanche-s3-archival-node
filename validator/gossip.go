@@ -52,8 +52,7 @@ func (gossipMarshaller) UnmarshalGossip(b []byte) (*gossipTx, error) {
 }
 
 // pushTargetBytes: one push message (the SDK sends one per Gossip call; its
-// 20 KiB default was ~180 transfers per tick). 64 KiB = ~580 transfers, and
-// the push loop calls Gossip as many times as the new bytes need.
+// 20 KiB default was ~180 transfers per tick). 64 KiB = ~580 transfers.
 const pushTargetBytes = 64 << 10
 
 const pushTick = 25 * time.Millisecond
