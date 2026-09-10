@@ -23,9 +23,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// retryDelay: subnet-evm's minimum gap between two build attempts on the
-// same parent.
-const retryDelay = 100 * time.Millisecond
+// retryDelay: the minimum gap before re-building on the SAME preferred parent
+// after an EMPTY build (every candidate skipped: already mined, or unpayable).
+// It only throttles that spin; a preference change or a non-empty build does
+// not wait it (see waitForEvent). subnet-evm uses 100 ms here, which put a
+// ~100 ms floor under every height's build; a proposervm drop is cheap and a
+// truly empty pool is rare with the fill policy, so 15 ms is enough to stop
+// the spin without pacing the pipeline.
+const retryDelay = 15 * time.Millisecond
 
 // poolWaitSlice: how long one epochdb_pool_wait blocks before the caller's
 // context is checked again (a preference change cancels the context; the
@@ -90,6 +95,11 @@ type builder struct {
 	normalOp        bool
 	lastBuildTime   time.Time
 	lastBuildParent ethcommon.Hash
+	// lastBuildEmpty: the last build on lastBuildParent reached BuildBlock and
+	// included no tx. The retry gap arms only for this case (a genuine
+	// "nothing buildable, try again shortly"); a non-empty build or a
+	// proposervm drop does not, so a new preferred parent builds at once.
+	lastBuildEmpty bool
 	// wakeUnbuilt: the last wake's PendingTxs has not reached BuildBlock yet
 	// (the snowman engine turns one wake into at most one BuildBlock, and
 	// proposervm may drop that call above the VM).
@@ -133,7 +143,7 @@ func (b *builder) setNormalOp() {
 
 func (b *builder) built(parent ethcommon.Hash, included uint64) {
 	b.mu.Lock()
-	b.lastBuildTime, b.lastBuildParent = time.Now(), parent
+	b.lastBuildTime, b.lastBuildParent, b.lastBuildEmpty = time.Now(), parent, included == 0
 	if included > 0 {
 		b.lastIncluded = included
 	}
@@ -185,6 +195,7 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 	t0 := time.Now()
 	var gap, fillWaited time.Duration
 	var free uint64
+	wakeReason := "none" // go-retrygap diagnostic: what held this wake back
 	for {
 		// Only FREE executable txs count: the preferred chain's txs stay in
 		// the pool until accept, and a build on it skips them.
@@ -218,7 +229,7 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 			}
 		}
 		b.mu.Lock()
-		lastTime, lastParent, pref, prefAt, target := b.lastBuildTime, b.lastBuildParent, b.pref, b.prefAt, b.fillTarget()
+		lastTime, lastParent, lastEmpty, pref, prefAt, target := b.lastBuildTime, b.lastBuildParent, b.lastBuildEmpty, b.pref, b.prefAt, b.fillTarget()
 		b.mu.Unlock()
 
 		// Fill policy: a fresh parent holds the build until the pool has
@@ -227,6 +238,7 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 		// repeated parent skips this and takes the retry gap below.
 		if lastParent != ethcommon.Hash(preferred) && free < target {
 			if left := time.Until(prefAt.Add(b.fill.wait)); left > 0 {
+				wakeReason = "fill-wait"
 				select {
 				case <-ctx.Done():
 					return 0, ctx.Err()
@@ -239,16 +251,16 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 			}
 		}
 
-		// The retry gap applies to a REPEATED build on the same preferred
-		// parent (our block is out and consensus has not moved yet). A new
-		// preferred block, ours or a peer's, builds at once: the engine's
-		// candidates skip the txs of the unaccepted ancestors, so nothing is
-		// re-offered. Both waits end when the preference moves (SetPreference
-		// closes pref; the ChangeNotifier also cancels this WaitForEvent) and
-		// the loop re-evaluates against the new parent.
+		// The retry gap throttles ONLY a repeated build on the same preferred
+		// parent whose LAST build was empty (every candidate skipped): without
+		// it WaitForEvent spins on the same unbuildable pool. A non-empty build
+		// on this parent, or a proposervm drop (BuildBlock never reached us),
+		// does not wait: the parent is about to change (SetPreference closes
+		// pref and re-evaluates the loop) so a new preferred block, ours or a
+		// peer's, builds at once and removes the ~100 ms per-height floor.
 		var next time.Time
 		reason, counter := "", (*atomic.Uint64)(nil)
-		if lastParent == ethcommon.Hash(preferred) {
+		if lastParent == ethcommon.Hash(preferred) && lastEmpty {
 			next, reason, counter = lastTime.Add(retryDelay), "retry-gap-wait", &b.stats.gapWait
 		} else if preferred == ids.ID(h.Hash()) {
 			next, reason, counter = minNextBlockTime(h), "min-delay-wait", &b.stats.delayWait // Granite: the wait lives here, not in BuildBlock
@@ -257,6 +269,7 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 		if gap <= 0 {
 			break
 		}
+		wakeReason = reason
 		cut := func(by string) {
 			counter.Add(1)
 			b.log.Info("validator: build-skip", zap.String("reason", reason), zap.String("by", by), zap.Uint64("head", h.Number.Uint64()),
@@ -278,9 +291,11 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 	b.mu.Lock()
 	b.wakeUnbuilt = true
 	b.lastFillWait, b.lastFree = fillWaited, free
+	sincePreferred := time.Since(b.prefAt)
 	b.mu.Unlock()
 	b.log.Info("validator: wake", zap.Uint64("head", h.Number.Uint64()), zap.Stringer("preferred", preferred), zap.Duration("poolWait", time.Since(t0)-max(gap, 0)-fillWaited),
-		zap.Duration("gap", max(gap, 0)), zap.Duration("fillWaited", fillWaited), zap.Uint64("free", free))
+		zap.Duration("gap", max(gap, 0)), zap.Duration("fillWaited", fillWaited), zap.Uint64("free", free),
+		zap.Duration("sincePreferred", sincePreferred), zap.String("delayReason", wakeReason))
 	return common.PendingTxs, nil
 }
 
@@ -359,8 +374,10 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	pending, queued := vm.eng.poolStatus() // what the pool holds right after the build (its txs stay until accept)
 	vm.b.mu.Lock()
 	fillWaited, freeAtBuild := vm.b.lastFillWait, vm.b.lastFree
+	sincePreferred := time.Since(vm.b.prefAt)
 	vm.b.mu.Unlock()
 	fields := []zap.Field{zap.Uint64("height", parent.Number.Uint64()+1), zap.Uint64("included", out.included),
+		zap.Duration("sincePreferred", sincePreferred),
 		zap.Duration("fillWaited", fillWaited), zap.Uint64("freeAtBuild", freeAtBuild),
 		zap.Int("candidates", len(out.skipped)), zap.Uint64("pending", pending), zap.Uint64("queued", queued), zap.Uint64("gasUsed", out.gasUsed),
 		zap.Int("skipNonceLow", skips[1]), zap.Int("skipFailed", skips[2]), zap.Int("skipPopped", skips[3]),
