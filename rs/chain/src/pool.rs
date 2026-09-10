@@ -268,8 +268,10 @@ struct Account {
     /// Last activity (the lifetime rule).
     beat: Instant,
     local: bool,
-    /// The last RECENT_MAX (nonce, outcome, when) events of this sender.
-    recent: VecDeque<(u64, Outcome, Instant)>,
+    /// The last outcome per nonce, the RECENT_MAX lowest nonces kept (the
+    /// gap the report explains sits just above `nonce`, so a hot sender's
+    /// churn on higher nonces never evicts it).
+    recent: BTreeMap<u64, (Outcome, Instant)>,
 }
 
 impl Account {
@@ -278,10 +280,11 @@ impl Account {
     }
 
     fn note(&mut self, nonce: u64, what: Outcome) {
-        if self.recent.len() >= RECENT_MAX {
-            self.recent.pop_front();
+        self.recent.insert(nonce, (what, Instant::now()));
+        while self.recent.len() > RECENT_MAX {
+            let hi = *self.recent.keys().next_back().unwrap();
+            self.recent.remove(&hi);
         }
-        self.recent.push_back((nonce, what, Instant::now()));
     }
 }
 
@@ -521,7 +524,7 @@ impl Pool {
             }
             let t_lock = Instant::now();
             for (a, (nonce, balance)) in need.iter().zip(states) {
-                g.accounts.entry(*a).or_insert_with(|| Account { txs: BTreeMap::new(), nonce, balance, exec: 0, exec_cost: U256::ZERO, head_key: None, beat: now, local, recent: VecDeque::new() });
+                g.accounts.entry(*a).or_insert_with(|| Account { txs: BTreeMap::new(), nonce, balance, exec: 0, exec_cost: U256::ZERO, head_key: None, beat: now, local, recent: BTreeMap::new() });
             }
             let mut promoted = false;
             for (i, t) in txs.drain(..) {
@@ -820,8 +823,8 @@ impl Pool {
             let Some((&low, _)) = a.txs.iter().next() else { continue };
             let mut line = format!("{addr}: pool nonce {}, state nonce {state_nonce}, lowest queued {low} ({} queued);", a.nonce, a.txs.len());
             for n in a.nonce..low.min(a.nonce + 4) {
-                let ev: Vec<String> = a.recent.iter().filter(|(x, _, _)| *x == n).map(|(_, o, t)| format!("{o:?} {:.0?} ago", now.duration_since(*t))).collect();
-                line += &format!(" nonce {n}: {}", if ev.is_empty() { "no record".to_string() } else { ev.join(", ") });
+                let ev = a.recent.get(&n).map_or("no record".to_string(), |(o, t)| format!("{o:?} {:.0?} ago", now.duration_since(*t)));
+                line += &format!(" nonce {n}: {ev}");
             }
             out.push(line);
         }
@@ -1331,6 +1334,41 @@ mod tests {
         assert_eq!(codes(&r), [Code::Ok]);
         assert_eq!(p.status(), (2, 0));
         assert!(p.gap_report(3, &st).is_empty());
+    }
+
+    /// The gap report keeps the stuck LOW nonce's fate even when the sender
+    /// churns on higher nonces (a re-pricing client hammering a full pool):
+    /// the ring is nonce-keyed and evicts the highest, never the gap.
+    #[test]
+    fn gap_report_retains_the_low_nonce_under_churn() {
+        // Global cap 3, no account cap in the way: the eviction path decides.
+        let p = pool(Config { account_slots: 100, account_queue: 100, global_slots: 3, global_queue: 0, ..Default::default() });
+        let st = state(0, 100 * ETH);
+        let a = key(19);
+        // Fill the pool with three 5 gwei txs of other senders.
+        for i in 21..24u8 {
+            p.add(vec![sign(&key(i), 0, 5 * GWEI, 50 * GWEI, 1)], false, &st);
+        }
+        assert_eq!(p.status().0, 3);
+        // a's needed nonce 0 at 1 gwei: full pool, cheaper than the cheapest
+        // -> Underpriced (the round-9 lockout of a sender's next nonce).
+        assert_eq!(codes(&p.add(vec![sign(&a, 0, GWEI, 50 * GWEI, 1)], false, &st)), [Code::Underpriced]);
+        // Then hammer a with 12 higher (gapped) nonces, all Underpriced too:
+        // 12 > RECENT_MAX, so a recency ring would drop nonce 0.
+        for n in 10..22u64 {
+            assert_eq!(codes(&p.add(vec![sign(&a, n, GWEI, 50 * GWEI, 1)], false, &st)), [Code::Underpriced]);
+        }
+        // a holds nothing (all refused) but the pool remembers nonce 0's fate.
+        let rep = p.gap_report(3, &st);
+        assert!(rep.is_empty(), "a holds no txs, so no gap line: {rep}");
+        // Give a a queued nonce 30 (drop a filler first so there is room).
+        p.on_accept(&p.candidates(5 * GWEI, u64::MAX, usize::MAX, &HashMap::new())[..1].to_vec(), head(), &mut state(1, 100 * ETH));
+        assert_eq!(codes(&p.add(vec![sign(&a, 30, GWEI, 50 * GWEI, 1)], false, &st)), [Code::Ok]);
+        // Now a is exec==0 with a queued tx: the report names it, and nonce 0
+        // still reads Rejected(Underpriced), not "no record".
+        let rep = p.gap_report(3, &st);
+        assert!(rep.contains(&format!("{}:", addr_of(&a))), "{rep}");
+        assert!(rep.contains("nonce 0: Rejected(Underpriced)"), "the low gap nonce rolled out of the ring: {rep}");
     }
 
     #[test]
