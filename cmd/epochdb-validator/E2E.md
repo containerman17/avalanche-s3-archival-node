@@ -916,3 +916,53 @@ p50 10-11 ms (max 45-88 ms) after `built` on both nodes.
 9. Pool memory: geth's pool keeps every pending tx decoded (~1-2 KB each); per-account slots are the effective cap.
    Chain configs for a validator should keep `tx-pool-account-slots` small (16 default) unless a few senders are meant
    to burst.
+
+## Build pipelining: wakes that build nothing, and a wake that fires only for free txs (branch go-pipeline off rust f270a0c, 2026-09-11 JST)
+
+Fleet round 3 (5 validators): `validator: wake` 713 vs `built` 386 on a proposer, heights in flight p50 0, accepted ->
+next built 68 ms p50. How avalanchego drives the wake (read from 1.14.3 source, nothing of it changed): the handler's
+`NotificationForwarder` calls `WaitForEvent` once, forwards the `PendingTxs` as one `Notify`, and re-subscribes only
+after the `ChangeNotifier` (wrapping the proposervm) fires `OnChange`, i.e. after every `BuildBlock` attempt (dropped
+or not) and every changed `SetPreference`; `OnChange` also CANCELS a WaitForEvent in progress, so a preference change
+already interrupted our retry-gap sleep through the gRPC context. proposervm's own `WaitForEvent` only calls ours when
+`timeToBuild` (the Windower's slot for THIS node on the current preferred parent, `proposervm-min-block-delay` 0 from
+tmpnet) is due, and its `BuildBlock` drops with `errUnexpectedProposer` ("build block dropped" debug line, snowman's
+`blks_built_failed` counter) when the slot moved between the wake and the call. So one wake pairs with at most one
+BuildBlock, and a wake with no block is one of:
+
+| `validator: build-skip` reason | where | means |
+|---|---|---|
+| `proposervm-window` | next WaitForEvent entry | PendingTxs returned, no BuildBlock reached the VM before the next subscription: proposervm dropped it (a) |
+| `engine-empty` | BuildBlock | `epochdb_build` included nothing: every candidate held by the parent chain or skipped (b) |
+| `engine-error` | BuildBlock | `epochdb_build` failed |
+| `retry-gap-wait` / `min-delay-wait` | WaitForEvent | the 100 ms gap / Granite delay was cut by a preference change (`by`: preference or cancel, `waited`: time lost) |
+
+Counters (`wakes`, `builds`, `blocks`, `skip*`) ride on every `validator: built` line and in the health check under
+`build`. Fleet reading for (a): the plugin's `skipProposervmWindow`, or avalanchego's `avalanche_<chain>_blks_built_failed`
+minus the plugin's `epochdb_build_empty_total` (a dropped BuildBlock never reaches the VM, an empty one does).
+
+Change (7e8fcec): `epochdb_pool_wait(parent_id)`: the pool's wait predicate (`Pool::wait_free`, `Inner::has_free`)
+counts only executable txs the unaccepted chain under the preferred block does not hold, the same skip set the build
+uses (`node_engine::held_nonces`, shared), so the wake fires only when a build would include something; the retry-gap
+and min-delay waits also end on our own `SetPreference` (a channel the builder closes) and re-evaluate against the
+new parent; pool wait slice 200 -> 50 ms. Retry-gap semantics unchanged (100 ms after a build on the same parent).
+
+Local proof, 3 all-ours --stress validators on this 16-thread box, `e2e --ours-n 3 --stock-n 0 --stress --load 60s
+--rate 40000 --keys 1024 --workers 8 --batch 1000 --chain-config-extra '{"push-gossip-frequency":"25ms",
+"push-gossip-target-bytes":262144}' --node-flags throttler-inbound-bandwidth-refill-rate=33554432,
+throttler-inbound-bandwidth-max-burst-size=67108864 --node-log-level debug`, load heights 9..155, per node:
+
+| build | wakes / built per node | build-skip | proposervm "build block dropped" | in flight after accept p50 / p90 / max | accepted(h-1) -> built(h) p50 | blocks/s | txs/block | mined/s |
+|---|---|---|---|---|---|---|---|---|
+| f270a0c (before) | 62/52, 43/41, 68/55 | not classified; snowman "failed building block" = 14, 6, 23, all `no transactions to build with` (engine-empty) | 0, 0, 0 | 3 / 7 / 10 | -1.5 to -1.8 s (built before the parent accepted) | 1.72 | 14,082 | 24.2k |
+| 7e8fcec minus the SetPreference channel | 46/46, 42/42, 60/61 | 0 engine-empty, 0 gap cuts, 2 proposervm-window (functional phase) | 0, 0, 0 | 3 / 6 / 9 | -1.6 s | 1.72 | 14,001 | 24.1k |
+| 7e8fcec | 52/52, 48/48, 46/46 | 0 engine-empty, 0 gap cuts, 1 proposervm-window in the load phase = the one "build block dropped" avalanchego logged on that node | 0, 0, 1 | 4 / 6 / 11 | -1.7 to -2.3 s | 1.58 | 13,751 | 21.8k (run-to-run noise on this shared box: 641 vs 608 ms between blocks, CPU-bound 14k-tx blocks) |
+
+Reading: on this box (b) is everything: every wasted wake before was an empty engine build (14 + 6 + 23 of 173 wakes,
+32%), and with the free-tx wait wakes == builds == blocks; proposervm dropped nothing here because a 3-node chain with
+600 ms blocks rarely moves the slot between wake and build. The fleet's 5-node round-3 pattern (wakes without any
+BuildBlock) is (a), now countable as `skipProposervmWindow` without debug logs. This box cannot reproduce the fleet's
+"in flight p50 0": builds start 1.5-2 s BEFORE the parent is accepted here (in flight p50 3-4) because verify + accept
+of 14k-tx blocks, not the wake, paces it; the fleet's 4k-tx / 30-50 ms regime needs the fleet run for the before/after
+on accepted -> next built. Nothing in verification or consensus changed; proposervm's window rules are untouched.
+`go test -count=1 ./validator/` (real and `-tags epochdb_stub`), `cargo test -p epochdb-chain` pass.
