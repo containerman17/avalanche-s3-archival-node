@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/database"
@@ -258,7 +259,8 @@ func (vm *VM) HealthCheck(context.Context) (interface{}, error) {
 		return nil, err
 	}
 	pending, queued := vm.pool.Stats()
-	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued, "removed": vm.drops.counts(), "settled": vm.chain.isSettled()}, nil
+	return map[string]any{"engine": json.RawMessage(raw), "pending": pending, "queued": queued, "removed": vm.drops.counts(),
+		"poolErrors": vm.drops.errors.Load(), "settled": vm.chain.isSettled()}, nil
 }
 
 func (vm *VM) Connected(ctx context.Context, id ids.NodeID, v *version.Application) error {
@@ -526,6 +528,7 @@ func processRSS() float64 {
 type dropLogHandler struct {
 	slog.Handler
 	removed *prometheus.CounterVec
+	errors  atomic.Uint64 // records at Error: libevm's pool never returns these ("Failed to reset txpool state" keeps its old state)
 	mu      sync.Mutex
 	n       map[string]uint64
 }
@@ -546,6 +549,9 @@ func (h *dropLogHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 	if r.Level < slog.LevelWarn {
 		return nil
+	}
+	if r.Level >= slog.LevelError {
+		h.errors.Add(1)
 	}
 	return h.Handler.Handle(ctx, r)
 }

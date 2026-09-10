@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ava-labs/avalanchego/ids"
 	ethcommon "github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
+	"github.com/ava-labs/libevm/core/types"
 	slog "golang.org/x/exp/slog"
 )
 
@@ -87,5 +89,47 @@ func TestRemovalReason(t *testing.T) {
 	}
 	if got := h.counts(); got["old"] != 4 || got["unpayable"] != 1 || got["invalidated"] != 1 {
 		t.Fatalf("counts %v", got)
+	}
+}
+
+// TestResetAtLaggedHead: the pool's reset loop can lag several accepts
+// (four accepts in 25 ms were seen); each reset then asks StateAt for the
+// root of a block below the head. Every such reset must succeed (a failed
+// one logs "Failed to reset txpool state" and keeps the pool's old nonce
+// view: 6k txs mined, then no landings for 15 s) and leave the pool's nonce
+// view equal to the engine's.
+func TestResetAtLaggedHead(t *testing.T) {
+	if !realEngine {
+		t.Skip("stub engine")
+	}
+	h := newHarness(t)
+	to := ethcommon.HexToAddress("0x1000000000000000000000000000000000000009")
+	heads := []*types.Header{h.vm.chain.CurrentBlock()}
+	for i := 0; i < 4; i++ {
+		h.transfer(to, big.NewInt(1))
+		h.buildAccept()
+		h.vm.chain.settle()
+		heads = append(heads, h.vm.chain.CurrentBlock())
+	}
+	// The lagging loop's calls: one reset per accepted step, all below the head now.
+	for i := 1; i < len(heads); i++ {
+		if _, err := h.vm.chain.StateAt(heads[i].Root); err != nil {
+			t.Fatalf("StateAt(root of height %d): %v", heads[i].Number.Uint64(), err)
+		}
+		h.vm.chain.sub.Reset(heads[i-1], heads[i])
+	}
+	if n := h.vm.drops.errors.Load(); n != 0 {
+		t.Fatalf("libevm logged %d errors during the lagged resets", n)
+	}
+	raw, err := h.vm.eng.accountState([]ethcommon.Address{h.addr}, ids.Empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eng, pool := decodeAccount(raw).Nonce, h.vm.pool.Nonce(h.addr); eng != 4 || pool != eng {
+		t.Fatalf("engine nonce %d, pool nonce %d, want 4", eng, pool)
+	}
+	// A root nobody accepted is answered too: the pool's reset must never fail.
+	if _, err := h.vm.chain.StateAt(ethcommon.HexToHash("0x0879")); err != nil {
+		t.Fatalf("StateAt(unknown root): %v", err)
 	}
 }

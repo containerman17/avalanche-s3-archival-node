@@ -49,7 +49,6 @@ type poolChain struct {
 	mu     sync.RWMutex
 	head   *types.Header
 	headID ids.ID
-	recent map[common.Hash]ids.ID // root -> block id of the last few heads
 
 	moving  int // head moves in flight (Accept started, pool reset not landed)
 	settled *sync.Cond
@@ -61,7 +60,7 @@ type poolChain struct {
 }
 
 func newPoolChain(eng *engine, config *params.ChainConfig, head *types.Header, headID ids.ID, log logging.Logger) *poolChain {
-	c := &poolChain{eng: eng, config: config, log: log, recent: map[common.Hash]ids.ID{}}
+	c := &poolChain{eng: eng, config: config, log: log}
 	c.settled = sync.NewCond(&c.mu)
 	c.acct = &accountCache{eng: eng, warn: func(msg string, err error) { log.Warn(msg, zap.Error(err)) }, entries: map[common.Address]types.StateAccount{}}
 	c.setHead(head, headID)
@@ -111,17 +110,8 @@ func (c *poolChain) setHead(h *types.Header, id ids.ID) {
 	c.mu.Lock()
 	old := c.head
 	c.head, c.headID = h, id
-	c.recent[h.Root] = id
-	if len(c.recent) > 16 {
-		for r, rid := range c.recent {
-			if rid != id {
-				delete(c.recent, r)
-				break
-			}
-		}
-	}
 	c.mu.Unlock()
-	c.acct.refresh(h.Root)
+	c.acct.refresh()
 	if c.sub == nil {
 		return // Initialize: the pool does not exist yet, it starts on this head
 	}
@@ -170,6 +160,16 @@ func (c *poolChain) GetBlock(hash common.Hash, number uint64) *types.Block {
 	return &blk
 }
 
+// StateAt answers every root with the accepted head's accounts. The pool
+// asks for the root of an accepted block only (its reset walks the accepted
+// chain: CurrentBlock and GetBlock), and when its loop lags several accepts
+// that root is below the head. The engine keeps no readable state for a
+// rolled-past block, and the head's nonces and balances are what the pool
+// wants anyway (the next reset would serve them). It must never fail: on an
+// error legacypool logs "Failed to reset txpool state" and keeps its old
+// state, so the pool's nonce view goes stale until another head lands (seen
+// with a bounded root -> id map here: 4 accepts in 25 ms, one root evicted,
+// 6k txs mined then no landings for 15 s).
 func (c *poolChain) StateAt(root common.Hash) (*state.StateDB, error) {
 	return state.New(root, (*stateDB)(c), nil)
 }
@@ -182,17 +182,7 @@ func (c *poolChain) SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event
 type stateDB poolChain
 
 func (d *stateDB) OpenTrie(root common.Hash) (state.Trie, error) {
-	c := (*poolChain)(d)
-	c.mu.RLock()
-	id, ok := c.recent[root]
-	c.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("validator: no state for root %s", root)
-	}
-	if id == c.headID {
-		id = ids.Empty // the accepted head, whatever it is by the time the read happens
-	}
-	return &accountTrie{cache: c.acct, root: root, block: id}, nil
+	return &accountTrie{cache: (*poolChain)(d).acct, root: root}, nil
 }
 
 func (d *stateDB) OpenStorageTrie(common.Hash, common.Address, common.Hash, state.Trie) (state.Trie, error) {
@@ -210,24 +200,22 @@ func (d *stateDB) TrieDB() *triedb.Database    { return nil }
 
 var errUnsupported = fmt.Errorf("validator: the pool state reader answers accounts only")
 
-// accountCache: nonce + balance per address, valid for one state root.
-// Misses cross once per address; refresh re-reads every entry in one
-// crossing when the head moves.
+// accountCache: nonce + balance per address at the accepted head. Misses
+// cross once per address (warm: once per batch); refresh re-reads every
+// entry in one crossing when the head moves.
 type accountCache struct {
 	eng     *engine
 	warn    func(string, error)
 	mu      sync.Mutex
-	root    common.Hash
 	entries map[common.Address]types.StateAccount
 	errs    atomic.Uint64 // engine read failures (each one makes an account look empty to the pool)
 }
 
 const maxCachedAccounts = 8192
 
-func (a *accountCache) refresh(root common.Hash) {
+func (a *accountCache) refresh() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.root = root
 	if len(a.entries) > maxCachedAccounts {
 		a.entries = map[common.Address]types.StateAccount{}
 	}
@@ -256,27 +244,55 @@ func (a *accountCache) refresh(root common.Hash) {
 	}
 }
 
-func (a *accountCache) get(addr common.Address, root common.Hash, block ids.ID) (types.StateAccount, error) {
+// warm reads the accounts the cache lacks among addrs at the accepted head
+// in one crossing: a batch's senders before the pool validates them one by
+// one under its lock (a miss there is one crossing per sender).
+func (a *accountCache) warm(addrs []common.Address) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if root == a.root {
-		if acc, ok := a.entries[addr]; ok {
-			return acc, nil
+	var miss []common.Address
+	seen := make(map[common.Address]struct{}, len(addrs))
+	for _, addr := range addrs {
+		if _, dup := seen[addr]; dup || addr == (common.Address{}) {
+			continue
+		}
+		seen[addr] = struct{}{}
+		if _, ok := a.entries[addr]; !ok {
+			miss = append(miss, addr)
 		}
 	}
-	raw, err := a.eng.accountState([]common.Address{addr}, block)
-	if err != nil && block != ids.Empty {
-		raw, err = a.eng.accountState([]common.Address{addr}, ids.Empty) // a rolled-past head: read the accepted one
+	if len(miss) == 0 {
+		return
 	}
+	raw, err := a.eng.accountState(miss, ids.Empty)
+	if err != nil {
+		a.errs.Add(1)
+		a.warn("validator: account warm failed", err)
+		return
+	}
+	for i, addr := range miss {
+		a.entries[addr] = decodeAccount(raw[i*40 : i*40+40])
+	}
+}
+
+// get answers at the accepted head (see StateAt). It used to key the cache
+// by the root the pool asked for and miss on every read of a lagging reset:
+// 3841 crossings under the pool lock at 1024 senders, 27 s when the engine
+// was busy, with the builder and every admitter waiting.
+func (a *accountCache) get(addr common.Address) (types.StateAccount, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if acc, ok := a.entries[addr]; ok {
+		return acc, nil
+	}
+	raw, err := a.eng.accountState([]common.Address{addr}, ids.Empty)
 	if err != nil {
 		a.errs.Add(1)
 		a.warn("validator: account read failed, the pool sees an empty account", err)
 		return types.StateAccount{}, err
 	}
 	acc := decodeAccount(raw)
-	if root == a.root {
-		a.entries[addr] = acc
-	}
+	a.entries[addr] = acc
 	return acc, nil
 }
 
@@ -288,15 +304,15 @@ func decodeAccount(b []byte) types.StateAccount {
 	return types.StateAccount{Nonce: nonce, Balance: new(uint256.Int).SetBytes32(b[8:40]), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash[:]}
 }
 
-// accountTrie is the read-only state.Trie the pool's StateDB sits on.
+// accountTrie is the read-only state.Trie the pool's StateDB sits on (an
+// accepted head's root; the reads answer at the accepted head, see get).
 type accountTrie struct {
 	cache *accountCache
 	root  common.Hash
-	block ids.ID
 }
 
 func (t *accountTrie) GetAccount(addr common.Address) (*types.StateAccount, error) {
-	acc, err := t.cache.get(addr, t.root, t.block)
+	acc, err := t.cache.get(addr)
 	if err != nil {
 		return nil, err
 	}
