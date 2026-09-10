@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,6 +150,8 @@ func main() {
 	oursN := flag.Int("ours-n", 3, "validators running our plugin")
 	stockN := flag.Int("stock-n", 2, "validators running the stock plugin")
 	slots := flag.Int("account-slots", 1000, "tx-pool-account-slots of the chain config (pending txs per sender; the pool's depth is keys x this)")
+	nodeLog := flag.String("node-log-level", "info", "avalanchego log-level for every node (verbo logs every consensus vote and network message)")
+	nodeFlags := flag.String("node-flags", "", "extra avalanchego flags for every node, comma separated key=value")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
 		flag.Usage()
@@ -175,7 +178,13 @@ func main() {
 	network.Genesis = testGenesis
 	network.DefaultFlags = tmpnet.FlagsMap{config.MinStakeDurationKey: "2s"}
 	network.DefaultFlags.SetDefaults(tmpnet.DefaultE2EFlags())
-	network.DefaultFlags[config.LogLevelKey] = "info"
+	network.DefaultFlags[config.LogLevelKey] = *nodeLog
+	network.DefaultFlags[config.LogDisplayLevelKey] = "info"
+	for _, kv := range strings.Split(*nodeFlags, ",") {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			network.DefaultFlags[k] = v
+		}
+	}
 	network.PreFundedKeys = []*secp256k1.PrivateKey{key}
 	network.DefaultRuntimeConfig = tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago}}
 	vmID, err := ids.FromString(subnetEVMID)
@@ -582,6 +591,76 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 	fmt.Printf("load done: sent=%d failed=%d in %s (%.0f tx/s offered)\n", sent.Load(), failed.Load(), dur, float64(sent.Load())/dur.Seconds())
 	time.Sleep(5 * time.Second)
 	fmt.Println("final ours metrics:", d.goStats())
+	d.consensusMetrics()
+	d.acceptGaps()
+}
+
+// acceptGaps prints the distribution of the time between consecutive
+// "validator: accepted" lines on every ours node (the chain log incl. its
+// rotated files): bursty acceptance shows as a p50 of milliseconds next to a
+// p90 of seconds.
+func (d *driver) acceptGaps() {
+	re := regexp.MustCompile(`^\[(\d\d-\d\d\|\d\d:\d\d:\d\d\.\d+)\].*validator: accepted`)
+	for _, n := range d.nodes {
+		if n.kind != "ours" {
+			continue
+		}
+		files, _ := filepath.Glob(filepath.Join(n.DataDir, "logs", network.Subnets[0].Chains[0].ChainID.String()+"*.log"))
+		var ts []time.Time
+		for _, f := range files {
+			raw, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			for _, l := range strings.Split(string(raw), "\n") {
+				if m := re.FindStringSubmatch(l); m != nil {
+					if t, err := time.Parse("01-02|15:04:05.000", m[1]); err == nil {
+						ts = append(ts, t)
+					}
+				}
+			}
+		}
+		sort.Slice(ts, func(i, j int) bool { return ts[i].Before(ts[j]) })
+		var gaps []time.Duration
+		var over2 time.Duration
+		for i := 1; i < len(ts); i++ {
+			g := ts[i].Sub(ts[i-1])
+			gaps = append(gaps, g)
+			if g > 2*time.Second {
+				over2 += g
+			}
+		}
+		if len(gaps) == 0 {
+			continue
+		}
+		sort.Slice(gaps, func(i, j int) bool { return gaps[i] < gaps[j] })
+		q := func(f float64) time.Duration { return gaps[min(int(float64(len(gaps))*f), len(gaps)-1)] }
+		fmt.Printf("accept gaps %s: n=%d span=%s p50=%s p90=%s p99=%s max=%s; gaps>2s sum %s\n", n.NodeID, len(gaps),
+			ts[len(ts)-1].Sub(ts[0]).Round(time.Millisecond), q(.5).Round(time.Millisecond), q(.9).Round(time.Millisecond),
+			q(.99).Round(time.Millisecond), gaps[len(gaps)-1].Round(time.Millisecond), over2.Round(time.Millisecond))
+	}
+}
+
+// consensusMetrics prints, per node, the avalanchego counters that tell
+// where a block waits between issue and accept: snowman polls and
+// processing set, the handler's lock and queue, the network timeouts and the
+// inbound byte throttler.
+func (d *driver) consensusMetrics() {
+	re := regexp.MustCompile(`_(polls_successful|polls_failed|blks_processing|blks_build_accept_latency_(sum|count)|handler_locking_time|blks_accepted_(sum|count)|blks_rejected_count|byte_throttler_inbound_acquire_latency_sum|bandwidth_throttler_inbound_acquire_latency_sum|requests_(current_timeout|average_latency|timeouts|pending_timeouts))( |\{)`)
+	for _, n := range d.nodes {
+		resp, err := http.Get(n.GetAccessibleURI() + "/ext/metrics")
+		if err != nil {
+			continue
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		fmt.Printf("consensus metrics %s %s:\n", n.kind, n.NodeID)
+		for _, l := range strings.Split(string(raw), "\n") {
+			if re.MatchString(l) && !strings.HasPrefix(l, "#") {
+				fmt.Println("  ", l)
+			}
+		}
+	}
 }
 
 func rawTxReq(id int, tx *types.Transaction) string {

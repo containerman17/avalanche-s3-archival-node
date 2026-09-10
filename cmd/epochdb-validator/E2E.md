@@ -547,8 +547,8 @@ BURSTY: both nodes extend a shared chain of up to 10 unaccepted blocks (each bui
 6-16 s (`buildToAccept` 6.3 / 8.2 / 10.6 / 16.1 s on 16k-tx blocks; accept-gap analysis of the 32k run: p50 80 ms,
 p90 4.5 s, max 24.9 s, the 27 gaps over 2 s sum to 238 s of the 257 s; avalanchego's chain health check fired "block
 processing too long: 30.6 s > 30 s"). The pool is not involved: `pending` in the built line stays 100-500k, candidates
-are 18k every build, skipNonceLow is 0. Candidates for the cause, to be settled with a consensus-debug run (not done,
-the box was shared): the snowman poll cadence with 1.8 MB blocks (each PushQuery answer waits for the peer's parse +
+are 18k every build, skipNonceLow is 0. Candidates for the cause at the time (settled by "Consensus cadence" below: the third one, avalanchego's 512 KiB/s
+per-peer inbound bandwidth throttle): the snowman poll cadence with 1.8 MB blocks (each PushQuery answer waits for the peer's parse +
 verify under ctx.Lock, 250-400 ms, times the virtuous commit threshold, so a 10-deep chain finalizes at once), the
 proposervm's 5 s proposer windows (`errProposerWindowNotStarted`; ACP-226's 1 ms delay does not remove them), and the
 2 MiB per-node at-large inbound throttle against 1.85 MB blocks. The generator itself adds noise once the pool is full:
@@ -564,6 +564,69 @@ per block interval at 600k pending) are microseconds each but the largest crossi
 = 1.7-2.7 GB RSS (the pool keeps each tx decoded plus its envelope; the parsed-block cache holds the unaccepted chain),
 and the gossip SDK's push tracking is the Go heap (300-450 MB). The 50k target needs (1) and (2) fixed: with the block
 cap at 16k txs, 50k tx/s is 3.1 blocks/s, i.e. a build + peer verify + accept + finalization round under 320 ms.
+
+## Consensus cadence: why acceptance came in bursts (branch rs-consensus off rs-mempool 0fe90b4, 2026-09-10 JST)
+
+Setup: 2 all-ours validators, `--stress`, `--load 90s --rate 60000 --keys 1024 --workers 8 --batch 1000`, avalanchego
+1.14.2 with `--node-log-level verbo` (every consensus vote and every network message logged; note that verbo writes
+the whole message as base64, so 8 MB x 7 rotated files keep only the last ~15 s), and the harness now dumps the
+snowman / request / throttler counters of every node (`consensusMetrics`) and the accept-gap distribution read
+from the chain logs (`acceptGaps`). Extra avalanchego flags go in with `--node-flags k=v,k=v`.
+
+Timeline of one burst (node Gbqa = builder of 127-131, node 5wdc = its peer; all times 11:14 JST):
+
+| t | event |
+|---|---|
+| 36.56-36.87 | 40 polls finish on Gbqa within 300 ms (the peer's Chits arrive in one burst), heights 122-125 accepted |
+| 36.97 | Gbqa is the slot-0 proposer of 126..131: builds 127 at 37.08, 128 at 37.31, 129 at 37.54, 130 at 37.77, 131 at 37.98 (116-124 ms each, one per ~230 ms, 16,029 txs each) |
+| 37.12, 37.34, 37.58, 37.81, 38.02 | Gbqa sends each block as a PushQuery to 5wdc: 1.09-1.10 MB on the wire (1.65 MB of block, zstd) |
+| 38.83, 40.96, 43.11, 45.28, 47.42 | 5wdc's read loop hands the five PushQuery bodies to the handler: exactly 2.14 s apart = 1.1 MB / 512 KiB/s. Between them the loop reads 2-8 messages per second (219 in the second before) |
+| 39.33 onwards, every ~230 ms | Gbqa's pull queries to 5wdc time out (2 s, the `network-minimum-timeout` floor): `query_failed`, `poll finished votes=4..13` (< alpha 15), `no progress was made after processing pending blocks {numProcessing: 6}`; 27 such polls until 51.7. Every one clears the confidence of the whole processing chain (`RecordUnsuccessfulPoll`), so beta = 20 successful polls must start over |
+| 38.02 | Gbqa is not the slot-0 proposer of 132: `slot time {"delay": "10s"}`, `Waiting until we should build a block 8.98s`; 5wdc is, but has not received 131 yet, so nobody builds until 47.1 (Gbqa, slot 2) |
+| 51.13 | 5wdc reads the last block (132, 0.8 MB); it verifies 126-132 (~250 ms each under ctx.Lock), its preference reaches the tip, and 20 polls succeed within 1 s |
+| 52.37-52.58 | 126..132 accepted on both nodes: 7 blocks in 210 ms after 15.5 s of nothing |
+
+Cause: avalanchego's per-peer inbound bandwidth throttler (`network/throttling/bandwidth_throttler.go`, a token bucket
+of `throttler-inbound-bandwidth-refill-rate` 512 KiB/s with a `throttler-inbound-bandwidth-max-burst-size` 2 MiB
+burst) runs in the peer's read loop BEFORE the message body is read, so every message from that peer (Chits,
+PullQuery, AppGossip) waits behind a block that waits for tokens. Metrics over the 2.5 min run:
+`bandwidth_throttler_inbound_acquire_latency_sum` 114 s on one node and 25 s on the other, `requests_timeouts` 379 /
+573, `polls_failed` 289 / 259 against ~700 successful, issue-to-accept latency (`blks_accepted_sum/count`) 6.8 s
+average, 21 blocks rejected. Not the cause: the at-large / validator byte throttler (`byte_throttler_inbound_acquire_latency_sum` 6 ms
+total, 6 MiB at-large and 32 MiB validator allocations never ran out), the handler queue (`unprocessed_msgs` 0), the
+CPU / disk throttlers (no waits), the VM (build 116-124 ms, peer verify p99 195 ms, accept 32 ms), the proposervm
+windows on their own (the slot-0 proposer builds within 100-250 ms of its parent; the 5 s slots only bite while the
+proposer has not received the parent, which the throttle caused). Inbound volume that has to fit in 512 KiB/s: one
+node received 62.7 MB of PushQuery + 18.2 MB of tx gossip in ~150 s = 540 KB/s, i.e. the budget exactly.
+
+Fix (deployment requirement for every validator of a chain with MB blocks): raise the bandwidth throttle, e.g.
+`--throttler-inbound-bandwidth-refill-rate=33554432 --throttler-inbound-bandwidth-max-burst-size=67108864` (32 MiB/s,
+64 MiB burst; the harness passes them with `--node-flags`). Nothing else changed. Same 90 s run:
+
+| | before (defaults) | after (32 MiB/s) |
+|---|---|---|
+| offered / refused | 18.3k tx/s (pool full after 20 s, 2.4 M refused) | 40.2k tx/s (130k refused near the end) |
+| load blocks, txs | 9..67, 728,758 txs, 12,352 txs/block, 1,575 ms apart | 9..202, 2,892,367 txs, 14,909 txs/block, 496 ms apart |
+| mined | ~8k tx/s (10k in the 2 min run) | ~30k tx/s over the accept span (2.89 M in 102 s) |
+| accept gaps (both nodes) | p50 45 ms, p90 15.5 s, max 15.5 s in the 16 s window the logs kept; earlier 2 min run: p90 4.5 s, max 24.9 s, gaps > 2 s = 238 of 257 s | p50 438 / 441 ms, p90 873 / 978 ms, p99 1.6 s, max 2.1 / 2.2 s; gaps > 2 s sum 2.1 / 4.4 s of 102 s |
+| issue-to-accept (avalanchego) | 6.8 s avg, health "block processing too long" | 2.1 s avg, blks_processing 6-7 (a 6-7 deep pipeline at 2 blocks/s) |
+| request timeouts / failed polls | 379-573 / 259-289 | 3-74 / 9-16 |
+| bandwidth throttler wait | 114 s / 25 s | 18 ms / 16 ms |
+| rejected blocks | 21 | 0 |
+| build p50 / verify p99 | 130 ms / 194 ms | 149 ms / 196 ms |
+
+Ceiling with the fix: the chain accepts 2.0 blocks/s x 14.9k txs = 30k tx/s with full blocks at 16,029 txs, and the
+per-height serialized path is now the bound: build 149 ms p50 + compress 15 ms + peer parse ~50 + verify ~200 ms
+under ctx.Lock, plus the 100 ms WaitForEvent retry cadence, i.e. ~450-500 ms per height, the measured 496 ms.
+50k tx/s = 3.1 blocks/s needs that under 320 ms (lower verify: the peer re-executes 16k transfers, 8-12 us each;
+or a bigger block). Message size is not the next bound: a full 1800 KiB block is 1.65 MB raw and 1.1 MB compressed
+against the 2 MiB `network-max-message-size`; the 1800 KiB miner target (subnet-evm parity) is the one that caps a
+block at 16k transfers = 337 M of 500 M gas, and lifting it to 2.5 MB of tx bytes would put the compressed block at
+~1.7 MB, still under the limit, for 25k txs per block. With 2 validators the proposervm slots stay as they are: the
+slot-0 proposer of every height is one of the two (seeded by height), so the other node waits 5 s only if the
+proposer has nothing to build or has not seen the parent; at 40k tx/s to both nodes neither happened (0 rejected
+blocks, 188 "Waiting until we should build" lines per node are the non-proposer's normal wait for its slot, cut short
+when the proposer's block arrives).
 
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
