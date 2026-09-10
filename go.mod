@@ -169,4 +169,4 @@ require (
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
 
-replace github.com/ava-labs/libevm => github.com/containerman17/libevm v1.13.15-0.20260817022927-4c8a6553b55f
+replace github.com/ava-labs/libevm => github.com/containerman17/libevm v1.13.15-0.20260910004709-c05bef53cab4
