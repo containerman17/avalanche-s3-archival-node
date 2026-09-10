@@ -51,6 +51,16 @@ const EMPTY_IDLE: Duration = Duration::from_secs(60);
 /// A pool lock waited for or held longer than this is printed with its
 /// caller (the builder's wait sits behind the same lock).
 const SLOW_LOCK: Duration = Duration::from_millis(50);
+/// Recent (nonce -> outcome) events kept per sender for `gap_report`.
+const RECENT_MAX: usize = 8;
+
+/// What became of one nonce of a sender (the `gap_report` ring): refused
+/// at admission with a code, or removed from the pool for a reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Rejected(Code),
+    Removed(&'static str),
+}
 
 /// The pool lock with a hold timer (`Pool::lock`).
 struct Held<'a> {
@@ -258,11 +268,20 @@ struct Account {
     /// Last activity (the lifetime rule).
     beat: Instant,
     local: bool,
+    /// The last RECENT_MAX (nonce, outcome, when) events of this sender.
+    recent: VecDeque<(u64, Outcome, Instant)>,
 }
 
 impl Account {
     fn queued(&self) -> usize {
         self.txs.len() - self.exec
+    }
+
+    fn note(&mut self, nonce: u64, what: Outcome) {
+        if self.recent.len() >= RECENT_MAX {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((nonce, what, Instant::now()));
     }
 }
 
@@ -303,6 +322,8 @@ struct Inner {
     /// Mined tx hashes, the last SEEN_MAX (`seen_ring` is the eviction order).
     seen: HashSet<B256>,
     seen_ring: VecDeque<B256>,
+    /// Txs removed unmined, by reason (health "pool-removed").
+    removed: BTreeMap<&'static str, u64>,
 }
 
 pub struct Pool {
@@ -410,6 +431,7 @@ impl Pool {
                 last_sweep: Instant::now(),
                 seen: HashSet::new(),
                 seen_ring: VecDeque::new(),
+                removed: BTreeMap::new(),
             }),
             cv: Condvar::new(),
             ingest: rayon::ThreadPoolBuilder::new().num_threads(cfg.ingest_threads).thread_name(|i| format!("ingest-{i}")).build().expect("ingest pool"),
@@ -499,7 +521,7 @@ impl Pool {
             }
             let t_lock = Instant::now();
             for (a, (nonce, balance)) in need.iter().zip(states) {
-                g.accounts.entry(*a).or_insert_with(|| Account { txs: BTreeMap::new(), nonce, balance, exec: 0, exec_cost: U256::ZERO, head_key: None, beat: now, local });
+                g.accounts.entry(*a).or_insert_with(|| Account { txs: BTreeMap::new(), nonce, balance, exec: 0, exec_cost: U256::ZERO, head_key: None, beat: now, local, recent: VecDeque::new() });
             }
             let mut promoted = false;
             for (i, t) in txs.drain(..) {
@@ -525,7 +547,7 @@ impl Pool {
         let mut touched: Vec<Address> = Vec::new();
         let mut seen = HashSet::new();
         for t in block_txs {
-            g.remove_hash(&t.hash);
+            g.remove_hash(&t.hash, "mined");
             if g.seen.insert(t.hash) {
                 g.seen_ring.push_back(t.hash);
                 if g.seen_ring.len() > SEEN_MAX {
@@ -770,6 +792,41 @@ impl Pool {
     pub fn gen(&self) -> u64 {
         self.lock("gen").gen
     }
+
+    /// Txs removed unmined since start, by reason.
+    pub fn removed(&self) -> Vec<(&'static str, u64)> {
+        self.lock("removed").removed.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// Why up to `max` senders hold queued txs and no executable one: per
+    /// sender the pool's account nonce, the state nonce (`read`, so a stale
+    /// cache shows), the lowest queued nonce, and what the ring remembers
+    /// of the nonces in between (never seen / rejected / removed, with the
+    /// age). One line per sender, for the builder's pool-quiet WARN.
+    pub fn gap_report(&self, max: usize, read: &dyn Fn(&[Address]) -> Vec<(u64, U256)>) -> String {
+        let picked: Vec<Address> = {
+            let g = self.lock("gap_report");
+            g.accounts.iter().filter(|(_, a)| a.exec == 0 && !a.txs.is_empty()).map(|(a, _)| *a).take(max).collect()
+        };
+        if picked.is_empty() {
+            return String::new();
+        }
+        let states = read(&picked);
+        let g = self.lock("gap_report");
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (addr, (state_nonce, _)) in picked.iter().zip(states) {
+            let Some(a) = g.accounts.get(addr) else { continue };
+            let Some((&low, _)) = a.txs.iter().next() else { continue };
+            let mut line = format!("{addr}: pool nonce {}, state nonce {state_nonce}, lowest queued {low} ({} queued);", a.nonce, a.txs.len());
+            for n in a.nonce..low.min(a.nonce + 4) {
+                let ev: Vec<String> = a.recent.iter().filter(|(x, _, _)| *x == n).map(|(_, o, t)| format!("{o:?} {:.0?} ago", now.duration_since(*t))).collect();
+                line += &format!(" nonce {n}: {}", if ev.is_empty() { "no record".to_string() } else { ev.join(", ") });
+            }
+            out.push(line);
+        }
+        out.join(" | ")
+    }
 }
 
 /// Records a hash that left `by_hash` for the next drain (bounded like the
@@ -816,11 +873,16 @@ impl Inner {
         self.heads.iter().map(|k| self.free_of(k, skip, base_fee)).sum()
     }
 
-    /// Removes one tx by hash (the account is re-settled by the caller).
-    fn remove_hash(&mut self, hash: &B256) -> bool {
+    /// Removes one tx by hash (the account is re-settled by the caller);
+    /// `why` goes to the sender's ring and, unless "mined", the counters.
+    fn remove_hash(&mut self, hash: &B256, why: &'static str) -> bool {
         let Some((sender, nonce)) = self.by_hash.remove(hash) else { return false };
         gone_push(&mut self.gone, *hash);
+        if why != "mined" {
+            *self.removed.entry(why).or_default() += 1;
+        }
         let Some(acct) = self.accounts.get_mut(&sender) else { return false };
+        acct.note(nonce, Outcome::Removed(why));
         if let Some(e) = acct.txs.remove(&nonce) {
             self.priced.remove(&PricedKey { tip: e.tx.gas_tip, seq: Reverse(e.seq), hash: e.tx.hash });
             self.total -= 1;
@@ -847,14 +909,23 @@ impl Inner {
     fn settle(&mut self, sender: &Address) {
         let gas_limit = self.head.gas_limit;
         let Some(acct) = self.accounts.get_mut(sender) else { return };
-        let mut drop: Vec<(u64, B256, u128, u64)> = Vec::new();
+        let mut drop: Vec<(u64, B256, u128, u64, &'static str)> = Vec::new();
         for (n, e) in &acct.txs {
-            if *n < acct.nonce || e.cost > acct.balance || e.tx.gas_limit > gas_limit {
-                drop.push((*n, e.tx.hash, e.tx.gas_tip, e.seq));
-            }
+            let why = if *n < acct.nonce {
+                "nonce-mined-elsewhere"
+            } else if e.cost > acct.balance {
+                "unpayable"
+            } else if e.tx.gas_limit > gas_limit {
+                "over-gas-limit"
+            } else {
+                continue;
+            };
+            drop.push((*n, e.tx.hash, e.tx.gas_tip, e.seq, why));
         }
-        for (n, hash, tip, seq) in drop {
+        for (n, hash, tip, seq, why) in drop {
             acct.txs.remove(&n);
+            acct.note(n, Outcome::Removed(why));
+            *self.removed.entry(why).or_default() += 1;
             self.by_hash.remove(&hash);
             gone_push(&mut self.gone, hash);
             self.priced.remove(&PricedKey { tip, seq: Reverse(seq), hash });
@@ -909,6 +980,17 @@ impl Inner {
         if self.by_hash.contains_key(&t.hash) {
             return (Code::Known, "already known");
         }
+        let (sender, nonce) = (t.sender.unwrap(), t.nonce);
+        let (code, message) = self.insert_inner(t, local, cfg, now, promoted);
+        if !matches!(code, Code::Ok | Code::Replaced) {
+            if let Some(acct) = self.accounts.get_mut(&sender) {
+                acct.note(nonce, Outcome::Rejected(code));
+            }
+        }
+        (code, message)
+    }
+
+    fn insert_inner(&mut self, t: Tx, local: bool, cfg: &Config, now: Instant, promoted: &mut bool) -> (Code, &'static str) {
         let sender = t.sender.unwrap();
         let Some(cost) = cost_of(&t) else { return (Code::Funds, "insufficient funds for gas * price + value") };
         let (replacing, gapped, queued, exec) = {
@@ -951,11 +1033,20 @@ impl Inner {
                 if cheapest.tip >= t.gas_tip {
                     return (Code::Underpriced, "transaction underpriced");
                 }
-                let victim = self.by_hash.get(&cheapest.hash).map(|(a, _)| *a);
-                self.remove_hash(&cheapest.hash);
-                if let Some(a) = victim {
-                    self.settle(&a);
+                let Some(&(victim, vnonce)) = self.by_hash.get(&cheapest.hash) else { return (Code::Full, "txpool is full") };
+                // legacypool ErrFutureReplacePending: a queued tx never evicts
+                // an executable one (under a client whose later nonces are
+                // pricier, the cheapest tx IS some sender's executable head;
+                // evicting it manufactures a nonce gap and every queued
+                // arrival then knocks out one more head: pending 0, queued N).
+                if gapped {
+                    let v = &self.accounts[&victim];
+                    if vnonce < v.nonce + v.exec as u64 {
+                        return (Code::Full, "future transaction tries to replace pending");
+                    }
                 }
+                self.remove_hash(&cheapest.hash, "evicted-full");
+                self.settle(&victim);
             }
         }
         self.seq += 1;
@@ -967,6 +1058,7 @@ impl Inner {
             acct.local = true;
         }
         if let Some(o) = acct.txs.remove(&tx.nonce) {
+            acct.note(tx.nonce, Outcome::Removed("replaced"));
             self.by_hash.remove(&o.tx.hash);
             gone_push(&mut self.gone, o.tx.hash);
             self.priced.remove(&PricedKey { tip: o.tx.gas_tip, seq: Reverse(o.seq), hash: o.tx.hash });
@@ -1005,7 +1097,7 @@ impl Inner {
         for a in idle {
             let hashes: Vec<B256> = self.accounts[&a].txs.values().map(|e| e.tx.hash).collect();
             for h in hashes {
-                self.remove_hash(&h);
+                self.remove_hash(&h, "expired");
             }
             self.accounts.remove(&a);
         }
@@ -1199,6 +1291,46 @@ mod tests {
         // Pending over the global slots: a third executable tx of a over its account slots is refused.
         let r = p.add(vec![sign(&a, 2, GWEI, 50 * GWEI, 1)], false, &st);
         assert_eq!(codes(&r), [Code::Full]);
+    }
+
+    /// A full pool under a client whose later nonces are pricier: the
+    /// cheapest tx is some sender's executable head. A QUEUED arrival must
+    /// not evict it (libevm ErrFutureReplacePending); an executable arrival
+    /// may. Prices within one sender's sequence are otherwise free: a
+    /// cheaper next nonce still promotes, and a rejected tx re-sent unchanged
+    /// is re-evaluated, not answered Known.
+    #[test]
+    fn queued_arrival_never_evicts_an_executable_head() {
+        let p = pool(Config { account_slots: 10, account_queue: 10, global_slots: 2, global_queue: 1, ..Default::default() });
+        let st = state(0, 10 * ETH);
+        let (a, b, c) = (key(16), key(17), key(18));
+        // a: 0 at 1 gwei (the cheapest, executable), 1 at 2 gwei; b: 0 at 3 gwei. Pool full (3).
+        let r = p.add(vec![sign(&a, 0, GWEI, 50 * GWEI, 1), sign(&a, 1, 2 * GWEI, 50 * GWEI, 1), sign(&b, 0, 3 * GWEI, 50 * GWEI, 1)], false, &st);
+        assert_eq!(codes(&r), [Code::Ok, Code::Ok, Code::Ok]);
+        assert_eq!(p.status(), (3, 0));
+        // c's nonce 5 (queued) at 4 gwei: pricier than a's head, but it may not knock it out.
+        let r = p.add(vec![sign(&c, 5, 4 * GWEI, 50 * GWEI, 1)], false, &st);
+        assert_eq!(codes(&r), [Code::Full]);
+        assert_eq!(p.status(), (3, 0));
+        assert_eq!(p.pending_nonce(addr_of(&a)), Some(2));
+        // The same bytes again: re-evaluated (still Full), not Known.
+        let r = p.add(vec![sign(&c, 5, 4 * GWEI, 50 * GWEI, 1)], false, &st);
+        assert_eq!(codes(&r), [Code::Full]);
+        // c's nonce 0 (executable) at 4 gwei evicts a's cheapest: its head; a's 1 is queued now.
+        let r = p.add(vec![sign(&c, 0, 4 * GWEI, 50 * GWEI, 1)], false, &st);
+        assert_eq!(codes(&r), [Code::Ok]);
+        assert_eq!(p.status(), (2, 1));
+        assert_eq!(p.removed(), [("evicted-full", 1)]);
+        // The report names a: pool nonce 0 = state nonce, lowest queued 1, nonce 0 evicted.
+        let rep = p.gap_report(3, &st);
+        assert!(rep.contains(&format!("{}: pool nonce 0, state nonce 0, lowest queued 1 (1 queued); nonce 0: Removed(\"evicted-full\")", addr_of(&a))), "{rep}");
+        // A cheaper next nonce promotes: a's 0 re-sent at 1 gwei (the pool has room after the on_accept below).
+        p.on_accept(&p.candidates(GWEI, u64::MAX, usize::MAX, &HashMap::new()), head(), &mut state(1, 10 * ETH));
+        assert_eq!(p.status(), (0, 1));
+        let r = p.add(vec![sign(&a, 0, GWEI, 50 * GWEI, 1)], false, &st);
+        assert_eq!(codes(&r), [Code::Ok]);
+        assert_eq!(p.status(), (2, 0));
+        assert!(p.gap_report(3, &st).is_empty());
     }
 
     #[test]

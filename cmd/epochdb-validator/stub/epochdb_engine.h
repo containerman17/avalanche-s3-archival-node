@@ -196,6 +196,14 @@ int epochdb_pool_add(struct epochdb_engine *e,
 int epochdb_pool_status(struct epochdb_engine *e, uint64_t *pending, uint64_t *queued);
 
 /**
+ * `out`: UTF-8 text, one entry per sender (up to 3) that holds queued txs
+ * and no executable one: the pool's nonce, the state nonce, the lowest
+ * queued nonce and what became of the nonces in between; empty when no
+ * sender is in that state. For the builder's pool-quiet WARN.
+ */
+int epochdb_pool_gaps(struct epochdb_engine *e, struct epochdb_buf *out);
+
+/**
  * `out` = 1 when the pool holds the tx with `hash`.
  */
 int epochdb_pool_has(struct epochdb_engine *e, const uint8_t *hash, uint8_t *out);

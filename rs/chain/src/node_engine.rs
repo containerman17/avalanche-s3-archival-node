@@ -849,6 +849,12 @@ impl NodeEngine {
     pub fn pool_add(&self, raws: Vec<Bytes>, local: bool) -> Vec<pool::Added> {
         self.txpool.add(raws, local, &|addrs| head_accounts(&self.inner, addrs))
     }
+
+    /// The pool's gap report (`Pool::gap_report`) for the builder's
+    /// pool-quiet WARN: up to 3 senders, state nonces from the accepted head.
+    pub fn pool_gaps(&self) -> String {
+        self.txpool.gap_report(3, &|addrs| head_accounts(&self.inner, addrs))
+    }
 }
 
 impl Engine for NodeEngine {
@@ -935,7 +941,8 @@ impl Engine for NodeEngine {
     fn health(&self) -> Result<serde_json::Value, Error> {
         let h = self.head.lock().unwrap().height;
         Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal(),
-            "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed), "pool-lock-ms": self.txpool.lock_ns.load(Ordering::Relaxed) / 1_000_000, "pool-add-ms": self.txpool.add_ns.load(Ordering::Relaxed) / 1_000_000}))
+            "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed), "pool-lock-ms": self.txpool.lock_ns.load(Ordering::Relaxed) / 1_000_000, "pool-add-ms": self.txpool.add_ns.load(Ordering::Relaxed) / 1_000_000,
+            "pool-removed": self.txpool.removed().into_iter().map(|(k, v)| (k.to_string(), serde_json::Value::from(v))).collect::<serde_json::Map<_, _>>()}))
     }
 
     /// Bootstrapping = the catch-up budget; NormalOp = the tip budget and

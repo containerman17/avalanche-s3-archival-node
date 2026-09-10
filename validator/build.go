@@ -189,6 +189,7 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 		// Only FREE executable txs count: the preferred chain's txs stay in
 		// the pool until accept, and a build on it skips them.
 		quietSince := time.Time{}
+		quietGaps := false
 		for free = b.eng.poolWait(preferred, poolWaitSlice); free == 0; free = b.eng.poolWait(preferred, poolWaitSlice) {
 			if err := ctx.Err(); err != nil {
 				return 0, err
@@ -204,9 +205,16 @@ func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header,
 					b.log.Warn("validator: pool quiet: pending txs but none buildable on the preferred block (underpriced for the next base fee, or all held by the preferred chain)",
 						zap.Uint64("head", h.Number.Uint64()), zap.Uint64("pending", pending), zap.Uint64("queued", queued), zap.Duration("for", since))
 					quietSince = time.Now()
+					// Once per quiet spell, when nothing is executable: which
+					// nonce every sender waits for and what the pool did with it.
+					if pending == 0 && !quietGaps {
+						quietGaps = true
+						b.log.Warn("validator: pool gaps", zap.String("senders", b.eng.poolGaps()))
+					}
 				}
 			} else {
 				quietSince = time.Time{}
+				quietGaps = false
 			}
 		}
 		b.mu.Lock()

@@ -119,6 +119,7 @@ int epochdb_pool_add(epochdb_engine *e, const uint8_t *txs, size_t n, uint8_t lo
   (void)e; (void)txs; (void)n; (void)local; (void)out; return -1;
 }
 int epochdb_pool_status(epochdb_engine *e, uint64_t *p, uint64_t *q) { (void)e; *p = 0; *q = 0; return 0; }
+int epochdb_pool_gaps(epochdb_engine *e, epochdb_buf *out) { (void)e; out->ptr = NULL; out->len = 0; return 0; }
 int epochdb_pool_has(epochdb_engine *e, const uint8_t *hash, uint8_t *out) { (void)e; (void)hash; *out = 0; return 0; }
 int epochdb_pool_content(epochdb_engine *e, const uint8_t *addr, size_t limit, epochdb_buf *out) {
   (void)e; (void)addr; (void)limit; *out = dup((const uint8_t *)"\xc0", 1); return 0;

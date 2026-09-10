@@ -538,6 +538,22 @@ pub unsafe extern "C" fn epochdb_pool_status(e: *mut epochdb_engine, pending: *m
     })
 }
 
+/// `out`: UTF-8 text, one entry per sender (up to 3) that holds queued txs
+/// and no executable one: the pool's nonce, the state nonce, the lowest
+/// queued nonce and what became of the nonces in between; empty when no
+/// sender is in that state. For the builder's pool-quiet WARN.
+#[no_mangle]
+pub unsafe extern "C" fn epochdb_pool_gaps(e: *mut epochdb_engine, out: *mut epochdb_buf) -> c_int {
+    if e.is_null() || out.is_null() {
+        return EPOCHDB_EINVAL;
+    }
+    let en = &*e;
+    en.guard(|| {
+        *out = buf(en.tree.engine.pool_gaps().into_bytes());
+        Ok(EPOCHDB_OK)
+    })
+}
+
 /// `out` = 1 when the pool holds the tx with `hash`.
 #[no_mangle]
 pub unsafe extern "C" fn epochdb_pool_has(e: *mut epochdb_engine, hash: *const u8, out: *mut u8) -> c_int {

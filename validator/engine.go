@@ -279,6 +279,17 @@ func (e *engine) poolStatus() (pending, queued uint64) {
 	return uint64(p), uint64(q)
 }
 
+// poolGaps: the pool's gap report (epochdb_pool_gaps), "" when every
+// sender with txs has an executable one.
+func (e *engine) poolGaps() string {
+	e.crossings[xPool].Add(1)
+	var b C.epochdb_buf
+	if err := e.err("epochdb_pool_gaps", C.epochdb_pool_gaps(e.p, &b)); err != nil {
+		return err.Error()
+	}
+	return string(take(&b))
+}
+
 // poolContent: the pool's tx envelopes, pending then queued, of one address
 // or of all (nil); limit per half (0 = all).
 func (e *engine) poolContent(addr *common.Address, limit int) ([][]byte, error) {
