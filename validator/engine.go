@@ -11,6 +11,7 @@ package validator
 import "C"
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -393,4 +394,18 @@ func (e *engine) snapshot() (out [nCrossing]uint64) {
 		out[i] = e.crossings[i].Load()
 	}
 	return out
+}
+
+// poolDup is the pool's pool_dup_total (txs answered Known from the hash
+// alone, no decode or recovery), read from the health JSON.
+func (e *engine) poolDup() uint64 {
+	raw, err := e.health()
+	if err != nil {
+		return 0
+	}
+	var h struct {
+		Dup uint64 `json:"pool-dup"`
+	}
+	_ = json.Unmarshal(raw, &h)
+	return h.Dup
 }

@@ -530,3 +530,11 @@ func processRSS() float64 {
 	pages, _ := strconv.ParseFloat(f[1], 64)
 	return pages * float64(os.Getpagesize())
 }
+
+// gossipKnown: inbound push txs the bloom filter dropped before the crossing.
+func (vm *VM) gossipKnown() uint64 {
+	if vm.set == nil {
+		return 0
+	}
+	return vm.set.known.Load()
+}

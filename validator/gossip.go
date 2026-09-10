@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ava-labs/avalanchego/graft/subnet-evm/plugin/evm/config"
 	"github.com/ava-labs/avalanchego/ids"
@@ -61,6 +62,9 @@ type gossipSet struct {
 	eng   *engine
 	bloom *gossip.BloomFilter
 	mu    sync.RWMutex
+	// Inbound push txs dropped before the crossing because the bloom
+	// filter already had them.
+	known atomic.Uint64
 }
 
 func newGossipSet(eng *engine, reg prometheus.Registerer) (*gossipSet, error) {
@@ -99,6 +103,15 @@ func (g *gossipSet) Add(t *gossipTx) error {
 
 func (g *gossipSet) Has(id ids.ID) bool { return g.eng.poolHas(id) }
 
+// has: the bloom filter says we already hold (or held) the tx. A false
+// positive (1% target, 5% before a reset) drops a tx this node never saw;
+// it stays in the pools of the nodes that had it and is mined by them.
+func (g *gossipSet) has(t *gossipTx) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.bloom.Has(t)
+}
+
 func (g *gossipSet) Iterate(f func(*gossipTx) bool) {
 	raws, err := g.eng.poolContent(nil, gossipIterateMax)
 	if err != nil {
@@ -131,10 +144,21 @@ func (h *txHandler) AppGossip(_ context.Context, nodeID ids.NodeID, gossipBytes 
 		h.log.Debug("failed to unmarshal gossip", zap.Error(err))
 		return
 	}
-	if len(raws) == 0 {
+	// Push gossip hands a node every tx several times: what the bloom filter
+	// already has does not even cross (the pool answers Known by hash for the
+	// rest of the duplicates, the ones admitted since the last push tick).
+	fresh := raws[:0]
+	for _, r := range raws {
+		if h.set.has(newGossipTx(r)) {
+			h.set.known.Add(1)
+			continue
+		}
+		fresh = append(fresh, r)
+	}
+	if len(fresh) == 0 {
 		return
 	}
-	if _, err := h.set.eng.poolAdd(raws, false); err != nil {
+	if _, err := h.set.eng.poolAdd(fresh, false); err != nil {
 		h.log.Debug("failed to add gossip to the pool", zap.Stringer("nodeID", nodeID), zap.Error(err))
 	}
 }

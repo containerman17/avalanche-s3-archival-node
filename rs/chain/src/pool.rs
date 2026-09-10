@@ -16,11 +16,15 @@
 //! cmd/epochdb-validator/E2E.md ("Mempool in the engine").
 //!
 //! Locking: `Inner` behind one mutex, held for microseconds per tx; sender
-//! recovery and the stateless checks run before it, in parallel on rayon;
-//! state reads run before it too (the engine's execution mutex, one batch
-//! per call) and are validated against `gen`, which every head change bumps.
+//! recovery and the stateless checks run before it, in parallel on the
+//! pool's own rayon pool (`ingest-threads`), and only for txs whose hash the
+//! pool does not hold or remember (gossip hands every tx to a node several
+//! times: those answer Known from the hash alone); state reads run before it
+//! too (the engine's execution mutex, one batch per call) and are validated
+//! against `gen`, which every head change bumps.
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +41,9 @@ pub const MAX_INIT_CODE: usize = 49152;
 const GOSSIP_MAX: usize = 100_000;
 /// How often the lifetime sweep runs (on a head change).
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
+/// Mined tx hashes remembered, so a gossip copy of a just-mined tx is Known
+/// without a decode (200k = ~12 full 16k-tx blocks).
+const SEEN_MAX: usize = 200_000;
 
 /// The per-tx admission result (the ABI's codes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,11 +90,16 @@ pub struct Config {
     /// `local-txs-enabled`: false makes every tx remote (legacypool NoLocals).
     pub locals: bool,
     pub allow_unprotected: bool,
+    /// `ingest-threads`: the rayon pool admission decodes and recovers on
+    /// (default min(cores / 2, 8)); the engine's `workers` pool is left to
+    /// verify and build.
+    pub ingest_threads: usize,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { price_limit: 1, price_bump: 10, account_slots: 16, global_slots: 4096 + 1024, account_queue: 64, global_queue: 1024, lifetime: Duration::from_secs(600), locals: false, allow_unprotected: false }
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        Config { price_limit: 1, price_bump: 10, account_slots: 16, global_slots: 4096 + 1024, account_queue: 64, global_queue: 1024, lifetime: Duration::from_secs(600), locals: false, allow_unprotected: false, ingest_threads: (cpus / 2).clamp(1, 8) }
     }
 }
 
@@ -117,6 +129,9 @@ impl Config {
         }
         if let Some(v) = num("tx-pool-global-queue") {
             c.global_queue = v as usize;
+        }
+        if let Some(v) = num("ingest-threads") {
+            c.ingest_threads = (v as usize).max(1);
         }
         // Duration: a JSON number is nanoseconds (subnet-evm's Duration), a string is Go's form ("10m").
         match conf.get("tx-pool-lifetime") {
@@ -239,6 +254,9 @@ struct Inner {
     head: Head,
     gossip: VecDeque<Arc<Tx>>,
     last_sweep: Instant,
+    /// Mined tx hashes, the last SEEN_MAX (`seen_ring` is the eviction order).
+    seen: HashSet<B256>,
+    seen_ring: VecDeque<B256>,
 }
 
 pub struct Pool {
@@ -246,6 +264,13 @@ pub struct Pool {
     chain: Arc<exec::Config>,
     inner: Mutex<Inner>,
     cv: Condvar,
+    ingest: rayon::ThreadPool,
+    /// Txs answered Known from the hash alone (pool_dup_total).
+    pub dup: AtomicU64,
+    /// Sender recoveries performed.
+    pub recovered: AtomicU64,
+    /// Nanoseconds `add` held the pool lock for its admission pass.
+    pub lock_ns: AtomicU64,
 }
 
 /// tx.Cost(): None on overflow (refused as unpayable).
@@ -310,7 +335,6 @@ fn validate(t: &Tx, head: &Head, cfg: &Config, chain: &exec::Config, local: bool
 impl Pool {
     pub fn new(cfg: Config, chain: Arc<exec::Config>, head: Head) -> Pool {
         Pool {
-            cfg,
             chain,
             inner: Mutex::new(Inner {
                 accounts: HashMap::new(),
@@ -324,38 +348,63 @@ impl Pool {
                 head,
                 gossip: VecDeque::new(),
                 last_sweep: Instant::now(),
+                seen: HashSet::new(),
+                seen_ring: VecDeque::new(),
             }),
             cv: Condvar::new(),
+            ingest: rayon::ThreadPoolBuilder::new().num_threads(cfg.ingest_threads).thread_name(|i| format!("ingest-{i}")).build().expect("ingest pool"),
+            dup: AtomicU64::new(0),
+            recovered: AtomicU64::new(0),
+            lock_ns: AtomicU64::new(0),
+            cfg,
         }
     }
 
-    /// Admits `raws` (tx envelopes, MarshalBinary form). `read` answers
-    /// (nonce, balance) at the accepted head for senders the pool does not
-    /// hold yet; it runs outside the pool lock and is retried when a head
-    /// change lands in between.
-    pub fn add(&self, raws: Vec<Bytes>, local: bool, read: &dyn Fn(&[Address]) -> Vec<(u64, U256)>) -> Vec<Added> {
+    /// Admits `raws` (tx envelopes, MarshalBinary form). The hash comes
+    /// first: a tx the pool holds or remembers as mined answers Known without
+    /// a decode or a recovery. `read` answers (nonce, balance) at the
+    /// accepted head for senders the pool does not hold yet; it runs outside
+    /// the pool lock and is retried when a head change lands in between.
+    pub fn add(&self, mut raws: Vec<Bytes>, local: bool, read: &dyn Fn(&[Address]) -> Vec<(u64, U256)>) -> Vec<Added> {
         let local = local && self.cfg.locals;
-        let head = self.inner.lock().unwrap().head;
-        let prep = |raw: Bytes| -> Result<Tx, Added> {
-            let hash = alloy_primitives::keccak256(&raw);
-            let mut t = block::eth::decode_tx(raw).map_err(|_| Added { code: Code::Other, message: "invalid transaction: does not decode", hash })?;
-            validate(&t, &head, &self.cfg, &self.chain, local).map_err(|(code, message)| Added { code, message, hash })?;
-            t.sender = block::recover(&t);
-            if t.sender.is_none() {
-                return Err(Added { code: Code::Invalid, message: "invalid sender", hash });
-            }
-            Ok(t)
+        let mut out: Vec<Added> = raws.iter().map(|r| Added { code: Code::Known, message: "already known", hash: alloy_primitives::keccak256(r) }).collect();
+        let (head, fresh) = {
+            let g = self.inner.lock().unwrap();
+            let mut in_batch = HashSet::with_capacity(out.len());
+            let fresh: Vec<(usize, Bytes)> = out.iter().enumerate().filter(|(_, a)| !g.by_hash.contains_key(&a.hash) && !g.seen.contains(&a.hash) && in_batch.insert(a.hash)).map(|(i, _)| (i, std::mem::take(&mut raws[i]))).collect();
+            (g.head, fresh)
         };
-        let prepared: Vec<Result<Tx, Added>> = if raws.len() < 32 { raws.into_iter().map(prep).collect() } else { raws.into_par_iter().map(prep).collect() };
-        let mut out: Vec<Added> = Vec::with_capacity(prepared.len());
+        self.dup.fetch_add((out.len() - fresh.len()) as u64, Ordering::Relaxed);
+        if fresh.is_empty() {
+            return out;
+        }
+        // ponytail: two concurrent adds of the same new tx both recover it
+        // (insert answers Known to the second); an in-flight set if it shows.
+        let recovered = AtomicU64::new(0);
+        let prep = |(i, raw): (usize, Bytes)| -> (usize, Result<Tx, Added>) {
+            let hash = out[i].hash;
+            let r = (|| {
+                let mut t = block::eth::decode_tx(raw).map_err(|_| Added { code: Code::Other, message: "invalid transaction: does not decode", hash })?;
+                validate(&t, &head, &self.cfg, &self.chain, local).map_err(|(code, message)| Added { code, message, hash })?;
+                recovered.fetch_add(1, Ordering::Relaxed);
+                t.sender = block::recover(&t);
+                if t.sender.is_none() {
+                    return Err(Added { code: Code::Invalid, message: "invalid sender", hash });
+                }
+                Ok(t)
+            })();
+            (i, r)
+        };
+        let prepared: Vec<(usize, Result<Tx, Added>)> = if fresh.len() < 32 { fresh.into_iter().map(prep).collect() } else { self.ingest.install(|| fresh.into_par_iter().map(prep).collect()) };
+        self.recovered.fetch_add(recovered.into_inner(), Ordering::Relaxed);
         let mut txs: Vec<(usize, Tx)> = Vec::new();
-        for (i, r) in prepared.into_iter().enumerate() {
+        for (i, r) in prepared {
             match r {
                 Ok(t) => {
-                    out.push(Added { code: Code::Ok, message: "", hash: t.hash });
+                    out[i] = Added { code: Code::Ok, message: "", hash: t.hash };
                     txs.push((i, t));
                 }
-                Err(a) => out.push(a),
+                Err(a) => out[i] = a,
             }
         }
         if txs.is_empty() {
@@ -380,6 +429,7 @@ impl Pool {
             if g.gen != gen {
                 continue; // a head landed in between: the states may be stale
             }
+            let t_lock = Instant::now();
             for (a, (nonce, balance)) in need.iter().zip(states) {
                 g.accounts.entry(*a).or_insert_with(|| Account { txs: BTreeMap::new(), nonce, balance, exec: 0, exec_cost: U256::ZERO, head_key: None, beat: now, local });
             }
@@ -394,6 +444,8 @@ impl Pool {
             for a in senders {
                 g.prune(&a);
             }
+            drop(g);
+            self.lock_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if promoted {
                 self.cv.notify_all();
             }
@@ -411,6 +463,13 @@ impl Pool {
         let mut seen = HashSet::new();
         for t in block_txs {
             g.remove_hash(&t.hash);
+            if g.seen.insert(t.hash) {
+                g.seen_ring.push_back(t.hash);
+                if g.seen_ring.len() > SEEN_MAX {
+                    let old = g.seen_ring.pop_front().unwrap();
+                    g.seen.remove(&old);
+                }
+            }
             if let Some(a) = t.sender {
                 if g.accounts.contains_key(&a) && seen.insert(a) {
                     touched.push(a);
@@ -1057,6 +1116,44 @@ mod tests {
         let (pend, q) = p.content(None, 0);
         assert_eq!((pend.len(), q.len()), (1, 0));
         assert_eq!(p.content(Some(Address::ZERO), 0).0.len(), 0);
+    }
+
+    /// Known by hash costs no recovery: 1000 new, the same 1000 again, then a
+    /// stream with every tx 5 times interleaved (gossip's shape); a mined tx
+    /// is Known too. `--nocapture` prints the ms per call.
+    #[test]
+    fn ingest_dedup_recovers_once() {
+        let p = pool(Config { account_slots: 100, global_slots: 100_000, ..Default::default() });
+        let st = state(0, 10 * ETH);
+        let raws: Vec<Bytes> = (0..1000u32).map(|i| sign_full(&Key(SecretKey::from_slice(&keccak256(i.to_be_bytes()).0).unwrap()), 0, GWEI, 50 * GWEI, 21_000, 1, Some(Address::from([9; 20])), &[])).collect();
+        let t = Instant::now();
+        let r = p.add(raws.clone(), false, &st);
+        let new_ms = t.elapsed().as_secs_f64() * 1e3;
+        assert!(r.iter().all(|a| a.code == Code::Ok));
+        assert_eq!(p.recovered.load(Ordering::Relaxed), 1000);
+        let t = Instant::now();
+        let r = p.add(raws.clone(), false, &st);
+        let same_ms = t.elapsed().as_secs_f64() * 1e3;
+        assert!(r.iter().all(|a| a.code == Code::Known));
+        assert_eq!((p.recovered.load(Ordering::Relaxed), p.dup.load(Ordering::Relaxed)), (1000, 1000));
+        // A fresh pool, the 5x interleaved stream in 5 batches of 1000.
+        let p = pool(Config { account_slots: 100, global_slots: 100_000, ..Default::default() });
+        let stream: Vec<Bytes> = raws.iter().flat_map(|r| std::iter::repeat_n(r.clone(), 5)).collect();
+        let t = Instant::now();
+        let mut ok = 0;
+        for chunk in stream.chunks(1000) {
+            ok += p.add(chunk.to_vec(), false, &st).iter().filter(|a| a.code == Code::Ok).count();
+        }
+        let dup5_ms = t.elapsed().as_secs_f64() * 1e3 / 5.0;
+        assert_eq!((ok, p.recovered.load(Ordering::Relaxed), p.dup.load(Ordering::Relaxed)), (1000, 1000, 4000));
+        // Mined: Known from the ring, no recovery.
+        let mined = p.candidates(GWEI, u64::MAX, usize::MAX, &HashMap::new());
+        assert_eq!(mined.len(), 1000);
+        p.on_accept(&mined, head(), &mut state(1, 10 * ETH));
+        let r = p.add(raws.clone(), false, &st);
+        assert!(r.iter().all(|a| a.code == Code::Known));
+        assert_eq!(p.recovered.load(Ordering::Relaxed), 1000);
+        eprintln!("pool.add(1000): new {new_ms:.2} ms, same again {same_ms:.2} ms, 5x interleaved {dup5_ms:.2} ms per 1000 (lock {:.2} ms total)", p.lock_ns.load(Ordering::Relaxed) as f64 / 1e6);
     }
 
     #[test]

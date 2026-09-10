@@ -424,7 +424,7 @@ impl NodeEngine {
         // wire against avalanchego's 2 MiB message limit, so there is room.
         let block_size_target = block_size_target_from(&conf);
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        let workers = cpus.saturating_sub(2).max(1);
+        let workers = conf_u64(&conf, "workers").map_or(cpus.saturating_sub(2), |w| w as usize).max(1);
         let data = PathBuf::from(&init.chain_data_dir);
         std::fs::create_dir_all(&data)?;
         let dir = data.join("vmstate");
@@ -702,7 +702,7 @@ impl NodeEngine {
             let mut g = inner.lock().unwrap();
             let fc = build::fee_config_at(&cfg, head.header.time, |slot| g.head_storage(exec::precompile::FEE_MANAGER, slot));
             let pc = pool::Config::from_json(conf);
-            eprintln!("epochdb-rs: pool: price-limit={} bump={}% account-slots={} global-slots={} account-queue={} global-queue={} lifetime={:?} locals={} unprotected={}", pc.price_limit, pc.price_bump, pc.account_slots, pc.global_slots, pc.account_queue, pc.global_queue, pc.lifetime, pc.locals, pc.allow_unprotected);
+            eprintln!("epochdb-rs: pool: price-limit={} bump={}% account-slots={} global-slots={} account-queue={} global-queue={} lifetime={:?} locals={} unprotected={} ingest-threads={}", pc.price_limit, pc.price_bump, pc.account_slots, pc.global_slots, pc.account_queue, pc.global_queue, pc.lifetime, pc.locals, pc.allow_unprotected, pc.ingest_threads);
             Arc::new(Pool::new(pc, cfg.clone(), pool::Head { gas_limit: head.header.gas_limit, min_base_fee: fc.min_base_fee.saturating_to(), time: head.header.time }))
         };
         let head = Arc::new(Mutex::new(head));
@@ -934,7 +934,8 @@ impl Engine for NodeEngine {
 
     fn health(&self) -> Result<serde_json::Value, Error> {
         let h = self.head.lock().unwrap().height;
-        Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal()}))
+        Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal(),
+            "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed), "pool-lock-ms": self.txpool.lock_ns.load(Ordering::Relaxed) / 1_000_000}))
     }
 
     /// Bootstrapping = the catch-up budget; NormalOp = the tip budget and

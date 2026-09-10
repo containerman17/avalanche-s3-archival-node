@@ -95,9 +95,10 @@ const chainConfig = `{"log-level":"info","state-sync-enabled":false,"pruning-ena
 var storeContract = ethcommon.Hex2Bytes("6012600c60003960126000f3" + "3615600c57600035600055005b60006000fd")
 
 var (
-	network *tmpnet.Network
-	keep    = flag.Bool("keep", false, "leave the network running")
-	logsDir = flag.String("logs", "", "copy every node's logs here and delete the network dir after the run (default: keep the network dir)")
+	network  *tmpnet.Network
+	keep     = flag.Bool("keep", false, "leave the network running")
+	logsDir  = flag.String("logs", "", "copy every node's logs here and delete the network dir after the run (default: keep the network dir)")
+	rpcNodes = flag.Int("rpc-nodes", 0, "load phase: post to the first N nodes only, the rest get every tx by gossip (0 = all nodes)")
 )
 
 // teardown stops the network and, with --logs, keeps only the logs.
@@ -541,7 +542,11 @@ func (d *driver) loadPhase(funder *ecdsa.PrivateKey, nonce *uint64, nkeys, rate 
 				// admission outran gossip the queue hit its cap and
 				// truncateQueue broke the sequences for good (400k queued,
 				// 2000 pending, blocks of 2000 then 3 txs).
-				n := d.nodes[w%len(d.nodes)]
+				nn := len(d.nodes)
+				if *rpcNodes > 0 && *rpcNodes < nn {
+					nn = *rpcNodes
+				}
+				n := d.nodes[w%nn]
 				bad := map[int]bool{}
 				for i, r := range batchPost(n.rpc, reqs) {
 					if r.Error != nil {
