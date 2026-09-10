@@ -104,9 +104,25 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 	var dbg struct {
 		Pprof      string `json:"pprof-addr"`
 		PushTarget int    `json:"push-gossip-target-bytes"`
+		Direct     string `json:"rpc-direct-addr"`
 	}
 	_ = json.Unmarshal(configBytes, &dbg)
 	vm.pushTarget = dbg.PushTarget
+	// "rpc-direct-addr" (e.g. "127.0.0.1:0"): MEASUREMENT ONLY. A plain
+	// net/http server inside the plugin process serving the same /rpc handler
+	// without avalanchego's HTTP server -> gRPC ghttp hop, so a client's
+	// round trip can be split into the hop and the plugin. No auth, no TLS,
+	// no API throttling: never on a production node.
+	if dbg.Direct != "" {
+		if l, err := net.Listen("tcp", dbg.Direct); err == nil {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/rpc", vm.serveRPC)
+			chainCtx.Log.Info("validator: rpc-direct (measurement only, no auth)", zap.Stringer("addr", l.Addr()))
+			go http.Serve(l, mux)
+		} else {
+			chainCtx.Log.Warn("validator: rpc-direct-addr", zap.Error(err))
+		}
+	}
 	if dbg.Pprof != "" {
 		if l, err := net.Listen("tcp", dbg.Pprof); err == nil {
 			chainCtx.Log.Info("validator: pprof", zap.Stringer("addr", l.Addr()))
