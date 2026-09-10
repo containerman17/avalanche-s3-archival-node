@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::{keccak256, Address, B256};
 use bytes::Bytes;
 use rayon::prelude::*;
 
@@ -59,6 +59,52 @@ pub fn decode_container(container: Bytes) -> Result<Block, Error> {
     let (header_rlp, txs) = eth::decode_block(&u.inner)?;
     let header = eth::decode_header(&header_rlp).map_err(|e| format!("header: {e}"))?;
     let hash = keccak256(&header_rlp);
+    Ok(Block {
+        height: header.number,
+        hash,
+        container_id: u.id.map(B256::from).unwrap_or(hash),
+        header,
+        header_rlp,
+        txs,
+        container,
+        pvm: u.pvm,
+    })
+}
+
+/// container_hash is the eth block hash of a container with only its header
+/// decoded (the parsed-block cache key, before the txs are touched).
+pub fn container_hash(container: &Bytes) -> Result<B256, Error> {
+    let u = pvm::unwrap(container)?;
+    let (header_rlp, _) = eth::split_block(&u.inner)?;
+    Ok(keccak256(&header_rlp))
+}
+
+/// decode_container_par is decode_container with the txs decoded, then their
+/// senders taken from `known` (by tx hash: what a mempool recovered at
+/// admission) and recovered for the rest, both in parallel on the caller's
+/// rayon pool from 64 txs. Recovery is the cost (~40 us of one core per tx).
+pub fn decode_container_par(container: Bytes, known: impl Fn(&[B256]) -> Vec<Option<Address>>) -> Result<Block, Error> {
+    use rayon::prelude::*;
+    let u = pvm::unwrap(&container)?;
+    let (header_rlp, raws) = eth::split_block(&u.inner)?;
+    let header = eth::decode_header(&header_rlp).map_err(|e| format!("header: {e}"))?;
+    let hash = keccak256(&header_rlp);
+    let par = raws.len() >= 64;
+    let mut txs: Vec<Tx> = if par { raws.into_par_iter().map(eth::decode_tx).collect::<Result<_, _>>()? } else { raws.into_iter().map(eth::decode_tx).collect::<Result<_, _>>()? };
+    let hashes: Vec<B256> = txs.iter().map(|t| t.hash).collect();
+    for (t, s) in txs.iter_mut().zip(known(&hashes)) {
+        t.sender = s;
+    }
+    let fill = |t: &mut Tx| {
+        if t.sender.is_none() {
+            t.sender = sender::recover(t);
+        }
+    };
+    if par {
+        txs.par_iter_mut().for_each(fill);
+    } else {
+        txs.iter_mut().for_each(fill);
+    }
     Ok(Block {
         height: header.number,
         hash,

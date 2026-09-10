@@ -548,6 +548,7 @@ impl NodeEngine {
         let mut ex = Executor::open(cfg.clone(), Layered::new(be));
         // The callTracer JSON is rendered on the checker thread, off the verify path.
         ex.defer_call_trace = true;
+        ex.defer_receipts_root = true;
         ex.block_size_target = block_size_target;
         let ex = Ex::Native(ex);
         eprintln!(
@@ -656,6 +657,7 @@ impl NodeEngine {
         );
         let mut ex = Executor::open(cfg.clone(), fw);
         ex.defer_call_trace = true;
+        ex.defer_receipts_root = true;
         ex.block_size_target = block_size_target_from(&conf);
         let ex = Ex::Firewood(ex);
         eprintln!(
@@ -807,6 +809,11 @@ impl NodeEngine {
     }
 
     /// A block parsed earlier, by id (the ABI's verify-by-id).
+    /// Empties the parsed-block cache (the bench's peer-side parse).
+    pub fn forget_parsed(&self) {
+        self.parsed.lock().unwrap().clear();
+    }
+
     pub fn parsed(&self, id: &Id) -> Option<Arc<Block>> {
         self.parsed.lock().unwrap().get(id).cloned()
     }
@@ -1039,11 +1046,15 @@ impl NodeEngine {
     }
 
     fn parse_inner(&self, bytes: Bytes) -> Result<Arc<Block>, Error> {
-        let mut b = block::decode_container(bytes)?;
-        if let Some(c) = self.parsed.lock().unwrap().get(&b.hash.0) {
+        // The header alone names the cache entry: the same bytes reach parse
+        // 2-3 times per height (the proposervm's inner parse, the snowman
+        // PushQuery, GetBlock), 10 ms each for a 16k-tx block if decoded.
+        let hash = block::container_hash(&bytes)?;
+        if let Some(c) = self.parsed.lock().unwrap().get(&hash.0) {
             return Ok(c.clone());
         }
-        self.recover_senders(&mut b.txs);
+        // Decode and sender recovery per tx in one parallel pass.
+        let b = self.pool.install(|| block::decode_container_par(bytes, |hs| self.txpool.senders(hs)))?;
         let b = Arc::new(b);
         let mut p = self.parsed.lock().unwrap();
         if p.len() >= PARSED_MAX {
@@ -1075,14 +1086,21 @@ impl NodeEngine {
             if r.gas_used != h.gas_used {
                 return Err(format!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used).into());
             }
-            if r.receipts_root != h.receipt_hash {
-                return Err(format!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash).into());
-            }
             if r.bloom != h.bloom {
                 return Err(format!("block {}: logsBloom differs from the header", h.number).into());
             }
             Ok(())
         };
+        let check_roots = |rr: B256, tr: B256| -> Result<(), Error> {
+            if rr != h.receipt_hash {
+                return Err(format!("block {}: receiptsRoot {} != header {}", h.number, rr, h.receipt_hash).into());
+            }
+            if tr != h.tx_hash {
+                return Err(format!("block {}: transactionsRoot {} != header {}", h.number, tr, h.tx_hash).into());
+            }
+            Ok(())
+        };
+        let txs: Vec<&block::Tx> = b.txs.iter().collect();
         match ex {
             Ex::Native(ex) => {
                 let parent = parent.map(|p| p.native().expect("firewood pending under the native engine").clone());
@@ -1094,12 +1112,18 @@ impl NodeEngine {
                 // NormalOp: the root now, on a layer over the parent's (bootstrapping
                 // leaves it to the checker, one block behind; a parent verified that
                 // way has no layer, so its children follow the checker path too).
-                if self.normal.load(Ordering::Relaxed) && parent.as_ref().is_none_or(|pp| pp.layer.is_some()) {
+                // The receipts and transactions roots are the other lanes of the
+                // same fork-join: three tries side by side instead of in a row.
+                let with_root = self.normal.load(Ordering::Relaxed) && parent.as_ref().is_none_or(|pp| pp.layer.is_some());
+                let (layer, (rr, tr)) = {
+                    let g = p.payload.lock().unwrap();
+                    let pl = g.as_ref().unwrap();
                     let dirty = &roller.as_ref().expect("the native engine rolls").dirty;
-                    let layer = {
-                        let g = p.payload.lock().unwrap();
-                        self.layer_for(dirty, parent.as_deref(), &g.as_ref().unwrap().ws).map_err(|e| format!("block {}: state root: {e:#}", h.number))?
-                    };
+                    self.pool.install(|| rayon::join(|| with_root.then(|| self.layer_for(dirty, parent.as_deref(), &pl.ws)), || rayon::join(|| exec::exec::receipts_root(&pl.result.txs), || build::tx_root(&txs))))
+                };
+                check_roots(rr, tr)?;
+                if let Some(layer) = layer {
+                    let layer = layer.map_err(|e| format!("block {}: state root: {e:#}", h.number))?;
                     if layer.root != h.root.0 {
                         return Err(format!("block {}: state root mismatch: computed {}, header {}", h.number, B256::from(layer.root), h.root).into());
                     }
@@ -1110,8 +1134,11 @@ impl NodeEngine {
             Ex::Firewood(ex) => {
                 let parent = parent.map(|p| p.firewood().expect("native pending under the firewood engine").clone());
                 ex.db_mut().begin(parent);
-                let r = ex.execute_block(b, pt).map_err(|e| format!("block {}: {e:#}", b.height))?;
+                let mut r = ex.execute_block(b, pt).map_err(|e| format!("block {}: {e:#}", b.height))?;
                 check(&r)?;
+                let (rr, tr) = self.pool.install(|| rayon::join(|| exec::exec::receipts_root(&r.txs), || build::tx_root(&txs)));
+                check_roots(rr, tr)?;
+                r.receipts_root = rr;
                 let db = ex.db_mut();
                 let (ws, code) = db.take_ws();
                 let p = Arc::new(db.finish(b.height, b.hash, h.time));
@@ -1189,13 +1216,17 @@ impl NodeEngine {
         // finish takes cur out of the executor's Layered; the hash comes after the root.
         let mut p = ex.db_mut().finish(h.number, B256::ZERO, h.time, r.result);
         lap(3, &mut t);
-        let layer = {
+        // The state root, the receipts root and the transactions root side by side.
+        let (layer, (rr, tr)) = {
             let g = p.payload.lock().unwrap();
-            self.layer_for(&roller.dirty, parent_n.as_deref(), &g.as_ref().unwrap().ws).map_err(|e| format!("build on {}: state root: {e:#}", parent_hdr.number))?
+            let pl = g.as_ref().unwrap();
+            self.pool.install(|| rayon::join(|| self.layer_for(&roller.dirty, parent_n.as_deref(), &pl.ws), || rayon::join(|| exec::exec::receipts_root(&pl.result.txs), || build::tx_root(&txs))))
         };
+        let layer = layer.map_err(|e| format!("build on {}: state root: {e:#}", parent_hdr.number))?;
         lap(4, &mut t);
-        let result = p.payload.lock().unwrap().take().unwrap();
-        let (hdr, header_rlp, bytes) = build::assemble(h, &txs, B256::from(layer.root), &result.result, &r.predicate_bytes)?;
+        let mut result = p.payload.lock().unwrap().take().unwrap();
+        result.result.receipts_root = rr;
+        let (hdr, header_rlp, bytes) = build::assemble(h, &txs, B256::from(layer.root), rr, tr, &result.result, &r.predicate_bytes)?;
         let hash = alloy_primitives::keccak256(&header_rlp);
         p.hash = hash;
         p.root = hdr.root;

@@ -293,6 +293,15 @@ pub fn decode_tx(raw: Bytes) -> Result<Tx, Error> {
 /// decode_block splits the inner block RLP `[header, txs, uncles]` into the
 /// header's raw RLP and the decoded transactions. Uncles are not decoded.
 pub fn decode_block(inner: &Bytes) -> Result<(Bytes, Vec<Tx>), Error> {
+    let (header_rlp, raws) = split_block(inner)?;
+    let txs = raws.into_iter().map(decode_tx).collect::<Result<_, _>>()?;
+    Ok((header_rlp, txs))
+}
+
+/// split_block splits the inner block RLP into the header's raw RLP and each
+/// transaction's envelope bytes, undecoded (a typed tx: the string's
+/// payload; a legacy tx: its list), so the decode can run per tx.
+pub fn split_block(inner: &Bytes) -> Result<(Bytes, Vec<Bytes>), Error> {
     let mut p = &inner[..];
     let h = list(&mut p)?;
     if h.payload_length != p.len() {
@@ -312,7 +321,7 @@ pub fn decode_block(inner: &Bytes) -> Result<(Bytes, Vec<Tx>), Error> {
         let total = ih.length() + ih.payload_length;
         let raw = if ih.list { &start[..total] } else { &start[ih.length()..total] };
         q = &start[total..];
-        txs.push(decode_tx(inner.slice_ref(raw))?);
+        txs.push(inner.slice_ref(raw));
     }
     Ok((header_rlp, txs))
 }

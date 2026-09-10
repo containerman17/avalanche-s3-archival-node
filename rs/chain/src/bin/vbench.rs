@@ -206,7 +206,9 @@ fn run_dump(engine: NodeEngine, dump: &str, to: u64, do_build: bool, quiet: bool
 /// (LONDON); the block is built at a Granite timestamp.
 fn synthetic(n: usize, data: &str) -> Result<()> {
     let s = chain::synth::Signer::new([0x11; 32]);
-    let init = Init { network_id: 1, subnet_id: [7; 32], chain_id: [9; 32], chain_data_dir: data.into(), genesis_bytes: chain::synth::genesis_json(s.address).into_bytes(), upgrade_bytes: Vec::new(), config_bytes: b"{}".to_vec() };
+    // The stress L1's 500 M gas limit, so a 16k-transfer block fits.
+    let genesis = chain::synth::genesis_json(s.address).replace("100000000", "500000000").replace("0x5f5e100", "0x1dcd6500");
+    let init = Init { network_id: 1, subnet_id: [7; 32], chain_id: [9; 32], chain_data_dir: data.into(), genesis_bytes: genesis.into_bytes(), upgrade_bytes: Vec::new(), config_bytes: b"{}".to_vec() };
     let engine = NodeEngine::open(&init).map_err(|e| anyhow!("{e}"))?;
     let tree = Tree::new(engine);
     tree.engine.set_state(true);
@@ -219,15 +221,26 @@ fn synthetic(n: usize, data: &str) -> Result<()> {
     let build_ms = t0.elapsed().as_secs_f64() * 1e3;
     let b = out.block.clone();
     eprintln!("vbench: synthetic block {} txs={} gas={} root={} extra={} bytes: build {build_ms:.2} ms", b.height, b.txs.len(), b.header.gas_used, b.header.root, b.header.extra.len());
+    eprintln!("vbench: build phases (ms): template {:.2} candidates+recover {:.2} exec {:.2} finish {:.2} root {:.2} assemble {:.2} cache {:.2}", out.phase_ns[0] as f64 / 1e6, out.phase_ns[1] as f64 / 1e6, out.phase_ns[2] as f64 / 1e6, out.phase_ns[3] as f64 / 1e6, out.phase_ns[4] as f64 / 1e6, out.phase_ns[5] as f64 / 1e6, out.phase_ns[6] as f64 / 1e6);
     assert_eq!(out.included.len(), n, "every transfer included: {:?}", out.reasons.iter().filter(|r| **r != exec::exec::SkipReason::Included).count());
     assert_eq!(b.header.time_milliseconds, Some(1_770_000_000_123));
     assert_eq!(b.header.min_delay_excess, Some(chain::build::INITIAL_DELAY_EXCESS));
     // The verify path on the same bytes: parse, verify (root inline), accept.
+    // A peer's parse: the cache is emptied first so the decode and the sender recovery run.
+    tree.engine.forget_parsed();
+    let t0 = Instant::now();
     let parsed = tree.engine.parse(b.container.clone()).map_err(|e| anyhow!("{e}"))?;
+    let parse_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t0 = Instant::now();
+    let again = tree.engine.parse(b.container.clone()).map_err(|e| anyhow!("{e}"))?;
+    eprintln!("vbench: synthetic parse (decode + recover) {parse_ms:.2} ms; parse again (cache hit) {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
     assert_eq!(parsed.hash, b.hash);
+    assert_eq!(again.hash, b.hash);
+    let root0 = tree.engine.stats.t_root.load(std::sync::atomic::Ordering::Relaxed);
     let t0 = Instant::now();
     tree.verify(parsed, None).map_err(|e| anyhow!("verify: {e}"))?;
     let verify_ms = t0.elapsed().as_secs_f64() * 1e3;
+    eprintln!("vbench: synthetic verify state root {:.2} ms of {verify_ms:.2}", (tree.engine.stats.t_root.load(std::sync::atomic::Ordering::Relaxed) - root0) as f64 / 1e6);
     tree.accept(&b.hash.0).map_err(|e| anyhow!("accept: {e}"))?;
     eprintln!("vbench: synthetic verify (execute + inline root) {verify_ms:.2} ms; build {build_ms:.2} ms; accepted head {}", tree.engine.last_accepted().height);
     let accts = tree.engine.accounts(None, &[s.address]);
@@ -322,7 +335,7 @@ fn window(args: &[String]) -> Result<()> {
                     if let Err(e) = chain::build::verify_block_fee(h.base_fee.unwrap(), h.block_gas_cost.unwrap_or_default(), &txs, &gas) {
                         eprintln!("vbench: window {}: block fee: {e}", b.height);
                     }
-                    let (hdr, _, bytes) = chain::build::assemble(h, &txs, b.header.root, &r.result, &r.predicate_bytes).map_err(|e| anyhow!("{e}"))?;
+                    let (hdr, _, bytes) = chain::build::assemble(h, &txs, b.header.root, r.result.receipts_root, chain::build::tx_root(&txs), &r.result, &r.predicate_bytes).map_err(|e| anyhow!("{e}"))?;
                     if bytes[..] == inner[..] {
                         ok += 1;
                     } else {

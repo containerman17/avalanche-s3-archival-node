@@ -59,13 +59,12 @@ type VM struct {
 	b      *builder
 	m      *metrics
 
-	mu          sync.Mutex
-	head        *types.Header // the accepted head's header (Accept decodes it once)
-	headID      ids.ID
-	preferred   ids.ID
-	lastBuilt   ids.ID            // the id of the last block we built (Accept logs "proposer": "self")
-	lastBuiltAt time.Time         // when buildBlock returned it (Accept logs the consensus latency)
-	lastX       [nCrossing]uint64 // crossing counters at the previous Accept
+	mu        sync.Mutex
+	head      *types.Header // the accepted head's header (Accept decodes it once)
+	headID    ids.ID
+	preferred ids.ID
+	built     map[ids.ID]time.Time // blocks we built and when buildBlock returned them (Accept logs "proposer": "self" and the consensus latency; a node builds h+1 on its own unaccepted h, so one id is not enough)
+	lastX     [nCrossing]uint64    // crossing counters at the previous Accept
 
 	gossipOnce sync.Once
 	cancel     context.CancelFunc
@@ -123,6 +122,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.head, vm.headID, vm.preferred = head, headID, headID
+	vm.built = map[ids.ID]time.Time{}
 
 	vm.net, err = p2p.NewNetwork(chainCtx.Log, appSender, vm.m.reg, "p2p")
 	if err != nil {
@@ -130,7 +130,7 @@ func (vm *VM) Initialize(_ context.Context, chainCtx *snow.Context, _ database.D
 		return err
 	}
 	vm.bg, vm.cancel = context.WithCancel(context.Background())
-	vm.b = newBuilder(eng)
+	vm.b = newBuilder(eng, chainCtx.Log)
 
 	chainCtx.Log.Info("validator: engine open", zap.Stringer("chain", chainCtx.ChainID),
 		zap.Stringer("chainId", chainConfig.ChainID), zap.Uint64("height", head.Number.Uint64()), zap.String("data", chainCtx.ChainDataDir))
@@ -293,7 +293,11 @@ func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
 func (vm *VM) NewHTTPHandler(context.Context) (http.Handler, error) { return nil, nil }
 
 func (vm *VM) WaitForEvent(ctx context.Context) (common.Message, error) {
-	return vm.b.waitForEvent(ctx, func() *types.Header { h, _ := vm.current(); return h })
+	return vm.b.waitForEvent(ctx, func() (*types.Header, ids.ID) {
+		vm.mu.Lock()
+		defer vm.mu.Unlock()
+		return vm.head, vm.preferred
+	})
 }
 
 func (vm *VM) SetPreference(_ context.Context, id ids.ID) error {
@@ -330,20 +334,24 @@ func (vm *VM) GetBlock(_ context.Context, id ids.ID) (snowman.Block, error) {
 		vm.ctx.Log.Error("validator: GetBlock failed", zap.Stringer("id", id), zap.Error(err))
 		return nil, err
 	}
+	start := time.Now()
 	m, err := vm.eng.parse(raw)
 	if err != nil {
 		return nil, err
 	}
+	vm.ctx.Log.Info("validator: getblock", zap.Uint64("height", m.height), zap.Duration("took", time.Since(start)))
 	return &Block{vm: vm, raw: raw, id: m.id, parent: m.parent, height: m.height, time: m.time}, nil
 }
 
 // ParseBlock hands the inner block bytes to the engine, which keeps the
 // decoded block; Go keeps only the metadata and the slice it was given.
 func (vm *VM) ParseBlock(_ context.Context, raw []byte) (snowman.Block, error) {
+	start := time.Now()
 	m, err := vm.eng.parse(raw)
 	if err != nil {
 		return nil, err
 	}
+	vm.ctx.Log.Info("validator: parsed", zap.Uint64("height", m.height), zap.Int("bytes", len(raw)), zap.Duration("took", time.Since(start)))
 	return &Block{vm: vm, raw: raw, id: m.id, parent: m.parent, height: m.height, time: m.time}, nil
 }
 
@@ -390,6 +398,7 @@ func (b *Block) verify(pchainHeight uint64) error {
 		return err
 	}
 	b.vm.m.verifyTxs.Observe(float64(txs))
+	b.vm.ctx.Log.Info("validator: verified", zap.Uint64("height", b.height), zap.Uint64("txs", txs), zap.Duration("took", time.Since(start)))
 	return nil
 }
 
@@ -416,11 +425,16 @@ func (b *Block) Accept(context.Context) error {
 	vm.head, vm.headID = h, b.id
 	prev := vm.lastX
 	vm.lastX = now
-	self := vm.lastBuilt == b.id
-	builtAt := vm.lastBuiltAt
+	builtAt, self := vm.built[b.id]
+	delete(vm.built, b.id)
+	for id, t := range vm.built { // built blocks consensus never named (superseded before they were proposed)
+		if start.Sub(t) > time.Minute {
+			delete(vm.built, id)
+		}
+	}
 	vm.mu.Unlock()
 	fields := make([]zap.Field, 0, nCrossing+5)
-	fields = append(fields, zap.Uint64("height", b.height), zap.Uint64("gasUsed", h.GasUsed))
+	fields = append(fields, zap.Uint64("height", b.height), zap.Uint64("gasUsed", h.GasUsed), zap.Duration("took", time.Since(start)))
 	if self {
 		fields = append(fields, zap.String("proposer", "self"), zap.Duration("buildToAccept", start.Sub(builtAt)))
 	}

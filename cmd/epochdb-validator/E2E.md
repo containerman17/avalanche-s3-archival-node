@@ -628,6 +628,98 @@ proposer has nothing to build or has not seen the parent; at 40k tx/s to both no
 blocks, 188 "Waiting until we should build" lines per node are the non-proposer's normal wait for its slot, cut short
 when the proposer's block arrives).
 
+## Per-height cycle: where a 16k-tx height spends its time (branch rs-cycle off rust 7d9a694, 2026-09-10 JST)
+
+Setup: 2 all-ours validators, `--stress`, `--load 60s --keys 1024 --workers 8 --batch 1000`, `--node-log-level debug`,
+`--node-flags throttler-inbound-bandwidth-refill-rate=33554432,throttler-inbound-bandwidth-max-burst-size=67108864,log-rotater-max-size=512`,
+box shared (another user's clickhouse at 100% of one core, other tabs idle-ish; 8 physical cores / 16 threads).
+The shell now logs `validator: parsed` (height, bytes, took), `validator: verified` (height, txs, took),
+`validator: wake` (WaitForEvent returning PendingTxs: the pool wait and the retry gap it slept), `validator: getblock`,
+and `took` on the accepted line; avalanchego's debug log adds `sent message` / `forwarding sync message to consensus`
+(messageOp push_query / chits), the proposervm's `built block` (blkID, height) and snowman's `adding block`.
+`cmd/epochdb-validator/e2e/timeline.py LOGS_DIR [from to]` joins the two nodes' chain logs on one clock: the proposer of
+h is the node whose `built block` id at h the other node added to consensus (both nodes build most heights: the
+`proposer: self` field used to name only the LAST built id, so a node that built h+1 on its own unaccepted h never
+logged itself as h's proposer; it is a set now). Segment medians / p90 over the load heights, all at 40k tx/s offered
+on the same plugin build (7d9a694 + the log lines):
+
+| segment | median | p90 |
+|---|---|---|
+| build (BuildBlock wall, 12.7k txs/block avg) | 146 ms | 201 |
+| build done -> PushQuery sent (proposervm wrap, gRPC copy of 1.8 MB, zstd) | 38 | 60 |
+| PushQuery sent -> peer handler recv | 3 | 101 |
+| peer recv -> parse start (gRPC copy into the plugin) | 7 | 13 |
+| parse (decode + 16k sender recoveries on the rayon pool) | 103 | 144 |
+| parse done -> verify start (a second parse of the same bytes) | 15 | 28 |
+| verify (execute + receipts root + state root) | 96 | 117 |
+| verify done -> chits sent | 3 | 245 |
+| chits sent -> chits recv at the proposer | 32 | 247 |
+| chits recv -> accept(h) at the proposer | 1629 | 2469 |
+| build start - accept(h-1) | -1880 | -464 |
+| accept took (proposer / peer) | 21 / 8 | 45 / 22 |
+
+Consensus is a PIPELINE: a block is built ~1.9 s before its parent is accepted and accepted ~2.1 s after it was
+built (6-7 blocks processing), so `accept(h-1) -> wake` is not a segment of the cycle and the 100 ms retry gap
+rarely bit (wake gap p50 26 ms on one node, 0 on the other). What bounds the height rate is the VM-lock work per
+height: the proposer's build + wrap (~185 ms), then, when the next height's slot-0 proposer is the other node (the
+proposervm seeds it by height, so about every second height), that node's parse + verify (~215 ms) before it can
+build; when the same node proposes twice the two overlap. Hence 313 ms median between accepts at 40k offered
+(365 ms per block over the run) and 479 ms at 60k offered with full blocks (base60k run).
+
+Found and cut (each measured in-process with `vbench --synthetic 15364` on an idle box, 500 M gas genesis, then in
+the 2-node run):
+
+1. Parse decoded all 16k txs BEFORE looking the block up in the parsed cache, and the same bytes reach parse 2-3
+   times per height (the proposervm's inner parse of its own block, the snowman PushQuery, `GetBlock` from the
+   rpcchainvm server): 9-13 ms each on the critical path. The cache key is now `block::container_hash` (header
+   only): a hit costs 0.5 ms (`getblock` p50 10.4 -> 0.5 ms, `parse done -> verify start` 15 -> 4 ms).
+2. Parse decoded serially (9 ms), then recovered on the pool. `block::decode_container_par` splits the tx RLP,
+   decodes per tx in parallel, takes the senders the pool already recovered at admission (`Pool::senders` by tx
+   hash, 1-2 ms for 16k) and recovers only the rest. In this harness the peer holds ~5% of the block's txs (a
+   generator worker sticks to one node and the push gossiper carries little), so recovery stays: 16k x ~40 us of
+   libsecp256k1 = 640 ms of CPU, 72 ms on 14 threads of 8 physical cores when idle, 90-140 ms when the box is
+   saturated. Under 15 ms is not reachable on this box; on a chain where gossip delivers the txs first the lookup
+   removes the recovery.
+3. The receipts trie was computed twice in a build (exec's `build_block`, then `assemble` again) and the tx trie
+   once, all serial: `assemble` 28 ms in-process, 35 ms in the run. exec leaves the receipts root out
+   (`defer_receipts_root`) and the engine computes the state root, the receipts root and the transactions root in one
+   `rayon::join` in both verify and build (`eng_exec` 96 -> 74 ms, `eng_assemble` 35 -> 4.4 ms, `eng_root` 3.6 -> 25 ms
+   because it now also spans the two other tries; the build crossing 168 -> 139 ms median at 60k). Verify also
+   checks the header's transactionsRoot now (it was not checked; the receipts and state roots covered the txs
+   indirectly). In-process: build 143 -> 105 ms, verify 103 -> 89 ms, parse 78 -> 72 ms (decode parallel; recovery is
+   the rest).
+4. WaitForEvent's 100 ms retry gap applied to every build within 100 ms of the previous one whatever the parent.
+   It now applies only to a REPEATED build on the same preferred parent; a new preferred block (ours or a peer's)
+   builds at once (the candidates skip the unaccepted ancestors' txs, so nothing is re-offered). Builds per accepted
+   block stayed ~1.03 (no dropped or rejected blocks in any run).
+5. `network-compression-type=none` (avalanchego flag): `build done -> PushQuery sent` 36 -> 15 ms; the wire carries
+   1.65 MB instead of 1.1 MB per block, nothing else changes. A deployment choice for a LAN-class validator set.
+
+Same 60 s runs, before (7d9a694) and after, 60k tx/s offered (the pool fills, blocks are full):
+
+| | base 60k | after 60k | after 60k + compression none |
+|---|---|---|---|
+| offered / refused | 45.1k tx/s / 55k | 46.7k / 28k | 48.6k / 5.5k |
+| load blocks, txs | 136 blocks, 1,939,779 txs, 14,263/block | 152, 2,149,810, 14,143/block | 161, 2,222,129, 13,802/block |
+| ms between blocks / tx/s mined over the accept span | 479 / 27.4k | 435 / 30.1k | 416 / 30.9k |
+| accept gaps p50 / p90 / p99 (two nodes) | 433 / 951 / 1513 and 416 / 909 / 1723 ms | 347 / 974 / 1872 and 361 / 995 / 1986 | 331 / 945 / 1615 and 307 / 907 / 1680 |
+| engine build crossing median (16,029-tx builds) | 168 ms (exec 96, candidates 21, root 3.6, assemble 35) | 139 (exec 74, candidates 24, roots 25, assemble 4.4) | 138 |
+| timeline: build wall / wrap / parse / verify median | n/a (no log lines) | 142 / 36 / 137 / 95 ms | 143 / 15 / 139 / 95 |
+| plugin RSS at t=60 s | 2467 / 2467 MB | 2222 / 2319 | 1984 / 2418 |
+
+At 40k offered both builds mine everything offered (2,393,024 txs each); after: 272 ms between blocks with 10.2k
+txs/block against 365 ms with 12.7k (the chain drains the pool faster, so blocks are smaller), accept gaps p50 201
+ms against 291. `cargo test --workspace --release` 75 passed, `go test -count=1 ./validator/` and `-tags epochdb_stub` ok.
+
+What remains per 16k-tx height, for the parallel-execution round: the peer's parse ~90-140 ms (sender recovery,
+CPU-bound: 640 ms of CPU per block; the pool lookup removes it only where gossip delivered the txs first), verify
+exec ~74 ms (16k transfers at ~4.6 us each on one thread) plus 25 ms of tries, the proposer's build exec ~74 ms plus
+the pool's candidate selection ~24 ms (24k candidates cloned out of the pool for a 16k block) plus 25 ms of tries,
+and the proposervm wrap + gRPC copies (~15 ms without compression, ~7 ms into the peer plugin). Consensus itself
+adds no idle time between heights at 2 validators: the proposervm's 5 s slot waits are the non-proposer's and are
+cut short by the proposer's block. The box is the other bound: at 60k offered the two plugins and the generator use
+13-16 of 16 threads (admission recovers every tx once per node, 46k tx/s x 40 us = 1.8 cores per node).
+
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and

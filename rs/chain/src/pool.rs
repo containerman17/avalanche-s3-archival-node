@@ -572,6 +572,15 @@ impl Pool {
         g.pending > 0
     }
 
+    /// The senders the pool already recovered for `hashes` (admission
+    /// recovers every tx once); None for a tx the pool does not hold. A
+    /// peer's block is mostly the pool's own txs, so its parse recovers only
+    /// the rest.
+    pub fn senders(&self, hashes: &[B256]) -> Vec<Option<Address>> {
+        let g = self.inner.lock().unwrap();
+        hashes.iter().map(|h| g.by_hash.get(h).map(|(a, _)| *a)).collect()
+    }
+
     /// Every tx admitted since the last drain (local and remote: the push
     /// gossiper forwards both), oldest first.
     pub fn drain_gossip(&self) -> Vec<Arc<Tx>> {

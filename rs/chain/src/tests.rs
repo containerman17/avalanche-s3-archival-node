@@ -93,7 +93,7 @@ fn siblings_root_in_verify_accept_one_reject_other() {
     assert_eq!(e.included, vec![0], "reasons {:?} nonce {:?}", e.reasons, t.engine.accounts(None, &[s.address]));
     let mut hdr = e.block.header.clone();
     hdr.root = alloy_primitives::B256::repeat_byte(0xab);
-    let (h2, _, bytes) = crate::build::assemble(hdr, &e.block.txs.iter().collect::<Vec<_>>(), alloy_primitives::B256::repeat_byte(0xab), &exec::BlockResult { gas_used: e.block.header.gas_used, receipts_root: e.block.header.receipt_hash, bloom: e.block.header.bloom, txs: Vec::new(), tail: Vec::new(), code: Vec::new() }, &[]).unwrap();
+    let (h2, _, bytes) = crate::build::assemble(hdr, &e.block.txs.iter().collect::<Vec<_>>(), alloy_primitives::B256::repeat_byte(0xab), e.block.header.receipt_hash, e.block.header.tx_hash, &exec::BlockResult { gas_used: e.block.header.gas_used, receipts_root: e.block.header.receipt_hash, bloom: e.block.header.bloom, txs: Vec::new(), tail: Vec::new(), code: Vec::new() }, &[]).unwrap();
     assert_eq!(h2.gas_used, 21_000);
     let bad = t.engine.parse(bytes::Bytes::from(bytes)).unwrap();
     let err = t.verify(bad, None).unwrap_err().to_string();

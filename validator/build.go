@@ -15,6 +15,7 @@ import (
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/utils/lock"
+	"github.com/ava-labs/avalanchego/utils/logging"
 	ethcommon "github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/rlp"
@@ -34,6 +35,7 @@ const poolWaitSlice = 200 * time.Millisecond
 // timing rules (retry delay, Granite minimum block delay) allow it.
 type builder struct {
 	eng  *engine
+	log  logging.Logger
 	mu   sync.Mutex
 	cond *lock.Cond
 
@@ -42,8 +44,8 @@ type builder struct {
 	lastBuildParent ethcommon.Hash
 }
 
-func newBuilder(eng *engine) *builder {
-	b := &builder{eng: eng}
+func newBuilder(eng *engine, log logging.Logger) *builder {
+	b := &builder{eng: eng, log: log}
 	b.cond = lock.NewCond(&b.mu)
 	return b
 }
@@ -63,8 +65,9 @@ func (b *builder) built(parent ethcommon.Hash) {
 
 // waitForEvent: NormalOp, then the pool holds an executable tx (the wait
 // lives in the engine; the pool's head moves inside Accept, so a mined tx
-// never counts as pending here), then the timing rules.
-func (b *builder) waitForEvent(ctx context.Context, head func() *types.Header) (common.Message, error) {
+// never counts as pending here), then the timing rules. `state` is the
+// accepted head's header and the preferred block's id.
+func (b *builder) waitForEvent(ctx context.Context, state func() (*types.Header, ids.ID)) (common.Message, error) {
 	b.mu.Lock()
 	for !b.normalOp {
 		if err := b.cond.Wait(ctx); err != nil {
@@ -73,6 +76,7 @@ func (b *builder) waitForEvent(ctx context.Context, head func() *types.Header) (
 		}
 	}
 	b.mu.Unlock()
+	t0 := time.Now()
 	for !b.eng.poolWait(poolWaitSlice) {
 		if err := ctx.Err(); err != nil {
 			return 0, err
@@ -82,30 +86,27 @@ func (b *builder) waitForEvent(ctx context.Context, head func() *types.Header) (
 	lastTime, lastParent := b.lastBuildTime, b.lastBuildParent
 	b.mu.Unlock()
 
-	h := head()
-	// A build within the retry gap of the previous one waits it out
-	// whatever the parent: a build on the preferred (unaccepted) block right
-	// after the build that made it found the same candidates minus that
-	// block's and burned an engine build every 50 ms (58 per height seen).
-	next := lastTime.Add(retryDelay)
-	if lastParent != h.Hash() {
-		next = maxTime(next, minNextBlockTime(h)) // Granite: the wait lives here, not in BuildBlock
+	h, preferred := state()
+	// The retry gap applies to a REPEATED build on the same preferred parent
+	// (our block is out and consensus has not moved yet). A new preferred
+	// block, ours or a peer's, builds at once: the engine's candidates skip
+	// the txs of the unaccepted ancestors, so nothing is re-offered.
+	var next time.Time
+	if lastParent == ethcommon.Hash(preferred) {
+		next = lastTime.Add(retryDelay)
+	} else if preferred == ids.ID(h.Hash()) {
+		next = minNextBlockTime(h) // Granite: the wait lives here, not in BuildBlock
 	}
-	if d := time.Until(next); d > 0 {
+	gap := time.Until(next)
+	if gap > 0 {
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
-		case <-time.After(d):
+		case <-time.After(gap):
 		}
 	}
+	b.log.Info("validator: wake", zap.Uint64("head", h.Number.Uint64()), zap.Duration("poolWait", time.Since(t0)-max(gap, 0)), zap.Duration("gap", max(gap, 0)))
 	return common.PendingTxs, nil
-}
-
-func maxTime(a, b time.Time) time.Time {
-	if a.After(b) {
-		return a
-	}
-	return b
 }
 
 // minNextBlockTime: Granite's minimum delay after the parent (ACP-226).
@@ -165,7 +166,7 @@ func (vm *VM) buildBlock(pchainHeight uint64) (snowman.Block, error) {
 	}
 	vm.m.buildTxs.Observe(float64(out.included))
 	vm.mu.Lock()
-	vm.lastBuilt, vm.lastBuiltAt = out.id, time.Now()
+	vm.built[out.id] = time.Now()
 	vm.mu.Unlock()
 	var skips [7]int
 	for _, c := range out.skipped {

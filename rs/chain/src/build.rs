@@ -190,8 +190,7 @@ pub fn verify_block_fee(base_fee: U256, block_gas_cost: U256, txs: &[&Tx], gas_u
 
 /// types.NewBlock: the header completed from execution, the block RLP
 /// `[header, txs, []]` and its hash.
-pub fn assemble(mut h: Header, txs: &[&Tx], root: B256, r: &exec::BlockResult, predicate_bytes: &[u8]) -> Result<(Header, Vec<u8>, Vec<u8>), String> {
-    use alloy_eips::eip2718::Encodable2718;
+pub fn assemble(mut h: Header, txs: &[&Tx], root: B256, receipts_root: B256, tx_root: B256, r: &exec::BlockResult, predicate_bytes: &[u8]) -> Result<(Header, Vec<u8>, Vec<u8>), String> {
     if !predicate_bytes.is_empty() {
         let mut e = h.extra.to_vec();
         e.extend_from_slice(predicate_bytes);
@@ -200,8 +199,8 @@ pub fn assemble(mut h: Header, txs: &[&Tx], root: B256, r: &exec::BlockResult, p
     h.root = root;
     h.gas_used = r.gas_used;
     h.bloom = r.bloom;
-    h.receipt_hash = if r.txs.is_empty() { EMPTY_ROOT_HASH } else { alloy_trie::root::ordered_trie_root_with_encoder(&r.txs, |t, buf| t.receipt.encode_2718(buf)) };
-    h.tx_hash = if txs.is_empty() { EMPTY_ROOT_HASH } else { alloy_trie::root::ordered_trie_root_with_encoder(txs, |t, buf| buf.extend_from_slice(&t.raw)) };
+    h.receipt_hash = receipts_root;
+    h.tx_hash = tx_root;
     let header_rlp = block::eth::encode_header(&h).map_err(|e| e.to_string())?;
     let mut body = Vec::with_capacity(header_rlp.len() + txs.iter().map(|t| t.raw.len() + 4).sum::<usize>() + 8);
     body.extend_from_slice(&header_rlp);
@@ -221,6 +220,14 @@ pub fn assemble(mut h: Header, txs: &[&Tx], root: B256, r: &exec::BlockResult, p
     alloy_rlp::Header { list: true, payload_length: body.len() }.encode(&mut out);
     out.extend_from_slice(&body);
     Ok((h, header_rlp, out))
+}
+
+/// The transactions trie root of `txs` in order (the header's txHash).
+pub fn tx_root(txs: &[&Tx]) -> B256 {
+    if txs.is_empty() {
+        return EMPTY_ROOT_HASH;
+    }
+    alloy_trie::root::ordered_trie_root_with_encoder(txs, |t, buf| buf.extend_from_slice(&t.raw))
 }
 
 trait HeaderHash {

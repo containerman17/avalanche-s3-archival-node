@@ -199,6 +199,15 @@ pub struct BlockResult {
     pub code: Vec<(B256, Bytes)>,
 }
 
+/// The receipts trie root of a block's tx results in order (EMPTY_ROOT_HASH
+/// for none).
+pub fn receipts_root(txs: &[TxResult]) -> B256 {
+    if txs.is_empty() {
+        return alloy_trie::EMPTY_ROOT_HASH;
+    }
+    alloy_trie::root::ordered_trie_root_with_encoder(txs, |t, buf| t.receipt.encode_2718(buf))
+}
+
 /// ethparams.TxGas: the miner stops once less than this is left in the pool.
 pub const TX_GAS: u64 = 21_000;
 /// miner.targetTxsSize: the built block's tx bytes stay under this.
@@ -727,6 +736,9 @@ pub struct Executor<D: StateDb = Db> {
     /// instead of rendering the JSON on this thread (the node's checker
     /// thread renders it before the store write).
     pub defer_call_trace: bool,
+    /// Leave `BlockResult::receipts_root` zero: the caller computes it with
+    /// `receipts_root` (the node overlaps it with the state root).
+    pub defer_receipts_root: bool,
     /// The miner's block size target in bytes of tx RLP (subnet-evm: 1800 KiB);
     /// config key `block-size-target-kib` in the node.
     pub block_size_target: usize,
@@ -785,6 +797,7 @@ impl<D: StateDb> Executor<D> {
             t_commit: Default::default(),
             trace: Trace::Call(CallConfig::default()),
             defer_call_trace: false,
+            defer_receipts_root: false,
             block_size_target: TARGET_TXS_SIZE,
         }
     }
@@ -1070,19 +1083,19 @@ impl<D: StateDb> Executor<D> {
 
         let bc = self.block_ctx(h, b.pvm.as_ref().map(|p| p.pchain_height), b.pvm.as_ref().and_then(|p| p.epoch_pchain_height))?;
         let mut cumulative = 0u64;
-        let mut receipts = Vec::with_capacity(b.txs.len());
         let mut bloom = Bloom::default();
         for (i, t) in b.txs.iter().enumerate() {
             let o = self.apply_tx(h, i, t, &bc, cumulative, Mode::Verify).map_err(|e| e.into_anyhow(h.number, i, t.hash))?;
             cumulative = o.result.cumulative_gas_used;
             bloom |= o.result.receipt.logs_bloom();
-            receipts.push(o.result.receipt.clone());
             out.code.extend(o.code);
             out.txs.push(o.result);
         }
         out.gas_used = cumulative;
         out.bloom = bloom;
-        out.receipts_root = alloy_trie::root::ordered_trie_root_with_encoder(&receipts, |r, buf| r.encode_2718(buf));
+        if !self.defer_receipts_root {
+            out.receipts_root = receipts_root(&out.txs);
+        }
         self.prev_pchain_height = this_pchain;
         Ok(out)
     }
@@ -1258,7 +1271,6 @@ impl<D: StateDb> Executor<D> {
         let mut results: warp::BlockResults = Default::default();
         let mut cumulative = 0u64;
         let mut size = 0usize;
-        let mut receipts = Vec::new();
         let mut bloom = Bloom::default();
         let mut included = Vec::new();
         let mut reasons = vec![SkipReason::NotReached; candidates.len()];
@@ -1297,7 +1309,6 @@ impl<D: StateDb> Executor<D> {
                     cumulative = o.result.cumulative_gas_used;
                     size += t.raw.len();
                     bloom |= o.result.receipt.logs_bloom();
-                    receipts.push(o.result.receipt.clone());
                     out.code.extend(o.code);
                     out.txs.push(o.result);
                     included.push(i);
@@ -1312,7 +1323,9 @@ impl<D: StateDb> Executor<D> {
         }
         out.gas_used = cumulative;
         out.bloom = bloom;
-        out.receipts_root = if receipts.is_empty() { alloy_trie::EMPTY_ROOT_HASH } else { alloy_trie::root::ordered_trie_root_with_encoder(&receipts, |r, buf| r.encode_2718(buf)) };
+        if !self.defer_receipts_root {
+            out.receipts_root = receipts_root(&out.txs);
+        }
         self.prev_pchain_height = this_pchain;
         let predicate_bytes = if durango { warp::encode_block_results(&results) } else { Vec::new() };
         Ok(BuildResult { result: out, included, reasons, predicate_bytes })
