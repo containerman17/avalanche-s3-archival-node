@@ -167,6 +167,7 @@ func main() {
 	chainExtra := flag.String("chain-config-extra", "", "JSON file merged into the chain config both plugin kinds receive (e.g. state-scheme, pool caps)")
 	oursN := flag.Int("ours-n", 3, "validators running our plugin")
 	stockN := flag.Int("stock-n", 2, "validators running the stock plugin")
+	nodeFlags := flag.String("node-flags", "", "comma-separated key=value avalanchego flags for every node (e.g. network-compression-type=none)")
 	rpcN := flag.Int("rpc-n", 0, "non-validator nodes running our plugin (printed as kind rpc), for submitting load to a validator and a non-validator at once")
 	flag.Parse()
 	if *avago == "" || *ours == "" || *stock == "" {
@@ -203,6 +204,11 @@ func main() {
 	// node-config.json.
 	network.DefaultFlags[config.InboundThrottlerBandwidthRefillRateKey] = "67108864"
 	network.DefaultFlags[config.InboundThrottlerBandwidthMaxBurstSizeKey] = "134217728"
+	for _, kv := range strings.Split(*nodeFlags, ",") {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			network.DefaultFlags[k] = v
+		}
+	}
 	network.PreFundedKeys = []*secp256k1.PrivateKey{key}
 	network.DefaultRuntimeConfig = tmpnet.NodeRuntimeConfig{Process: &tmpnet.ProcessRuntimeConfig{AvalancheGoPath: *avago}}
 	vmID, err := ids.FromString(subnetEVMID)
