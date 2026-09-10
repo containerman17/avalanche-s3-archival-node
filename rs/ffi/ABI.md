@@ -83,8 +83,9 @@ int   epochdb_pool_nonce(epochdb_engine*, const uint8_t addr[20], uint64_t* out)
       // EPOCHDB_ENOTFOUND when the pool holds nothing of the address (the caller uses the state's nonce)
 int   epochdb_pool_wait(epochdb_engine*, uint64_t timeout_ms, uint8_t* out);        // blocks until an executable tx
       // is pending (out 1) or the timeout passes (out 0); returns at once when one already is
-int   epochdb_pool_drain_gossip(epochdb_engine*, epochdb_buf* out);                  // every tx admitted since the
-      // previous call (local and remote), RLP list of envelopes, oldest first; empty buffer = none
+int   epochdb_pool_drain_gossip(epochdb_engine*, epochdb_buf* out);                  // RLP [[envelopes...], [hashes...]]:
+      // every tx admitted since the previous call (local and remote), oldest first, and every tx hash that left the
+      // pool since then (mined, replaced, dropped), both under one pool lock; empty buffer = neither
 int   epochdb_account_state(epochdb_engine*, const uint8_t* addrs /* 20*n */, size_t n,
                             const uint8_t block_id[32] /* zero = accepted head */, epochdb_buf* out);
       // out: n x { uint64 nonce LE, uint8 balance[32] BE } at the given block's state (pending allowed)

@@ -279,13 +279,6 @@ func (e *engine) poolStatus() (pending, queued uint64) {
 	return uint64(p), uint64(q)
 }
 
-func (e *engine) poolHas(hash ids.ID) bool {
-	e.crossings[xPool].Add(1)
-	var out C.uint8_t
-	C.epochdb_pool_has(e.p, c32(hash), &out)
-	return out != 0
-}
-
 // poolContent: the pool's tx envelopes, pending then queued, of one address
 // or of all (nil); limit per half (0 = all).
 func (e *engine) poolContent(addr *common.Address, limit int) ([][]byte, error) {
@@ -319,14 +312,26 @@ func (e *engine) poolWait(timeout time.Duration) bool {
 	return out != 0
 }
 
-// poolDrainGossip: every tx admitted since the previous call.
-func (e *engine) poolDrainGossip() ([][]byte, error) {
+// poolDrainGossip: every tx admitted since the previous call, and every tx
+// hash that left the pool since then (mined, replaced, dropped), one crossing.
+func (e *engine) poolDrainGossip() (added [][]byte, gone []ids.ID, err error) {
 	e.crossings[xPool].Add(1)
 	var b C.epochdb_buf
 	if err := e.err("epochdb_pool_drain_gossip", C.epochdb_pool_drain_gossip(e.p, &b)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return decodeEnvelopes(take(&b))
+	raw := take(&b)
+	if len(raw) == 0 {
+		return nil, nil, nil
+	}
+	var out struct {
+		Added [][]byte
+		Gone  []ids.ID
+	}
+	if err := rlp.DecodeBytes(raw, &out); err != nil {
+		return nil, nil, fmt.Errorf("pool drain: %w", err)
+	}
+	return out.Added, out.Gone, nil
 }
 
 // decodeEnvelopes: the pool's RLP list of byte strings (empty buffer = none).

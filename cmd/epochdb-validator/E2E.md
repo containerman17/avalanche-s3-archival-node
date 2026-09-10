@@ -824,6 +824,43 @@ per insert; a brand-new sender's state read still takes the engine's execution m
 head snapshot, or batching the reads of concurrent calls); the gossip rate is a manual pairing of a chain config
 key with a node flag, the plugin cannot check the node's throttle.
 
+## Accept-window pool crossings and the proposer's block-sent lap (branch go-accept off rust e751275, 2026-09-11 JST)
+
+Fleet round 2 (5 validators, ~7.4k-tx blocks) showed `x_pool` = 8942 per accept-to-accept window on a peer, one
+`epochdb_pool_*` crossing per tx. Source: the SDK's `PushGossiper.gossip` asks `set.Has(id)` for EVERY tx it is
+about to push (each new tx once, each regossip round again) and `gossipSet.Has` was `epochdb_pool_has`, one cgo
+call per tx. The count is bounded by the push rate, not the block: 16k-tx blocks here at the SDK default rate gave
+x_pool p50 4032 / 3369 per window, the fleet's 25 ms / 64 KiB gossip keys gave 8.9k.
+
+Change: the pool records every hash that leaves `by_hash` (mined by `on_accept`, replaced, unpayable or expired in
+`settle` / `expire`, evicted) in a `gone` deque next to the `gossip` deque, and `epochdb_pool_drain_gossip` returns
+both under ONE lock as RLP `[[envelopes...], [hashes...]]`; Go keeps `gossipSet.held` = drained ids minus gone ids
+(adds before deletes, so a tx admitted and dropped between two drains cancels out) and answers `Has` from it, no
+crossing. `epochdb_pool_has` stays in the ABI, unused by the plugin. `TestGossipHasFollowsPool` covers admit ->
+held, accept -> gone after the next drain. Verification and consensus untouched.
+
+Also: `validator: block-sent {height, id, t_since_built_ms}` on the proposer, logged once per height from the
+Verify of a block we built: rpcchainvm's BuildBlock response already carries the bytes (there is no later Bytes()
+fetch), and BlockVerify (re-parse + verify of our own block) is the last VM call before consensus adds the block and
+PushQueries it, so it is the closest observable "sent" point. Peer timeline per height stays parsed -> verified ->
+accepted. `parsed` is logged TWICE per height on a peer: rpcchainvm ParseBlock (the PushQuery/Put bytes, through
+proposervm's inner-block parse) and BlockVerify, which re-parses the bytes it was handed before Verify; on the
+proposer only BlockVerify parses. `getblock` once per height is BlockAccept fetching the block by id.
+
+Measured, 2 all-ours --stress validators on this box (16 threads shared), `e2e --ours-n 2 --stock-n 0 --stress
+--load 45s --rate 40000 --keys 1024 --workers 8 --batch 1000`, heights of >= 3k txs (p50 16,029 txs, 69-71 heights):
+
+| build | x_pool per accept window p50 / max | x_total p50 | accept took p50 / p90 |
+|---|---|---|---|
+| e751275 node A / B | 4032 / 95,559 and 3369 / 60,811 | 4036 / 3375 | 32.8 / 85.9 ms and 24.2 / 65.9 ms |
+| go-accept node A / B | 3 / 564 and 2 / 662 | 9 / 8 | 29.4 / 78.5 ms and 27.2 / 78.4 ms |
+
+The remaining x_pool are the RPC door's batch adds (one per 1000-tx batch), the tick's drain and the status reads.
+`accept took` did NOT move: the Has crossings ran in the push loop's goroutine, never inside Accept, so accept's
+27-33 ms for 16k txs (fleet: 11 ms for 7.4k) is the engine's own `epochdb_accept` (state commit + `on_accept` over
+the block's txs) plus one head header read; the "under 3 ms" target needs engine work, not Go. `block-sent` came
+p50 10-11 ms (max 45-88 ms) after `built` on both nodes.
+
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and

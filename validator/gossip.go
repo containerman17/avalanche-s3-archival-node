@@ -56,11 +56,16 @@ const gossipIterateMax = 50_000
 
 // gossipSet is the gossip SDK's view of the engine's pool: a bloom filter of
 // what we hold (so peers skip it), Add for what they send, Iterate for what
-// we serve to pull requests.
+// we serve to pull requests, Has for what the push gossiper may still send.
+// held mirrors the pool for Has: the push gossiper asks Has once per tx it
+// pushes (every new tx once, every regossip round again), which was one cgo
+// crossing per mined tx per height; the pool's drain reports admissions and
+// removals under one lock, so held is exact for every tx the gossiper tracks.
 type gossipSet struct {
 	eng   *engine
 	bloom *gossip.BloomFilter
 	mu    sync.RWMutex
+	held  map[ids.ID]struct{}
 }
 
 func newGossipSet(eng *engine, reg prometheus.Registerer) (*gossipSet, error) {
@@ -69,21 +74,27 @@ func newGossipSet(eng *engine, reg prometheus.Registerer) (*gossipSet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bloom filter: %w", err)
 	}
-	return &gossipSet{eng: eng, bloom: b}, nil
+	return &gossipSet{eng: eng, bloom: b, held: map[ids.ID]struct{}{}}, nil
 }
 
-// added keeps the bloom filter in step with the pool's admissions (the
-// push loop drains them).
-func (g *gossipSet) added(txs []*gossipTx) {
+// added keeps the bloom filter and held in step with the pool (the push
+// loop drains it): txs admitted, gone the hashes removed since the previous
+// drain. Adds before deletes: a tx admitted and dropped between two drains
+// is in both lists.
+func (g *gossipSet) added(txs []*gossipTx, gone []ids.ID) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	pending, _ := g.eng.poolStatus()
 	optimal := (int(pending) + len(txs)) * config.TxGossipBloomChurnMultiplier
 	for _, tx := range txs {
+		g.held[tx.id] = struct{}{}
 		g.bloom.Add(tx)
 		if reset, err := gossip.ResetBloomFilterIfNeeded(g.bloom, optimal); err == nil && reset {
 			g.Iterate(func(t *gossipTx) bool { g.bloom.Add(t); return true })
 		}
+	}
+	for _, id := range gone {
+		delete(g.held, id)
 	}
 }
 
@@ -97,7 +108,14 @@ func (g *gossipSet) Add(t *gossipTx) error {
 	return res[0].err()
 }
 
-func (g *gossipSet) Has(id ids.ID) bool { return g.eng.poolHas(id) }
+// Has: is the tx still in the pool. Answered from held (see gossipSet), no
+// crossing; only the push gossiper asks, about txs added went through.
+func (g *gossipSet) Has(id ids.ID) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	_, ok := g.held[id]
+	return ok
+}
 
 func (g *gossipSet) Iterate(f func(*gossipTx) bool) {
 	raws, err := g.eng.poolContent(nil, gossipIterateMax)

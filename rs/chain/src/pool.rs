@@ -256,6 +256,10 @@ struct Inner {
     gen: u64,
     head: Head,
     gossip: VecDeque<Arc<Tx>>,
+    /// Every hash that left `by_hash` since the last drain (mined, replaced,
+    /// unpayable, expired, evicted): the push gossiper's Has is answered in
+    /// Go from the drained txs minus these, no crossing per tx.
+    gone: VecDeque<B256>,
     last_sweep: Instant,
     /// Mined tx hashes, the last SEEN_MAX (`seen_ring` is the eviction order).
     seen: HashSet<B256>,
@@ -352,6 +356,7 @@ impl Pool {
                 gen: 0,
                 head,
                 gossip: VecDeque::new(),
+                gone: VecDeque::new(),
                 last_sweep: Instant::now(),
                 seen: HashSet::new(),
                 seen_ring: VecDeque::new(),
@@ -648,9 +653,12 @@ impl Pool {
     }
 
     /// Every tx admitted since the last drain (local and remote: the push
-    /// gossiper forwards both), oldest first.
-    pub fn drain_gossip(&self) -> Vec<Arc<Tx>> {
-        self.inner.lock().unwrap().gossip.drain(..).collect()
+    /// gossiper forwards both), oldest first, and every hash that left the
+    /// pool since then; both under one lock, so a tx admitted and dropped
+    /// between two drains shows in both lists of the same drain.
+    pub fn drain_gossip(&self) -> (Vec<Arc<Tx>>, Vec<B256>) {
+        let mut g = self.inner.lock().unwrap();
+        (g.gossip.drain(..).collect(), g.gone.drain(..).collect())
     }
 
     /// Drops the queued txs of senders idle for longer than the lifetime
@@ -664,10 +672,20 @@ impl Pool {
     }
 }
 
+/// Records a hash that left `by_hash` for the next drain (bounded like the
+/// gossip backlog: before NormalOp nobody drains and Go holds nothing).
+fn gone_push(gone: &mut VecDeque<B256>, hash: B256) {
+    if gone.len() >= GOSSIP_MAX {
+        gone.pop_front();
+    }
+    gone.push_back(hash);
+}
+
 impl Inner {
     /// Removes one tx by hash (the account is re-settled by the caller).
     fn remove_hash(&mut self, hash: &B256) -> bool {
         let Some((sender, nonce)) = self.by_hash.remove(hash) else { return false };
+        gone_push(&mut self.gone, *hash);
         let Some(acct) = self.accounts.get_mut(&sender) else { return false };
         if let Some(e) = acct.txs.remove(&nonce) {
             self.priced.remove(&PricedKey { tip: e.tx.gas_tip, seq: Reverse(e.seq), hash: e.tx.hash });
@@ -703,6 +721,7 @@ impl Inner {
         for (n, hash, tip, seq) in drop {
             acct.txs.remove(&n);
             self.by_hash.remove(&hash);
+            gone_push(&mut self.gone, hash);
             self.priced.remove(&PricedKey { tip, seq: Reverse(seq), hash });
             self.total -= 1;
         }
@@ -800,6 +819,7 @@ impl Inner {
         }
         if let Some(o) = acct.txs.remove(&tx.nonce) {
             self.by_hash.remove(&o.tx.hash);
+            gone_push(&mut self.gone, o.tx.hash);
             self.priced.remove(&PricedKey { tip: o.tx.gas_tip, seq: Reverse(o.seq), hash: o.tx.hash });
             self.total -= 1;
             if tx.nonce < acct.nonce + acct.exec as u64 {
@@ -1109,8 +1129,8 @@ mod tests {
         assert!(!p.wait(Duration::from_millis(1)));
         p.add(vec![sign(&k, 3, GWEI, 50 * GWEI, 1)], false, &st); // queued only
         assert_eq!(p.status(), (0, 1));
-        assert_eq!(p.drain_gossip().len(), 1);
-        assert!(p.drain_gossip().is_empty());
+        assert_eq!(p.drain_gossip().0.len(), 1);
+        assert!(p.drain_gossip().0.is_empty());
         p.expire(Instant::now() + Duration::from_secs(2));
         assert_eq!(p.status(), (0, 0));
         p.add(vec![sign(&k, 0, GWEI, 50 * GWEI, 1)], false, &st);

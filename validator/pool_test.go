@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ava-labs/avalanchego/ids"
 	ethcommon "github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/common/hexutil"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // TestPoolHeadMovesWithAccept: once Accept returned, no pool read answers
@@ -126,5 +128,49 @@ func TestBuildAfterAcceptSeesNoMinedTx(t *testing.T) {
 	}
 	if p, _ := h.vm.eng.poolStatus(); p != 40 {
 		t.Fatalf("pending after two unaccepted builds: %d, want 40", p)
+	}
+}
+
+// TestGossipHasFollowsPool: the push gossiper's Has is answered from the
+// drained txs minus the pool's removals, no crossing per tx; a mined tx
+// stops answering after the next drain.
+func TestGossipHasFollowsPool(t *testing.T) {
+	if !realEngine {
+		t.Skip("stub engine")
+	}
+	h := newHarness(t)
+	set, err := newGossipSet(h.vm.eng, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain := func() {
+		raws, gone, err := h.vm.eng.poolDrainGossip()
+		if err != nil {
+			t.Fatal(err)
+		}
+		txs := make([]*gossipTx, len(raws))
+		for i, r := range raws {
+			txs[i] = newGossipTx(r)
+		}
+		set.added(txs, gone)
+	}
+	hash := ids.ID(h.transfer(ethcommon.HexToAddress("0x1000000000000000000000000000000000000007"), big.NewInt(1)))
+	if set.Has(hash) {
+		t.Fatal("Has before the drain")
+	}
+	drain()
+	if !set.Has(hash) {
+		t.Fatal("drained tx not held")
+	}
+	h.buildAccept()
+	if !set.Has(hash) {
+		t.Fatal("mined tx dropped before the drain reported it")
+	}
+	drain()
+	if set.Has(hash) {
+		t.Fatal("mined tx still held after the drain")
+	}
+	if len(set.held) != 0 {
+		t.Fatalf("held %d after everything was mined", len(set.held))
 	}
 }

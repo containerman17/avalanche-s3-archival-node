@@ -256,15 +256,15 @@ func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duratio
 			return
 		case <-t.C:
 		}
-		raws, err := vm.eng.poolDrainGossip()
+		raws, gone, err := vm.eng.poolDrainGossip()
 		if err != nil {
 			vm.ctx.Log.Warn("validator: pool drain failed", zap.Error(err))
-		} else if len(raws) > 0 {
+		} else if len(raws) > 0 || len(gone) > 0 {
 			txs := make([]*gossipTx, len(raws))
 			for i, r := range raws {
 				txs[i] = newGossipTx(r)
 			}
-			vm.set.added(txs)
+			vm.set.added(txs, gone)
 			push.Add(txs...)
 		}
 		if err := push.Gossip(vm.bg); err != nil && vm.bg.Err() == nil {
@@ -379,6 +379,11 @@ func (vm *VM) GetBlock(_ context.Context, id ids.ID) (snowman.Block, error) {
 
 // ParseBlock hands the inner block bytes to the engine, which keeps the
 // decoded block; Go keeps only the metadata and the slice it was given.
+// "parsed" is logged TWICE per height on a peer: rpcchainvm's ParseBlock
+// (the PushQuery/Put bytes, through proposervm's inner-block parse) and its
+// BlockVerify, which re-parses the bytes it was handed before calling Verify.
+// On the proposer only BlockVerify parses (BuildBlock returned the block).
+// "getblock" is once per height: BlockAccept fetches the block by id.
 func (vm *VM) ParseBlock(_ context.Context, raw []byte) (snowman.Block, error) {
 	start := time.Now()
 	m, err := vm.eng.parse(raw)
@@ -423,6 +428,18 @@ func (b *Block) VerifyWithContext(_ context.Context, bc *block.Context) error {
 func (b *Block) verify(pchainHeight uint64) error {
 	if b.height == 0 {
 		return nil
+	}
+	// A block we built: this Verify is avalanchego handing the bytes back
+	// (rpcchainvm's BlockVerify re-parses them, then verifies) right before
+	// consensus adds the block and PushQueries it to the peers, so it is the
+	// closest observable point to "sent" (BuildBlock's response already
+	// carried the bytes, there is no later Bytes() fetch). Once per height.
+	b.vm.mu.Lock()
+	builtAt, self := b.vm.built[b.id]
+	b.vm.mu.Unlock()
+	if self {
+		b.vm.ctx.Log.Info("validator: block-sent", zap.Uint64("height", b.height), zap.Stringer("id", b.id),
+			zap.Int64("t_since_built_ms", time.Since(builtAt).Milliseconds()))
 	}
 	start := time.Now()
 	_, _, txs, err := b.vm.eng.verify(b.id, pchainHeight)

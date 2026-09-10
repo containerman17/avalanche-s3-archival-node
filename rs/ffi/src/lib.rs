@@ -596,8 +596,10 @@ pub unsafe extern "C" fn epochdb_pool_wait(e: *mut epochdb_engine, timeout_ms: u
     })
 }
 
-/// Every tx admitted (locally or from gossip) since the previous call, as
-/// an RLP list of envelopes, oldest first: what the push gossiper forwards.
+/// RLP `[[envelopes...], [hashes...]]`: every tx admitted (locally or from
+/// gossip) since the previous call, oldest first (what the push gossiper
+/// forwards), and every tx hash that left the pool since then (what the
+/// push gossiper's Has stops answering). Empty buffer = neither.
 #[no_mangle]
 pub unsafe extern "C" fn epochdb_pool_drain_gossip(e: *mut epochdb_engine, out: *mut epochdb_buf) -> c_int {
     if e.is_null() || out.is_null() {
@@ -605,8 +607,17 @@ pub unsafe extern "C" fn epochdb_pool_drain_gossip(e: *mut epochdb_engine, out: 
     }
     let en = &*e;
     en.guard(|| {
-        let txs = en.tree.engine.txpool.drain_gossip();
-        *out = buf(if txs.is_empty() { Vec::new() } else { encode_envelopes(txs.iter().map(|t| &t.raw[..])) });
+        let (txs, gone) = en.tree.engine.txpool.drain_gossip();
+        *out = buf(if txs.is_empty() && gone.is_empty() {
+            Vec::new()
+        } else {
+            let mut body = encode_envelopes(txs.iter().map(|t| &t.raw[..]));
+            body.extend_from_slice(&encode_envelopes(gone.iter().map(|h| &h[..])));
+            let mut all = Vec::with_capacity(body.len() + 9);
+            alloy_rlp::Header { list: true, payload_length: body.len() }.encode(&mut all);
+            all.extend_from_slice(&body);
+            all
+        });
         Ok(EPOCHDB_OK)
     })
 }
