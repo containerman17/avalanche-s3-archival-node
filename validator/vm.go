@@ -192,7 +192,7 @@ func (vm *VM) startGossip() error {
 	handler, pull, push, err := gossip.NewSystem(vm.ctx.NodeID, vm.net, validators, set, gossipMarshaller{},
 		gossip.SystemConfig{
 			Log: vm.ctx.Log, Registry: vm.m.reg, Namespace: "eth_tx_gossip",
-			RequestPeriod: vm.cfg.PullGossipFrequency.Duration,
+			RequestPeriod: vm.cfg.PullGossipFrequency.Duration, TargetMessageSize: pushTargetBytes,
 			PushGossipParams: gossip.BranchingFactor{
 				StakePercentage: vm.cfg.PushGossipPercentStake, Validators: vm.cfg.PushGossipNumValidators, Peers: vm.cfg.PushGossipNumPeers,
 			},
@@ -214,10 +214,14 @@ func (vm *VM) startGossip() error {
 }
 
 // pushLoop: every push period, the pool's newly admitted txs (one crossing)
-// go to the push gossiper and the bloom filter, then one push round.
+// go to the push gossiper and the bloom filter, then as many push rounds as
+// their bytes need (the SDK sends at most pushTargetBytes per round), so a
+// node taking the RPC load ships everything new to its peers within a tick.
+// The tick is 25 ms; push-gossip-frequency below that is honoured (subnet-evm's
+// 100 ms default is not: at 20 KiB per round it carried 1.8k tx/s).
 func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duration) {
-	if period <= 0 {
-		period = 100 * time.Millisecond
+	if period <= 0 || period > pushTick {
+		period = pushTick
 	}
 	t := time.NewTicker(period)
 	defer t.Stop()
@@ -227,6 +231,7 @@ func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duratio
 			return
 		case <-t.C:
 		}
+		rounds := 0 // new bytes this tick, then the Gossip calls they need
 		raws, err := vm.eng.poolDrainGossip()
 		if err != nil {
 			vm.ctx.Log.Warn("validator: pool drain failed", zap.Error(err))
@@ -234,12 +239,15 @@ func (vm *VM) pushLoop(push *gossip.PushGossiper[*gossipTx], period time.Duratio
 			txs := make([]*gossipTx, len(raws))
 			for i, r := range raws {
 				txs[i] = newGossipTx(r)
+				rounds += len(r)
 			}
 			vm.set.added(txs)
 			push.Add(txs...)
 		}
-		if err := push.Gossip(vm.bg); err != nil && vm.bg.Err() == nil {
-			vm.ctx.Log.Warn("validator: push gossip failed", zap.Error(err))
+		for rounds = rounds/pushTargetBytes + 1; rounds > 0; rounds-- {
+			if err := push.Gossip(vm.bg); err != nil && vm.bg.Err() == nil {
+				vm.ctx.Log.Warn("validator: push gossip failed", zap.Error(err))
+			}
 		}
 	}
 }
@@ -534,12 +542,4 @@ func processRSS() float64 {
 	}
 	pages, _ := strconv.ParseFloat(f[1], 64)
 	return pages * float64(os.Getpagesize())
-}
-
-// gossipKnown: inbound push txs the bloom filter dropped before the crossing.
-func (vm *VM) gossipKnown() uint64 {
-	if vm.set == nil {
-		return 0
-	}
-	return vm.set.known.Load()
 }
