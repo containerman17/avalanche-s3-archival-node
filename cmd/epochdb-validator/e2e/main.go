@@ -250,6 +250,20 @@ func main() {
 	}
 	chainID := network.Subnets[0].Chains[0].ChainID
 	fmt.Println("network:", network.Dir, "chain:", chainID)
+	// tmpnet only tracks the subnet on its validators; the rpc nodes need the
+	// flag too, and a restart to pick it up.
+	if *rpcN > 0 {
+		var restarted []*tmpnet.Node
+		for _, n := range nodes {
+			if n.kind != "rpc" {
+				continue
+			}
+			n.Flags[config.TrackSubnetsKey] = network.Subnets[0].SubnetID.String()
+			check(n.Node.Restart(ctx), "restart rpc node with track-subnets")
+			restarted = append(restarted, n.Node)
+		}
+		check(tmpnet.WaitForHealthyNodes(ctx, log, restarted), "rpc nodes healthy")
+	}
 	for _, n := range nodes {
 		n.rpc = n.GetAccessibleURI() + "/ext/bc/" + chainID.String() + "/rpc"
 		n.ec, err = ethclient.Dial(n.rpc)
