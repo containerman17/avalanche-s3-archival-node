@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 const maxRPCBody = 16 << 20
@@ -115,4 +118,28 @@ func (vm *VM) serveRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Write(resp)
+}
+
+// serveDirect starts the rpc-direct-addr listener (see Initialize): loopback
+// or private addresses only unless allowPublic; a WARN line every time.
+func (vm *VM) serveDirect(addr string, allowPublic bool) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	private := host == "localhost" || (ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()))
+	if !private && !allowPublic {
+		return fmt.Errorf("%q is not a loopback or private address; set rpc-direct-allow-public: true to bind it anyway", addr)
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rpc", vm.serveRPC)
+	vm.ctx.Log.Warn("validator: rpc-direct-addr is ON: this listener bypasses avalanchego's HTTP auth, API throttling and TLS; measurement only, never on a production node",
+		zap.Stringer("addr", l.Addr()), zap.Bool("public", !private))
+	go http.Serve(l, mux)
+	return nil
 }
