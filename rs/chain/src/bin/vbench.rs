@@ -140,7 +140,7 @@ fn run_dump(engine: NodeEngine, dump: &str, to: u64, do_build: bool, quiet: bool
                 };
                 let carries_predicates = b.txs.iter().any(|t| t.access_list.iter().any(|a| a.address == exec::precompile::WARP));
                 let t0 = Instant::now();
-                match tree.engine.build(None, &parent.header, &params, pvm_h, Some(b.txs.clone())) {
+                match tree.engine.build(None, &parent.header, &params, pvm_h, Some(b.txs.clone()), &[]) {
                     Ok(out) => {
                         lb.add(t0);
                         if out.block.container[..] == inner[..] && out.block.hash == b.hash {
@@ -215,7 +215,7 @@ fn synthetic(n: usize, data: &str) -> Result<()> {
     let txs: Vec<block::Tx> = (0..n as u64).map(|i| s.transfer(99999, i, 1_000_000_000, 50_000_000_000, 21_000, Address::from_slice(&keccak256(i.to_be_bytes())[12..]), U256::from(1_000_000_000_000u64))).collect();
     let params = Params { timestamp_ms: 1_770_000_000_123, coinbase: Address::from([0xcc; 20]), desired_min_delay_excess: None };
     let t0 = Instant::now();
-    let out = tree.engine.build(None, &genesis_blk.header, &params, None, Some(txs)).map_err(|e| anyhow!("build: {e}"))?;
+    let out = tree.engine.build(None, &genesis_blk.header, &params, None, Some(txs), &[]).map_err(|e| anyhow!("build: {e}"))?;
     let build_ms = t0.elapsed().as_secs_f64() * 1e3;
     let b = out.block.clone();
     eprintln!("vbench: synthetic block {} txs={} gas={} root={} extra={} bytes: build {build_ms:.2} ms", b.height, b.txs.len(), b.header.gas_used, b.header.root, b.header.extra.len());

@@ -428,8 +428,18 @@ pub unsafe extern "C" fn epochdb_build(
         let candidates = if raw.is_empty() { None } else { Some(decode_candidates(raw, snd).map_err(ferr)?) };
         let t1 = std::time::Instant::now();
         let (parent, pb) = en.parent(&pid)?;
+        // The unaccepted ancestors' txs: the pool still holds them (they leave
+        // at accept), so the build must not offer them again.
+        let mut chain: Vec<Arc<block::Block>> = Vec::new();
+        let mut cur = pid;
+        while en.tree.pending(&cur).is_some() {
+            let Some(b) = en.tree.get_block(&cur) else { break };
+            cur = b.header.parent_hash.0;
+            chain.push((*b).clone());
+        }
+        let parent_txs: Vec<&block::Tx> = chain.iter().flat_map(|b| b.txs.iter()).collect();
         let params = Params { timestamp_ms, coinbase: Address::from_slice(cb), desired_min_delay_excess: en.tree.engine.desired_delay_excess };
-        let r = en.tree.engine.build(parent.as_ref(), &pb.header, &params, if pchain_height == 0 { None } else { Some(pchain_height) }, candidates).map_err(ferr)?;
+        let r = en.tree.engine.build(parent.as_ref(), &pb.header, &params, if pchain_height == 0 { None } else { Some(pchain_height) }, candidates, &parent_txs).map_err(ferr)?;
         let t2 = std::time::Instant::now();
         let b = r.block.clone();
         en.tree.insert_verified(b.clone(), r.pending);

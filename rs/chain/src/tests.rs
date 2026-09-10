@@ -41,8 +41,8 @@ fn siblings_root_in_verify_accept_one_reject_other() {
     let p = |ms: u64| Params { timestamp_ms: ms, coinbase: cb, desired_min_delay_excess: None };
 
     // A: 2 transfers; B: 1 transfer to a different recipient.
-    let a = t.engine.build(None, &g.header, &p(ts), None, Some(vec![tx(0, 1), tx(1, 2)])).unwrap();
-    let b = t.engine.build(None, &g.header, &p(ts), None, Some(vec![tx(0, 3)])).unwrap();
+    let a = t.engine.build(None, &g.header, &p(ts), None, Some(vec![tx(0, 1), tx(1, 2)]), &[]).unwrap();
+    let b = t.engine.build(None, &g.header, &p(ts), None, Some(vec![tx(0, 3)]), &[]).unwrap();
     assert_ne!(a.block.hash, b.block.hash);
     assert_ne!(a.block.header.root, b.block.header.root);
     assert!(a.pending.has_layer() && b.pending.has_layer());
@@ -56,8 +56,8 @@ fn siblings_root_in_verify_accept_one_reject_other() {
     assert_eq!(t.engine.accounts(None, &[s.address])[0].0, 0);
 
     // Grandchildren: on A the next nonce is 2, on B it is 1.
-    let ca = t.engine.build(t.pending(&ha).as_ref(), &a.block.header, &p(ts + 2000), None, Some(vec![tx(2, 4)])).unwrap();
-    let cb_ = t.engine.build(t.pending(&hb).as_ref(), &b.block.header, &p(ts + 2000), None, Some(vec![tx(1, 5), tx(0, 6)])).unwrap();
+    let ca = t.engine.build(t.pending(&ha).as_ref(), &a.block.header, &p(ts + 2000), None, Some(vec![tx(2, 4)]), &[]).unwrap();
+    let cb_ = t.engine.build(t.pending(&hb).as_ref(), &b.block.header, &p(ts + 2000), None, Some(vec![tx(1, 5), tx(0, 6)]), &[]).unwrap();
     assert_eq!(ca.included, vec![0]);
     assert_eq!(cb_.included, vec![0], "nonce 0 is too low on B: skipped, not popped");
     assert_eq!(cb_.reasons[1], exec::exec::SkipReason::NonceTooLow);
@@ -81,7 +81,7 @@ fn siblings_root_in_verify_accept_one_reject_other() {
     assert_eq!(t.verified_len(), 0);
 
     // A block re-parsed from bytes on the new head verifies with the root inline and accepts.
-    let d = t.engine.build(None, &ca.block.header, &p(ts + 4000), None, Some(vec![tx(3, 7)])).unwrap();
+    let d = t.engine.build(None, &ca.block.header, &p(ts + 4000), None, Some(vec![tx(3, 7)]), &[]).unwrap();
     let parsed = t.engine.parse(d.block.container.clone()).unwrap();
     drop(d);
     let m = t.verify(parsed, None).unwrap();
@@ -89,7 +89,7 @@ fn siblings_root_in_verify_accept_one_reject_other() {
     t.accept(&m.id).unwrap();
 
     // A block whose header claims a wrong root fails verify (not the process).
-    let e = t.engine.build(None, &t.engine.last_accepted().header, &p(ts + 6000), None, Some(vec![tx(4, 8)])).unwrap();
+    let e = t.engine.build(None, &t.engine.last_accepted().header, &p(ts + 6000), None, Some(vec![tx(4, 8)]), &[]).unwrap();
     assert_eq!(e.included, vec![0], "reasons {:?} nonce {:?}", e.reasons, t.engine.accounts(None, &[s.address]));
     let mut hdr = e.block.header.clone();
     hdr.root = alloy_primitives::B256::repeat_byte(0xab);
@@ -122,7 +122,7 @@ fn bootstrapping_then_normal_op() {
     let mut blocks = Vec::new();
     let mut parent = src.engine.last_accepted();
     for n in 0..3u64 {
-        let b = src.engine.build(None, &parent.header, &Params { timestamp_ms: 1_770_000_000_000 + n * 2000, coinbase: Address::from([1; 20]), desired_min_delay_excess: None }, None, Some(vec![tx(n, n)])).unwrap();
+        let b = src.engine.build(None, &parent.header, &Params { timestamp_ms: 1_770_000_000_000 + n * 2000, coinbase: Address::from([1; 20]), desired_min_delay_excess: None }, None, Some(vec![tx(n, n)]), &[]).unwrap();
         src.insert_verified(b.block.clone(), b.pending);
         src.accept(&b.block.hash.0).unwrap();
         parent = b.block.clone();

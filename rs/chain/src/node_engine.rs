@@ -1120,8 +1120,10 @@ impl NodeEngine {
     /// `pchain_height` is the proposervm context height for the predicates
     /// (own height from Etna, the epoch's under Granite).
     /// `candidates` None: the pool's, by effective tip at the block's base fee,
-    /// up to 1.5x the gas limit and the miner's size target plus slack.
-    pub fn build(&self, parent: Option<&Arc<Pending>>, parent_hdr: &block::Header, params: &build::Params, pchain_height: Option<u64>, candidates: Option<Vec<block::Tx>>) -> Result<BuildOut, Error> {
+    /// up to 1.5x the gas limit and the miner's size target plus slack, minus
+    /// what `parent_txs` (the txs of the unaccepted ancestors, when the parent
+    /// is not the head) already hold per sender.
+    pub fn build(&self, parent: Option<&Arc<Pending>>, parent_hdr: &block::Header, params: &build::Params, pchain_height: Option<u64>, candidates: Option<Vec<block::Tx>>, parent_txs: &[&block::Tx]) -> Result<BuildOut, Error> {
         if !self.normal.load(Ordering::Relaxed) {
             return Err("build needs NormalOp (SetState 2)".into());
         }
@@ -1151,7 +1153,14 @@ impl NodeEngine {
             None => {
                 let base_fee: u128 = h.base_fee.unwrap_or_default().saturating_to();
                 let target = exec::exec::TARGET_TXS_SIZE;
-                self.txpool.candidates(base_fee, h.gas_limit + h.gas_limit / 2, target + target / 8)
+                let mut skip: HashMap<Address, u64> = HashMap::new();
+                for t in parent_txs {
+                    if let Some(a) = t.sender {
+                        let e = skip.entry(a).or_insert(0);
+                        *e = (*e).max(t.nonce + 1);
+                    }
+                }
+                self.txpool.candidates(base_fee, h.gas_limit + h.gas_limit / 2, target + target / 8, &skip)
             }
         };
         self.recover_senders(&mut candidates);

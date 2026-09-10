@@ -61,6 +61,30 @@ int   epochdb_build(epochdb_engine*, const uint8_t parent_id[32], uint64_t times
       // id is a lookup. out: block_bytes (epochdb_buf), id[32], gas_used, included_count,
       // skipped (epochdb_buf: for each candidate index a u8 reason code), needs_more (1 if gas limit
       // unfilled and candidates exhausted).
+      // txs NULL / 0: the engine takes the candidates from ITS OWN POOL (effective tip at the block's base fee
+      // desc, arrival, per-sender nonce order; 1.5x the gas limit and the miner's size target plus 1/8 as the
+      // cut; senders past what the block's unaccepted ancestors already hold), see "Mempool" below.
+int   epochdb_pool_add(epochdb_engine*, const uint8_t* txs, size_t /* RLP list of byte strings, one tx envelope
+                       (MarshalBinary form) each */, uint8_t local, epochdb_buf* out);
+      // out: 33 bytes per input: a code, then the tx hash (keccak of the bytes handed in). Codes: 0 ok, 1 already
+      // known, 2 replaced an older tx of the same nonce, 3 underpriced (tip under tx-pool-price-limit, fee cap under
+      // the fee config's min base fee, a replacement under the price bump, or not better than the cheapest tx of
+      // a full pool), 4 nonce too low, 5 insufficient funds (alone, or with the sender's executable sequence),
+      // 6 gas limit over the block's, 7 intrinsic gas, 8 invalid signature / chain id / unprotected legacy tx,
+      // 9 pool full (per-account queue, per-account slots under a full pending set, or no evictable tx), 10 other
+      // (does not decode, type > 2, over 128 KiB, tip over fee cap, initcode over 49152). `local` is honoured only
+      // with `local-txs-enabled` (exempt from the price limit and from eviction).
+int   epochdb_pool_status(epochdb_engine*, uint64_t* pending, uint64_t* queued);
+int   epochdb_pool_has(epochdb_engine*, const uint8_t hash[32], uint8_t* out);      // 1 when the pool holds it
+int   epochdb_pool_content(epochdb_engine*, const uint8_t* addr /* 20 bytes, or NULL = every address */,
+                           size_t limit /* per half, 0 = all */, epochdb_buf* out);
+      // out: RLP list of envelopes, pending (address order, then nonce) then queued
+int   epochdb_pool_nonce(epochdb_engine*, const uint8_t addr[20], uint64_t* out);  // state nonce + executable txs;
+      // EPOCHDB_ENOTFOUND when the pool holds nothing of the address (the caller uses the state's nonce)
+int   epochdb_pool_wait(epochdb_engine*, uint64_t timeout_ms, uint8_t* out);        // blocks until an executable tx
+      // is pending (out 1) or the timeout passes (out 0); returns at once when one already is
+int   epochdb_pool_drain_gossip(epochdb_engine*, epochdb_buf* out);                  // every tx admitted since the
+      // previous call (local and remote), RLP list of envelopes, oldest first; empty buffer = none
 int   epochdb_account_state(epochdb_engine*, const uint8_t* addrs /* 20*n */, size_t n,
                             const uint8_t block_id[32] /* zero = accepted head */, epochdb_buf* out);
       // out: n x { uint64 nonce LE, uint8 balance[32] BE } at the given block's state (pending allowed)
@@ -71,7 +95,28 @@ void  epochdb_buf_free(epochdb_buf*);
 ```
 
 Thread safety: every function may be called from any goroutine; the engine serializes verify/accept/
-reject/build behind its existing mutex, reads and rpc take snapshots. No callbacks into Go (heads for
+reject/build behind its existing mutex, reads and rpc take snapshots. The pool functions take the pool's
+own lock (microseconds per tx); `epochdb_pool_add` reads the unseen senders' state under the execution
+mutex once per batch, before the pool lock, and `epochdb_pool_wait` blocks the calling thread on the
+pool's condition variable.
+
+## Mempool (rs/chain/src/pool.rs, 2026-09-10)
+
+The transaction pool lives in the engine. Admission (`epochdb_pool_add`, and `eth_sendRawTransaction`
+through `epochdb_rpc`, which admits every send of a JSON-RPC batch in one pool call) decodes, checks
+libevm's stateless rules and recovers the sender in parallel on rayon, reads the unseen senders' nonce
+and balance at the accepted head in one batch, then inserts under the pool lock: known hash, nonce >=
+state nonce, balance >= cost and >= the sender's executable sequence + cost, replacement by fee cap AND
+tip both over `tx-pool-price-bump` percent, the caps (`tx-pool-account-slots`, `tx-pool-global-slots`,
+`tx-pool-account-queue`, `tx-pool-global-queue`; a full pool evicts its cheapest remote tx for a dearer
+newcomer), `tx-pool-lifetime` for idle senders with no executable tx. `epochdb_accept` moves the pool in
+the same call: the block's txs leave, its senders and (when they hold txs) its recipients are re-read at
+the new head and re-settled, the head rules (block gas limit, fee config min base fee) move; nothing is
+walked per head. `epochdb_build` with no candidates takes them from the pool. Only the Go shell's gossip
+and BuildBlock timing remain in Go; the RPC pool methods are answered by the engine's JSON-RPC
+(`txpool_status/content/contentFrom/inspect`, `eth_pendingTransactions`, `eth_getTransactionCount(addr,
+"pending")` = state nonce + executable txs). Rules, deviations and numbers: cmd/epochdb-validator/E2E.md,
+"Mempool in the engine". No callbacks into Go (heads for
 /ws are served by the Rust rpc's own ws when mounted; the Go shell mounts `/ws` by proxying the upgrade
 to Rust's ws server over a local socket, or leaves /ws to a later step).
 

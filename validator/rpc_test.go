@@ -69,7 +69,7 @@ func TestBatchAdmission(t *testing.T) {
 	if st.Pending != 2 {
 		t.Fatalf("txpool_status inside the batch saw pending=%d, want 2 (admission is synchronous)", st.Pending)
 	}
-	for _, want := range []string{"insufficient funds", "typed transaction too short"} {
+	for _, want := range []string{"insufficient funds", "does not decode"} {
 		found := false
 		for _, r := range resps {
 			if r.Error != nil && strings.Contains(r.Error.Message, want) {

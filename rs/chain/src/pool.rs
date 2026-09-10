@@ -338,7 +338,7 @@ impl Pool {
         let head = self.inner.lock().unwrap().head;
         let prep = |raw: Bytes| -> Result<Tx, Added> {
             let hash = alloy_primitives::keccak256(&raw);
-            let mut t = block::eth::decode_tx(raw).map_err(|_| Added { code: Code::Other, message: "typed transaction too short", hash })?;
+            let mut t = block::eth::decode_tx(raw).map_err(|_| Added { code: Code::Other, message: "invalid transaction: does not decode", hash })?;
             validate(&t, &head, &self.cfg, &self.chain, local).map_err(|(code, message)| Added { code, message, hash })?;
             t.sender = block::recover(&t);
             if t.sender.is_none() {
@@ -446,10 +446,12 @@ impl Pool {
     /// (min(tip cap, fee cap - base fee)) desc then arrival, each sender's
     /// txs in nonce order behind its head, until the summed gas limits
     /// reach `gas_budget` or the summed sizes reach `max_bytes`; a sender
-    /// whose head cannot pay the base fee is left out. Exact miner order
-    /// from the tip-cap index: a head whose effective tip is below its tip
-    /// cap waits in a side heap until the index reaches its level.
-    pub fn candidates(&self, base_fee: u128, gas_budget: u64, max_bytes: usize) -> Vec<Tx> {
+    /// whose head cannot pay the base fee is left out. `skip` (sender -> the
+    /// nonce after its txs in the pending parent chain) starts a sender past
+    /// what the block's unaccepted ancestors already hold. Exact miner
+    /// order from the tip-cap index: a head whose effective tip is below its
+    /// tip cap waits in a side heap until the index reaches its level.
+    pub fn candidates(&self, base_fee: u128, gas_budget: u64, max_bytes: usize, skip: &HashMap<Address, u64>) -> Vec<Tx> {
         #[derive(PartialEq, Eq)]
         struct Cand {
             eff: u128,
@@ -485,9 +487,13 @@ impl Pool {
                 }
                 let k = *heads.next().unwrap();
                 let acct = &g.accounts[&k.sender];
-                let e = &acct.txs[&acct.nonce];
+                let first = skip.get(&k.sender).map_or(acct.nonce, |n| (*n).max(acct.nonce));
+                if first >= acct.nonce + acct.exec as u64 {
+                    continue; // everything executable is already in the parent chain
+                }
+                let e = &acct.txs[&first];
                 if let Some(eff) = eff(e) {
-                    heap.push(Cand { eff, seq: Reverse(e.seq), sender: k.sender, nonce: acct.nonce });
+                    heap.push(Cand { eff, seq: Reverse(e.seq), sender: k.sender, nonce: first });
                 }
             }
             let Some(c) = heap.pop() else { break };
@@ -589,9 +595,7 @@ impl Inner {
         let Some((sender, nonce)) = self.by_hash.remove(hash) else { return false };
         let Some(acct) = self.accounts.get_mut(&sender) else { return false };
         if let Some(e) = acct.txs.remove(&nonce) {
-            if !acct.local {
-                self.priced.remove(&PricedKey { tip: e.tx.gas_tip, seq: Reverse(e.seq), hash: e.tx.hash });
-            }
+            self.priced.remove(&PricedKey { tip: e.tx.gas_tip, seq: Reverse(e.seq), hash: e.tx.hash });
             self.total -= 1;
             if nonce < acct.nonce + acct.exec as u64 {
                 // Inside the executable prefix: the prefix now ends here.
@@ -616,18 +620,16 @@ impl Inner {
     fn settle(&mut self, sender: &Address) {
         let head = self.head;
         let Some(acct) = self.accounts.get_mut(sender) else { return };
-        let mut drop: Vec<(u64, B256, u128, u64, bool)> = Vec::new();
+        let mut drop: Vec<(u64, B256, u128, u64)> = Vec::new();
         for (n, e) in &acct.txs {
             if *n < acct.nonce || e.cost > acct.balance || e.tx.gas_limit > head.gas_limit {
-                drop.push((*n, e.tx.hash, e.tx.gas_tip, e.seq, acct.local));
+                drop.push((*n, e.tx.hash, e.tx.gas_tip, e.seq));
             }
         }
-        for (n, hash, tip, seq, local) in drop {
+        for (n, hash, tip, seq) in drop {
             acct.txs.remove(&n);
             self.by_hash.remove(&hash);
-            if !local {
-                self.priced.remove(&PricedKey { tip, seq: Reverse(seq), hash });
-            }
+            self.priced.remove(&PricedKey { tip, seq: Reverse(seq), hash });
             self.total -= 1;
         }
         let was = acct.exec;
@@ -689,7 +691,7 @@ impl Inner {
                 Some(o) if t.nonce < exec_end => acct.exec_cost - o.cost,
                 _ => acct.exec_cost,
             };
-            if acct.balance < spent + cost {
+            if spent.checked_add(cost).is_none_or(|need| acct.balance < need) {
                 return (Code::Funds, "insufficient funds for gas * price + value");
             }
             (old.is_some(), t.nonce > exec_end, acct.queued(), acct.exec)
@@ -727,9 +729,7 @@ impl Inner {
         }
         if let Some(o) = acct.txs.remove(&tx.nonce) {
             self.by_hash.remove(&o.tx.hash);
-            if !acct.local {
-                self.priced.remove(&PricedKey { tip: o.tx.gas_tip, seq: Reverse(o.seq), hash: o.tx.hash });
-            }
+            self.priced.remove(&PricedKey { tip: o.tx.gas_tip, seq: Reverse(o.seq), hash: o.tx.hash });
             self.total -= 1;
             if tx.nonce < acct.nonce + acct.exec as u64 {
                 // Replacing inside the prefix: settle recounts it below.
@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(codes(&r), [Code::Ok]);
         assert_eq!(p.status(), (3, 0));
         assert_eq!(p.pending_nonce(addr_of(&k)), Some(3));
-        let c = p.candidates(GWEI, 1_000_000, 1 << 20);
+        let c = p.candidates(GWEI, 1_000_000, 1 << 20, &HashMap::new());
         assert_eq!(c.iter().map(|t| t.nonce).collect::<Vec<_>>(), [0, 1, 2]);
         // Known, nonce too low after a head that mined 0 and 1.
         let r = p.add(vec![sign(&k, 2, GWEI, 50 * GWEI, 1)], false, &st);
@@ -894,7 +894,7 @@ mod tests {
         let r = p.add(vec![sign(&k, 0, 2 * GWEI, 60 * GWEI, 2)], false, &st);
         assert_eq!(codes(&r), [Code::Replaced]);
         assert_eq!(p.status(), (1, 0));
-        let c = p.candidates(GWEI, 1_000_000, 1 << 20);
+        let c = p.candidates(GWEI, 1_000_000, 1 << 20, &HashMap::new());
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].value, U256::from(2));
     }
@@ -973,7 +973,7 @@ mod tests {
         p.add(vec![sign(&a, 0, 5 * GWEI, 6 * GWEI, 1), sign(&a, 1, 5 * GWEI, 6 * GWEI, 1)], false, &st);
         p.add(vec![sign(&b, 0, 3 * GWEI, 50 * GWEI, 1)], false, &st);
         p.add(vec![sign(&c, 0, 3 * GWEI, 50 * GWEI, 1)], false, &st);
-        let order = |base: u128| p.candidates(base, 10_000_000, 1 << 20).iter().map(|t| (t.sender.unwrap(), t.nonce)).collect::<Vec<_>>();
+        let order = |base: u128| p.candidates(base, 10_000_000, 1 << 20, &HashMap::new()).iter().map(|t| (t.sender.unwrap(), t.nonce)).collect::<Vec<_>>();
         let (aa, ba, ca) = (addr_of(&a), addr_of(&b), addr_of(&c));
         assert_eq!(order(GWEI), [(aa, 0), (aa, 1), (ba, 0), (ca, 0)]);
         // Base fee 4 gwei: a's effective tip is 2, below b and c (3); b before c by arrival.
@@ -981,8 +981,8 @@ mod tests {
         // Base fee 7 gwei: a cannot pay it and is left out.
         assert_eq!(order(7 * GWEI), [(ba, 0), (ca, 0)]);
         // The gas budget cuts the list.
-        assert_eq!(p.candidates(GWEI, 30_000, 1 << 20).len(), 2);
-        assert_eq!(p.candidates(GWEI, 10_000_000, 100).len(), 1);
+        assert_eq!(p.candidates(GWEI, 30_000, 1 << 20, &HashMap::new()).len(), 2);
+        assert_eq!(p.candidates(GWEI, 10_000_000, 100, &HashMap::new()).len(), 1);
     }
 
     #[test]
@@ -991,10 +991,10 @@ mod tests {
         let st = state(0, 10 * ETH);
         let (a, b) = (key(11), key(12));
         p.add(vec![sign(&a, 0, GWEI, 50 * GWEI, 1), sign(&a, 1, GWEI, 50 * GWEI, 1), sign(&b, 0, GWEI, 50 * GWEI, 1)], false, &st);
-        let c1 = p.candidates(GWEI, 10_000_000, 1 << 20);
+        let c1 = p.candidates(GWEI, 10_000_000, 1 << 20, &HashMap::new());
         assert_eq!(c1.len(), 3);
         // A rejected block: nothing changed, the same candidates come back.
-        let c2 = p.candidates(GWEI, 10_000_000, 1 << 20);
+        let c2 = p.candidates(GWEI, 10_000_000, 1 << 20, &HashMap::new());
         assert_eq!(c1.iter().map(|t| t.hash).collect::<Vec<_>>(), c2.iter().map(|t| t.hash).collect::<Vec<_>>());
         // A block with a's first tx only: a re-read (nonce 1), b untouched (the reader must not see it).
         let mined = vec![c1.iter().find(|t| t.sender == Some(addr_of(&a)) && t.nonce == 0).unwrap().clone()];
@@ -1011,9 +1011,24 @@ mod tests {
         assert_eq!(p.status(), (1, 0));
         assert_eq!(p.pending_nonce(addr_of(&a)), None);
         // A balance drop makes b's tx unpayable at the next touch.
-        let bt = p.candidates(GWEI, 10_000_000, 1 << 20);
+        let bt = p.candidates(GWEI, 10_000_000, 1 << 20, &HashMap::new());
         p.on_accept(&bt, head(), &mut state(0, 0));
         assert_eq!(p.status(), (0, 0));
+    }
+
+    #[test]
+    fn candidates_skip_the_pending_parents_txs() {
+        let p = pool(Config { account_slots: 100, global_slots: 1000, ..Default::default() });
+        let st = state(0, 10 * ETH);
+        let (a, b) = (key(14), key(15));
+        p.add(vec![sign(&a, 0, GWEI, 50 * GWEI, 1), sign(&a, 1, GWEI, 50 * GWEI, 1), sign(&a, 2, GWEI, 50 * GWEI, 1), sign(&b, 0, GWEI, 50 * GWEI, 1)], false, &st);
+        // The unaccepted parent holds a's 0 and 1 and b's 0: only a's 2 is left.
+        let skip = HashMap::from([(addr_of(&a), 2u64), (addr_of(&b), 1u64)]);
+        let c = p.candidates(GWEI, 10_000_000, 1 << 20, &skip);
+        assert_eq!(c.iter().map(|t| (t.sender.unwrap(), t.nonce)).collect::<Vec<_>>(), [(addr_of(&a), 2)]);
+        // A stale skip (below the state nonce) changes nothing.
+        let skip = HashMap::from([(addr_of(&a), 0u64)]);
+        assert_eq!(p.candidates(GWEI, 10_000_000, 1 << 20, &skip).len(), 4);
     }
 
     #[test]

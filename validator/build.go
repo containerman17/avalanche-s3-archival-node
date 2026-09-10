@@ -83,11 +83,13 @@ func (b *builder) waitForEvent(ctx context.Context, head func() *types.Header) (
 	b.mu.Unlock()
 
 	h := head()
-	var next time.Time
-	if lastParent == h.Hash() && !lastTime.IsZero() {
-		next = lastTime.Add(retryDelay) // a retry on the same parent: the block was not accepted
-	} else {
-		next = minNextBlockTime(h) // Granite: the wait lives here, not in BuildBlock
+	// A build within the retry gap of the previous one waits it out
+	// whatever the parent: a build on the preferred (unaccepted) block right
+	// after the build that made it found the same candidates minus that
+	// block's and burned an engine build every 50 ms (58 per height seen).
+	next := lastTime.Add(retryDelay)
+	if lastParent != h.Hash() {
+		next = maxTime(next, minNextBlockTime(h)) // Granite: the wait lives here, not in BuildBlock
 	}
 	if d := time.Until(next); d > 0 {
 		select {
@@ -97,6 +99,13 @@ func (b *builder) waitForEvent(ctx context.Context, head func() *types.Header) (
 		}
 	}
 	return common.PendingTxs, nil
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // minNextBlockTime: Granite's minimum delay after the parent (ACP-226).

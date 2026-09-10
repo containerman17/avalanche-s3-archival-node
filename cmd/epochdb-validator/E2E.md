@@ -1,17 +1,18 @@
 # epochdb-validator: oracle results
 
-The validator is the Go shell in `validator/` (avalanchego rpcchainvm 45 plugin: libevm txpool, tx gossip over the p2p
-gossip SDK with subnet-evm's wire format, BuildBlock orchestration, `/rpc`) over the Rust engine `rs/ffi`
-(`libepochdb_engine.a`, C ABI in `rs/ffi/ABI.md`): parse, verify with the state root inline, accept, build, account
-reads, JSON-RPC. Oracle: a local tmpnet subnet with 5 validators, 3 running this plugin and 2 running stock subnet-evm
+The validator is the Go shell in `validator/` (avalanchego rpcchainvm 45 plugin: tx gossip over the p2p gossip SDK
+with subnet-evm's wire format, BuildBlock timing, `/rpc` forwarded whole) over the Rust engine `rs/ffi`
+(`libepochdb_engine.a`, C ABI in `rs/ffi/ABI.md`): parse, verify with the state root inline, accept, build, the
+transaction pool (since rs-mempool, "Mempool in the engine" below; the runs before it used libevm's legacypool in Go),
+account reads, JSON-RPC. Oracle: a local tmpnet subnet with 5 validators, 3 running this plugin and 2 running stock subnet-evm
 v1.14.2, one genesis, same VM id (`cmd/epochdb-validator/e2e`). Machine: 16 cores, WSL2, shared with two other
 agents' workloads during every run below (load 5-45), so the latencies are upper bounds.
 
 ## How to run
 
 ```
-cd rs && cargo build --release -p epochdb-ffi                     # rs/target/release/libepochdb_engine.a
-go test ./validator/                                              # in-process tests against the real engine
+cd rs && cargo build --release -p epochdb-ffi && ffi/localize.sh target/release/libepochdb_engine.a   # rs/target/release/libepochdb_engine.a
+go test -count=1 ./validator/                                     # in-process tests against the real engine (the cgo archive is invisible to the test cache)
 go test -tags epochdb_stub ./validator/                            # the same plumbing against the canned C stub
 go build -o $P/ours/srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy ./cmd/epochdb-validator   # $P/stock holds stock subnet-evm
 go run ./cmd/epochdb-validator/e2e --avalanchego ~/avalanchego/build/avalanchego --ours $P/ours --stock $P/stock \
@@ -441,6 +442,95 @@ would save CPU, not serial time; not built. JSON decode, gossip and the account 
 once per batch of new senders, 0.1-1 ms). Batch size: 500 measured; the path has no per-batch count cap (16 MB body),
 so 1000 halves the per-batch fixed costs (lock handshake, promotion request, HTTP/gRPC).
 
+## Mempool in the engine (branch rs-mempool off go-admit a6b3c85, 2026-09-10 JST)
+
+The pool moved from Go (libevm legacypool) into the engine: `rs/chain/src/pool.rs`, wired into `NodeEngine` (open,
+accept, build) and the Rust JSON-RPC, exposed through `epochdb_pool_*` (ABI.md). What legacypool cost per head was
+O(pending): `reset` walked every pending account (1-1.7 s at 150-400k pending), `pricedList.Reheap` re-heaped the
+whole pool at every base fee change (10.7 s of a 15 s profile), `Pending()` copied everything under the same lock, and
+the builder sometimes ran before the reset landed. Now:
+
+- Per sender a `BTreeMap<nonce, tx>` split at the sender's state nonce into the executable prefix and the queue;
+  `heads` (a `BTreeSet` keyed tip cap desc, arrival, one entry per sender with an executable head) and `priced` (tip
+  cap asc, one entry per remote tx) are updated per insert / remove, never rebuilt. A head change
+  (`Pool::on_accept`, inside `epochdb_accept` under the execution mutex) removes the block's txs, re-reads the nonce
+  and balance of the block's senders and of its recipients that hold txs here, re-settles those senders (mined,
+  unpayable and over-gas txs drop, the prefix is recomputed, the head key follows) and moves the head rules (block gas
+  limit, fee config min base fee). No other sender is touched: `TestAcceptCostDeepPool` measures Accept at 120k
+  pending; the pool part is the block's senders.
+- Admission (`Pool::add`): decode + libevm's stateless checks + sender recovery in parallel on rayon (from 32 txs),
+  the unseen senders' state in ONE read under the execution mutex, validated against a head generation the accept
+  bumps (a head landing in between re-reads), then the pool lock per tx (known, nonce, cost alone and with the
+  executable sequence, replacement bump, caps, eviction). `epochdb_pool_add(1000 presigned transfers)` = 7-8 ms in
+  process (`TestAdmitBatchCost`; libevm: 46 ms, 6-14 ms with its cached sender AFTER the caller recovered and warmed).
+- Build: `epochdb_build` with no candidates asks the pool (`Pool::candidates`): the `heads` index walked in tip-cap
+  order with a side heap for heads whose effective tip (min(tip, fee cap - base fee)) is below their tip cap, so the
+  order is the miner's exactly, per-sender nonce order behind each head, cut at 1.5x the gas limit and the 1800 KiB
+  target + 1/8 (as Go did). A sender's txs already in the block's unaccepted ancestors are skipped (the ffi walks the
+  tree), so a build on the preferred block right after the one that made it offers only what is new. Built blocks do
+  not remove anything: a rejected block's txs are simply still there.
+- RPC: the engine's JSON-RPC answers `eth_sendRawTransaction` (every send of a batch in ONE pool call, answers in
+  order, one bad element refuses itself), `txpool_status/content/contentFrom/inspect` (geth's shape, with `from`),
+  `eth_pendingTransactions`, `eth_getTransactionCount(addr, "pending")` (state nonce + executable txs); Go forwards
+  the body whole. `epochdb_pool_wait` blocks WaitForEvent until an executable tx is pending; since the pool moves
+  inside Accept a mined tx never counts.
+- Gossip (Go, `validator/gossip.go`): the same wire format (id = tx hash, payload = the envelope), no decode in Go.
+  An inbound push message is admitted in one `epochdb_pool_add`; the push loop drains the pool's admissions
+  (`epochdb_pool_drain_gossip`) into the push gossiper and the bloom filter every 100 ms; pull responses go through
+  the SDK's per-element `Add` (one crossing per tx, 1 s period), `Has` (one crossing per tx the push gossiper is about
+  to send) and `Iterate` (`epochdb_pool_content`, capped at 50k) are the SDK's contract. Stock nodes exchange txs
+  with ours unchanged (the 3+2 run below).
+- Go: no libevm pool, no `poolChain`, no account cache, no reset goroutine, no drop-log counters; `validator/pool.go`
+  is gone, `vm.go` lost 200 lines. The Go heap is the gossip SDK's.
+
+Admission rules kept from libevm (`ValidateTransaction` + `ValidateTransactionWithState`, legacypool `add`): tx types
+0/1/2 only, 128 KiB max, chain id must be ours (a legacy tx without EIP-155 needs `allow-unprotected-txs`), initcode
+<= 49152 for creates from Durango, gas limit <= the block gas limit of the head's fee config, fee cap >= tip, intrinsic
+gas (21,000 / 53,000 + calldata + access list + initcode words from Durango), tip >= `tx-pool-price-limit` (locals
+exempt), nonce >= state nonce, balance >= cost and >= the executable sequence's cost + cost (minus the replaced tx's),
+replacement needs fee cap AND tip both > old and >= old x (100 + `tx-pool-price-bump`) / 100, nonce gaps allowed
+(queued), a full pool (`tx-pool-global-slots` + `tx-pool-global-queue`) evicts its cheapest remote tx for a dearer
+newcomer or refuses "transaction underpriced", `tx-pool-lifetime` drops the txs of a sender idle that long with no
+executable tx, `local-txs-enabled` false makes everything remote. Error texts are libevm's.
+
+Deviations from libevm (each deliberate):
+
+1. Fee cap must be >= the fee config's min base fee at the head (subnet-evm's `SetMinFee`; libevm's pool lacked it and
+   the Go shell held such txs until expiry).
+2. `tx-pool-price-limit` is enforced as a tip floor (stock does; the Go shell set the gas tip to 0).
+3. Slots are counted per tx, not per 32 KiB (`numSlots`); a 128 KiB tx takes 1, not 4.
+4. Per-account caps refuse the newcomer ("txpool is full") instead of admitting and dropping the sender's highest
+   nonce later: the queue cap (`tx-pool-account-queue`) always, the pending cap (`tx-pool-account-slots`) only while
+   the global pending set is at `tx-pool-global-slots` (as legacypool's `truncatePending`, which trims other offenders).
+5. Eviction picks the cheapest remote tx by tip cap (legacypool: effective tip at the current base fee, and its
+   `ErrFutureReplacePending` and `changesSinceReorg` throttle are not reproduced).
+6. Unpayable and over-gas txs of a sender are dropped when that sender is next touched by a block (its own tx, or a
+   value transfer to it), not at every head; base-fee changes never drop anything (legacypool keeps them too, the
+   miner filter skips them).
+7. Lifetime sweeps run on a head change at most every 30 s over senders with no executable tx (legacypool: the
+   queue-only heartbeat rule, every minute).
+8. Intrinsic gas at admission is the plain access-list cost; a warp predicate's `PredicateGas` is applied by the build
+   (which pops the sender) and the verify, not the pool.
+9. `priority-regossip-addresses` are not honoured (there is no local sender set; `local-txs-enabled` marks RPC
+   senders local only if the shell passes local = 1, which it does not).
+10. A build on a preferred, unaccepted parent: candidates skip the parent chain's txs per sender (legacypool + the Go
+    shell offered them again and the engine skipped them as nonce-low).
+
+Oracles run: `cargo test -p epochdb-chain pool::` (nonce order and gap promotion, replacement bump, sequence cost,
+stateless rules and intrinsic gas, caps and eviction, effective-tip order under a base fee change, accept touching only
+its senders and rejected blocks re-including, candidates skipping the pending parent, lifetime / gossip / wait, config
+keys); `go test -count=1 ./validator/` (`TestBuildVerifyAccept`, `TestPoolHeadMovesWithAccept` incl. a rejected
+sibling, `TestBatchAdmission`, `TestAdmitBatchCost`, `TestPoolDrainsUnderChurn`, `TestLatencyByBlockSize`,
+`TestSiblingStaysRetrievableAfterAccept`, `TestRPCForward`, `TestAccountStateAtOldID`; the reset / lagged-head /
+removal-reason tests are gone with the code they tested), `-tags epochdb_stub` for the plumbing.
+
+Compatibility (3 ours + 2 stock, `e2e --load 2m --rate 300 --keys 200`, commit 6057fb6): blocks 1..71 identical on
+5 nodes, 37,000 txs, 587 txs/block, 62% of the 20 M limit, proposers ours 38 / stock 33, txs sent to stock mined by
+ours and vice versa (functional phase incl. the nonce gap filled from stock), no invalid-block lines in the stock logs,
+0 refused; ours: Go heap 11 MB, GC 0.000, RSS 142 MB, verify p50 2.2 ms, build p50 3.4 ms.
+
+MEASUREMENTS_PLACEHOLDER
+
 ## Summary for a validator (this machine, 16 cores shared with other agents' jobs)
 
 - Correctness: every block built by ours was accepted by stock and vice versa; `eth_getBlockByNumber` and
@@ -474,15 +564,15 @@ so 1000 halves the per-batch fixed costs (lock handshake, promotion request, HTT
 
 ## Deviations and open items
 
-1. Pool: libevm's `core/txpool` instead of subnet-evm's. subnet-evm/core links firewood's Rust staticlib and two Rust
-   runtimes cannot share one binary (`rust_eh_personality` and the allocator shims collide). Same lineage; missing
-   `SetMinFee` (a tx under the chain's min base fee is held until it expires, the build filter skips it) and the
-   fee-config gas limit check at admission. The gossip set is a 90-line adaptation of `plugin/evm/eth_gossiper.go`
-   (same wire format, bloom, push/pull), for the same reason.
+1. Pool: the engine's own (`rs/chain/src/pool.rs`, "Mempool in the engine"; the libevm pool of the earlier runs is
+   gone). The gossip set is a 140-line adaptation of `plugin/evm/eth_gossiper.go` (same wire format, bloom,
+   push/pull) over the engine's pool: subnet-evm/core links firewood's Rust staticlib and two Rust runtimes cannot
+   share one binary.
 2. blst/secp256k1/jemalloc/Rust runtime symbols: the archive is localized by `rs/ffi/localize.sh` (17 `epochdb_*`
    globals only), so it links next to avalanchego's bls and firewood without `--allow-multiple-definition`.
 3. `/ws` is not mounted (the engine's ws server has no socket door through the FFI).
-4. `txpool_content` / `eth_pendingTransactions` return libevm's tx JSON (hash, no `from`), not ethapi's RPCTransaction.
+4. Resolved by the engine pool: `txpool_content` / `eth_pendingTransactions` return geth's RPCTransaction shape (with
+   `from`, null block fields).
 5. Coinbase: `allowFeeRecipients=false` -> blackhole, else the config's `feeRecipient`; a RewardManager precompile is
    not read. `GetFeeConfigAt`-style runtime fee config changes (FeeManager) are not read by the Go side (the engine
    enforces them at build/verify).
