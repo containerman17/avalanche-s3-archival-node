@@ -326,3 +326,37 @@ fn sae_pool_admits_a_funder_burst_across_settlement() {
     te.engine.shutdown();
     let _ = std::fs::remove_dir_all(&edir);
 }
+
+/// The functional-phase nonce-gap through the SAE pool: one sender mines nonces
+/// 0..6, then a gap tx (nonce 8) is queued and a fill (nonce 7) must be admitted
+/// (not "nonce too low"). Reproduces the network gap-fill single node.
+#[test]
+fn sae_pool_gap_then_fill() {
+    use crate::pool::Code;
+    let s = Signer::new([0xa1; 32]);
+    let ts = 1_770_000_000_000u64;
+    let cb = Address::from([0xcc; 20]);
+    let p = |ms: u64| Params { timestamp_ms: ms, coinbase: cb, desired_min_delay_excess: None };
+    let raw = |nonce: u64| s.transfer(99999, nonce, 1_000_000_000, 50_000_000_000, 21_000, to(nonce + 1), U256::from(1_000_000u64)).raw;
+    let edir = tmp("sae-gap-fill");
+    let te = open_sae(&edir, &s, 8);
+    te.engine.set_state(true);
+    // Mine nonces 0..6 one per block (as the functional transfers/deploy/calls).
+    for n in 0..7u64 {
+        let parent = te.engine.last_accepted();
+        let a = te.engine.pool_add(vec![raw(n)], true);
+        assert_eq!(a[0].code, Code::Ok, "add nonce {n}: {}", a[0].message);
+        let b = te.engine.build(None, &parent.header, &p(ts + (n + 1) * 2000), None, None, &[]).unwrap();
+        assert_eq!(b.included.len(), 1, "block for nonce {n}");
+        te.insert_verified(b.block.clone(), b.pending);
+        te.accept(&b.block.hash.0).unwrap();
+    }
+    wait_settled(&te, 7);
+    // Gap tx (nonce 8) queues; fill (nonce 7) must be admitted.
+    let g = te.engine.pool_add(vec![raw(8)], true);
+    assert_eq!(g[0].code, Code::Ok, "gap tx: {}", g[0].message);
+    let f = te.engine.pool_add(vec![raw(7)], true);
+    assert_eq!(f[0].code, Code::Ok, "fill tx nonce 7: {}", f[0].message);
+    te.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&edir);
+}

@@ -214,8 +214,11 @@ pub fn sae_executor(
 ) -> anyhow::Result<()> {
     for b in rx {
         let h = b.header.number;
-        // Under the engine lock: execute on the settled state, apply, root, roll.
-        let (payload, root, balances) = {
+        // Under the engine lock: execute on the settled state, apply the backend
+        // + Dirty, gate the root, and retire the projection ALL atomically, so a
+        // reader (Accept's pool refresh, RPC) never sees the backend nonce
+        // advanced while the projection still counts the block as unsettled.
+        let payload = {
             let mut g = inner.lock().unwrap();
             let inner = &mut *g;
             let Ex::Native(ex) = &mut inner.ex else { bail!("SAE mode needs the native state engine") };
@@ -261,13 +264,15 @@ pub fn sae_executor(
                 }
             }
             roller.maybe_roll(be, inner.roll_budget, h, root);
-            (payload, root, balances)
+            // The block's OWN receipts root / bloom (the header at h+k commits
+            // these with the settled root), the gate, and the projection retire,
+            // still under the engine lock so the settled state is atomic.
+            let receipts_root = exec::exec::receipts_root(&payload.result.txs);
+            sae.on_settle(h, Settled { root, receipts_root, bloom: payload.result.bloom });
+            sae.proj.lock().unwrap().settle_block(h, &b.txs, Some(&balances));
+            payload
         };
-        // Off the engine lock: the block's OWN receipts root / bloom (the header
-        // at h+k commits these with the settled root), gate, settle, store.
-        let receipts_root = exec::exec::receipts_root(&payload.result.txs);
-        sae.on_settle(h, Settled { root, receipts_root, bloom: payload.result.bloom });
-        sae.proj.lock().unwrap().settle_block(h, &b.txs, Some(&balances));
+        // Off the engine lock: render the traces and write the store row.
         let mut result = payload.result;
         exec::exec::render_deferred(&mut result).with_context(|| format!("SAE block {h}: callTracer render"))?;
         let rows = BlockWrite::from_exec(&b, &result).with_context(|| format!("SAE block {h}: store rows"))?;
