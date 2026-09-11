@@ -36,7 +36,7 @@ fn default_roles(c: &mut Ctx, precompile: Address) {
 }
 
 fn env(durango: bool) -> Env {
-    Env { durango, granite: false, block_number: 7, network_id: 54321, blockchain_id: B256::repeat_byte(0xab), predicates: Vec::new(), failed: Vec::new() }
+    Env { durango, granite: false, coreth: false, block_number: 7, network_id: 54321, blockchain_id: B256::repeat_byte(0xab), predicates: Vec::new(), failed: Vec::new() }
 }
 
 type ModuleFn = fn(&mut Ctx, &Env, &[u8], &mut Gas, bool, Address) -> Result<Bytes, Halt>;
@@ -474,7 +474,7 @@ fn feemanager_cases() {
 // warp
 
 fn warp_env(predicates: Vec<Vec<B256>>, failed: Vec<u8>) -> Env {
-    Env { durango: true, granite: false, block_number: 7, network_id: 54321, blockchain_id: B256::repeat_byte(0xab), predicates, failed }
+    Env { durango: true, granite: false, coreth: false, block_number: 7, network_id: 54321, blockchain_id: B256::repeat_byte(0xab), predicates, failed }
 }
 
 #[test]
