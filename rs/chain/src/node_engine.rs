@@ -299,17 +299,28 @@ pub struct NodeEngine {
 pub struct PoolRpc {
     pub pool: Arc<Pool>,
     pub inner: Arc<Mutex<Inner>>,
+    pub sae: Option<Arc<crate::sae_mode::Sae>>,
 }
 
-/// (nonce, balance) of `addrs` at the accepted head.
-fn head_accounts(inner: &Mutex<Inner>, addrs: &[Address]) -> Vec<(u64, U256)> {
+/// (nonce, balance) of `addrs` the pool admits against: the accepted-head state
+/// in the sync path; in SAE the PROJECTED nonce (settled nonce + the sender's
+/// accepted-but-unsettled txs) and the settled balance, so admission matches
+/// verify_light (else a burst reads as "nonce too low" while its earlier txs
+/// are accepted but not yet settled).
+fn head_accounts(inner: &Mutex<Inner>, sae: Option<&Arc<crate::sae_mode::Sae>>, addrs: &[Address]) -> Vec<(u64, U256)> {
     let mut g = inner.lock().unwrap();
-    addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
+    match sae {
+        Some(sae) => {
+            let proj = sae.proj.lock().unwrap();
+            addrs.iter().map(|a| { let (n, b) = g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance)); (n + proj.unsettled_count(a), b) }).collect()
+        }
+        None => addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect(),
+    }
 }
 
 impl PoolRpc {
     pub fn add(&self, raws: Vec<Bytes>, local: bool) -> Vec<pool::Added> {
-        self.pool.add(raws, local, &|addrs| head_accounts(&self.inner, addrs))
+        self.pool.add(raws, local, &|addrs| head_accounts(&self.inner, self.sae.as_ref(), addrs))
     }
 }
 
@@ -777,7 +788,7 @@ impl NodeEngine {
         let chain_config = serde_json::from_slice::<serde_json::Value>(&init.genesis_bytes).ok().and_then(|g| g.get("config").cloned()).unwrap_or_default();
         let upgrades = serde_json::from_slice::<serde_json::Value>(&init.upgrade_bytes).ok();
         let rpc = rpc::Server::new(rpc_store.clone(), cfg.clone(), genesis.clone(), chain_config, upgrades);
-        let _ = rpc.mempool.set(Arc::new(PoolRpc { pool: pool.clone(), inner: inner.clone() }));
+        let _ = rpc.mempool.set(Arc::new(PoolRpc { pool: pool.clone(), inner: inner.clone(), sae: sae.clone() }));
         Ok(NodeEngine {
             cfg: cfg.clone(),
             txpool: pool,
@@ -915,13 +926,13 @@ impl NodeEngine {
     /// Admits tx envelopes into the pool (the ABI's epochdb_pool_add; the
     /// RPC's eth_sendRawTransaction goes through the same PoolRpc).
     pub fn pool_add(&self, raws: Vec<Bytes>, local: bool) -> Vec<pool::Added> {
-        self.txpool.add(raws, local, &|addrs| head_accounts(&self.inner, addrs))
+        self.txpool.add(raws, local, &|addrs| head_accounts(&self.inner, self.sae.as_ref(), addrs))
     }
 
     /// The pool's gap report (`Pool::gap_report`) for the builder's
     /// pool-quiet WARN: up to 3 senders, state nonces from the accepted head.
     pub fn pool_gaps(&self) -> String {
-        self.txpool.gap_report(3, &|addrs| head_accounts(&self.inner, addrs))
+        self.txpool.gap_report(3, &|addrs| head_accounts(&self.inner, self.sae.as_ref(), addrs))
     }
 }
 
