@@ -74,3 +74,49 @@ pub fn follow(ws: &str, http: &str, out: &Sender<RawBlock>) -> Result<()> {
         }
     }
 }
+
+/// Consecutive blocks from `from` onward, forever: the gap up to the live
+/// head by number over HTTP, then every `newHeads` in order, refilling any
+/// gap (a reconnect) by number. Catch-up blocks get the time they were
+/// fetched as `received_ms`.
+pub fn stream(ws: &str, http: &str, from: u64, out: &Sender<RawBlock>) {
+    let mut next = from;
+    loop {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ws2, http2) = (ws.to_string(), http.to_string());
+        let feeder = std::thread::spawn(move || follow(&ws2, &http2, &tx));
+        loop {
+            let live = match rx.recv() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            while next < live.height {
+                match rpc(http, "eth_getBlockByNumber", json!([format!("0x{next:x}"), true])) {
+                    Ok(block) if !block.is_null() => {
+                        let hash = block["hash"].as_str().unwrap_or_default().to_string();
+                        if out.send(RawBlock { received_ms: now_ms(), height: next, hash, block }).is_err() {
+                            return;
+                        }
+                        next += 1;
+                    }
+                    Ok(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                    Err(e) => {
+                        eprintln!("feed: catch-up {next}: {e:#}");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+            }
+            if live.height == next {
+                if out.send(live).is_err() {
+                    return;
+                }
+                next += 1;
+            }
+        }
+        match feeder.join() {
+            Ok(Err(e)) => eprintln!("feed: {e:#}; reconnecting"),
+            _ => eprintln!("feed: socket closed; reconnecting"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}

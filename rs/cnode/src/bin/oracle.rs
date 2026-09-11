@@ -1,4 +1,4 @@
-//! oracle <http url> [blocks]: execute the latest blocks with their pre-state
+//! oracle <http url> [blocks per round] [rounds]: execute the latest blocks with their pre-state
 //! read from the node at the parent block, then compare every touched
 //! account and slot with the node at the block. Gas used and the receipts
 //! root are compared inside `Applier::execute`. The node is pruned, so only
@@ -76,12 +76,21 @@ impl Base for RpcBase {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let http = a[1].clone();
-    let n: u64 = a.get(2).map_or(5, |s| s.parse().unwrap());
-    let head = u64::from_str_radix(rpc(&http, "eth_blockNumber", json!([])).unwrap().as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    let n: u64 = a.get(2).map_or(4, |s| s.parse().unwrap());
+    let rounds: u64 = a.get(3).map_or(1, |s| s.parse().unwrap());
     let base = RpcBase { http: http.clone(), block: Mutex::new(0), accts: Mutex::new(HashMap::new()), slots: Mutex::new(HashMap::new()), calls: Mutex::new(0) };
     let mut ap = Applier::new(base);
     let mut bad = 0;
+    let mut done = 0u64;
+    let mut last_head = 0u64;
+    for _round in 0..rounds {
+    let head = u64::from_str_radix(rpc(&http, "eth_blockNumber", json!([])).unwrap().as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    if head < last_head + n {
+        std::thread::sleep(std::time::Duration::from_secs((last_head + n - head) * 2));
+    }
+    last_head = head;
     for h in (head - n)..head {
+        done += 1;
         ap.ex.db_mut().base.reset(h - 1);
         let json = rpc(&http, "eth_getBlockByNumber", json!([format!("0x{h:x}"), true])).unwrap();
         let t = std::time::Instant::now();
@@ -122,6 +131,7 @@ fn main() {
         bad += mism;
         ap.ex.db_mut().take_diff();
     }
-    println!("done: {n} blocks, {bad} problems");
+    }
+    println!("done: {done} blocks, {bad} problems");
     std::process::exit(if bad == 0 { 0 } else { 1 });
 }

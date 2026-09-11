@@ -8,6 +8,8 @@ pub mod feed;
 pub mod history;
 pub mod hot;
 pub mod import;
+pub mod node;
+pub use node::{BlockEvent, Node};
 
 use alloy_primitives::B256;
 use std::path::PathBuf;
@@ -40,6 +42,9 @@ pub struct Config {
     pub rpc_http: String,
     pub validator_ws: Vec<String>,
     pub data_dir: PathBuf,
+    /// The cmd/cnode-export output: the import when data_dir is empty, and
+    /// code.bin on every restart (the rolled run holds no code).
+    pub bootstrap_dir: PathBuf,
     pub checker_lag_blocks: u64,
     pub snapshot_every_blocks: u64,
 }

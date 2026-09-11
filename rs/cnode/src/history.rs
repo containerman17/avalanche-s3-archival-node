@@ -44,6 +44,21 @@ pub fn decode_rows(mut b: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
+/// Rows back into a hot-state diff (a restart replay). Account rows are
+/// applied before slot rows, as `hot::rows` emitted them.
+pub fn diff_from_rows(rows: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<crate::hot::Diff> {
+    use alloy_primitives::U256;
+    let mut d = crate::hot::Diff::default();
+    for (k, v) in rows {
+        match k.len() {
+            33 => d.accounts.push((k[..32].try_into().unwrap(), if v.is_empty() { None } else { Some(crate::import::parse_account_row(v)?) })),
+            65 => d.storage.push((k[..32].try_into().unwrap(), k[33..65].try_into().unwrap(), U256::from_be_slice(v))),
+            n => anyhow::bail!("history row with a {n}-byte key"),
+        }
+    }
+    Ok(d)
+}
+
 impl History {
     pub fn open(path: &Path) -> Result<History> {
         let db = Database::create(path)?;
