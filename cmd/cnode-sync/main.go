@@ -63,7 +63,7 @@ const requestTimeout = 15 * time.Second
 func main() {
 	out := flag.String("out", "", "output dir (accounts.bin, storage.bin, code.bin, meta.json)")
 	node := flag.String("node", "https://api.avax.network", "public node for platform.getCurrentValidators and info.peers")
-	workers := flag.Int("workers", 256, "concurrent leaf requests in flight")
+	workers := flag.Int("workers", 1024, "concurrent leaf requests in flight")
 	perPeer := flag.Int("per-peer", 3, "outstanding requests per peer")
 	reqSize := flag.Int("request-size", 1024, "leafs per request")
 	connect := flag.Duration("connect", 90*time.Second, "how long to gather peers before asking for summaries")
@@ -430,13 +430,18 @@ type syncState struct {
 	accounts *shardWriter
 	storage  *shardWriter
 	tasks    chan leaf.SyncTask
-	pending  sync.WaitGroup // storage tasks queued but not finished
-	codeMu   sync.Mutex
-	codes    map[common.Hash]struct{}
-	nAcc     atomic.Uint64
-	nSlot    atomic.Uint64
-	nStor    atomic.Uint64
-	nReq     atomic.Uint64
+	// Storage tasks found while walking the accounts: an unbounded queue
+	// (millions of tiny tries) drained by one feeder into `tasks`.
+	qmu     sync.Mutex
+	queue   []leaf.SyncTask
+	qsignal chan struct{}
+	pending sync.WaitGroup // storage tasks queued but not finished
+	codeMu  sync.Mutex
+	codes   map[common.Hash]struct{}
+	nAcc    atomic.Uint64
+	nSlot   atomic.Uint64
+	nStor   atomic.Uint64
+	nReq    atomic.Uint64
 }
 
 type accountTask struct {
@@ -492,10 +497,48 @@ func (t *accountTask) OnLeafs(_ context.Context, keys, vals [][]byte) error {
 			// ponytail: identical storage roots are fetched once per account, not shared; dedupe if the duplicates ever dominate.
 			t.s.pending.Add(1)
 			t.s.nStor.Add(1)
-			go func(root common.Hash, acc common.Hash) { t.s.tasks <- &storageTask{s: t.s, root: root, account: acc} }(common.BytesToHash(a.Root), common.BytesToHash(k))
+			t.s.enqueue(&storageTask{s: t.s, root: common.BytesToHash(a.Root), account: common.BytesToHash(k)})
 		}
 	}
 	return nil
+}
+
+func (s *syncState) enqueue(t leaf.SyncTask) {
+	s.qmu.Lock()
+	s.queue = append(s.queue, t)
+	s.qmu.Unlock()
+	select {
+	case s.qsignal <- struct{}{}:
+	default:
+	}
+}
+
+// feeder moves queued tasks into the workers' channel until `stop` closes
+// and the queue is empty.
+func (s *syncState) feeder(stop <-chan struct{}) {
+	for {
+		s.qmu.Lock()
+		var t leaf.SyncTask
+		if len(s.queue) > 0 {
+			t = s.queue[0]
+			s.queue = s.queue[1:]
+		}
+		s.qmu.Unlock()
+		if t != nil {
+			s.tasks <- t
+			continue
+		}
+		select {
+		case <-s.qsignal:
+		case <-stop:
+			s.qmu.Lock()
+			n := len(s.queue)
+			s.qmu.Unlock()
+			if n == 0 {
+				return
+			}
+		}
+	}
 }
 
 type storageTask struct {
@@ -630,7 +673,7 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 	log.Printf("SUMMARY: height %d hash %s root %s (agreed by the stake below)", summary.BlockNumber, summary.BlockHash, summary.BlockRoot)
 
 	// 4. Leafs.
-	st := &syncState{tasks: make(chan leaf.SyncTask, 1<<16), codes: map[common.Hash]struct{}{}}
+	st := &syncState{tasks: make(chan leaf.SyncTask, 1024), qsignal: make(chan struct{}, 1), codes: map[common.Hash]struct{}{}}
 	if st.accounts, err = newShardWriter(out, "accounts.bin"); err != nil {
 		return err
 	}
@@ -653,9 +696,14 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 		t := &shardTask{accountTask: accountTask{s: st, root: summary.BlockRoot, start: start, end: end}, wg: &shards}
 		st.tasks <- t
 	}
+	stopFeed := make(chan struct{})
+	feedDone := make(chan struct{})
+	go func() { st.feeder(stopFeed); close(feedDone) }()
 	go func() {
 		shards.Wait()
 		st.pending.Wait()
+		close(stopFeed)
+		<-feedDone
 		close(st.tasks)
 	}()
 	t0 := time.Now()
