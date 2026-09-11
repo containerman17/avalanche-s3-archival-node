@@ -44,6 +44,14 @@ pub const MODULES: [(&str, Address); 6] = [
     ("warpConfig", WARP),
 ];
 
+/// coreth params/hooks_libevm.go PrecompiledContractsGranite: GenesisContractAddr
+/// (the coinbase 0x0100..00), NativeAssetBalanceAddr, NativeAssetCallAddr.
+pub const CORETH_DEPRECATED: [Address; 3] = [
+    Address::new(alloy_primitives::hex!("0100000000000000000000000000000000000000")),
+    Address::new(alloy_primitives::hex!("0100000000000000000000000000000000000001")),
+    Address::new(alloy_primitives::hex!("0100000000000000000000000000000000000002")),
+];
+
 pub fn module_index(addr: Address) -> Option<usize> {
     MODULES.iter().position(|(_, a)| *a == addr)
 }
@@ -60,6 +68,9 @@ pub const INVALIDATE_DELEGATE_UNIX: u64 = 1754107200;
 pub struct Env {
     pub durango: bool,
     pub granite: bool,
+    /// coreth (mainnet C): the three deprecated native-asset addresses are
+    /// precompiles that revert returning all gas (nativeasset.DeprecatedContract).
+    pub coreth: bool,
     pub block_number: u64,
     pub network_id: u32,
     pub blockchain_id: B256,

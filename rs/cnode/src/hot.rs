@@ -120,6 +120,14 @@ impl HotState {
         Ok(v)
     }
 
+    /// The writer's own reads (no generation check: nothing else writes).
+    pub fn account_raw(&self, addr_hash: &H) -> Option<Account> {
+        self.accounts.pin().get(addr_hash).copied()
+    }
+    pub fn storage_raw(&self, addr_hash: &H, slot_hash: &H) -> U256 {
+        self.storage.pin().get(addr_hash).and_then(|m| m.pin().get(slot_hash).copied()).unwrap_or(U256::ZERO)
+    }
+
     pub fn code(&self, hash: &B256) -> Option<Arc<[u8]>> {
         self.code.pin().get(hash).cloned()
     }

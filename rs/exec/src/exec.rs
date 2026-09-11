@@ -396,6 +396,11 @@ impl SevmPrecompiles {
         if self.env.granite {
             self.warm.insert(P256_VERIFY);
         }
+        if self.env.coreth {
+            for a in precompile::CORETH_DEPRECATED {
+                self.warm.insert(a);
+            }
+        }
         self.warm_changed = true;
     }
 
@@ -420,6 +425,10 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for SevmPrecompiles {
 
     fn run(&mut self, ctx: &mut CTX, inputs: &CallInputs) -> Result<Option<InterpreterResult>, String> {
         let addr = inputs.bytecode_address;
+        if self.env.coreth && precompile::CORETH_DEPRECATED.contains(&addr) {
+            // DeprecatedContract.Run: (nil, suppliedGas, ErrExecutionReverted).
+            return Ok(Some(InterpreterResult::new(InstructionResult::Revert, Bytes::new(), Gas::new(inputs.gas_limit))));
+        }
         if self.env.granite && addr == P256_VERIFY {
             let input = inputs.input.as_bytes(ctx);
             let mut gas = Gas::new(inputs.gas_limit);
@@ -917,6 +926,12 @@ impl<D: StateDb> Executor<D> {
     /// (a window replay): no genesis is materialised.
     pub fn resume(cfg: Config, db: D) -> Result<Executor<D>> {
         Ok(Executor::open(cfg, db))
+    }
+
+    /// mainnet C rules: the deprecated native-asset precompiles (warm, revert).
+    pub fn set_coreth(&mut self) {
+        self.evm.precompiles.env.coreth = true;
+        self.evm.precompiles.rebuild_warm();
     }
 
     pub fn db(&self) -> &D {
