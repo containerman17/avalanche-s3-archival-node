@@ -87,6 +87,21 @@ impl Projection {
         self.senders.get(addr).map(|s| s.settled_nonce + s.unsettled_count)
     }
 
+    /// The pool's admission baseline for a tracked sender: (projected nonce,
+    /// settled balance), the same pair verify_light checks against. None if the
+    /// sender is not tracked, OR its settled_balance is still the U256::MAX
+    /// placeholder (accepted but not yet settled with a real balance): those
+    /// callers must read the real backend balance to keep the funds gate honest.
+    /// Serving this from the projection lets pool.add avoid the engine lock the
+    /// continuous executor holds for a whole block.
+    pub fn settled_baseline(&self, addr: &Address) -> Option<(u64, U256)> {
+        let s = self.senders.get(addr)?;
+        if s.settled_balance == U256::MAX {
+            return None;
+        }
+        Some((s.settled_nonce + s.unsettled_count, s.settled_balance))
+    }
+
     /// The count of a sender's accepted-but-unsettled txs (0 if untracked): the
     /// gap between its settled nonce and its projected nonce, which the pool
     /// adds to the settled-state nonce to admit against the projected nonce.
@@ -354,6 +369,23 @@ mod tests {
         assert!(q.verify_light(&two, 0, CAP, SIZE).is_ok());
         let three = [tx(3, 0, 21_000, 50, 1), tx(3, 1, 21_000, 50, 1), tx(3, 2, 21_000, 50, 1)];
         assert_eq!(q.verify_light(&three, 0, CAP, SIZE), Err(Reject::Underfunded(2)));
+    }
+
+    #[test]
+    fn settled_baseline_serves_tracked_senders_and_misses_placeholders() {
+        let mut p = Projection::new();
+        // Untracked sender: miss.
+        assert_eq!(p.settled_baseline(&addr(1)), None);
+        // Tracked with a real settled balance: (projected nonce, balance).
+        p.set_settled(addr(1), 5, U256::from(100));
+        let b = [tx(1, 5, 21_000, 1, 0)];
+        p.accept_block(1, &b);
+        assert_eq!(p.settled_baseline(&addr(1)), Some((6, U256::from(100))));
+        // Accepted but not yet settled with a real balance (U256::MAX placeholder): miss.
+        let c = [tx(2, 0, 21_000, 1, 0)];
+        p.accept_block(2, &c);
+        assert_eq!(p.projected_nonce(&addr(2)), Some(1));
+        assert_eq!(p.settled_baseline(&addr(2)), None);
     }
 
     #[test]

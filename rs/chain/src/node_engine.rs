@@ -308,13 +308,46 @@ pub struct PoolRpc {
 /// verify_light (else a burst reads as "nonce too low" while its earlier txs
 /// are accepted but not yet settled).
 fn head_accounts(inner: &Mutex<Inner>, sae: Option<&Arc<crate::sae_mode::Sae>>, addrs: &[Address]) -> Vec<(u64, U256)> {
-    let mut g = inner.lock().unwrap();
     match sae {
         Some(sae) => {
+            // Serve the admission baseline from the projection (its own briefly-
+            // held lock), NOT the engine `inner` the continuous executor holds
+            // for a whole block's execute + apply + settled-root. verify_light
+            // already reads the same settled_balance, so this is the same gate,
+            // not a new relaxation. Only senders the projection cannot answer
+            // (untracked, or no real settled balance yet) fall back to a backend
+            // read under `inner`.
+            let baselines: Vec<Option<(u64, U256)>> = {
+                let proj = sae.proj.lock().unwrap();
+                addrs.iter().map(|a| proj.settled_baseline(a)).collect()
+            };
+            let misses = baselines.iter().filter(|b| b.is_none()).count() as u64;
+            sae.admit_reads.fetch_add(addrs.len() as u64, Ordering::Relaxed);
+            sae.admit_fallback.fetch_add(misses, Ordering::Relaxed);
+            if misses == 0 {
+                return baselines.into_iter().map(|b| b.unwrap()).collect();
+            }
+            // Some misses: lock `inner` once and read ONLY those from the
+            // backend, reusing the old logic (projected nonce over the backend
+            // settled nonce, backend balance).
+            let mut g = inner.lock().unwrap();
             let proj = sae.proj.lock().unwrap();
-            addrs.iter().map(|a| { let (n, b) = g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance)); (proj.projected_nonce(a).unwrap_or(n), b) }).collect()
+            addrs
+                .iter()
+                .zip(baselines)
+                .map(|(a, b)| match b {
+                    Some(v) => v,
+                    None => {
+                        let (n, bal) = g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance));
+                        (proj.projected_nonce(a).unwrap_or(n), bal)
+                    }
+                })
+                .collect()
         }
-        None => addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect(),
+        None => {
+            let mut g = inner.lock().unwrap();
+            addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
+        }
     }
 }
 
@@ -1024,6 +1057,7 @@ impl Engine for NodeEngine {
             return Ok(serde_json::json!({"height": h, "sae": true, "settlement-blocks": sae.k, "settled-head": settled, "settlement-lag": lag,
                 "settled-txs": sae.settled_tx.load(Ordering::Relaxed), "settled-gas": sae.settled_gas.load(Ordering::Relaxed),
                 "projection-tracked": sae.proj.lock().unwrap().tracked(), "normal-op": self.is_normal(),
+                "admit-reads": sae.admit_reads.load(Ordering::Relaxed), "admit-fallback": sae.admit_fallback.load(Ordering::Relaxed),
                 "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed)}));
         }
         Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal(),

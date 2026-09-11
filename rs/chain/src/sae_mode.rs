@@ -83,6 +83,12 @@ pub struct Sae {
     pub settled_tx: AtomicU64,
     pub settled_gas: AtomicU64,
     pub settled_time: AtomicU64,
+    /// Admission-read health: `admit_reads` = per-sender baseline lookups by
+    /// pool.add / the builder; `admit_fallback` = those that missed the
+    /// projection and fell back to a backend read under `inner`. A low
+    /// fallback/reads ratio confirms most admissions now avoid the engine lock.
+    pub admit_reads: AtomicU64,
+    pub admit_fallback: AtomicU64,
 }
 
 impl Sae {
@@ -101,6 +107,8 @@ impl Sae {
             settled_tx: AtomicU64::new(0),
             settled_gas: AtomicU64::new(0),
             settled_time: AtomicU64::new(0),
+            admit_reads: AtomicU64::new(0),
+            admit_fallback: AtomicU64::new(0),
         }
     }
 
