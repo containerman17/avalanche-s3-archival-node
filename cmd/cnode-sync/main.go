@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -461,9 +462,11 @@ type syncState struct {
 	queue   []leaf.SyncTask
 	qsignal chan struct{}
 	pending sync.WaitGroup // storage tasks queued but not finished
+	reqSize int
 	codeMu  sync.Mutex
 	codes   map[common.Hash]struct{}
 	nAcc    atomic.Uint64
+	nSplit  atomic.Uint64
 	nSlot   atomic.Uint64
 	nStor   atomic.Uint64
 	nReq    atomic.Uint64
@@ -522,7 +525,7 @@ func (t *accountTask) OnLeafs(_ context.Context, keys, vals [][]byte) error {
 			// ponytail: identical storage roots are fetched once per account, not shared; dedupe if the duplicates ever dominate.
 			t.s.pending.Add(1)
 			t.s.nStor.Add(1)
-			t.s.enqueue(&storageTask{s: t.s, root: common.BytesToHash(a.Root), account: common.BytesToHash(k)})
+			t.s.enqueue(&storageTask{s: t.s, root: common.BytesToHash(a.Root), account: common.BytesToHash(k), reqSize: t.s.reqSize})
 		}
 	}
 	return nil
@@ -567,20 +570,74 @@ func (s *syncState) feeder(stop <-chan struct{}) {
 }
 
 type storageTask struct {
-	s       *syncState
-	root    common.Hash
-	account common.Hash
+	s          *syncState
+	root       common.Hash
+	account    common.Hash
+	start, end []byte
+	// A big trie: the first full response ends this task at its last key and
+	// the rest of the range goes on as 16 sub-tasks (each splitting again).
+	reqSize int
+	split   bool
 }
 
-func (t *storageTask) Root() common.Hash              { return t.root }
-func (t *storageTask) Account() common.Hash           { return t.account }
-func (t *storageTask) Start() []byte                  { return nil }
-func (t *storageTask) End() []byte                    { return nil }
-func (t *storageTask) NodeType() evmmessage.NodeType  { return evmmessage.StateTrieNode }
-func (t *storageTask) OnStart() (bool, error)         { return false, nil }
-func (t *storageTask) OnFinish(context.Context) error { t.s.pending.Done(); return nil }
+func (t *storageTask) Root() common.Hash             { return t.root }
+func (t *storageTask) Account() common.Hash          { return t.account }
+func (t *storageTask) Start() []byte                 { return t.start }
+func (t *storageTask) End() []byte                   { return t.end }
+func (t *storageTask) NodeType() evmmessage.NodeType { return evmmessage.StateTrieNode }
+func (t *storageTask) OnStart() (bool, error)        { return false, nil }
+func (t *storageTask) OnFinish(context.Context) error {
+	t.s.pending.Done()
+	return nil
+}
+
+// splitRange enqueues the key space (from, to] as 16 sub-tasks.
+func (t *storageTask) splitRange(from, to []byte) {
+	lo := new(big.Int).SetBytes(from)
+	hi := new(big.Int).SetBytes(to)
+	span := new(big.Int).Sub(hi, lo)
+	if span.Sign() <= 0 {
+		return
+	}
+	step := new(big.Int).Div(span, big.NewInt(16))
+	if step.Sign() == 0 {
+		step = big.NewInt(1)
+	}
+	cur := new(big.Int).Add(lo, big.NewInt(1))
+	for cur.Cmp(hi) <= 0 {
+		next := new(big.Int).Add(cur, step)
+		if next.Cmp(hi) > 0 {
+			next = new(big.Int).Set(hi)
+		}
+		sub := &storageTask{s: t.s, root: t.root, account: t.account, start: pad32(cur), end: pad32(next), reqSize: t.reqSize}
+		t.s.pending.Add(1)
+		t.s.enqueue(sub)
+		t.s.nSplit.Add(1)
+		cur = new(big.Int).Add(next, big.NewInt(1))
+	}
+}
+
+func pad32(v *big.Int) []byte {
+	b := v.Bytes()
+	out := make([]byte, 32)
+	copy(out[32-len(b):], b)
+	return out
+}
+
 func (t *storageTask) OnLeafs(_ context.Context, keys, vals [][]byte) error {
 	t.s.nReq.Add(1)
+	if !t.split && len(keys) >= t.reqSize {
+		// Full response: more to come. Stop this task at the last key and
+		// hand the rest of the range to sub-tasks.
+		t.split = true
+		last := keys[len(keys)-1]
+		to := t.end
+		if to == nil {
+			to = bytes.Repeat([]byte{0xff}, 32)
+		}
+		t.end = last
+		t.splitRange(last, to)
+	}
 	for i, k := range keys {
 		if len(k) != 32 {
 			return fmt.Errorf("slot key of %d bytes", len(k))
@@ -698,7 +755,7 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 	log.Printf("SUMMARY: height %d hash %s root %s (agreed by the stake below)", summary.BlockNumber, summary.BlockHash, summary.BlockRoot)
 
 	// 4. Leafs.
-	st := &syncState{tasks: make(chan leaf.SyncTask, 1024), qsignal: make(chan struct{}, 1), codes: map[common.Hash]struct{}{}}
+	st := &syncState{tasks: make(chan leaf.SyncTask, 1024), qsignal: make(chan struct{}, 1), codes: map[common.Hash]struct{}{}, reqSize: int(reqSize)}
 	if st.accounts, err = newShardWriter(out, "accounts.bin"); err != nil {
 		return err
 	}
@@ -755,8 +812,8 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 			p.mu.Lock()
 			refused := p.refused
 			p.mu.Unlock()
-			log.Printf("sync: %d accounts, %d slots (%d storage tries named, %d queued), %d responses, %d timeouts, %d failures, %.0f leafs/s, peers %d serving, %d refusing (%.1f%% stake connected), %.0fs",
-				st.nAcc.Load(), st.nSlot.Load(), st.nStor.Load(), queued, st.nReq.Load(), nc.timeouts.Load(), nc.failures.Load(), float64(st.nAcc.Load()+st.nSlot.Load())/el, n-refused, refused, 100*float64(w)/float64(p.total), el)
+			log.Printf("sync: %d accounts, %d slots (%d storage tries named, %d splits, %d queued), %d responses, %d timeouts, %d failures, %.0f leafs/s, peers %d serving, %d refusing (%.1f%% stake connected), %.0fs",
+				st.nAcc.Load(), st.nSlot.Load(), st.nStor.Load(), st.nSplit.Load(), queued, st.nReq.Load(), nc.timeouts.Load(), nc.failures.Load(), float64(st.nAcc.Load()+st.nSlot.Load())/el, n-refused, refused, 100*float64(w)/float64(p.total), el)
 		}
 	}
 finished:
