@@ -9,7 +9,7 @@
 //! a `Base` (the hot state, or an RPC at the parent block for the oracle).
 //! After the block the overlay IS the diff.
 
-use crate::hot::{addr_hash, slot_hash, Account, Diff, HotState};
+use crate::hot::{addr_hash, slot_hash, Account, Diff, HashCache, HotState};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use anyhow::{anyhow, bail, Context, Result};
 use exec::config::{Config, FeeConfig, PrecompileConfig};
@@ -42,16 +42,17 @@ pub trait Base: Send + Sync {
 /// The hot state as a base, plus the BLOCKHASH ring the applier maintains.
 pub struct HotBase {
     pub hot: Arc<HotState>,
+    pub cache: Arc<HashCache>,
     pub hashes: std::sync::Mutex<HashMap<u64, B256>>,
 }
 
 impl Base for HotBase {
     fn account(&self, a: Address) -> Option<(AccountInfo, bool)> {
-        let acc = self.hot.account_raw(&addr_hash(&a))?;
+        let acc = self.hot.account_raw(&self.cache.addr(&a))?;
         Some((AccountInfo { balance: acc.balance, nonce: acc.nonce, code_hash: acc.code_hash, code: None, ..Default::default() }, acc.multicoin))
     }
     fn storage(&self, a: Address, slot: U256) -> U256 {
-        self.hot.storage_raw(&addr_hash(&a), &slot_hash(&slot))
+        self.hot.storage_raw(&self.cache.addr(&a), &self.cache.slot(&slot))
     }
     fn code(&self, h: B256) -> Option<Bytecode> {
         self.hot.code(&h).map(|c| Bytecode::new_raw(Bytes::copy_from_slice(&c)))
@@ -66,13 +67,14 @@ impl Base for HotBase {
 /// result.
 pub struct GenBase {
     pub hot: Arc<HotState>,
+    pub cache: Arc<HashCache>,
     pub g: crate::Generation,
     pub stale: std::sync::atomic::AtomicBool,
 }
 
 impl Base for GenBase {
     fn account(&self, a: Address) -> Option<(AccountInfo, bool)> {
-        match self.hot.account(self.g, &addr_hash(&a)) {
+        match self.hot.account(self.g, &self.cache.addr(&a)) {
             Ok(v) => v.map(|acc| (AccountInfo { balance: acc.balance, nonce: acc.nonce, code_hash: acc.code_hash, code: None, ..Default::default() }, acc.multicoin)),
             Err(_) => {
                 self.stale.store(true, std::sync::atomic::Ordering::Release);
@@ -81,7 +83,7 @@ impl Base for GenBase {
         }
     }
     fn storage(&self, a: Address, slot: U256) -> U256 {
-        self.hot.storage(self.g, &addr_hash(&a), &slot_hash(&slot)).unwrap_or_else(|_| {
+        self.hot.storage(self.g, &self.cache.addr(&a), &self.cache.slot(&slot)).unwrap_or_else(|_| {
             self.stale.store(true, std::sync::atomic::Ordering::Release);
             U256::ZERO
         })
@@ -591,6 +593,32 @@ impl<B: Base> Applier<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real block (95033472, six txs and one atomic tx of 311 bytes) parses
+    /// into the executor's block and its atomic tx decodes.
+    #[test]
+    fn real_block_parses() {
+        let v: Value = serde_json::from_str(include_str!("block_95033472.json")).unwrap();
+        let b = block_from_json(&v).unwrap();
+        assert_eq!((b.height, b.txs.len(), b.header.gas_used), (95033472, 6, 0x69364));
+        assert!(b.txs.iter().all(|t| t.sender.is_some()));
+        assert_eq!(b.header.extra.len(), 30);
+        let ext: Bytes = v["blockExtraData"].as_str().unwrap().parse().unwrap();
+        let txs = decode_atomic(&ext).unwrap();
+        assert_eq!(txs.len(), 1);
+        let avax: B256 = B256::from_slice(&bs58::decode(AVAX_ASSET).into_vec().unwrap()[..32]);
+        match &txs[0] {
+            AtomicTx::Import(outs) => {
+                assert!(!outs.is_empty());
+                assert!(outs.iter().all(|(_, amt, asset)| *asset == avax && *amt > 0));
+            }
+            AtomicTx::Export(ins) => {
+                assert!(!ins.is_empty());
+                assert!(ins.iter().all(|(_, amt, asset, _)| *asset == avax && *amt > 0));
+            }
+        }
+        assert!(decode_atomic(&ext[..ext.len() - 1]).is_err());
+    }
 
     #[test]
     fn mask_clears_bit_248() {

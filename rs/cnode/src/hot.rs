@@ -232,6 +232,32 @@ pub fn slot_hash(k: &U256) -> H {
     keccak256(k.to_be_bytes::<32>()).0
 }
 
+/// keccak preimages seen so far (a keccak is 100 to 300 ns, a hit is one
+/// cache line): every address and slot the host asks for or a block touches.
+/// Unbounded on purpose, memory is free.
+#[derive(Default)]
+pub struct HashCache {
+    addrs: HashMap<Address, H>,
+    slots: HashMap<U256, H>,
+}
+
+impl HashCache {
+    pub fn addr(&self, a: &Address) -> H {
+        let m = self.addrs.pin();
+        match m.get(a) {
+            Some(h) => *h,
+            None => *m.get_or_insert_with(*a, || addr_hash(a)),
+        }
+    }
+    pub fn slot(&self, k: &U256) -> H {
+        let m = self.slots.pin();
+        match m.get(k) {
+            Some(h) => *h,
+            None => *m.get_or_insert_with(*k, || slot_hash(k)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

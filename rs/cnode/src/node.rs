@@ -7,7 +7,7 @@ use crate::exec::{Applier, HotBase};
 use crate::feed::{self, now_ms, RawBlock};
 use crate::history::{History, StoredBlock};
 use crate::mempool::{Mempool, PendingEvent};
-use crate::hot::{addr_hash, rows, slot_hash, Account, HotState};
+use crate::hot::{rows, Account, HashCache, HotState};
 use crate::{import, Config, Generation, Mode, Stale, Status};
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{anyhow, bail, Context, Result};
@@ -30,6 +30,7 @@ pub struct BlockEvent {
 
 struct Shared {
     hot: Arc<HotState>,
+    cache: Arc<HashCache>,
     halted: AtomicBool,
     halt: Mutex<Option<Mismatch>>,
     checked: AtomicU64,
@@ -127,6 +128,7 @@ impl Node {
 
         let s = Arc::new(Shared {
             hot: hot.clone(),
+            cache: Arc::new(HashCache::default()),
             halted: AtomicBool::new(false),
             halt: Mutex::new(None),
             checked: AtomicU64::new(height),
@@ -169,8 +171,9 @@ impl Node {
             let history = history.clone();
             let http = cfg.rpc_http.clone();
             let ring = block_hash_ring(&http, height, &history)?;
+            let cache = s.cache.clone();
             std::thread::Builder::new().name("cnode-applier".into()).spawn(move || {
-                if let Err(e) = applier_loop(s.clone(), history, hot, ring, raw_rx, chk_tx, height, hash) {
+                if let Err(e) = applier_loop(s.clone(), history, hot, cache, ring, raw_rx, chk_tx, height, hash) {
                     eprintln!("node: applier stopped: {e:#}");
                     s.halted.store(true, Ordering::Release);
                 }
@@ -213,7 +216,7 @@ impl Node {
 
     pub fn account(&self, g: Generation, a: Address) -> Result<Option<Account>, Stale> {
         self.live()?;
-        self.s.hot.account(g, &addr_hash(&a))
+        self.s.hot.account(g, &self.s.cache.addr(&a))
     }
     pub fn account_by_hash(&self, g: Generation, h: &[u8; 32]) -> Result<Option<Account>, Stale> {
         self.live()?;
@@ -221,7 +224,7 @@ impl Node {
     }
     pub fn storage(&self, g: Generation, a: Address, k: U256) -> Result<U256, Stale> {
         self.live()?;
-        self.s.hot.storage(g, &addr_hash(&a), &slot_hash(&k))
+        self.s.hot.storage(g, &self.s.cache.addr(&a), &self.s.cache.slot(&k))
     }
     pub fn storage_by_hash(&self, g: Generation, h: &[u8; 32], k: &[u8; 32]) -> Result<U256, Stale> {
         self.live()?;
@@ -254,7 +257,7 @@ impl Node {
         if head.number != g.height {
             return Err(Stale);
         }
-        let base = crate::exec::GenBase { hot: self.s.hot.clone(), g, stale: AtomicBool::new(false) };
+        let base = crate::exec::GenBase { hot: self.s.hot.clone(), cache: self.s.cache.clone(), g, stale: AtomicBool::new(false) };
         let mut ap = Applier::new(base);
         let mut b = json!({"transactions": txs});
         for (k, v) in [("number", format!("0x{:x}", head.number + 1)), ("timestamp", format!("0x{:x}", now_ms() / 1000)), ("gasLimit", format!("0x{:x}", head.gas_limit)), ("baseFeePerGas", format!("0x{:x}", head.base_fee.unwrap_or_default())), ("miner", format!("{}", head.coinbase)), ("difficulty", "0x1".into()), ("extraData", "0x".into()), ("parentHash", format!("{}", g.hash)), ("excessBlobGas", "0x0".into())] {
@@ -305,13 +308,14 @@ fn applier_loop(
     s: Arc<Shared>,
     history: Arc<History>,
     hot: Arc<HotState>,
+    cache: Arc<HashCache>,
     ring: HashMap<u64, B256>,
     rx: Receiver<RawBlock>,
     chk: Sender<(u64, Vec<(Vec<u8>, Vec<u8>)>, B256)>,
     mut height: u64,
     mut hash: B256,
 ) -> Result<()> {
-    let base = HotBase { hot: hot.clone(), hashes: Mutex::new(ring) };
+    let base = HotBase { hot: hot.clone(), cache, hashes: Mutex::new(ring) };
     let mut ap = Applier::new(base);
     while let Ok(raw) = rx.recv() {
         if s.halted.load(Ordering::Acquire) {
