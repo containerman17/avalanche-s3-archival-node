@@ -53,6 +53,7 @@ import (
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
+	evmlog "github.com/ava-labs/libevm/log"
 	"github.com/ava-labs/libevm/rlp"
 )
 
@@ -71,6 +72,9 @@ func main() {
 	if *out == "" {
 		log.Fatal("-out is required")
 	}
+	if os.Getenv("CNODE_SYNC_DEBUG") != "" {
+		evmlog.SetDefault(evmlog.NewLogger(evmlog.NewTerminalHandlerWithLevel(os.Stderr, evmlog.LevelDebug, false)))
+	}
 	if err := run(*out, *node, *workers, *perPeer, uint16(*reqSize), *connect); err != nil {
 		log.Fatalf("cnode-sync: %v", err)
 	}
@@ -86,6 +90,7 @@ type peers struct {
 	total   uint64
 
 	mu          sync.Mutex
+	refused     int                // peers that answered "not a validator"
 	connected   map[ids.NodeID]int // outstanding requests
 	failures    map[ids.NodeID]int
 	nextReq     uint32
@@ -126,6 +131,7 @@ func (p *peers) Disconnected(nodeID ids.NodeID) {
 }
 
 var opCounts sync.Map
+var appErrors atomic.Uint64
 
 func (p *peers) HandleInbound(_ context.Context, msg *message.InboundMessage) {
 	defer msg.OnFinishedHandling()
@@ -144,6 +150,16 @@ func (p *peers) HandleInbound(_ context.Context, msg *message.InboundMessage) {
 		m, ok := msg.Message.(*p2ppb.AppError)
 		if !ok {
 			return
+		}
+		if n := appErrors.Add(1); n <= 5 || n%100000 == 0 {
+			log.Printf("app error #%d from %s: code %d: %s", n, msg.NodeID, m.ErrorCode, m.ErrorMessage)
+		}
+		if m.ErrorMessage == "not a validator" {
+			// The p2p validator-only gate: this peer will never serve us.
+			p.mu.Lock()
+			p.failures[msg.NodeID] = 1 << 20
+			p.refused++
+			p.mu.Unlock()
 		}
 		p.route(m.RequestId, nil)
 	case message.StateSummaryFrontierOp:
@@ -329,7 +345,9 @@ func (n *netClient) request(ctx context.Context, id ids.NodeID, request []byte) 
 
 func (n *netClient) RegisterResponse(nodeID ids.NodeID, _ float64) {
 	n.p.mu.Lock()
-	n.p.failures[nodeID] = 0
+	if n.p.failures[nodeID] < 1<<20 {
+		n.p.failures[nodeID] = 0
+	}
 	n.p.mu.Unlock()
 }
 
@@ -731,8 +749,11 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 			st.qmu.Lock()
 			queued := len(st.queue)
 			st.qmu.Unlock()
-			log.Printf("sync: %d accounts, %d slots (%d storage tries named, %d queued), %d responses, %d timeouts, %d failures, %.0f leafs/s, peers %d (%.1f%% stake), %.0fs",
-				st.nAcc.Load(), st.nSlot.Load(), st.nStor.Load(), queued, st.nReq.Load(), nc.timeouts.Load(), nc.failures.Load(), float64(st.nAcc.Load()+st.nSlot.Load())/el, n, 100*float64(w)/float64(p.total), el)
+			p.mu.Lock()
+			refused := p.refused
+			p.mu.Unlock()
+			log.Printf("sync: %d accounts, %d slots (%d storage tries named, %d queued), %d responses, %d timeouts, %d failures, %.0f leafs/s, peers %d serving, %d refusing (%.1f%% stake connected), %.0fs",
+				st.nAcc.Load(), st.nSlot.Load(), st.nStor.Load(), queued, st.nReq.Load(), nc.timeouts.Load(), nc.failures.Load(), float64(st.nAcc.Load()+st.nSlot.Load())/el, n-refused, refused, 100*float64(w)/float64(p.total), el)
 		}
 	}
 finished:
