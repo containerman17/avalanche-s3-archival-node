@@ -308,8 +308,11 @@ func (n *netClient) request(ctx context.Context, id ids.NodeID, request []byte) 
 	defer n.p.release(id)
 	p := n.p
 	p.mu.Lock()
-	p.nextReq++
-	reqID := p.nextReq
+	// coreth's network.IsNetworkRequest: EVEN request ids reach the legacy
+	// state-sync handler, odd ones go to the SDK router (where the tx gossip
+	// handler answers "not a validator").
+	p.nextReq += 2
+	reqID := p.nextReq &^ 1
 	ch := make(chan []byte, 1)
 	p.routes[reqID] = ch
 	p.mu.Unlock()
