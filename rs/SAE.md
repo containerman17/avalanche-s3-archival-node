@@ -130,4 +130,20 @@ exact on a valid dump and any mismatch is a projection bug.
 - P3 (rpc): state reads serve the SETTLED state by default (`latest` = settled
   head); a block / receipt / trace for an accepted-but-unsettled height answers
   a clear "not settled yet"; a new surface exposes the settled head and the lag;
-  `eth_blockNumber` = the accepted head.
+  `eth_blockNumber` = the accepted head. Landed on branch `sae` (rs/rpc only,
+  plus the additive `Store::accepted_head()` with a default of `head()`). The
+  Store trait carries two heads: `head()` = settled (the executed height, the
+  ceiling for state / receipt / trace reads), `accepted_head()` = the chain
+  height. A state / receipt / trace read of a height in `(settled, accepted]`
+  returns the defined not-settled error (JSON-RPC code **-32011**, message
+  "block N is accepted but not settled yet"); above the accepted head is the
+  existing unfinalized error. A BLOCK read (eth_getBlockByNumber and friends)
+  at an accepted-but-unsettled height DOES return the block (header + txs, the
+  SAE header verbatim); only the block's own execution results (receipts,
+  traces, own post-state) are gated. The head / lag surface is
+  `eth_blockNumber` (accepted), `edb_settledNumber` = `{settled, accepted,
+  lag}`, and `epochdb_head` (number = accepted, plus settled and lag). The
+  `PluginStore` (rs/chain) must override `accepted_head()` to the accepted head
+  and keep `head()` at the settled height for the gap to appear; with the
+  default it serves the synchronous model correctly (accepted == settled). See
+  rs/rpc/REPORT.md "SAE mode".

@@ -166,6 +166,11 @@ impl Server {
     /// The block's stored receipts, and the block-wide log index each tx's
     /// logs start at.
     pub fn block_receipts(&self, b: &Block) -> Result<(Vec<crate::Receipt>, Vec<u64>), RpcError> {
+        // Receipts exist only for a settled (executed) block; an accepted but
+        // unsettled height answers "not settled yet", never an empty or wrong set.
+        if b.height > self.head() {
+            return Err(crate::not_settled(b.height, self.head()));
+        }
         if b.txs.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -219,7 +224,9 @@ impl Server {
     /// The [from, to] of a filter object, validated.
     pub fn parse_filter_range(&self, f: &serde_json::Map<String, Value>) -> Result<(u64, u64), RpcError> {
         let from = self.block_number(f.get("fromBlock"))?.max(1);
-        let to = self.block_number(f.get("toBlock"))?;
+        // Logs come from settled receipts / postings; cap the range at the
+        // settled head so an unsettled tail is not scanned for logs it has none of.
+        let to = self.block_number(f.get("toBlock"))?.min(self.head());
         if to < from {
             return Err(invalid(format!("toBlock {to} below fromBlock {from}")));
         }
@@ -260,6 +267,7 @@ impl Server {
     fn account_field(&self, method: &str, params: &[Value]) -> RpcResult {
         let addr = parse_addr(Some(params.first().ok_or_else(|| missing_arg(0))?)).map_err(|e| bad_arg(0, e))?;
         let n = self.block_number(params.get(1)).map_err(|e| if e.code == -32602 { bad_arg(1, e) } else { e })?;
+        let n = self.require_settled(n)?;
         let mut st = self.store.state_at(n)?;
         let acct = st.account(addr)?;
         // The pending tag: the pool's nonce (state nonce + its executable txs) when it holds the address.
@@ -281,6 +289,7 @@ impl Server {
         let raw = alloy_primitives::hex::decode(slot_s.trim_start_matches("0x")).or_else(|_| alloy_primitives::hex::decode(format!("0{}", slot_s.trim_start_matches("0x")))).map_err(|_| invalid("bad slot"))?;
         let slot = B256::left_padding_from(&raw[raw.len().saturating_sub(32)..]);
         let n = self.block_number(params.get(2)).map_err(|e| if e.code == -32602 { bad_arg(2, e) } else { e })?;
+        let n = self.require_settled(n)?;
         let v = self.store.state_at(n)?.storage(addr, slot.into())?;
         Ok(json!(B256::from(v)))
     }

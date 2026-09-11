@@ -314,7 +314,7 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(s: &Server, stream: S) {
                 // ServeCodec: a message that is not JSON gets the parse error and ends the connection.
                 let parse_error = serde_json::from_slice::<Value>(&data).is_err();
                 let body = tokio::task::block_in_place(|| s.handle_with(&data, &mut |m, p| match m {
-                    "eth_subscribe" => Some(conn.subscribe(s.head(), p)),
+                    "eth_subscribe" => Some(conn.subscribe(s.accepted_head(), p)),
                     "eth_unsubscribe" => Some(conn.unsubscribe(p)),
                     _ => None,
                 }));

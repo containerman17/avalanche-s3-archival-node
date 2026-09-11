@@ -204,3 +204,93 @@ python3 $S/rpc/rpccmp2.py http://127.0.0.1:19908$P http://127.0.0.1:19907/ --sca
 python3 $S/rpc/bench.py http://127.0.0.1:19907/ 40000
 ```
 `storecheck write --dump $S/rs/beam/beam-containers-1-1000000.bin --genesis $S/rs/beam/chain.json --upgrade $S/rs/beam/upgrade.json --data $S/rpc/beam-store --to 50000` builds the beam store. Never `pkill -f` a pattern that is also in the calling shell's command line (it kills the shell; every launcher above kills by a bracketed pattern from inside a script).
+
+## SAE mode (P3 rs-sae-rpc, branch `sae`)
+
+Under Streaming Asynchronous Execution (ACP-194, rs/SAE.md) acceptance no
+longer implies executed state: the ACCEPTED head (the chain height) runs `k`
+blocks ahead of the SETTLED head (the last executed height, whose state,
+receipts and traces are stored). The RPC never serves a wrong value for the
+unsettled gap; it answers what is settled, and says "not settled yet" for the
+rest.
+
+### Two heads on the Store trait
+
+- `Store::head()` = the SETTLED head (unchanged meaning: the last executed
+  height). It is `latest` state and the ceiling for state / receipt / trace
+  reads.
+- `Store::accepted_head()` = the ACCEPTED head (the chain height). NEW, with a
+  default of `head()`, so the synchronous model (accept implies execution, and
+  every existing `Store` impl, `StoreDb` included) is unchanged: accepted ==
+  settled, lag 0. A SAE store overrides it to report the two heads; the RPC
+  code is identical for both, only the numbers differ.
+
+`Server::head()` (settled), `Server::accepted_head()`, and
+`Server::require_settled(n)` (the gate) sit on top.
+
+### Resolution and gating
+
+- `block_number(tag)` resolves a block/tx read to a height in `[0, accepted]`:
+  a numeric or hash tag reaches an accepted-but-unsettled height (its block
+  exists); the tags `latest` / `pending` / `safe` / `finalized` resolve to the
+  SETTLED head, so a state read at a tag serves settled state and
+  `eth_call("latest")` never lands in the unsettled band. Above the accepted
+  head is the existing `ErrUnfinalizedData` ("cannot query unfinalized data",
+  -32000).
+- `require_settled(n)` refuses a height in `(settled, accepted]` with the
+  defined error `not_settled` (code **-32011**, message
+  "block N is accepted but not settled yet (settled head S, lag L)"). Never a
+  value, never a silent `latest`.
+
+### Per-method contract
+
+| Method(s) | `latest` | at/below settled | accepted-but-unsettled | above accepted |
+|---|---|---|---|---|
+| eth_call, estimateGas, callDetailed, createAccessList, debug_traceCall | settled state | that height | -32011 not settled | -32000 unfinalized |
+| eth_getBalance, getTransactionCount, getCode, getStorageAt | settled state | that height | -32011 not settled | -32000 unfinalized |
+| eth_feeConfig | settled state | that height | -32011 not settled | -32000 unfinalized |
+| eth_getBlockByNumber / ByHash, getHeaderBy*, getBlockTransactionCount*, getTransactionByBlock* , debug_getRawBlock / RawHeader | full block header + txs | full | **header + txs returned** (execution results are separate calls) | -32000 unfinalized |
+| eth_getBlockReceipts, getTransactionReceipt, debug_getRawReceipts | settled | full | -32011 not settled | -32000 unfinalized |
+| debug_traceBlockByNumber / ByHash, debug_traceTransaction | settled | full | -32011 not settled | -32000 unfinalized |
+| eth_getLogs, eth_newFilter range | up to settled | full | range capped at the settled head (logs live only in settled receipts) | n/a |
+| eth_getTransactionCount `pending` | settled nonce + pool pending | | | |
+
+The block header at an unsettled height is returned verbatim, including
+whatever `stateRoot` (settled root of `h-k`), `gasUsed` (worst-case) and
+`receiptsRoot` the SAE header carries; only the block's OWN execution results
+(its receipts, traces, own post-state) are gated, since those exist only once
+`h` itself settles. So `eth_getBlockByNumber` at the accepted head returns the
+block, and `eth_getBlockReceipts` / the tracers at that height answer -32011.
+
+### Head / lag surface
+
+- `eth_blockNumber` = the ACCEPTED head (the chain height).
+- `edb_settledNumber` (alias `epochdb_settledNumber`) = `{settled, accepted,
+  lag}` (lag = accepted - settled).
+- `epochdb_head` carries `number` (= accepted), `accepted`, `settled`, `lag`,
+  plus the accepted block's hash / timestamp and `txs`.
+- WebSocket `eth_subscribe` records the ACCEPTED head as its baseline (heads
+  fan out on accept).
+
+Note: a block read at the `latest` tag resolves to the SETTLED head (the latest
+fully-available block), while `eth_blockNumber` returns the accepted head. This
+keeps `latest` state and `latest` block consistent and safe (never an unsettled
+answer); a caller that wants the accepted tip reads `eth_blockNumber` (or
+`epochdb_head`) and asks for that numeric height, which returns the block with
+its execution results gated as above.
+
+### Oracle
+
+`rs/rpc/tests/sae.rs` drives the real dispatch (`Server::handle`) over a
+synthetic `Store` with settled head 3 and accepted head 6: the settled-state
+answers equal the store's recorded post-state at each settled height (the
+stand-in for a re-execution's post-state), every height in `(3, 6]` returns the
+-32011 not-settled error for state / receipts / traces and never a value, the
+block itself is still returned at those heights, and the settled-head / lag
+surface is correct. Proven against a TEST HARNESS, not a real SAE store: the
+strong oracle (settled answers byte-equal a full synchronous EVM re-execution
+at the settled height) needs the SAE store rs-sae-plugin builds, whose
+`PluginStore` must override `accepted_head()` to the accepted head and keep
+`head()` at the settled (executed) height; today's `PluginStore` reports one
+head (accepted == settled), so it already serves correctly via the default and
+gains the SAE behavior the moment those two heads diverge.

@@ -510,7 +510,10 @@ impl Server {
     }
 
     fn call_block(&self, params: &[Value]) -> Result<(u64, Arc<Block>), RpcError> {
-        let n = self.block_number(params.get(1))?;
+        // Every executing read (eth_call, estimateGas, callDetailed,
+        // createAccessList, debug_traceCall) needs the SETTLED state at n; an
+        // accepted-but-unsettled height answers "not settled yet".
+        let n = self.require_settled(self.block_number(params.get(1))?)?;
         Ok((n, self.block_at(n)?))
     }
 

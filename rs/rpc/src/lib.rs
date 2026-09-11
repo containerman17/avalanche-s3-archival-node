@@ -61,8 +61,17 @@ pub trait StateRead: Send {
 /// `None` is "not on this chain"; an error is "could not read", never
 /// collapsed into a None (the Go node's rule).
 pub trait Store: Send + Sync {
-    /// The last stored (executed) height.
+    /// The SETTLED head: the last executed height (its state, receipts and
+    /// traces are stored). Under SAE this is `k` blocks behind the accepted
+    /// head; in the synchronous model it is the accepted head.
     fn head(&self) -> u64;
+    /// The ACCEPTED head: the chain's height (eth_blockNumber). Under SAE it
+    /// runs ahead of `head` (settled); its blocks exist (header + txs) but
+    /// their execution results are not settled yet. Default = settled head
+    /// (synchronous model, where accept implies execution).
+    fn accepted_head(&self) -> u64 {
+        self.head()
+    }
     /// The block at h with senders recovered.
     fn block(&self, h: u64) -> Result<Option<Arc<Block>>>;
     fn hash_at(&self, h: u64) -> Result<Option<B256>>;
@@ -146,6 +155,16 @@ pub trait Mempool: Send + Sync {
 /// subnet-evm's ErrUnfinalizedData: a height past the accepted head.
 pub fn unfinalized() -> RpcError {
     "cannot query unfinalized data".into()
+}
+
+/// The SAE not-settled error code (server-defined range). A height that is
+/// accepted but not yet settled (executed): its block exists, its execution
+/// results (state, receipts, traces) are not available. Never a wrong value.
+pub const NOT_SETTLED_CODE: i64 = -32011;
+
+/// A height accepted but not settled yet, with the settlement lag.
+pub fn not_settled(h: u64, settled: u64) -> RpcError {
+    RpcError { code: NOT_SETTLED_CODE, message: format!("block {h} is accepted but not settled yet (settled head {settled}, lag {})", h.saturating_sub(settled)), data: None }
 }
 
 /// geth's "invalid argument N: ..." for a bad param.
@@ -254,8 +273,28 @@ impl Server {
         }
     }
 
+    /// The settled head (the executed height): `latest` state, and the ceiling
+    /// for state / receipt / trace reads.
     pub fn head(&self) -> u64 {
         self.store.head()
+    }
+
+    /// The accepted head (the chain height): eth_blockNumber, and the ceiling
+    /// for block / tx reads. Equals the settled head in the synchronous model.
+    pub fn accepted_head(&self) -> u64 {
+        self.store.accepted_head()
+    }
+
+    /// Reject a height that is accepted but not settled yet (its state /
+    /// execution results are not available). A height <= the settled head
+    /// passes; one above the accepted head is already refused as unfinalized
+    /// by `block_number`.
+    pub fn require_settled(&self, n: u64) -> std::result::Result<u64, RpcError> {
+        let settled = self.head();
+        if n > settled {
+            return Err(not_settled(n, settled));
+        }
+        Ok(n)
     }
 
     /// A block by height with the JSON-RPC error shape.
@@ -267,9 +306,15 @@ impl Server {
     }
 
     /// The Go node's blockNumber: a tag, a hex number, a bare hash or the
-    /// object form, resolved to a height within [0, head].
+    /// object form. Resolves to a height in [0, accepted], so a block / tx read
+    /// reaches an accepted-but-unsettled height (its execution results are
+    /// gated separately, see `require_settled`). The tags `latest` / `pending`
+    /// / `safe` / `finalized` resolve to the SETTLED head, so a state read at a
+    /// tag serves settled state and eth_call("latest") never hits the unsettled
+    /// band; `eth_blockNumber` returns the accepted head on its own.
     pub fn block_number(&self, v: Option<&Value>) -> std::result::Result<u64, RpcError> {
         let head = self.head();
+        let accepted = self.accepted_head();
         let Some(v) = v else { return Ok(head) };
         match v {
             Value::Null => Ok(head),
@@ -293,7 +338,7 @@ impl Server {
                     "earliest" => Ok(0),
                     _ => {
                         let n = json::parse_qty(v)?;
-                        if n > head {
+                        if n > accepted {
                             return Err(unfinalized());
                         }
                         Ok(n)
@@ -302,7 +347,7 @@ impl Server {
             }
             Value::Number(n) => {
                 let n = n.as_u64().ok_or_else(|| invalid("bad block number"))?;
-                if n > head {
+                if n > accepted {
                     return Err(unfinalized());
                 }
                 Ok(n)
@@ -320,7 +365,7 @@ impl Server {
         let p = |i: usize| params.get(i).filter(|v| !v.is_null());
         match method {
             "eth_chainId" => Ok(json!(json::qty(self.cfg.chain_id))),
-            "eth_blockNumber" => Ok(json!(json::qty(self.head()))),
+            "eth_blockNumber" => Ok(json!(json::qty(self.accepted_head()))),
             "net_version" => Ok(json!(self.cfg.chain_id.to_string())),
             "web3_clientVersion" => Ok(json!(CLIENT_VERSION)),
             "web3_sha3" => {
@@ -348,9 +393,17 @@ impl Server {
             "eth_sign" | "eth_signTransaction" => Err(format!("{method}: no keystore on this node").into()),
             "eth_subscribe" | "eth_unsubscribe" => Err(format!("{method} requires the WebSocket transport").into()),
             "epochdb_head" => {
-                let h = self.head();
-                let b = self.block_at(h)?;
-                Ok(json!({"number": json::qty(h), "hash": b.hash, "timestamp": json::qty(b.header.time), "accepted": json::qty(h), "settled": json::qty(h), "txs": json::qty(self.store.next_tx())}))
+                let (accepted, settled) = (self.accepted_head(), self.head());
+                // number = the accepted head (the chain height); hash / timestamp
+                // of the accepted block. settled and lag surface the SAE gap.
+                let b = self.block_at(accepted)?;
+                Ok(json!({"number": json::qty(accepted), "hash": b.hash, "timestamp": json::qty(b.header.time), "accepted": json::qty(accepted), "settled": json::qty(settled), "lag": json::qty(accepted.saturating_sub(settled)), "txs": json::qty(self.store.next_tx())}))
+            }
+            // The SAE settled-head / lag surface: the accepted head is
+            // eth_blockNumber, the settled head is the executed height.
+            "edb_settledNumber" | "epochdb_settledNumber" => {
+                let (accepted, settled) = (self.accepted_head(), self.head());
+                Ok(json!({"settled": json::qty(settled), "accepted": json::qty(accepted), "lag": json::qty(accepted.saturating_sub(settled))}))
             }
             _ => {
                 if let Some(r) = eth::dispatch(self, method, params) {

@@ -43,7 +43,7 @@ impl Server {
 
     /// eth_feeConfig [blockNrOrHash]: ethapi FeeConfigResult.
     pub fn fee_config(&self, params: &[Value]) -> RpcResult {
-        let n = self.block_number(params.first())?;
+        let n = self.require_settled(self.block_number(params.first())?)?;
         let b = self.block_at(n)?;
         let mut st = self.store.state_at(n)?;
         let (fc, lca) = self.fee_config_and_last_changed(&b.header, st.as_mut())?;

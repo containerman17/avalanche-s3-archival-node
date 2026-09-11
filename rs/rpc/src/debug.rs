@@ -65,6 +65,7 @@ impl Server {
         let hash = parse_hash32(params.first()).map_err(|e| invalid(format!("bad tx hash: {}", e.message)))?;
         let cfg = parse_trace_config(params.get(1))?;
         let Some((b, i)) = self.find_tx(&hash)? else { return Err(format!("transaction {hash} not found").into()) };
+        self.require_settled(b.height)?;
         let mut ts = self.traces_of(&b, &cfg)?;
         Ok(ts.swap_remove(i))
     }
@@ -73,7 +74,7 @@ impl Server {
         if params.is_empty() {
             return Err(invalid("need [blockTag, traceConfig]"));
         }
-        let n = self.block_number(params.first())?;
+        let n = self.require_settled(self.block_number(params.first())?)?;
         let b = self.block_at(n)?;
         let cfg = parse_trace_config(params.get(1))?;
         let ts = self.traces_of(&b, &cfg)?;
