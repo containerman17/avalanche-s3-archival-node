@@ -784,7 +784,7 @@ impl NodeEngine {
             Arc::new(Pool::new(pc, cfg.clone(), pool::Head { gas_limit: head.header.gas_limit, fee: fc, time: head.header.time }))
         };
         let head = Arc::new(Mutex::new(head));
-        let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), db_reads.clone(), recent.clone(), cfg.clone()));
+        let rpc_store = Arc::new(crate::rpc_store::PluginStore::new(genesis.clone(), head.clone(), inner.clone(), db_reads.clone(), recent.clone(), cfg.clone(), sae.clone()));
         let chain_config = serde_json::from_slice::<serde_json::Value>(&init.genesis_bytes).ok().and_then(|g| g.get("config").cloned()).unwrap_or_default();
         let upgrades = serde_json::from_slice::<serde_json::Value>(&init.upgrade_bytes).ok();
         let rpc = rpc::Server::new(rpc_store.clone(), cfg.clone(), genesis.clone(), chain_config, upgrades);

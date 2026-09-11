@@ -21,11 +21,15 @@ pub struct PluginStore {
     pub inner: Arc<Mutex<Inner>>,
     pub recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>,
     pub store: StoreDb,
+    /// SAE: the settlement window, so head() serves the SETTLED head (durable
+    /// execution results) while accepted_head() serves the accepted head.
+    /// None = the synchronous path (head() = accepted, as before).
+    pub sae: Option<Arc<crate::sae_mode::Sae>>,
 }
 
 impl PluginStore {
-    pub fn new(genesis: Arc<Block>, head: Arc<Mutex<Arc<Block>>>, inner: Arc<Mutex<Inner>>, db: Arc<DB>, recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>, cfg: Arc<exec::Config>) -> PluginStore {
-        PluginStore { genesis, head, inner, recent, store: StoreDb::new(db, cfg) }
+    pub fn new(genesis: Arc<Block>, head: Arc<Mutex<Arc<Block>>>, inner: Arc<Mutex<Inner>>, db: Arc<DB>, recent: Arc<Mutex<HashMap<Id, Arc<Block>>>>, cfg: Arc<exec::Config>, sae: Option<Arc<crate::sae_mode::Sae>>) -> PluginStore {
+        PluginStore { genesis, head, inner, recent, store: StoreDb::new(db, cfg), sae }
     }
 
     /// A block the engine still holds in memory (senders recovered).
@@ -60,6 +64,16 @@ impl StateRead for HeadState<'_> {
 
 impl Store for PluginStore {
     fn head(&self) -> u64 {
+        // SAE: the SETTLED head (receipts / traces / state are durable only up
+        // to here); the accepted-but-unsettled tail is served as blocks + tx
+        // hashes from `recent`, but its execution results answer -32011.
+        // Sync: the accepted head, whose unappended tail `recent` serves.
+        match &self.sae {
+            Some(s) => s.settled_head.load(std::sync::atomic::Ordering::Relaxed),
+            None => self.head.lock().unwrap().height,
+        }
+    }
+    fn accepted_head(&self) -> u64 {
         self.head.lock().unwrap().height
     }
     fn block(&self, h: u64) -> Result<Option<Arc<Block>>> {
@@ -69,7 +83,7 @@ impl Store for PluginStore {
         self.store.block(h)
     }
     fn hash_at(&self, h: u64) -> Result<Option<B256>> {
-        if h > self.head() {
+        if h > self.accepted_head() {
             return Ok(None);
         }
         if let Some(b) = self.live_block(h) {
