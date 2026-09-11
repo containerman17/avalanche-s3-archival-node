@@ -1500,6 +1500,12 @@ impl NodeEngine {
         if b.header.gas_used != sum_limit {
             return Err(format!("block {}: SAE gasUsed {} != worst-case sum(gasLimit) {}", b.height, b.header.gas_used, sum_limit).into());
         }
+        // The settle path runs the classic executor (per-block gas limit), so a
+        // block that overruns it cannot execute; reject it here rather than let
+        // it halt the executor after acceptance.
+        if sum_limit > b.header.gas_limit {
+            return Err(format!("block {}: SAE worst-case gas {sum_limit} exceeds the block gas limit {}", b.height, b.header.gas_limit).into());
+        }
         let txs: Vec<&block::Tx> = b.txs.iter().collect();
         let tr = build::tx_root(&txs);
         if tr != b.header.tx_hash {
@@ -1586,14 +1592,20 @@ impl NodeEngine {
             (fc, hdr, base_fee, target)
         };
         let _ = fc;
+        // The block's worst-case gas (sum of gasLimit) must fit the executor's
+        // per-block gas limit: the settle path runs the classic executor, which
+        // enforces header.gas_limit, so a block whose txs overrun it cannot
+        // execute (the ACP-194 20s-capacity model needs the gas-clock executor,
+        // not wired here). Cap selection at gas_limit (and at sae.capacity).
+        let gas_cap = hdr.gas_limit.min(sae.capacity);
         let mut candidates = match candidates {
             Some(c) => c,
-            None => self.txpool.candidates(base_fee, sae.capacity, target + target / 8, &held_nonces(parent_txs.iter().copied())),
+            None => self.txpool.candidates(base_fee, gas_cap, target + target / 8, &held_nonces(parent_txs.iter().copied())),
         };
         self.recover_senders(&mut candidates);
-        // Select by projected nonce and worst-case funds up to the capacity.
+        // Select by projected nonce and worst-case funds up to the gas cap.
         let base = parent.and_then(|p| p.sae()).map(|p| p.overlay.clone()).unwrap_or_default();
-        let (included, reasons, overlay, needs_more) = self.sae_select(sae, &candidates, base, target);
+        let (included, reasons, overlay, needs_more) = self.sae_select(sae, &candidates, base, target, gas_cap);
         let txs: Vec<&block::Tx> = included.iter().map(|&i| &candidates[i]).collect();
         let gas_used = txs.iter().map(|t| t.gas_limit).fold(0u64, |a, g| a.saturating_add(g));
         let tr = build::tx_root(&txs);
@@ -1622,7 +1634,7 @@ impl NodeEngine {
     /// size target. Returns the included indices, a reason per candidate, the
     /// resulting overlay (for the built block's Pending), and whether the block
     /// still had capacity for more (BuildBlock's fill loop).
-    fn sae_select(&self, sae: &crate::sae_mode::Sae, candidates: &[block::Tx], base: node::sae::Overlay, size_target: usize) -> (Vec<usize>, Vec<SkipReason>, node::sae::Overlay, bool) {
+    fn sae_select(&self, sae: &crate::sae_mode::Sae, candidates: &[block::Tx], base: node::sae::Overlay, size_target: usize, gas_cap: u64) -> (Vec<usize>, Vec<SkipReason>, node::sae::Overlay, bool) {
         let proj = sae.proj.lock().unwrap();
         let mut overlay = base;
         let mut gas = 0u64;
@@ -1639,7 +1651,7 @@ impl NodeEngine {
                 reasons[i] = SkipReason::SenderPopped;
                 continue;
             }
-            if gas.saturating_add(t.gas_limit) > sae.capacity {
+            if gas.saturating_add(t.gas_limit) > gas_cap {
                 reasons[i] = SkipReason::NoGas;
                 popped.insert(s, ());
                 continue;
@@ -1665,7 +1677,7 @@ impl NodeEngine {
         }
         // Capacity for more if every candidate was considered and gas capacity
         // is not tight (the fill loop asks the pool again).
-        let needs_more = reasons.iter().all(|r| *r != SkipReason::NotReached) && gas + exec::exec::TX_GAS <= sae.capacity;
+        let needs_more = reasons.iter().all(|r| *r != SkipReason::NotReached) && gas + exec::exec::TX_GAS <= gas_cap;
         (included, reasons, overlay, needs_more)
     }
 }
