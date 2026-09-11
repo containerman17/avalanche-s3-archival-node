@@ -10,9 +10,18 @@
 //!       [--from 1] [--to N] [--stop-at N] [--duration S] [--workers 14]
 //!       [--roll-budget MB] [--history FILE] [--network 1]
 //!       [--state native|firewood] [--fw-cache-mb 192] [--fw-revisions 128] [--fw-deferred 1] [--fw-kv-cache-mb 0] [--fw-parallel auto|never|always] [--root-inline]
+//!
+//! `--sae` runs the ACP-194 Streaming Asynchronous Execution model (native
+//! state only): accept (verify_light + the projection, no execution) is one
+//! stream, the continuous executor + settle (the settled root, the oracle) is
+//! another, k blocks behind. See rs/SAE.md and sae.rs.
+//!   epochdb-rs --dump FILE --genesis chain.json --data DIR --sae
+//!       [--settlement-blocks 8] [--max-inflight 4096] [--exec-threads N]
+//!       [--gas-capacity N] [--size-cap-kib N] [--duration S] [--stop-at N]
 
 use crate::engine;
 use crate::firewood::{Committer, Firewood, Layer, Opts};
+use crate::sae::{Projection, Reject};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Bytes, B256};
 use anyhow::{anyhow, bail, Context, Result};
@@ -395,6 +404,12 @@ pub fn main(args: Vec<String>) -> Result<()> {
     let t0 = Instant::now();
 
     let cfg = Config::from_genesis(&genesis, &upgrade, network).context("config")?.with_chain(blockchain_id, subnet_id);
+    if args.iter().any(|a| a == "--sae") {
+        if arg(&args, "--state").as_deref().is_some_and(|s| s == "firewood") {
+            bail!("--sae runs on the native state engine (firewood SAE is out of scope for P1)");
+        }
+        return sae_main(&args, cfg, dump, data, stop_at, workers, roll_budget, duration, history, t0);
+    }
     match arg(&args, "--state").as_deref().unwrap_or("native") {
         "native" => {}
         "firewood" => {
@@ -699,5 +714,372 @@ fn firewood_main(args: &[String], cfg: Config, dump: String, data: PathBuf, to: 
     let root = committer.root();
     committer.close()?;
     eprintln!("epochdb-rs: firewood closed: root={root} disk={}B in {:.0}ms", Committer::disk_bytes(&dir), tc.elapsed().as_secs_f64() * 1e3);
+    Ok(())
+}
+
+// ===================== SAE (ACP-194) bench =====================
+//
+// Streaming Asynchronous Execution: three streams instead of one.
+//   feed   : reads the dump, verify_light + accept_block on the projection,
+//            enqueues the block (bounded channel = the in-flight cap). No exec.
+//   exec   : pulls accepted blocks in order, executes k blocks behind, takes
+//            the write set. The continuous executor.
+//   checker: applies the write set to Dirty, the SETTLED root, checked against
+//            the header (the oracle), then settle_block retires the projection.
+// Lag = accepted head - settled head (blocks) and the block-time gap (seconds).
+// The dump is the ground-truth chain, so the feed accepts every block and
+// COUNTS admission rejections (a synchronous dump can trip the stricter SAE
+// worst-case funds check); a nonce-projection mismatch is a projection bug.
+
+#[derive(Clone, Copy, Default)]
+struct SaeStats {
+    acc_head: u64,
+    acc_blk: u64,
+    acc_tx: u64,
+    acc_time: u64,
+    exec_head: u64,
+    exec_gas: u64,
+    set_head: u64,
+    set_blk: u64,
+    set_tx: u64,
+    set_time: u64,
+    rej_nonce: u64,
+    rej_funds: u64,
+    rej_cap: u64,
+    rej_sig: u64,
+    rej_size: u64,
+    overlay: usize,
+    dirty: usize,
+    rolls: u64,
+    rolling: bool,
+    tracked: usize,
+}
+
+struct SaeItem {
+    block: Arc<block::Block>,
+    ws: Vec<(Vec<u8>, Vec<u8>)>,
+    want: B256,
+}
+
+enum SaeMsg {
+    Block(Box<SaeItem>),
+    Park(SyncSender<()>, Receiver<()>),
+}
+
+/// The SAE checker: the settled root (Dirty) checked against the header, then
+/// the projection retired for that height.
+fn sae_checker(rx: Receiver<SaeMsg>, dirty: Arc<Mutex<Dirty>>, proj: Arc<Mutex<Projection>>, stats: Arc<Mutex<SaeStats>>) -> Result<()> {
+    for msg in rx {
+        let it = match msg {
+            SaeMsg::Park(parked, resume) => {
+                let _ = parked.send(());
+                let _ = resume.recv();
+                continue;
+            }
+            SaeMsg::Block(it) => it,
+        };
+        let h = it.block.header.number;
+        let dirty_bytes = {
+            let mut d = dirty.lock().unwrap();
+            let root = if it.ws.is_empty() {
+                d.current_root()
+            } else {
+                for (k, v) in &it.ws {
+                    d.apply(k, v).with_context(|| format!("block {h}: apply write set"))?;
+                }
+                d.root().with_context(|| format!("block {h}: state root"))?
+            };
+            if root != it.want.0 {
+                eprintln!("epochdb-rs: block {h}: SETTLED root mismatch: computed {}, header {}", B256::from(root), it.want);
+                std::process::exit(1);
+            }
+            d.bytes()
+        };
+        proj.lock().unwrap().settle_block(h, &it.block.txs, None);
+        let mut s = stats.lock().unwrap();
+        s.set_head = h;
+        s.set_blk += 1;
+        s.set_tx += it.block.txs.len() as u64;
+        s.set_time = it.block.header.time;
+        s.dirty = dirty_bytes;
+    }
+    Ok(())
+}
+
+/// One SAE bench line every 10 s and one at exit; sets `stop` after --duration.
+struct SaeBench {
+    stats: Arc<Mutex<SaeStats>>,
+    k: u64,
+    t0: Instant,
+    first: Option<Instant>,
+    last: SaeStats,
+    last_t: Instant,
+}
+
+impl SaeBench {
+    fn line(&mut self, tag: &str) {
+        let s = *self.stats.lock().unwrap();
+        let now = Instant::now();
+        let dt = (now - self.last_t).as_secs_f64().max(1e-9);
+        let l = self.last;
+        let rate = |a: u64, b: u64| (a - b) as f64 / dt;
+        let mgas = (s.exec_gas - l.exec_gas) as f64 / dt / 1e6;
+        let lag_blk = s.acc_head.saturating_sub(s.set_head);
+        let lag_sec = s.acc_time.saturating_sub(s.set_time);
+        let backlog = s.acc_head.saturating_sub(s.exec_head);
+        eprintln!(
+            "{tag} t={:.0} acc_h={} set_h={} | accept blk/s={:.0} tx/s={:.0} | settled blk/s={:.0} tx/s={:.0} | lag={lag_blk}blk {lag_sec}s backlog={backlog} | exec {mgas:.1} mgas/s | rej n={} f={} c={} s={} sz={} | k={} tracked={} rss={}MB overlay={}MB dirty={}MB rolls={} rolling={}",
+            (now - self.t0).as_secs_f64(),
+            s.acc_head,
+            s.set_head,
+            rate(s.acc_blk, l.acc_blk),
+            rate(s.acc_tx, l.acc_tx),
+            rate(s.set_blk, l.set_blk),
+            rate(s.set_tx, l.set_tx),
+            s.rej_nonce,
+            s.rej_funds,
+            s.rej_cap,
+            s.rej_sig,
+            s.rej_size,
+            self.k,
+            s.tracked,
+            rss_mb(),
+            s.overlay >> 20,
+            s.dirty >> 20,
+            s.rolls,
+            s.rolling,
+        );
+        self.last = s;
+        self.last_t = now;
+    }
+
+    fn run(mut self, exit: Receiver<()>, duration: Option<f64>, stop: Arc<AtomicBool>) {
+        let mut n = 0;
+        loop {
+            match exit.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if self.first.is_none() && self.stats.lock().unwrap().set_blk > 0 {
+                self.first = Some(Instant::now());
+            }
+            if let (Some(f), Some(d)) = (self.first, duration) {
+                if f.elapsed().as_secs_f64() >= d && !stop.swap(true, Ordering::Relaxed) {
+                    eprintln!("epochdb-rs: --duration {d} s reached");
+                }
+            }
+            n += 1;
+            if n % 10 == 0 {
+                self.line("sae");
+            }
+        }
+        self.line("sae exit");
+        let s = *self.stats.lock().unwrap();
+        let dur = self.first.map_or(0.0, |f| f.elapsed().as_secs_f64()).max(1e-9);
+        eprintln!(
+            "epochdb-rs: sae summary: settled blocks={} txs={} gas={} in {:.1}s = {:.0} settled tx/s ({:.1} mgas/s) | accepted head={} settled head={} final lag={} blk {}s | admission rejections nonce={} funds={} cap={} sig={} size={}",
+            s.set_blk,
+            s.set_tx,
+            s.exec_gas,
+            dur,
+            s.set_tx as f64 / dur,
+            s.exec_gas as f64 / dur / 1e6,
+            s.acc_head,
+            s.set_head,
+            s.acc_head.saturating_sub(s.set_head),
+            s.acc_time.saturating_sub(s.set_time),
+            s.rej_nonce,
+            s.rej_funds,
+            s.rej_cap,
+            s.rej_sig,
+            s.rej_size,
+        );
+    }
+}
+
+/// SAE bench: accept + async executor + settle over the native state engine.
+#[allow(clippy::too_many_arguments)]
+fn sae_main(args: &[String], cfg: Config, dump: String, data: PathBuf, stop_at: u64, workers: usize, roll_budget: usize, duration: Option<f64>, history: Option<History>, t0: Instant) -> Result<()> {
+    if history.is_some() {
+        eprintln!("epochdb-rs: --history is ignored in --sae mode (the oracle is the settled-root check)");
+    }
+    let k: u64 = num(args, "--settlement-blocks", 8)?;
+    let max_inflight: usize = num(args, "--max-inflight", 4096)?;
+    // ACP-194 block gas capacity (20s x target) and byte size cap: off by
+    // default so a pre-Helicon dump streams; a small value exercises the check.
+    let capacity: u64 = num(args, "--gas-capacity", u64::MAX)?;
+    let size_cap: usize = arg(args, "--size-cap-kib").map(|s| s.parse::<usize>()).transpose()?.map_or(usize::MAX, |k| k << 10);
+    let dirty_workers = num(args, "--exec-threads", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))?;
+    let to = stop_at;
+
+    // Genesis: the alloc into the first run, the first trie rolled from it, its
+    // root checked against a full alloy-trie recompute (as native).
+    let dir = data.join("vmstate");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let mut ex = Executor::with_db(cfg.clone(), Backend::new())?;
+    let want = oracle::state_root(Executor::new(cfg.clone())?.db());
+    let (run0, file0) = {
+        let be = ex.db_mut();
+        be.take_ws();
+        let frozen = be.freeze();
+        let user = user_data(0, &want);
+        let run0 = merge(&run_path(&dir, 0), &View::new(Some(&frozen), &[]), user).context("genesis merge")?;
+        let (root, st) = roll(&mut run0.iter(None, None), &trie_path(&dir, 0), user).context("genesis roll")?;
+        if root != want.0 {
+            bail!("genesis root mismatch: rolled {}, alloc {want}", B256::from(root));
+        }
+        let file0 = File::open(&trie_path(&dir, 0))?;
+        write_manifest(&dir, 0, 0, &want)?;
+        eprintln!("epochdb-rs: genesis state ok: root={want} accounts={} keys={} nodes={} run={}B trie={}B", cfg.alloc.len(), st.keys, st.nodes, run0.bytes(), st.bytes);
+        let run0 = Arc::new(run0);
+        be.swap(run0.clone());
+        (run0, Arc::new(file0))
+    };
+    let mut dirty = Dirty::new(file0, seek_fn(run0));
+    dirty.workers = dirty_workers;
+    let dirty = Arc::new(Mutex::new(dirty));
+
+    // The projection, seeded from the genesis alloc (real balances/nonces for
+    // the genesis accounts; other senders seed lazily to their first tx nonce).
+    let mut proj = Projection::new();
+    for (addr, acct) in &cfg.alloc {
+        proj.set_settled(*addr, acct.nonce, acct.balance);
+    }
+    let proj = Arc::new(Mutex::new(proj));
+
+    let stats = Arc::new(Mutex::new(SaeStats::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (accept_tx, accept_rx) = sync_channel::<Arc<block::Block>>(max_inflight);
+    let (check_tx, check_rx) = sync_channel::<SaeMsg>(CHECK_DEPTH);
+
+    let checker = {
+        let (dirty, proj, stats) = (dirty.clone(), proj.clone(), stats.clone());
+        std::thread::spawn(move || sae_checker(check_rx, dirty, proj, stats))
+    };
+    let feed = {
+        let (proj, stats, stop, dump) = (proj.clone(), stats.clone(), stop.clone(), dump.clone());
+        std::thread::spawn(move || -> Result<()> {
+            let blocks = block::Blocks::open(&dump, 1, to)?;
+            let mut it = block::recovered(blocks, workers);
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let Some(b) = it.next() else { return Ok(()) };
+                let b = Arc::new(b.map_err(|e| anyhow!("block decode: {e}"))?);
+                if b.header.number > stop_at {
+                    return Ok(());
+                }
+                let (rej, tracked) = {
+                    let mut p = proj.lock().unwrap();
+                    let rej = p.verify_light(&b.txs, b.container.len(), capacity, size_cap).err();
+                    p.accept_block(b.header.number, &b.txs);
+                    (rej, p.tracked())
+                };
+                {
+                    let mut s = stats.lock().unwrap();
+                    s.acc_head = b.header.number;
+                    s.acc_blk += 1;
+                    s.acc_tx += b.txs.len() as u64;
+                    s.acc_time = b.header.time;
+                    s.tracked = tracked;
+                    match rej {
+                        None => {}
+                        Some(Reject::NonceGap { index, want, got }) => {
+                            if s.rej_nonce < 3 {
+                                eprintln!("epochdb-rs: sae: block {} tx {index}: nonce gap, projected {want} got {got} (a projection bug on a real chain)", b.header.number);
+                            }
+                            s.rej_nonce += 1;
+                        }
+                        Some(Reject::Underfunded(_)) => s.rej_funds += 1,
+                        Some(Reject::OverCapacity { .. }) => s.rej_cap += 1,
+                        Some(Reject::BadSig(_)) => s.rej_sig += 1,
+                        Some(Reject::OverSize { .. }) => s.rej_size += 1,
+                    }
+                }
+                if accept_tx.send(b).is_err() {
+                    return Ok(());
+                }
+            }
+        })
+    };
+    let (bench_exit_tx, bench_exit_rx) = sync_channel::<()>(1);
+    let bench = {
+        let b = SaeBench { stats: stats.clone(), k, t0, first: None, last: SaeStats::default(), last_t: t0 };
+        let stop = stop.clone();
+        std::thread::spawn(move || b.run(bench_exit_rx, duration, stop))
+    };
+    eprintln!(
+        "epochdb-rs: SAE chainId={} dump={dump} heights=1..{} settlement-blocks(k)={k} max-inflight={max_inflight} exec-threads={dirty_workers} workers={workers} roll-budget={}MB gas-capacity={} size-cap={}",
+        cfg.chain_id,
+        if stop_at == u64::MAX { "end".to_string() } else { stop_at.to_string() },
+        roll_budget >> 20,
+        if capacity == u64::MAX { "off".to_string() } else { capacity.to_string() },
+        if size_cap == usize::MAX { "off".to_string() } else { format!("{}KiB", size_cap >> 10) },
+    );
+
+    // The executor thread (this thread): pulls accepted blocks in order, runs k
+    // behind, checks gasUsed/receiptsRoot/logsBloom against the header, hands
+    // the write set to the checker (the settled root).
+    let mut roller = Roller::new(dir, 0, 0, dirty, dirty_workers);
+    let mut parent_time = cfg.genesis_timestamp;
+    let mut first = true;
+    let res = (|| -> Result<()> {
+        for b in accept_rx.iter() {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if let Some(r) = roller.poll_roll(false)? {
+                let (ptx, prx) = sync_channel(0);
+                let (rtx, rrx) = sync_channel(0);
+                check_tx.send(SaeMsg::Park(ptx, rrx)).map_err(|_| anyhow!("checker gone"))?;
+                prx.recv().map_err(|_| anyhow!("checker gone"))?;
+                roller.finish_roll(ex.db_mut(), r, || Ok(()))?;
+                rtx.send(()).map_err(|_| anyhow!("checker gone"))?;
+            }
+            let h = &b.header;
+            if first {
+                ex.set_block_hash(h.number - 1, h.parent_hash);
+                first = false;
+            }
+            let r = ex.execute_block(&b, parent_time).with_context(|| format!("block {}", h.number))?;
+            if r.gas_used != h.gas_used {
+                bail!("block {}: gasUsed {} != header {}", h.number, r.gas_used, h.gas_used);
+            }
+            if r.receipts_root != h.receipt_hash {
+                bail!("block {}: receiptsRoot {} != header {}", h.number, r.receipts_root, h.receipt_hash);
+            }
+            if r.bloom != h.bloom {
+                bail!("block {}: logsBloom differs from the header", h.number);
+            }
+            ex.set_block_hash(h.number, b.hash);
+            parent_time = h.time;
+            roller.maybe_roll(ex.db_mut(), roll_budget, h.number, h.root);
+            let (ws, _code) = ex.db_mut().take_ws();
+            {
+                let mut s = stats.lock().unwrap();
+                s.exec_head = h.number;
+                s.exec_gas += r.gas_used;
+                s.overlay = ex.db().overlay.bytes();
+                s.rolls = roller.rolls;
+                s.rolling = roller.rolling();
+            }
+            let item = SaeItem { block: b.clone(), ws, want: h.root };
+            if check_tx.send(SaeMsg::Block(Box::new(item))).is_err() {
+                bail!("checker stopped");
+            }
+        }
+        Ok(())
+    })();
+    stop.store(true, Ordering::Relaxed);
+    drop(check_tx);
+    let cres = checker.join().map_err(|_| anyhow!("checker panicked"))?;
+    let fres = feed.join().map_err(|_| anyhow!("feed panicked"))?;
+    let _ = bench_exit_tx.send(());
+    let _ = bench.join();
+    res?;
+    cres?;
+    fres?;
     Ok(())
 }
