@@ -1,8 +1,11 @@
 //! The node: import or restart, catch up, follow. One applier thread (execute,
-//! hot apply, history), one checker thread (root per block, halt on
-//! mismatch), one feed thread. Every public call is safe from any thread.
+//! hot apply, history, diff log), one feed thread. The root check runs in
+//! another process (`cnode-check`) that tails the diff log and writes
+//! `<data>/HALTED` on a mismatch; the applier polls for that file every
+//! block. Every public call is safe from any thread.
 
-use crate::checker::{Checker, Mismatch};
+use crate::checker::{self, Checker, Mismatch};
+use crate::difflog;
 use crate::exec::{Applier, HotBase};
 use crate::feed::{self, now_ms, RawBlock};
 use crate::history::{History, StoredBlock};
@@ -13,7 +16,7 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -33,7 +36,7 @@ struct Shared {
     cache: Arc<HashCache>,
     halted: AtomicBool,
     halt: Mutex<Option<Mismatch>>,
-    checked: AtomicU64,
+    data_dir: PathBuf,
     last_received_ms: AtomicU64,
     frozen: bool,
     subscribers: Mutex<Vec<Sender<BlockEvent>>>,
@@ -47,10 +50,6 @@ pub struct Node {
     pub history: Arc<History>,
 }
 
-fn halt_file(dir: &Path, m: &Mismatch) {
-    let _ = std::fs::write(dir.join("HALTED"), format!("{{\"height\":{},\"expected_root\":\"{}\",\"got_root\":\"{}\",\"at_ms\":{}}}\n", m.height, m.expected, m.got, now_ms()));
-}
-
 impl Node {
     pub fn open(cfg: Config, mode: Mode) -> Result<Node> {
         std::fs::create_dir_all(&cfg.data_dir)?;
@@ -61,35 +60,31 @@ impl Node {
         let history = Arc::new(History::open(&cfg.data_dir.join("history.redb"))?);
         let hot = Arc::new(HotState::new(0, B256::ZERO));
 
-        // 1. The state: a restart from the newest roll, or the bootstrap export.
+        // 1. The state: a restart from the checker's newest roll, or the bootstrap export.
         let t = std::time::Instant::now();
-        let (mut checker, snap_height, _snap_root) = match crate::checker::read_manifest(&vmstate)? {
+        let snap_height = match checker::read_manifest(&vmstate)? {
             Some(m) if matches!(mode, Mode::AtHeight(h) if h < m.height) => {
-                // A frozen view below the newest roll: the newest older run, no checker needed.
+                // A frozen view below the newest roll: the newest older run.
                 let Mode::AtHeight(h) = mode else { unreachable!() };
                 let (rh, g) = Checker::runs(&vmstate)?.into_iter().filter(|(rh, _)| *rh <= h).last().ok_or_else(|| anyhow!("AtHeight({h}): no rolled run at or below it (the import was at a later height?)"))?;
                 let run = state::run::Run::open(&vmstate.join(format!("run.{g}")))?;
                 let (a, s) = import::load_run(&run, &hot)?;
                 let codes = import::load_code(&cfg.bootstrap_dir, &hot)?;
                 eprintln!("node: frozen view: run gen {g} at height {rh}: {a} accounts, {s} slots, {codes} codes in {:.1?}", t.elapsed());
-                let (c, _) = Checker::open(&vmstate)?;
-                (c, rh, B256::ZERO)
+                rh
             }
             Some(m) => {
-                let (c, _) = Checker::open(&vmstate)?;
-                let (a, s) = import::load_run(&c.run(), &hot)?;
+                let run = state::run::Run::open(&vmstate.join(format!("run.{}", m.gen))).context("run")?;
+                let (a, s) = import::load_run(&run, &hot)?;
                 let codes = import::load_code(&cfg.bootstrap_dir, &hot).context("code.bin from the bootstrap export")?;
                 eprintln!("node: restart from roll gen {} at height {} root {}: {a} accounts, {s} slots, {codes} codes in {:.1?}", m.gen, m.height, m.root, t.elapsed());
-                (c, m.height, m.root)
+                m.height
             }
             None => {
-                let meta = import::read_meta(&cfg.bootstrap_dir).with_context(|| format!("no vmstate in {} and no bootstrap export in {}: run cmd/cnode-export first", cfg.data_dir.display(), cfg.bootstrap_dir.display()))?;
+                let meta = import::read_meta(&cfg.bootstrap_dir).with_context(|| format!("no vmstate in {} and no bootstrap export in {}: run cmd/cnode-sync first", cfg.data_dir.display(), cfg.bootstrap_dir.display()))?;
                 let (a, s, c) = import::load(&cfg.bootstrap_dir, &hot)?;
-                eprintln!("node: import at height {} root {}: {a} accounts, {s} slots, {c} codes into the hot state in {:.1?}", meta.height, meta.state_root, t.elapsed());
-                let mut rows = import::ExportIter::open(&cfg.bootstrap_dir)?;
-                let c = Checker::seed(&vmstate, &mut rows, meta.height, meta.state_root)?;
-                eprintln!("node: checker seeded, {} rows, root verified at {} in {:.1?} total", rows.rows, meta.height, t.elapsed());
-                (c, meta.height, meta.state_root)
+                eprintln!("node: import at height {} root {}: {a} accounts, {s} slots, {c} codes into the hot state in {:.1?} (root check: cnode-check)", meta.height, meta.state_root, t.elapsed());
+                meta.height
             }
         };
 
@@ -108,7 +103,6 @@ impl Node {
         while height < head.min(stop) {
             let h = height + 1;
             let (Some(sb), Some(diff_rows)) = (history.block(h)?, history.diff(h)?) else { bail!("history: block {h} missing after snapshot {snap_height}") };
-            let root: B256 = sb.block["stateRoot"].as_str().unwrap_or_default().parse()?;
             let d = crate::history::diff_from_rows(&diff_rows)?;
             for (ch, code) in &d.code {
                 hot.put_code(*ch, code.clone());
@@ -116,9 +110,6 @@ impl Node {
             }
             hash = sb.block["hash"].as_str().unwrap_or_default().parse()?;
             hot.apply(h, hash, &d);
-            if h > checker.height {
-                checker.replay(h, &diff_rows, root);
-            }
             height = h;
         }
         if height > snap_height {
@@ -131,7 +122,7 @@ impl Node {
             cache: Arc::new(HashCache::default()),
             halted: AtomicBool::new(false),
             halt: Mutex::new(None),
-            checked: AtomicU64::new(height),
+            data_dir: cfg.data_dir.clone(),
             last_received_ms: AtomicU64::new(0),
             frozen: matches!(mode, Mode::AtHeight(_)),
             subscribers: Mutex::new(Vec::new()),
@@ -149,22 +140,15 @@ impl Node {
             return Ok(node);
         }
 
-        // 3. Follow: feed -> applier -> checker; the validators' mempools on the side.
+        // 3. Follow: feed -> applier -> diff log (-> cnode-check); the validators' mempools on the side.
         for (i, ws) in cfg.validator_ws.iter().enumerate() {
             let (m, ws) = (s.mempool.clone(), ws.clone());
             std::thread::Builder::new().name(format!("cnode-mempool-{i}")).spawn(move || m.run(i, ws))?;
         }
         let (raw_tx, raw_rx) = channel::<RawBlock>();
-        let (chk_tx, chk_rx) = channel::<(u64, Vec<(Vec<u8>, Vec<u8>)>, B256)>();
         {
             let (ws, http) = (cfg.rpc_ws.clone(), cfg.rpc_http.clone());
             std::thread::Builder::new().name("cnode-feed".into()).spawn(move || feed::stream(&ws, &http, height + 1, &raw_tx))?;
-        }
-        {
-            let s = s.clone();
-            let every = cfg.snapshot_every_blocks.max(1);
-            let dir = cfg.data_dir.clone();
-            std::thread::Builder::new().name("cnode-checker".into()).spawn(move || checker_loop(s, checker, chk_rx, every, &dir))?;
         }
         {
             let s = s.clone();
@@ -172,8 +156,9 @@ impl Node {
             let http = cfg.rpc_http.clone();
             let ring = block_hash_ring(&http, height, &history)?;
             let cache = s.cache.clone();
+            let log = difflog::Writer::open(&cfg.data_dir.join("difflog"))?;
             std::thread::Builder::new().name("cnode-applier".into()).spawn(move || {
-                if let Err(e) = applier_loop(s.clone(), history, hot, cache, ring, raw_rx, chk_tx, height, hash) {
+                if let Err(e) = applier_loop(s.clone(), history, hot, cache, ring, raw_rx, log, height, hash) {
                     eprintln!("node: applier stopped: {e:#}");
                     s.halted.store(true, Ordering::Release);
                 }
@@ -201,9 +186,11 @@ impl Node {
         Status::Following { height: g.height, lag_ms: if r == 0 { 0 } else { now_ms().saturating_sub(r) } }
     }
 
-    /// Blocks applied minus blocks checked: the checker's backlog.
+    /// Blocks applied minus blocks checked: the `cnode-check` backlog (from
+    /// its `<data>/CHECKED` file; the whole height when it never ran).
     pub fn checker_lag(&self) -> u64 {
-        self.s.hot.generation().height.saturating_sub(self.s.checked.load(Ordering::Relaxed))
+        let checked = checker::read_checked(&self.s.data_dir).map_or(0, |c| c.height);
+        self.s.hot.generation().height.saturating_sub(checked)
     }
 
     fn live(&self) -> Result<(), Stale> {
@@ -311,7 +298,7 @@ fn applier_loop(
     cache: Arc<HashCache>,
     ring: HashMap<u64, B256>,
     rx: Receiver<RawBlock>,
-    chk: Sender<(u64, Vec<(Vec<u8>, Vec<u8>)>, B256)>,
+    mut log: difflog::Writer,
     mut height: u64,
     mut hash: B256,
 ) -> Result<()> {
@@ -319,6 +306,13 @@ fn applier_loop(
     let mut ap = Applier::new(base);
     while let Ok(raw) = rx.recv() {
         if s.halted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // cnode-check found a mismatch: stop applying, reads return Stale.
+        if let Some(m) = checker::read_halt_file(&s.data_dir) {
+            eprintln!("node: HALTED by cnode-check at {}: header root {} but our state rolls to {}", m.height, m.expected, m.got);
+            *s.halt.lock().unwrap() = Some(m);
+            s.halted.store(true, Ordering::Release);
             return Ok(());
         }
         if raw.height != height + 1 {
@@ -352,30 +346,17 @@ fn applier_loop(
         s.last_received_ms.store(raw.received_ms, Ordering::Relaxed);
         let rows = rows(&diff);
         *s.head.lock().unwrap() = Some(b.header.clone());
+        // The diff log before the history: a crash in between re-applies the
+        // block on restart and the log gets the height twice, which the
+        // reader skips; the other order would leave a gap.
+        log.append(b.height, b.header.root, &crate::history::encode_rows(&rows))?;
         history.put(b.height, &StoredBlock { received_ms: raw.received_ms, applied_ms, block: raw.block }, &rows)?;
         let captured = s.mempool.flush();
         if !captured.is_empty() {
             history.put_mempool(b.height, &captured)?;
         }
-        let _ = chk.send((b.height, rows, b.header.root));
         let ev = BlockEvent { height: b.height, hash: b.hash, received_ms: raw.received_ms, applied_ms, exec_ms, txs: b.txs.len() };
         s.subscribers.lock().unwrap().retain(|t| t.send(ev.clone()).is_ok());
     }
     Ok(())
-}
-
-fn checker_loop(s: Arc<Shared>, mut c: Checker, rx: Receiver<(u64, Vec<(Vec<u8>, Vec<u8>)>, B256)>, every: u64, dir: &Path) {
-    while let Ok((h, rows, root)) = rx.recv() {
-        if let Err(m) = c.apply(h, &rows, root) {
-            eprintln!("CHECKER MISMATCH at {}: header root {} but our state rolls to {}. HALTED.", m.height, m.expected, m.got);
-            halt_file(dir, &m);
-            *s.halt.lock().unwrap() = Some(m);
-            s.halted.store(true, Ordering::Release);
-            return;
-        }
-        s.checked.store(h, Ordering::Relaxed);
-        if let Err(e) = c.maybe_roll(every) {
-            eprintln!("checker: roll failed: {e:#}");
-        }
-    }
 }

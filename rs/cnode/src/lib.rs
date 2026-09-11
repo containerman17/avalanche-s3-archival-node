@@ -3,6 +3,7 @@
 //! Running notes: NOTES.md next to this crate.
 
 pub mod checker;
+pub mod difflog;
 pub mod exec;
 pub mod feed;
 pub mod history;

@@ -90,6 +90,47 @@ pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>> {
     }
 }
 
+/// `<data>/HALTED`: written by whoever finds the mismatch (the checker
+/// process), polled by the node's applier, and a refusal to start until a
+/// human removes it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HaltFile {
+    height: u64,
+    expected_root: B256,
+    got_root: B256,
+    at_ms: u64,
+}
+
+pub fn write_halt_file(data_dir: &Path, m: &Mismatch) {
+    let f = HaltFile { height: m.height, expected_root: m.expected, got_root: m.got, at_ms: crate::feed::now_ms() };
+    let _ = std::fs::write(data_dir.join("HALTED"), serde_json::to_string(&f).unwrap() + "\n");
+}
+
+pub fn read_halt_file(data_dir: &Path) -> Option<Mismatch> {
+    let b = std::fs::read(data_dir.join("HALTED")).ok()?;
+    let f: HaltFile = serde_json::from_slice(&b).ok()?;
+    Some(Mismatch { height: f.height, expected: f.expected_root, got: f.got_root })
+}
+
+/// `<data>/CHECKED`: the checker's progress, for the node's status line.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Checked {
+    pub height: u64,
+    pub root: B256,
+    pub at_ms: u64,
+}
+
+pub fn write_checked(data_dir: &Path, height: u64, root: B256) -> Result<()> {
+    let tmp = data_dir.join("CHECKED.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&Checked { height, root, at_ms: crate::feed::now_ms() })?)?;
+    std::fs::rename(&tmp, data_dir.join("CHECKED"))?;
+    Ok(())
+}
+
+pub fn read_checked(data_dir: &Path) -> Option<Checked> {
+    serde_json::from_slice(&std::fs::read(data_dir.join("CHECKED")).ok()?).ok()
+}
+
 impl Checker {
     /// Writes run.0 from sorted contract rows, rolls trie.0, and requires its
     /// root to be `expected` (the header's state root at `height`).
@@ -158,21 +199,23 @@ impl Checker {
     /// Applies one block's rows and compares the root. On a mismatch the
     /// checker is left as is (halted by the caller).
     pub fn apply(&mut self, height: u64, rows: &[(Vec<u8>, Vec<u8>)], expected: B256) -> std::result::Result<(), Mismatch> {
-        for (k, v) in rows {
-            self.dirty.apply(k, v).expect("contract row");
-            self.fresh.put(k, v);
-        }
+        self.replay(height, rows, expected);
+        self.check(height, expected)
+    }
+
+    /// Compares the root of everything replayed so far with `expected` (the
+    /// header root at `height`). One root computation covers any number of
+    /// replayed blocks, so `cnode-check` calls it once per pass.
+    pub fn check(&mut self, height: u64, expected: B256) -> std::result::Result<(), Mismatch> {
         let got = B256::from(self.dirty.root().expect("root"));
         if got != expected {
             return Err(Mismatch { height, expected, got });
         }
-        self.height = height;
-        self.root = expected;
-        self.blocks_since_roll += 1;
         Ok(())
     }
 
-    /// Feeds rows without checking (a restart replaying already-checked blocks).
+    /// Feeds rows without checking (blocks checked as a batch later, or a
+    /// restart replaying already-checked blocks).
     pub fn replay(&mut self, height: u64, rows: &[(Vec<u8>, Vec<u8>)], root: B256) {
         for (k, v) in rows {
             self.dirty.apply(k, v).expect("contract row");
