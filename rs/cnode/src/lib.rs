@@ -2,7 +2,9 @@
 //! Design of record: ~/dotfiles/projects/archival-node/assets/defi_node_handover_task.md
 //! Running notes: NOTES.md next to this crate.
 
+pub mod checker;
 pub mod feed;
+pub mod history;
 pub mod hot;
 pub mod import;
 
