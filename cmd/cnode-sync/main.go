@@ -49,6 +49,7 @@ import (
 	syncclient "github.com/ava-labs/avalanchego/graft/evm/sync/client"
 	"github.com/ava-labs/avalanchego/graft/evm/sync/client/stats"
 	"github.com/ava-labs/avalanchego/graft/evm/sync/leaf"
+	pvmsummary "github.com/ava-labs/avalanchego/vms/proposervm/summary"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
@@ -124,8 +125,14 @@ func (p *peers) Disconnected(nodeID ids.NodeID) {
 	p.mu.Unlock()
 }
 
+var opCounts sync.Map
+
 func (p *peers) HandleInbound(_ context.Context, msg *message.InboundMessage) {
 	defer msg.OnFinishedHandling()
+	if os.Getenv("CNODE_SYNC_DEBUG") != "" {
+		v, _ := opCounts.LoadOrStore(msg.Op.String(), new(atomic.Int64))
+		v.(*atomic.Int64).Add(1)
+	}
 	switch msg.Op {
 	case message.AppResponseOp:
 		m, ok := msg.Message.(*p2ppb.AppResponse)
@@ -781,8 +788,25 @@ func chooseSummary(p *peers) (*evmmessage.BlockSyncSummary, error) {
 	}
 	sent := p.send(msg, set.Of(list...))
 	log.Printf("frontier: asked %d validators", sent.Len())
+	if os.Getenv("CNODE_SYNC_DEBUG") != "" {
+		// Control: a request the archival fetcher is known to get answered.
+		p.mu.Lock()
+		p.nextReq++
+		cid := p.nextReq
+		p.mu.Unlock()
+		if m, err := p.creator.GetAcceptedFrontier(cChainID, cid, requestTimeout); err == nil {
+			log.Printf("debug: GetAcceptedFrontier sent to %d", p.send(m, set.Of(list[:20]...)).Len())
+		}
+		defer func() {
+			opCounts.Range(func(k, v any) bool { log.Printf("debug: inbound %s x%d", k, v.(*atomic.Int64).Load()); return true })
+		}()
+	}
+	// The C-chain runs under the proposervm: a frontier summary is the
+	// proposervm wrapper (proposer block bytes + the inner coreth summary), and
+	// the acceptance vote names the WRAPPER's ID.
 	type cand struct {
 		summary *atomicsync.Summary
+		outerID ids.ID
 		weight  uint64
 		n       int
 	}
@@ -794,15 +818,25 @@ collect:
 		select {
 		case a := <-fch:
 			got++
-			s, err := provider.Parse(a.summary, nil)
+			outer, err := pvmsummary.Parse(a.summary)
 			if err != nil {
+				if got <= 3 {
+					log.Printf("frontier: %s: unparseable proposervm summary (%d bytes): %v", a.node, len(a.summary), err)
+				}
+				continue
+			}
+			s, err := provider.Parse(outer.InnerSummaryBytes(), nil)
+			if err != nil {
+				if got <= 3 {
+					log.Printf("frontier: %s: unparseable inner summary (%d bytes): %v", a.node, len(outer.InnerSummaryBytes()), err)
+				}
 				continue
 			}
 			as := s.(*atomicsync.Summary)
-			c := cands[as.ID()]
+			c := cands[outer.ID()]
 			if c == nil {
-				c = &cand{summary: as}
-				cands[as.ID()] = c
+				c = &cand{summary: as, outerID: outer.ID()}
+				cands[outer.ID()] = c
 			}
 			c.weight += p.weights[a.node]
 			c.n++
@@ -848,7 +882,7 @@ collect2:
 			answered += p.weights[a.node]
 			nAnswered++
 			for _, id := range a.ids {
-				if id == best.summary.ID() {
+				if id == best.outerID {
 					agree += p.weights[a.node]
 					nAgree++
 				}
