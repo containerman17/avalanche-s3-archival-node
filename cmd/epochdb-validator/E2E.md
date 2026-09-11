@@ -1125,3 +1125,62 @@ eviction picks the lowest-tip remote tx regardless of nonce, so a lower nonce WA
 now blocked for a gapped newcomer (fix 1); (d) the cost check spans the executable run plus the newcomer minus any tx
 it replaces, so a rising-price sequence is refused Funds, not silently gapped; (e) `promote` has no price test, a
 cheaper next nonce still promotes. `cargo test -p epochdb-chain` (28), `go test -count=1 ./validator/` pass.
+
+## SAE plugin (ACP-194 Streaming Asynchronous Execution)
+
+The plugin runs SAE when the chain config carries `"sae": true`. `"sae-settlement-blocks"` (default 8) is the
+settlement window k; `"sae-gas-capacity"` and `"sae-size-cap-kib"` bound admission (off by default). Native state
+engine only. The synchronous native and firewood paths are untouched (SAE branches at the top of verify / accept /
+build / set_state / shutdown; see `rs/chain/src/sae_mode.rs` and `rs/node/src/sae.rs`).
+
+The model, mirroring the bench's `sae_main` three-thread design:
+- Verify = `verify_light` over the projection plus the parent's unaccepted-ancestor overlay: signatures, projected
+  nonce, worst-case funds and gas capacity, and the header's worst-case `gasUsed = sum(gasLimit)` and transactions
+  root. NO execution, independent of executed state, so a chain of verified-but-not-accepted blocks stands several
+  deep (heights in flight above 1, the SAE point).
+- Accept advances the projection and enqueues the block to one continuous executor thread, then returns. No execution
+  on the vote path.
+- The executor runs k blocks behind the accepted head. Per block it executes on the settled state, applies the
+  backend and the rolled Dirty, gates the settled root, retires the projection and writes the store row, all
+  atomically under the engine lock (so a reader never sees the backend nonce advanced while the projection still
+  counts the block unsettled).
+- BuildBlock builds without executing: the header at h commits the SETTLED root / receiptsRoot / logsBloom of h-k
+  (genesis for h <= k), `gasUsed` is the worst-case `sum(gasLimit)`. Selection is capped at the executor's per-block
+  gas limit (the classic executor enforces `header.gas_limit`; the ACP-194 20s-capacity / gas-clock model is not
+  wired, so full-capacity blocks are a follow-up).
+- Head divergence: `last_accepted` and `eth_blockNumber` are the ACCEPTED head; RPC `latest` reads the executor's
+  SETTLED state. The store holds only settled blocks; accepted-but-unsettled blocks live in the `recent` map.
+- Settled-root gate: Accept records the root a header commits for h-k, the executor records the root it settles at h;
+  whichever arrives second compares, and a mismatch halts the process (the sync checker's fatal exit).
+- Recovery (deviation from rs/SAE.md, noted): a restart reports the settled store head as last-accepted and the
+  accepted-but-unsettled backlog re-bootstraps, rather than persisting and re-executing it. Safe (a lagging node
+  catches up), simpler. BuildBlock is blocked until the executor re-settles the window; a follower still verifies,
+  accepts and settles.
+
+### Local oracle (all-ours tmpnet)
+
+The `e2e` harness doubles as the SAE oracle when run all-ours with SAE on (no stock node is a valid oracle: the SAE
+header differs from stock subnet-evm). `compareAll` checks every block (stateRoot included) and `eth_getBlockReceipts`
+are byte-identical across all nodes at every height, so all nodes agreeing on the SAE settled-root commitments IS the
+cross-node settled-root match; the in-process gate halts any node whose settled root diverges.
+
+    S=/tmp/.../scratchpad; PDIR=$S/plugins   # $PDIR holds epochdb-validator as srEXi...
+    go build -o "$PDIR/srEXiWaHuhNyGwPUi444Tu47ZEDwxTWrbQiuD7FmgSAQ6X7Dy" ./cmd/epochdb-validator
+    go run ./cmd/epochdb-validator/e2e --avalanchego ~/avalanchego/build/avalanchego \
+      --ours "$PDIR" --stock "$PDIR" --ours-n 3 --stock-n 0 \
+      --chain-config-extra '{"sae":true,"sae-settlement-blocks":8}' --load 40s --rate 800 --keys 200
+
+Note: the Go cgo link caches the static archive by path; after rebuilding `libepochdb_engine.a`, run `go clean -cache`
+before `go build` or the plugin links the stale archive.
+
+Result (3 x local node, avalanchego 1.14.2 rpcchainvm 45, 20 M gas / 2 s genesis, 2026-09-11): the functional phase
+(transfers, deploy, call, failing call, nonce gap) and the 40 s load phase both passed with blocks byte-identical on
+all 3 nodes. Load: head 28..30, 867 txs/block at 18.2 M gas (91% of the 20 M limit), 2 s blocks. Heights in flight
+(`blks_processing`) = 4 (vs ~1 on the synchronous path, the pipelining win). Settlement kept up: final lag 0 blocks,
+19,249 settled txs, 404 M gas, at ~433 accepted tx/s = ~433 settled tx/s (the 2 s cadence is the ACP-226 min block
+delay, not execution: Accept on the vote path took 1..6 ms, execution is off it). No settled-root mismatch on any
+node. The in-process oracle (`cargo test -p epochdb-chain sae`) proves the SAE settled root at every height equals a
+full synchronous re-execution of the same txs, and a 4-deep verified-but-not-accepted chain with no executed state.
+
+Still open for a fleet run: the full 20 s-capacity block (needs the gas-clock executor; blocks are gas-limited today),
+and the persist-and-re-execute recovery of the unsettled backlog.

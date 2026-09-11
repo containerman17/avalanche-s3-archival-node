@@ -17,6 +17,12 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, U256};
 use block::Tx;
 
+/// Per sender, (projected nonce, cumulative worst-case cost) across an
+/// unaccepted ancestor chain: the block tree's verified-but-not-accepted delta
+/// on top of the projection, so `verify_light_over` pipelines siblings without
+/// executed state. An empty overlay = the parent is the accepted head.
+pub type Overlay = HashMap<Address, (u64, U256)>;
+
 /// tx worst-case cost: gasLimit * feeCap + value (feeCap = the tx's max fee per
 /// gas). Saturating: an overflow reads as unpayable and fails the funds check.
 pub fn cost_of(t: &Tx) -> U256 {
@@ -81,9 +87,65 @@ impl Projection {
         self.senders.get(addr).map(|s| s.settled_nonce + s.unsettled_count)
     }
 
+    /// The count of a sender's accepted-but-unsettled txs (0 if untracked): the
+    /// gap between its settled nonce and its projected nonce, which the pool
+    /// adds to the settled-state nonce to admit against the projected nonce.
+    pub fn unsettled_count(&self, addr: &Address) -> u64 {
+        self.senders.get(addr).map_or(0, |s| s.unsettled_count)
+    }
+
+    /// The settled head / accepted head the projection has advanced to.
+    pub fn heads(&self) -> (u64, u64) {
+        (self.settled_head, self.accepted_head)
+    }
+
     /// Number of senders currently tracked (in-flight set; a leak watch).
     pub fn tracked(&self) -> usize {
         self.senders.len()
+    }
+
+    /// verify_light over an overlay of unaccepted ancestor blocks (the block
+    /// tree's verified-but-not-accepted chain): the same checks, but a sender's
+    /// baseline is advanced by the ancestors' txs already, so a chain of
+    /// verified blocks pipelines to OptimalProcessing depth without touching
+    /// executed state. `parent` is the ancestor chain's overlay (empty when the
+    /// block's parent is the accepted head); the returned overlay is `parent`
+    /// plus this block's txs, to pass to a child's verify. Read-only on the
+    /// projection. The plugin's Verify uses this; `verify_light` is the empty-
+    /// overlay case (the bench's single-stream feed).
+    ///
+    /// An overlay entry is (projected nonce, cumulative worst-case cost) for a
+    /// sender across the unsettled backlog plus the ancestor chain. Balance is
+    /// read from the projection's settled baseline (a sender with no baseline is
+    /// unfunded-unknown = U256::MAX, the funds check skipped, exactly as
+    /// verify_light seeds a new sender).
+    pub fn verify_light_over(&self, txs: &[Tx], parent: &Overlay, size_bytes: usize, capacity: u64, size_cap: usize) -> Result<Overlay, Reject> {
+        let mut ov = parent.clone();
+        let mut total_gas: u64 = 0;
+        for (i, t) in txs.iter().enumerate() {
+            let sender = t.sender.ok_or(Reject::BadSig(i))?;
+            let (proj_nonce, cost_acc) = *ov.entry(sender).or_insert_with(|| match self.senders.get(&sender) {
+                Some(s) => (s.settled_nonce + s.unsettled_count, s.unsettled_cost),
+                None => (t.nonce, U256::ZERO),
+            });
+            if t.nonce != proj_nonce {
+                return Err(Reject::NonceGap { index: i, want: proj_nonce, got: t.nonce });
+            }
+            let balance = self.senders.get(&sender).map_or(U256::MAX, |s| s.settled_balance);
+            let committed = cost_acc.saturating_add(cost_of(t));
+            if committed > balance {
+                return Err(Reject::Underfunded(i));
+            }
+            ov.insert(sender, (proj_nonce + 1, committed));
+            total_gas = total_gas.saturating_add(t.gas_limit);
+        }
+        if total_gas > capacity {
+            return Err(Reject::OverCapacity { used: total_gas, capacity });
+        }
+        if size_bytes > size_cap {
+            return Err(Reject::OverSize { size: size_bytes, cap: size_cap });
+        }
+        Ok(ov)
     }
 
     /// verify_light: signatures, projected nonce per tx position, worst-case
@@ -233,6 +295,42 @@ mod tests {
         assert_eq!(p.tracked(), 0);
     }
 
+    /// One sender funds 20 consecutive nonces, all accepted, then settled a few
+    /// at a time: projected_nonce is invariant across every settle (settled nonce
+    /// advances by exactly the count the settle retires), and ends at 20. Pins
+    /// the "nonce too low" class of bug (the expected nonce over-advancing).
+    #[test]
+    fn projected_nonce_is_invariant_across_accept_then_settle() {
+        let mut p = Projection::new();
+        p.set_settled(addr(1), 0, U256::MAX);
+        // 20 blocks, one tx of sender 1 each (nonces 0..20).
+        let blocks: Vec<Vec<Tx>> = (0..20).map(|i| vec![tx(1, i, 21_000, 1, 0)]).collect();
+        for (i, b) in blocks.iter().enumerate() {
+            p.accept_block(i as u64 + 1, b);
+        }
+        assert_eq!(p.projected_nonce(&addr(1)), Some(20));
+        assert_eq!(p.unsettled_count(&addr(1)), 20);
+        // Settle in chunks of 3; projected stays 20 the whole way, unsettled
+        // shrinks by exactly the settled count, settled nonce grows to match.
+        let mut settled = 0u64;
+        for (i, b) in blocks.iter().enumerate() {
+            // The executor overwrites the settled nonce from the post-block
+            // backend state: after settling block i+1, sender 1's nonce is i+1.
+            let bal: std::collections::HashMap<Address, (u64, U256)> = [(addr(1), (i as u64 + 1, U256::MAX))].into_iter().collect();
+            p.settle_block(i as u64 + 1, b, Some(&bal));
+            settled += 1;
+            if settled < 20 {
+                // Still in flight: projected is invariant, unsettled shrinks by
+                // exactly the settled count.
+                assert_eq!(p.projected_nonce(&addr(1)), Some(20), "projected nonce moved at settle {}", i + 1);
+                assert_eq!(p.unsettled_count(&addr(1)), 20 - settled);
+            }
+        }
+        // Fully settled: the sender drops (nothing in flight), projected == chain nonce.
+        assert_eq!(p.projected_nonce(&addr(1)), None);
+        assert_eq!(p.settled_head, 20);
+    }
+
     #[test]
     fn worst_case_funds_span_the_unsettled_sequence() {
         let mut p = Projection::new();
@@ -292,6 +390,39 @@ mod tests {
         // A gap within a new sender's run is still caught.
         let gap = [tx(8, 12, 21_000, 1, 0), tx(8, 14, 21_000, 1, 0)];
         assert_eq!(p.verify_light(&gap, 0, CAP, SIZE), Err(Reject::NonceGap { index: 1, want: 13, got: 14 }));
+    }
+
+    /// The overlay pipelines a chain of verified-but-not-accepted blocks: each
+    /// child verifies against its ancestors' projection delta, not the accepted
+    /// state, so heights in flight exceed 1 without executed state. The result
+    /// matches accepting the ancestors then verify_light on the child.
+    #[test]
+    fn verify_light_over_pipelines_the_unaccepted_chain() {
+        let mut p = Projection::new();
+        p.set_settled(addr(1), 5, U256::MAX);
+        p.set_settled(addr(2), 0, U256::from(10u64) * U256::from(21_000u64 * 50 + 1));
+        // Block h+1 (sender 1 nonce 5, sender 2 nonce 0), verified on the head.
+        let b1 = [tx(1, 5, 21_000, 1, 0), tx(2, 0, 21_000, 50, 1)];
+        let ov1 = p.verify_light_over(&b1, &Overlay::new(), 0, CAP, SIZE).unwrap();
+        assert_eq!(ov1[&addr(1)].0, 6);
+        assert_eq!(ov1[&addr(2)].0, 1);
+        // Block h+2 on top of the still-unaccepted h+1: nonces continue.
+        let b2 = [tx(1, 6, 21_000, 1, 0), tx(2, 1, 21_000, 50, 1)];
+        let ov2 = p.verify_light_over(&b2, &ov1, 0, CAP, SIZE).unwrap();
+        assert_eq!(ov2[&addr(1)].0, 7);
+        assert_eq!(ov2[&addr(2)].0, 2);
+        // A gap against the ancestor chain is caught (h+2 must start at 6, not 7).
+        let gap = [tx(1, 7, 21_000, 1, 0)];
+        assert_eq!(p.verify_light_over(&gap, &ov1, 0, CAP, SIZE), Err(Reject::NonceGap { index: 0, want: 6, got: 7 }));
+        // The overlay carries the funds cost: sender 2's balance covers 10 txs;
+        // after 2 in flight, the cumulative cost is 2 units, not reset per block.
+        assert_eq!(ov2[&addr(2)].1, U256::from(2u64) * U256::from(21_000u64 * 50 + 1));
+        // Accepting the ancestors then verify_light on the child agrees with the
+        // overlay path (the projection advanced by accept == the overlay delta).
+        p.accept_block(1, &b1);
+        let ov2b = p.verify_light_over(&b2, &Overlay::new(), 0, CAP, SIZE).unwrap();
+        assert_eq!(ov2b[&addr(1)].0, ov2[&addr(1)].0);
+        assert_eq!(ov2b[&addr(2)].0, ov2[&addr(2)].0);
     }
 
     #[test]

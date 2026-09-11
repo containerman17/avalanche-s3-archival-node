@@ -87,10 +87,14 @@ struct CheckItem {
     layer: Option<Arc<FwLayer>>,
 }
 
-/// A verified block's state on top of its parent's, for either engine.
+/// A verified block's state on top of its parent's, for either engine, or the
+/// SAE projection delta (no executed state).
 pub enum Pending {
     Native(Arc<crate::layered::Pending>),
     Firewood { p: Arc<firewood::Pending>, payload: Mutex<Option<Payload>> },
+    /// SAE: only the block's projection overlay (its unaccepted ancestor
+    /// chain's delta), so a child's Verify pipelines without executed state.
+    Sae(Arc<crate::sae_mode::SaePending>),
 }
 
 impl Pending {
@@ -98,18 +102,25 @@ impl Pending {
         match self {
             Pending::Native(p) => p.payload.lock().unwrap().take(),
             Pending::Firewood { payload, .. } => payload.lock().unwrap().take(),
+            Pending::Sae(_) => None,
         }
     }
     fn native(&self) -> Option<&Arc<crate::layered::Pending>> {
         match self {
             Pending::Native(p) => Some(p),
-            Pending::Firewood { .. } => None,
+            _ => None,
         }
     }
     fn firewood(&self) -> Option<&Arc<firewood::Pending>> {
         match self {
             Pending::Firewood { p, .. } => Some(p),
-            Pending::Native(_) => None,
+            _ => None,
+        }
+    }
+    pub(crate) fn sae(&self) -> Option<&Arc<crate::sae_mode::SaePending>> {
+        match self {
+            Pending::Sae(p) => Some(p),
+            _ => None,
         }
     }
     /// The block's state root as verify settled it (native: computed in
@@ -123,13 +134,14 @@ impl Pending {
     pub fn root(&self) -> Option<B256> {
         match self {
             Pending::Native(p) => Some(p.root),
-            Pending::Firewood { .. } => None,
+            _ => None,
         }
     }
     fn meta(&self) -> (B256, u64, u64) {
         match self {
             Pending::Native(p) => (p.hash, p.number, p.time),
             Pending::Firewood { p, .. } => (p.hash, p.number, p.time),
+            Pending::Sae(p) => (p.hash, p.number, p.time),
         }
     }
 }
@@ -184,8 +196,8 @@ pub struct BuildOut {
 pub struct Inner {
     pub ex: Ex,
     /// None under Firewood (no roll).
-    roller: Option<Roller>,
-    roll_budget: usize,
+    pub(crate) roller: Option<Roller>,
+    pub(crate) roll_budget: usize,
 }
 
 impl Inner {
@@ -277,23 +289,38 @@ pub struct NodeEngine {
     /// The transaction pool: admission validates against the head state
     /// here, accept moves it, build takes from it (pool.rs).
     pub txpool: Arc<Pool>,
+    /// SAE (ACP-194) mode: Some = Verify is verify_light, Accept enqueues to a
+    /// continuous executor k blocks behind, the header commits the settled root
+    /// of h-k. None = the synchronous native/firewood path. See sae_mode.rs.
+    pub sae: Option<Arc<crate::sae_mode::Sae>>,
 }
 
 /// The pool behind the RPC's eth_sendRawTransaction / txpool_ methods.
 pub struct PoolRpc {
     pub pool: Arc<Pool>,
     pub inner: Arc<Mutex<Inner>>,
+    pub sae: Option<Arc<crate::sae_mode::Sae>>,
 }
 
-/// (nonce, balance) of `addrs` at the accepted head.
-fn head_accounts(inner: &Mutex<Inner>, addrs: &[Address]) -> Vec<(u64, U256)> {
+/// (nonce, balance) of `addrs` the pool admits against: the accepted-head state
+/// in the sync path; in SAE the PROJECTED nonce (settled nonce + the sender's
+/// accepted-but-unsettled txs) and the settled balance, so admission matches
+/// verify_light (else a burst reads as "nonce too low" while its earlier txs
+/// are accepted but not yet settled).
+fn head_accounts(inner: &Mutex<Inner>, sae: Option<&Arc<crate::sae_mode::Sae>>, addrs: &[Address]) -> Vec<(u64, U256)> {
     let mut g = inner.lock().unwrap();
-    addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect()
+    match sae {
+        Some(sae) => {
+            let proj = sae.proj.lock().unwrap();
+            addrs.iter().map(|a| { let (n, b) = g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance)); (proj.projected_nonce(a).unwrap_or(n), b) }).collect()
+        }
+        None => addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect(),
+    }
 }
 
 impl PoolRpc {
     pub fn add(&self, raws: Vec<Bytes>, local: bool) -> Vec<pool::Added> {
-        self.pool.add(raws, local, &|addrs| head_accounts(&self.inner, addrs))
+        self.pool.add(raws, local, &|addrs| head_accounts(&self.inner, self.sae.as_ref(), addrs))
     }
 }
 
@@ -429,7 +456,11 @@ impl NodeEngine {
         std::fs::create_dir_all(&data)?;
         let dir = data.join("vmstate");
         let engine = conf.get("state-engine").and_then(|v| v.as_str()).unwrap_or("native").to_string();
+        let sae_cfg = crate::sae_mode::config(&conf);
         if engine == "firewood" {
+            if sae_cfg.is_some() {
+                bail!("SAE mode needs the native state engine (the rolled Dirty is the settled root); state-engine must be native");
+            }
             let opts = firewood::Opts { cache_bytes: conf_u64(&conf, "firewood-cache-mb").unwrap_or(192) as usize * 1_000_000, ..Default::default() };
             return Self::open_firewood(init, cfg, genesis, conf, opts, sync_roll, tip_roll, grace, workers, cpus, data, t0);
         } else if engine != "native" {
@@ -497,9 +528,14 @@ impl NodeEngine {
         if head_h >= 1 && header_at(1)?.parent_hash != genesis.hash {
             bail!("the store's block 1 has parent {}, the genesis is {}", header_at(1)?.parent_hash, genesis.hash);
         }
-        let want = header_at(rolled_h)?.root;
-        if file.root() != want.0 {
-            bail!("vmstate rolled at height {rolled_h} with root {}, but the chain's root there is {want}", B256::from(file.root()));
+        // The rolled file's root is the SETTLED root at rolled_h. In SAE the
+        // header there commits the settled root of rolled_h-k, not its own, so
+        // the check is against the manifest's stored root instead of the header.
+        if sae_cfg.is_none() {
+            let want = header_at(rolled_h)?.root;
+            if file.root() != want.0 {
+                bail!("vmstate rolled at height {rolled_h} with root {}, but the chain's root there is {want}", B256::from(file.root()));
+            }
         }
         let mut dirty = Dirty::new(file, seek_fn(run));
         dirty.workers = cpus;
@@ -512,14 +548,23 @@ impl NodeEngine {
             }
             rows += r.ws.len();
         }
-        if head_h > rolled_h {
+        // The rebuilt root at the store head: in SAE the store holds only
+        // SETTLED blocks, so this is the settled root there (no header carries
+        // it; the replay is the source, seeded into the gate below). In the
+        // sync path it must match the head header's root.
+        let sae_head_root = if head_h > rolled_h {
             let root = dirty.root().context("recovery root")?;
-            let want = header_at(head_h)?.root;
-            if root != want.0 {
-                eprintln!("epochdb-rs: recovery: state rebuilt through height {head_h} has root {}, header {want}", B256::from(root));
-                std::process::exit(1);
+            if sae_cfg.is_none() {
+                let want = header_at(head_h)?.root;
+                if root != want.0 {
+                    eprintln!("epochdb-rs: recovery: state rebuilt through height {head_h} has root {}, header {want}", B256::from(root));
+                    std::process::exit(1);
+                }
             }
-        }
+            B256::from(root)
+        } else {
+            header_at(head_h)?.root
+        };
         // Code deployed since the roll came with the write sets above through
         // the code/ rows, so nothing else to load.
         for h in head_h.saturating_sub(256)..=head_h {
@@ -560,7 +605,26 @@ impl NodeEngine {
             window_max_bytes,
             grace.as_secs()
         );
-        Self::finish_open(init, &conf, cfg, genesis, store, db, head, ex, Some(roller), RootCheck::Dirty(dirty), sync_roll, tip_roll, workers, t0)
+        // SAE mode: the projection seeded from the genesis alloc; on recovery
+        // the accepted head is the settled store head (the unaccepted backlog
+        // re-bootstraps) and its rebuilt root seeds the settled-root gate.
+        let sae = sae_cfg.map(|(k, capacity, size_cap)| {
+            let s = Arc::new(crate::sae_mode::Sae::new(k, capacity, size_cap, genesis.header.root));
+            {
+                let mut p = s.proj.lock().unwrap();
+                for (addr, acct) in &cfg.alloc {
+                    p.set_settled(*addr, acct.nonce, acct.balance);
+                }
+                p.settled_head = head_h;
+                p.accepted_head = head_h;
+            }
+            if head_h > 0 {
+                s.seed_settled(head_h, sae_head_root);
+            }
+            eprintln!("epochdb-rs: SAE mode: settlement-blocks(k)={k} gas-capacity={} size-cap={} settled-head={head_h}", if capacity == u64::MAX { "off".into() } else { capacity.to_string() }, if size_cap == usize::MAX { "off".into() } else { format!("{}KiB", size_cap >> 10) });
+            s
+        });
+        Self::finish_open(init, &conf, cfg, genesis, store, db, head, ex, Some(roller), RootCheck::Dirty(dirty), sync_roll, tip_roll, workers, sae, t0)
     }
 
     /// The Firewood engine's open: genesis into the first proposal on an
@@ -670,13 +734,14 @@ impl NodeEngine {
             db.flush_bytes,
             grace.as_secs()
         );
-        Self::finish_open(init, &conf, cfg, genesis, store, db, head, ex, None, RootCheck::Firewood(committer), sync_roll, tip_roll, workers, t0)
+        Self::finish_open(init, &conf, cfg, genesis, store, db, head, ex, None, RootCheck::Firewood(committer), sync_roll, tip_roll, workers, None, t0)
     }
 
     /// The threads and the shared handles, the same for both engines.
     #[allow(clippy::too_many_arguments)]
-    fn finish_open(init: &Init, conf: &serde_json::Value, cfg: Config, genesis: Arc<Block>, store: DbStore, db: Arc<store::db::DB>, head: Arc<Block>, ex: Ex, roller: Option<Roller>, root_check: RootCheck, sync_roll: usize, tip_roll: usize, workers: usize, t0: Instant) -> anyhow::Result<NodeEngine> {
+    fn finish_open(init: &Init, conf: &serde_json::Value, cfg: Config, genesis: Arc<Block>, store: DbStore, db: Arc<store::db::DB>, head: Arc<Block>, ex: Ex, roller: Option<Roller>, root_check: RootCheck, sync_roll: usize, tip_roll: usize, workers: usize, sae: Option<Arc<crate::sae_mode::Sae>>, t0: Instant) -> anyhow::Result<NodeEngine> {
         let db_reads = db.clone();
+        let head_time = head.header.time;
         let store: Arc<Mutex<Box<dyn BlockStore>>> = Arc::new(Mutex::new(Box::new(store)));
         let recent = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
@@ -692,11 +757,24 @@ impl NodeEngine {
                 }
             }
         });
-        let checker = {
-            let (store, recent, stats) = (store.clone(), recent.clone(), stats.clone());
-            std::thread::spawn(move || checker(check_rx, root_check, store, recent, stats, flush_tx))
-        };
         let inner = Arc::new(Mutex::new(Inner { ex, roller, roll_budget: sync_roll }));
+        // SAE: the continuous executor owns the settle path (root, projection,
+        // store) off the vote path, so the sync checker is not spawned; Accept
+        // enqueues here instead. Else the sync checker runs the root one block
+        // behind accept.
+        let checker = if let Some(sae) = &sae {
+            let (exec_tx, exec_rx) = sync_channel::<Arc<Block>>(CHECK_DEPTH.max(16));
+            *sae.exec_tx.lock().unwrap() = Some(exec_tx);
+            let (inner, store, recent, sae2, stats2) = (inner.clone(), store.clone(), recent.clone(), sae.clone(), stats.clone());
+            let h = std::thread::spawn(move || crate::sae_mode::sae_executor(exec_rx, inner, store, recent, sae2, stats2, head_time));
+            *sae.exec_thread.lock().unwrap() = Some(h);
+            drop(check_rx);
+            drop(flush_tx);
+            None
+        } else {
+            let (store, recent, stats) = (store.clone(), recent.clone(), stats.clone());
+            Some(std::thread::spawn(move || checker(check_rx, root_check, store, recent, stats, flush_tx)))
+        };
         let cfg = Arc::new(cfg);
         let pool = {
             let mut g = inner.lock().unwrap();
@@ -710,7 +788,7 @@ impl NodeEngine {
         let chain_config = serde_json::from_slice::<serde_json::Value>(&init.genesis_bytes).ok().and_then(|g| g.get("config").cloned()).unwrap_or_default();
         let upgrades = serde_json::from_slice::<serde_json::Value>(&init.upgrade_bytes).ok();
         let rpc = rpc::Server::new(rpc_store.clone(), cfg.clone(), genesis.clone(), chain_config, upgrades);
-        let _ = rpc.mempool.set(Arc::new(PoolRpc { pool: pool.clone(), inner: inner.clone() }));
+        let _ = rpc.mempool.set(Arc::new(PoolRpc { pool: pool.clone(), inner: inner.clone(), sae: sae.clone() }));
         Ok(NodeEngine {
             cfg: cfg.clone(),
             txpool: pool,
@@ -724,8 +802,8 @@ impl NodeEngine {
             rpc,
             recent,
             parsed: Mutex::new(HashMap::new()),
-            check_tx: Mutex::new(Some(check_tx)),
-            checker: Mutex::new(Some(checker)),
+            check_tx: Mutex::new(if sae.is_some() { None } else { Some(check_tx) }),
+            checker: Mutex::new(checker),
             stats,
             pool: rayon::ThreadPoolBuilder::new().num_threads(workers).build()?,
             sync_roll,
@@ -733,6 +811,7 @@ impl NodeEngine {
             t0,
             normal: AtomicBool::new(false),
             desired_delay_excess: conf_u64(&conf, "min-delay-target").map(build::desired_delay_excess),
+            sae,
         })
     }
 
@@ -847,13 +926,13 @@ impl NodeEngine {
     /// Admits tx envelopes into the pool (the ABI's epochdb_pool_add; the
     /// RPC's eth_sendRawTransaction goes through the same PoolRpc).
     pub fn pool_add(&self, raws: Vec<Bytes>, local: bool) -> Vec<pool::Added> {
-        self.txpool.add(raws, local, &|addrs| head_accounts(&self.inner, addrs))
+        self.txpool.add(raws, local, &|addrs| head_accounts(&self.inner, self.sae.as_ref(), addrs))
     }
 
     /// The pool's gap report (`Pool::gap_report`) for the builder's
     /// pool-quiet WARN: up to 3 senders, state nonces from the accepted head.
     pub fn pool_gaps(&self) -> String {
-        self.txpool.gap_report(3, &|addrs| head_accounts(&self.inner, addrs))
+        self.txpool.gap_report(3, &|addrs| head_accounts(&self.inner, self.sae.as_ref(), addrs))
     }
 }
 
@@ -940,6 +1019,13 @@ impl Engine for NodeEngine {
 
     fn health(&self) -> Result<serde_json::Value, Error> {
         let h = self.head.lock().unwrap().height;
+        if let Some(sae) = &self.sae {
+            let (settled, lag) = sae.status(h);
+            return Ok(serde_json::json!({"height": h, "sae": true, "settlement-blocks": sae.k, "settled-head": settled, "settlement-lag": lag,
+                "settled-txs": sae.settled_tx.load(Ordering::Relaxed), "settled-gas": sae.settled_gas.load(Ordering::Relaxed),
+                "projection-tracked": sae.proj.lock().unwrap().tracked(), "normal-op": self.is_normal(),
+                "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed)}));
+        }
         Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal(),
             "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed), "pool-lock-ms": self.txpool.lock_ns.load(Ordering::Relaxed) / 1_000_000, "pool-add-ms": self.txpool.add_ns.load(Ordering::Relaxed) / 1_000_000,
             "pool-removed": self.txpool.removed().into_iter().map(|(k, v)| (k.to_string(), serde_json::Value::from(v))).collect::<serde_json::Map<_, _>>()}))
@@ -948,6 +1034,16 @@ impl Engine for NodeEngine {
     /// Bootstrapping = the catch-up budget; NormalOp = the tip budget and
     /// one roll of whatever the overlay holds (tickBudget on the switch).
     fn set_state(&self, normal: bool) {
+        // SAE: the executor owns the settle path (root, roll, store) off the
+        // vote path, so there is no sync checker to park and no verify-time
+        // root to flush; NormalOp only enables BuildBlock.
+        if self.sae.is_some() {
+            let mut g = self.inner.lock().unwrap();
+            g.roll_budget = if normal { self.tip_roll } else { self.sync_roll };
+            self.normal.store(normal, Ordering::Relaxed);
+            eprintln!("epochdb-rs: SAE budget {}: roll-budget={}MB", if normal { "tip (build enabled)" } else { "catch-up" }, g.roll_budget >> 20);
+            return;
+        }
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
         inner.roll_budget = if normal { self.tip_roll } else { self.sync_roll };
@@ -983,6 +1079,27 @@ impl Engine for NodeEngine {
     /// A roll in flight is finished and swapped in, the checker drains and
     /// the store is synced; the counters go to stderr.
     fn shutdown(&self) {
+        // SAE: close the executor's queue and join it (it settles the backlog,
+        // syncs and closes the store). No sync checker.
+        if let Some(sae) = &self.sae {
+            drop(sae.exec_tx.lock().unwrap().take());
+            if let Some(j) = sae.exec_thread.lock().unwrap().take() {
+                match j.join() {
+                    Ok(Err(e)) => eprintln!("epochdb-rs: SAE executor: {e:#}"),
+                    Err(_) => eprintln!("epochdb-rs: SAE executor panicked"),
+                    Ok(Ok(())) => {}
+                }
+            }
+            let (settled, lag) = sae.status(self.head.lock().unwrap().height);
+            eprintln!(
+                "epochdb-rs: SAE exit: accepted head={} settled head={settled} lag={lag} blk | settled txs={} gas={} | uptime {:.0}s",
+                self.head.lock().unwrap().height,
+                sae.settled_tx.load(Ordering::Relaxed),
+                sae.settled_gas.load(Ordering::Relaxed),
+                self.t0.elapsed().as_secs_f64()
+            );
+            return;
+        }
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
         if inner.roller.as_ref().is_some_and(|r| r.rolling()) {
@@ -1091,6 +1208,9 @@ impl NodeEngine {
     }
 
     fn verify_inner(&self, b: &Arc<Block>, parent: Option<&Arc<Pending>>) -> Result<Pending, Error> {
+        if let Some(sae) = &self.sae {
+            return self.sae_verify(b, parent, sae);
+        }
         let mut g = self.inner.lock().unwrap();
         let (ph, pn, pt) = match parent {
             Some(p) => p.meta(),
@@ -1182,6 +1302,9 @@ impl NodeEngine {
         if !self.normal.load(Ordering::Relaxed) {
             return Err("build needs NormalOp (SetState 2)".into());
         }
+        if let Some(sae) = &self.sae {
+            return self.sae_build(parent, parent_hdr, params, candidates, parent_txs, sae);
+        }
         let t0 = Instant::now();
         let mut g = self.inner.lock().unwrap();
         let Inner { ex, roller, .. } = &mut *g;
@@ -1265,6 +1388,9 @@ impl NodeEngine {
     }
 
     fn accept_inner(&self, b: &Arc<Block>, p: &Pending) -> Result<(), Error> {
+        if let Some(sae) = &self.sae {
+            return self.sae_accept(b, p, sae);
+        }
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
         self.swap_roll(inner, false)?;
@@ -1348,6 +1474,212 @@ impl NodeEngine {
         Ok(())
     }
 
+    // ---- SAE (ACP-194) mode. See sae_mode.rs. ----
+
+    /// Verify = verify_light: signatures, projected nonce, worst-case funds and
+    /// capacity over the projection plus the parent's unaccepted-ancestor
+    /// overlay. NO execution, independent of executed state, so a chain of
+    /// verified blocks pipelines. Also ties the header's worst-case gasUsed and
+    /// transactions root to the body. The settled root is NOT checked here (it
+    /// is not computed yet); the executor's settle gate does that k blocks later.
+    fn sae_verify(&self, b: &Arc<Block>, parent: Option<&Arc<Pending>>, sae: &crate::sae_mode::Sae) -> Result<Pending, Error> {
+        let (ph, pn) = match parent {
+            Some(p) => {
+                let (h, n, _) = p.meta();
+                (h, n)
+            }
+            None => {
+                let h = self.head.lock().unwrap();
+                (h.hash, h.height)
+            }
+        };
+        if b.header.parent_hash != ph || b.height != pn + 1 {
+            return Err(format!("block {} {} parent {} does not follow {} {}", b.height, b.hash, b.header.parent_hash, pn, ph).into());
+        }
+        let sum_limit = b.txs.iter().map(|t| t.gas_limit).fold(0u64, |a, g| a.saturating_add(g));
+        if b.header.gas_used != sum_limit {
+            return Err(format!("block {}: SAE gasUsed {} != worst-case sum(gasLimit) {}", b.height, b.header.gas_used, sum_limit).into());
+        }
+        // The settle path runs the classic executor (per-block gas limit), so a
+        // block that overruns it cannot execute; reject it here rather than let
+        // it halt the executor after acceptance.
+        if sum_limit > b.header.gas_limit {
+            return Err(format!("block {}: SAE worst-case gas {sum_limit} exceeds the block gas limit {}", b.height, b.header.gas_limit).into());
+        }
+        let txs: Vec<&block::Tx> = b.txs.iter().collect();
+        let tr = build::tx_root(&txs);
+        if tr != b.header.tx_hash {
+            return Err(format!("block {}: transactionsRoot {} != header {}", b.height, tr, b.header.tx_hash).into());
+        }
+        let base = parent.and_then(|p| p.sae()).map(|p| p.overlay.clone()).unwrap_or_default();
+        let overlay = sae
+            .proj
+            .lock()
+            .unwrap()
+            .verify_light_over(&b.txs, &base, b.container.len(), sae.capacity, sae.size_cap)
+            .map_err(|r| format!("block {} {}: verify_light: {r:?}", b.height, b.hash))?;
+        Ok(Pending::Sae(Arc::new(crate::sae_mode::SaePending { overlay, hash: b.hash, number: b.height, time: b.header.time })))
+    }
+
+    /// Accept = advance the projection and enqueue the block to the continuous
+    /// executor, then return (no execution on the vote path). Records the
+    /// settled root the header commits for `h-k` (the settle-gate rendezvous),
+    /// advances the accepted head, moves the pool against the projected nonce.
+    fn sae_accept(&self, b: &Arc<Block>, _p: &Pending, sae: &Arc<crate::sae_mode::Sae>) -> Result<(), Error> {
+        sae.proj.lock().unwrap().accept_block(b.height, &b.txs);
+        if b.height > sae.k {
+            sae.accept_expected(b.height, b.header.root);
+        } else if let Some(gr) = sae.settled_root(0) {
+            // h <= k commits the genesis root.
+            if b.header.root != gr {
+                eprintln!("epochdb-rs: SAE block {}: header root {} != genesis root {gr}", b.height, b.header.root);
+                std::process::exit(1);
+            }
+        }
+        // Enqueue to the executor (backpressure bounds the settlement lag: a
+        // full queue blocks Accept, it never lets execution fall unboundedly
+        // behind). No lock held here.
+        let tx = sae.exec_tx.lock().unwrap().clone().ok_or("SAE executor stopped")?;
+        tx.send(b.clone()).map_err(|_| "SAE executor stopped")?;
+        *self.head.lock().unwrap() = b.clone();
+        self.recent.lock().unwrap().insert(b.hash.0, b.clone());
+        self.stats.executed.fetch_add(1, Ordering::Relaxed);
+        self.stats.txs.fetch_add(b.txs.len() as u64, Ordering::Relaxed);
+        // The pool: mined txs out, senders re-read at the projected nonce and
+        // settled balance (the same admission verify_light enforces).
+        let fc = build::fee_config_at(&self.cfg, b.header.time, |slot| self.inner.lock().unwrap().head_storage(exec::precompile::FEE_MANAGER, slot));
+        self.txpool.on_accept(&b.txs, pool::Head { gas_limit: b.header.gas_limit, fee: fc, time: b.header.time }, &mut |addrs| self.sae_accounts(sae, addrs));
+        self.parsed.lock().unwrap().retain(|_, x| x.height >= b.height);
+        Ok(())
+    }
+
+    /// (projected nonce, settled balance) of `addrs`: the settled state through
+    /// the executor's backend plus the projection's unsettled count.
+    fn sae_accounts(&self, sae: &crate::sae_mode::Sae, addrs: &[Address]) -> Vec<(u64, U256)> {
+        let mut g = self.inner.lock().unwrap();
+        let proj = sae.proj.lock().unwrap();
+        match &mut g.ex {
+            Ex::Native(ex) => crate::sae_mode::sae_accounts(&proj, &mut ex.db_mut().backend, addrs),
+            Ex::Firewood(_) => addrs.iter().map(|_| (0, U256::ZERO)).collect(),
+        }
+    }
+
+    /// BuildBlock without execution: the header commits the settled root /
+    /// receiptsRoot / logsBloom of `h-k` (genesis for `h <= k`), gasUsed is the
+    /// worst-case `sum(gasLimit)` of the selected txs, chosen by projected nonce
+    /// and worst-case funds (verify_light) up to the block gas capacity. The
+    /// Pending carries only the projection overlay.
+    fn sae_build(&self, parent: Option<&Arc<Pending>>, parent_hdr: &block::Header, params: &build::Params, candidates: Option<Vec<block::Tx>>, parent_txs: &[&block::Tx], sae: &crate::sae_mode::Sae) -> Result<BuildOut, Error> {
+        let t0 = Instant::now();
+        let h_num = parent_hdr.number + 1;
+        let settled = if h_num <= sae.k {
+            crate::sae_mode::Settled { root: sae.settled_root(0).unwrap_or(self.genesis.header.root), receipts_root: alloy_trie::EMPTY_ROOT_HASH, bloom: alloy_primitives::Bloom::default() }
+        } else {
+            let s = h_num - sae.k;
+            sae.settled(s).ok_or_else(|| format!("SAE build on {}: settlement is behind h-k={s} (settled head {}), retry", parent_hdr.number, sae.settled_head.load(Ordering::Relaxed)))?
+        };
+        // The header template and candidate defaults read the SETTLED state.
+        let (fc, hdr, base_fee, target) = {
+            let mut g = self.inner.lock().unwrap();
+            let Ex::Native(ex) = &mut g.ex else { return Err("SAE needs the native state engine".into()) };
+            ex.db_mut().begin(None);
+            let target = ex.block_size_target;
+            let (cfg, db) = ex.cfg_and_db();
+            let fc = build::fee_config_at(cfg, parent_hdr.time, |slot| db.storage(exec::precompile::FEE_MANAGER, slot).unwrap());
+            let rule = build::coinbase_rule(cfg, parent_hdr.time, || db.storage(exec::precompile::REWARD_MANAGER, exec::rewardmanager::reward_address_slot()).unwrap());
+            let hdr = build::template(cfg, &fc, parent_hdr, params, rule)?;
+            let base_fee: u128 = hdr.base_fee.unwrap_or_default().saturating_to();
+            (fc, hdr, base_fee, target)
+        };
+        let _ = fc;
+        // The block's worst-case gas (sum of gasLimit) must fit the executor's
+        // per-block gas limit: the settle path runs the classic executor, which
+        // enforces header.gas_limit, so a block whose txs overrun it cannot
+        // execute (the ACP-194 20s-capacity model needs the gas-clock executor,
+        // not wired here). Cap selection at gas_limit (and at sae.capacity).
+        let gas_cap = hdr.gas_limit.min(sae.capacity);
+        let mut candidates = match candidates {
+            Some(c) => c,
+            None => self.txpool.candidates(base_fee, gas_cap, target + target / 8, &held_nonces(parent_txs.iter().copied())),
+        };
+        self.recover_senders(&mut candidates);
+        // Select by projected nonce and worst-case funds up to the gas cap.
+        let base = parent.and_then(|p| p.sae()).map(|p| p.overlay.clone()).unwrap_or_default();
+        let (included, reasons, overlay, needs_more) = self.sae_select(sae, &candidates, base, target, gas_cap);
+        let txs: Vec<&block::Tx> = included.iter().map(|&i| &candidates[i]).collect();
+        let gas_used = txs.iter().map(|t| t.gas_limit).fold(0u64, |a, g| a.saturating_add(g));
+        let tr = build::tx_root(&txs);
+        let result = exec::BlockResult { gas_used, receipts_root: settled.receipts_root, bloom: settled.bloom, txs: Vec::new(), tail: Vec::new(), code: Vec::new() };
+        let (hdr, header_rlp, bytes) = build::assemble(hdr, &txs, settled.root, settled.receipts_root, tr, &result, &[])?;
+        let hash = alloy_primitives::keccak256(&header_rlp);
+        let b = Arc::new(Block {
+            height: hdr.number,
+            hash,
+            container_id: hash,
+            header: hdr,
+            header_rlp: Bytes::from(header_rlp),
+            txs: txs.into_iter().cloned().collect(),
+            container: Bytes::from(bytes),
+            pvm: None,
+        });
+        self.parsed.lock().unwrap().insert(hash.0, b.clone());
+        let mut phase_ns = [0u64; 7];
+        phase_ns[2] = t0.elapsed().as_nanos() as u64;
+        Ok(BuildOut { block: b.clone(), pending: Pending::Sae(Arc::new(crate::sae_mode::SaePending { overlay, hash, number: b.height, time: b.header.time })), included, reasons, needs_more, phase_ns })
+    }
+
+    /// Greedy candidate selection for a SAE build: include a candidate when its
+    /// nonce matches the running projected nonce, its worst-case cost fits the
+    /// sender's settled balance, and the block stays under the gas capacity and
+    /// size target. Returns the included indices, a reason per candidate, the
+    /// resulting overlay (for the built block's Pending), and whether the block
+    /// still had capacity for more (BuildBlock's fill loop).
+    fn sae_select(&self, sae: &crate::sae_mode::Sae, candidates: &[block::Tx], base: node::sae::Overlay, size_target: usize, gas_cap: u64) -> (Vec<usize>, Vec<SkipReason>, node::sae::Overlay, bool) {
+        let proj = sae.proj.lock().unwrap();
+        let mut overlay = base;
+        let mut gas = 0u64;
+        let mut size = 0usize;
+        let mut included = Vec::new();
+        let mut reasons = vec![SkipReason::NotReached; candidates.len()];
+        let mut popped: HashMap<Address, ()> = HashMap::new();
+        for (i, t) in candidates.iter().enumerate() {
+            let Some(s) = t.sender else {
+                reasons[i] = SkipReason::Invalid;
+                continue;
+            };
+            if popped.contains_key(&s) {
+                reasons[i] = SkipReason::SenderPopped;
+                continue;
+            }
+            if gas.saturating_add(t.gas_limit) > gas_cap {
+                reasons[i] = SkipReason::NoGas;
+                popped.insert(s, ());
+                continue;
+            }
+            if size + t.raw.len() > size_target {
+                reasons[i] = SkipReason::Size;
+                popped.insert(s, ());
+                continue;
+            }
+            match proj.verify_light_over(std::slice::from_ref(t), &overlay, 0, u64::MAX, usize::MAX) {
+                Ok(next) => {
+                    overlay = next;
+                    gas += t.gas_limit;
+                    size += t.raw.len();
+                    included.push(i);
+                    reasons[i] = SkipReason::Included;
+                }
+                Err(_) => {
+                    reasons[i] = SkipReason::Invalid;
+                    popped.insert(s, ());
+                }
+            }
+        }
+        // Capacity for more if every candidate was considered and gas capacity
+        // is not tight (the fill loop asks the pool again).
+        let needs_more = reasons.iter().all(|r| *r != SkipReason::NotReached) && gas + exec::exec::TX_GAS <= gas_cap;
+        (included, reasons, overlay, needs_more)
+    }
 }
 
 pub fn id_hex(id: &Id) -> String {
@@ -1372,7 +1704,7 @@ fn block_size_target_from(conf: &serde_json::Value) -> usize {
     (kib.min(BLOCK_SIZE_TARGET_MAX_KIB) as usize) << 10
 }
 
-fn conf_u64(conf: &serde_json::Value, key: &str) -> Option<u64> {
+pub(crate) fn conf_u64(conf: &serde_json::Value, key: &str) -> Option<u64> {
     match conf.get(key)? {
         serde_json::Value::Number(n) => n.as_u64(),
         serde_json::Value::String(s) => s.trim().parse().ok(),
