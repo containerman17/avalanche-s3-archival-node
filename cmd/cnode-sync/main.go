@@ -258,8 +258,10 @@ func (p *peers) release(id ids.NodeID) {
 // syncclient.Network over the peers.
 
 type netClient struct {
-	p       *peers
-	perPeer int
+	p        *peers
+	perPeer  int
+	timeouts atomic.Uint64
+	failures atomic.Uint64
 }
 
 var errNoPeer = errors.New("no peer available")
@@ -315,6 +317,7 @@ func (n *netClient) request(ctx context.Context, id ids.NodeID, request []byte) 
 		p.mu.Lock()
 		delete(p.routes, reqID)
 		p.mu.Unlock()
+		n.timeouts.Add(1)
 		return nil, fmt.Errorf("timeout from %s", id)
 	case <-ctx.Done():
 		p.mu.Lock()
@@ -331,6 +334,7 @@ func (n *netClient) RegisterResponse(nodeID ids.NodeID, _ float64) {
 }
 
 func (n *netClient) RegisterFailure(nodeID ids.NodeID) {
+	n.failures.Add(1)
 	n.p.mu.Lock()
 	n.p.failures[nodeID]++
 	n.p.mu.Unlock()
@@ -680,7 +684,8 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 	if st.storage, err = newShardWriter(out, "storage.bin"); err != nil {
 		return err
 	}
-	client := syncclient.New(&syncclient.Config{Network: &netClient{p: p, perPeer: perPeer}, Codec: evmmessage.CorethCodec, Stats: stats.NewNoOpStats()})
+	nc := &netClient{p: p, perPeer: perPeer}
+	client := syncclient.New(&syncclient.Config{Network: nc, Codec: evmmessage.CorethCodec, Stats: stats.NewNoOpStats()})
 	syncer := leaf.NewCallbackSyncer(client, st.tasks, &leaf.SyncerConfig{RequestSize: reqSize, NumWorkers: workers, LeafsRequestType: evmmessage.CorethLeafsRequestType})
 	syncCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -723,8 +728,11 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 		case <-tick.C:
 			n, w := p.connectedWeight()
 			el := time.Since(t0).Seconds()
-			log.Printf("sync: %d accounts, %d slots (%d storage tries named), %d responses, %.0f leafs/s, peers %d (%.1f%% stake), %.0fs",
-				st.nAcc.Load(), st.nSlot.Load(), st.nStor.Load(), st.nReq.Load(), float64(st.nAcc.Load()+st.nSlot.Load())/el, n, 100*float64(w)/float64(p.total), el)
+			st.qmu.Lock()
+			queued := len(st.queue)
+			st.qmu.Unlock()
+			log.Printf("sync: %d accounts, %d slots (%d storage tries named, %d queued), %d responses, %d timeouts, %d failures, %.0f leafs/s, peers %d (%.1f%% stake), %.0fs",
+				st.nAcc.Load(), st.nSlot.Load(), st.nStor.Load(), queued, st.nReq.Load(), nc.timeouts.Load(), nc.failures.Load(), float64(st.nAcc.Load()+st.nSlot.Load())/el, n, 100*float64(w)/float64(p.total), el)
 		}
 	}
 finished:
