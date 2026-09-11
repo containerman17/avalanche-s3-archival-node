@@ -200,7 +200,7 @@ fn compute(reader: &dyn NodeReader, root: Hash, pending: HashMap<Hash, Pending>,
             Some(row) => account_leaf(row, &j.root)?,
             None => {
                 let cur = j.cur.as_ref().unwrap();
-                leaf_value(&cur.nonce, &cur.balance, &j.root, &cur.code)
+                leaf_value(&cur.nonce, &cur.balance, &j.root, &cur.code, cur.extra.as_deref())
             }
         };
         ops.push((j.hash.to_vec(), val));

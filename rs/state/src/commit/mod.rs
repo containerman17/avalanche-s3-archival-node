@@ -102,16 +102,22 @@ pub fn account_leaf(row: &[u8], root: &Hash) -> Result<Vec<u8>> {
     let Some((content, _)) = rlp::split_list(row) else { return err("commit: account row is not a list") };
     let (Some((nonce, r)), ) = (rlp::split_string(content),) else { return err("commit: account row nonce") };
     let Some((bal, r)) = rlp::split_string(r) else { return err("commit: account row balance") };
-    let Some((code, _)) = rlp::split_string(r) else { return err("commit: account row code hash") };
-    Ok(leaf_value(nonce, bal, root, code))
+    let Some((code, r)) = rlp::split_string(r) else { return err("commit: account row code hash") };
+    // coreth (mainnet C) rows carry a 4th element, the IsMultiCoin bool, that
+    // libevm appends to every account leaf as a 5th field; subnet-evm rows have none.
+    let extra = if r.is_empty() { None } else { rlp::split_string(r).map(|(e, _)| e) };
+    Ok(leaf_value(nonce, bal, root, code, extra))
 }
 
-pub fn leaf_value(nonce: &[u8], bal: &[u8], root: &Hash, code: &[u8]) -> Vec<u8> {
+pub fn leaf_value(nonce: &[u8], bal: &[u8], root: &Hash, code: &[u8], extra: Option<&[u8]>) -> Vec<u8> {
     let mut body = Vec::with_capacity(80);
     rlp::put_bytes(&mut body, nonce);
     rlp::put_bytes(&mut body, bal);
     rlp::put_bytes(&mut body, root);
     rlp::put_bytes(&mut body, code);
+    if let Some(e) = extra {
+        rlp::put_bytes(&mut body, e);
+    }
     let mut out = Vec::with_capacity(body.len() + 2);
     rlp::put_header(&mut out, true, body.len());
     out.extend_from_slice(&body);
@@ -124,6 +130,8 @@ pub struct LeafFields {
     pub balance: Vec<u8>,
     pub root: Hash,
     pub code: Vec<u8>,
+    /// The 5th leaf field when present (coreth's IsMultiCoin bool).
+    pub extra: Option<Vec<u8>>,
 }
 
 pub fn parse_leaf(val: &[u8]) -> Result<LeafFields> {
@@ -131,11 +139,12 @@ pub fn parse_leaf(val: &[u8]) -> Result<LeafFields> {
     let Some((nonce, r)) = rlp::split_string(content) else { return err("commit: leaf nonce") };
     let Some((bal, r)) = rlp::split_string(r) else { return err("commit: leaf balance") };
     let Some((root, r)) = rlp::split_string(r) else { return err("commit: leaf root") };
-    let Some((code, _)) = rlp::split_string(r) else { return err("commit: leaf code hash") };
+    let Some((code, r)) = rlp::split_string(r) else { return err("commit: leaf code hash") };
     if root.len() != 32 {
         return err("commit: leaf root is not 32 bytes");
     }
-    Ok(LeafFields { nonce: nonce.to_vec(), balance: bal.to_vec(), root: root.try_into().unwrap(), code: code.to_vec() })
+    let extra = if r.is_empty() { None } else { rlp::split_string(r).map(|(e, _)| e.to_vec()) };
+    Ok(LeafFields { nonce: nonce.to_vec(), balance: bal.to_vec(), root: root.try_into().unwrap(), code: code.to_vec(), extra })
 }
 
 /// Reads a Go binary.Uvarint: (value, bytes consumed).

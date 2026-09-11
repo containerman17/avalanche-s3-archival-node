@@ -5,6 +5,7 @@ edition = "2021"
 description = "In-process mainnet C-chain state follower for a trading bot: flat state in memory, revm simulation, root checker, block and mempool history"
 
 [dependencies]
+alloy-rlp = "0.3"
 alloy-primitives = { version = "1", features = ["std", "map", "serde", "rlp", "asm-keccak"] }
 revm = { version = "43", features = ["std", "serde"] }
 papaya = "0.2"

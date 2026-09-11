@@ -47,6 +47,8 @@ pub struct Account {
     pub nonce: u64,
     pub balance: U256,
     pub code_hash: B256,
+    /// coreth's IsMultiCoin extra: part of the trie leaf, sticky per account.
+    pub multicoin: bool,
 }
 
 pub type SlotMap = HashMap<H, U256, Take8>;
@@ -179,6 +181,42 @@ impl HotState {
     }
 }
 
+/// The contract rows of a diff in rs/state's key form (the checker's and the
+/// history log's shape): account = keccak(addr)+0x00 -> RLP[nonce, balance,
+/// codeHash, multicoin], slot = keccak(addr)+0x01+keccak(slot) -> trimmed word,
+/// empty value = delete. Account rows first (a delete must precede its slots' recreate).
+pub fn rows(d: &Diff) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use alloy_rlp::Encodable;
+    let mut out = Vec::with_capacity(d.accounts.len() + d.storage.len());
+    for (h, a) in &d.accounts {
+        let mut k = Vec::with_capacity(33);
+        k.extend_from_slice(h);
+        k.push(0);
+        let v = match a {
+            None => Vec::new(),
+            Some(a) => {
+                let mut v = Vec::with_capacity(80);
+                let len = a.nonce.length() + a.balance.length() + a.code_hash.length() + a.multicoin.length();
+                alloy_rlp::Header { list: true, payload_length: len }.encode(&mut v);
+                a.nonce.encode(&mut v);
+                a.balance.encode(&mut v);
+                a.code_hash.encode(&mut v);
+                a.multicoin.encode(&mut v);
+                v
+            }
+        };
+        out.push((k, v));
+    }
+    for (a, s, v) in &d.storage {
+        let mut k = Vec::with_capacity(65);
+        k.extend_from_slice(a);
+        k.push(1);
+        k.extend_from_slice(s);
+        out.push((k, if v.is_zero() { Vec::new() } else { v.to_be_bytes_trimmed_vec() }));
+    }
+    out
+}
+
 pub fn addr_hash(a: &Address) -> H {
     keccak256(a.as_slice()).0
 }
@@ -195,7 +233,7 @@ mod tests {
         let hs = HotState::new(10, B256::ZERO);
         let a = addr_hash(&Address::repeat_byte(1));
         let k = slot_hash(&U256::from(7));
-        hs.put_account(a, Account { nonce: 1, balance: U256::from(5), code_hash: B256::ZERO });
+        hs.put_account(a, Account { nonce: 1, balance: U256::from(5), code_hash: B256::ZERO, multicoin: false });
         hs.put_slot(a, k, U256::from(9));
         let g = hs.generation();
         assert_eq!(g.seq, 0);
@@ -204,10 +242,17 @@ mod tests {
         assert_eq!(hs.storage(g, &a, &[0u8; 32]).unwrap(), U256::ZERO);
 
         let d = Diff {
-            accounts: vec![(a, Some(Account { nonce: 2, balance: U256::from(6), code_hash: B256::ZERO }))],
+            accounts: vec![(a, Some(Account { nonce: 2, balance: U256::from(6), code_hash: B256::ZERO, multicoin: true }))],
             storage: vec![(a, k, U256::ZERO), (a, [3u8; 32], U256::from(4))],
             code: vec![],
         };
+        let r = rows(&d);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].0.len(), 33);
+        assert_eq!(r[0].1, alloy_primitives::hex!("e40206a00000000000000000000000000000000000000000000000000000000000000000" "01").to_vec());
+        assert_eq!(r[1].0.len(), 65);
+        assert!(r[1].1.is_empty());
+        assert_eq!(r[2].1, vec![4]);
         hs.apply(11, B256::repeat_byte(0xaa), &d);
         assert_eq!(hs.account(g, &a), Err(Stale));
         let g2 = hs.generation();

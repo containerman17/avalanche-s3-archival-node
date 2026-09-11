@@ -1,5 +1,5 @@
 //! Loads the bootstrap export (cmd/cnode-export) into a `HotState`.
-//! Files: meta.json, accounts.bin (104 B records), storage.bin (96 B records),
+//! Files: meta.json, accounts.bin (105 B records), storage.bin (96 B records),
 //! code.bin ([32 B hash][u32 le len][bytes]).
 
 use crate::hot::{Account, HotState};
@@ -43,13 +43,14 @@ fn records(path: &Path, size: usize, mut f: impl FnMut(&[u8])) -> Result<u64> {
 
 /// Fills `hs` from the export in `dir`; returns (accounts, slots, codes) loaded.
 pub fn load(dir: &Path, hs: &HotState) -> Result<(u64, u64, u64)> {
-    let accounts = records(&dir.join("accounts.bin"), 104, |b| {
+    let accounts = records(&dir.join("accounts.bin"), 105, |b| {
         hs.put_account(
             b[..32].try_into().unwrap(),
             Account {
                 nonce: u64::from_le_bytes(b[32..40].try_into().unwrap()),
                 balance: U256::from_be_slice(&b[40..72]),
                 code_hash: B256::from_slice(&b[72..104]),
+                multicoin: b[104] != 0,
             },
         );
     })?;
