@@ -69,7 +69,14 @@ func main() {
 	perPeer := flag.Int("per-peer", 3, "outstanding requests per peer")
 	reqSize := flag.Int("request-size", 1024, "leafs per request")
 	connect := flag.Duration("connect", 90*time.Second, "how long to gather peers before asking for summaries")
+	codesOnly := flag.String("codes", "", "fetch only these code hashes (hex, one per line) one at a time and append them to code.bin")
 	flag.Parse()
+	if *codesOnly != "" {
+		if err := fetchCodes(*out, *node, *codesOnly, *connect); err != nil {
+			log.Fatalf("cnode-sync: %v", err)
+		}
+		return
+	}
 	if *out == "" {
 		log.Fatal("-out is required")
 	}
@@ -504,9 +511,13 @@ func (t *accountTask) OnLeafs(_ context.Context, keys, vals [][]byte) error {
 		} else {
 			copy(rec[72:104], a.CodeHash)
 			h := common.BytesToHash(a.CodeHash)
-			t.s.codeMu.Lock()
-			t.s.codes[h] = struct{}{}
-			t.s.codeMu.Unlock()
+			// An explicit empty-code hash exists on a few accounts; no peer
+			// serves code for it and a batch holding it never succeeds.
+			if h != types.EmptyCodeHash {
+				t.s.codeMu.Lock()
+				t.s.codes[h] = struct{}{}
+				t.s.codeMu.Unlock()
+			}
 		}
 		if len(a.Rest) > 0 {
 			var multi bool
@@ -669,10 +680,29 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 	}
 	ctx := context.Background()
 
+	p, dispatchErr, err := connectPeers(nodeURI, connect)
+	if err != nil {
+		return err
+	}
+
+	// 3. The summary: frontier from everyone, then acceptance of the best height.
+	summary, err := chooseSummary(p)
+	if err != nil {
+		return err
+	}
+	log.Printf("SUMMARY: height %d hash %s root %s (agreed by the stake below)", summary.BlockNumber, summary.BlockHash, summary.BlockRoot)
+	return syncLeafs(ctx, out, p, dispatchErr, summary, workers, perPeer, reqSize)
+}
+
+// connectPeers: validators and weights from the P-chain RPC, the network with
+// a throwaway identity, the validator set loaded so gossip brings every
+// validator's IP, `connect` of dialing.
+func connectPeers(nodeURI string, connect time.Duration) (*peers, <-chan error, error) {
+	ctx := context.Background()
 	// 1. Validators and their weights: the only thing we take from the P-chain.
 	vdrs, err := platformvm.NewClient(nodeURI).GetCurrentValidators(ctx, avaconstants.PrimaryNetworkID, nil)
 	if err != nil {
-		return fmt.Errorf("platform.getCurrentValidators: %w", err)
+		return nil, nil, fmt.Errorf("platform.getCurrentValidators: %w", err)
 	}
 	p := &peers{
 		weights:     map[ids.NodeID]uint64{},
@@ -693,7 +723,7 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 
 	peerInfos, err := info.NewClient(nodeURI).Peers(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("info.peers: %w", err)
+		return nil, nil, fmt.Errorf("info.peers: %w", err)
 	}
 	log.Printf("info.peers: %d entry points", len(peerInfos))
 
@@ -702,21 +732,21 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 	mgr := validators.NewManager()
 	netCfg, err := network.NewTestNetworkConfig(prometheus.NewRegistry(), avaconstants.MainnetID, mgr, set.Set[ids.ID]{})
 	if err != nil {
-		return fmt.Errorf("network config: %w", err)
+		return nil, nil, fmt.Errorf("network config: %w", err)
 	}
 	cert, err := staking.ParseCertificate(netCfg.TLSConfig.Certificates[0].Leaf.Raw)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	netCfg.MyNodeID = ids.NodeIDFromCert(cert)
 	net, err := network.NewTestNetwork(logging.NoLog{}, prometheus.NewRegistry(), netCfg, p)
 	if err != nil {
-		return fmt.Errorf("NewTestNetwork: %w", err)
+		return nil, nil, fmt.Errorf("NewTestNetwork: %w", err)
 	}
 	p.net = net
 	creator, err := message.NewCreator(prometheus.NewRegistry(), avaconstants.DefaultNetworkCompressionType, avaconstants.DefaultNetworkMaximumInboundTimeout)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	p.creator = creator
 	dispatchErr := make(chan error, 1)
@@ -737,22 +767,20 @@ func run(out, nodeURI string, workers, perPeer int, reqSize uint16, connect time
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-dispatchErr:
-			return fmt.Errorf("network: %w", err)
+			return nil, nil, fmt.Errorf("network: %w", err)
 		case <-time.After(5 * time.Second):
 		}
 		n, w := p.connectedWeight()
 		log.Printf("peers: %d validators connected, %.1f%% of stake", n, 100*float64(w)/float64(p.total))
 	}
 	if n, _ := p.connectedWeight(); n == 0 {
-		return errors.New("no validator connected")
+		return nil, nil, errors.New("no validator connected")
 	}
+	return p, dispatchErr, nil
+}
 
-	// 3. The summary: frontier from everyone, then acceptance of the best height.
-	summary, err := chooseSummary(p)
-	if err != nil {
-		return err
-	}
-	log.Printf("SUMMARY: height %d hash %s root %s (agreed by the stake below)", summary.BlockNumber, summary.BlockHash, summary.BlockRoot)
+func syncLeafs(ctx context.Context, out string, p *peers, dispatchErr <-chan error, summary *evmmessage.BlockSyncSummary, workers, perPeer int, reqSize uint16) error {
+	var err error
 
 	// 4. Leafs.
 	st := &syncState{tasks: make(chan leaf.SyncTask, 1024), qsignal: make(chan struct{}, 1), codes: map[common.Hash]struct{}{}, reqSize: int(reqSize)}
@@ -849,8 +877,11 @@ finished:
 		go func(batch []common.Hash) {
 			defer cg.Done()
 			defer func() { <-sem }()
-			codes, err := client.GetCode(ctx, batch)
+			bctx, bcancel := context.WithTimeout(ctx, 2*time.Minute)
+			codes, err := client.GetCode(bctx, batch)
+			bcancel()
 			if err != nil {
+				log.Printf("code batch %v: %v (fetch them with -codes)", batch, err)
 				codeErr.Store(err)
 				return
 			}
@@ -892,7 +923,7 @@ finished:
 		return err
 	}
 	log.Printf("DONE: %s", mb)
-	net.StartClose()
+	p.net.StartClose()
 	return nil
 }
 
@@ -904,6 +935,50 @@ type shardTask struct {
 func (t *shardTask) OnFinish(ctx context.Context) error {
 	t.wg.Done()
 	return t.accountTask.OnFinish(ctx)
+}
+
+// fetchCodes: the repair path for a poisoned code batch, one hash per request.
+func fetchCodes(out, nodeURI, listPath string, connect time.Duration) error {
+	raw, err := os.ReadFile(listPath)
+	if err != nil {
+		return err
+	}
+	var hashes []common.Hash
+	for _, line := range bytes.Fields(raw) {
+		hashes = append(hashes, common.HexToHash(string(line)))
+	}
+	evmlog.SetDefault(evmlog.NewLogger(evmlog.NewTerminalHandlerWithLevel(os.Stderr, evmlog.LevelDebug, false)))
+	p, dispatchErr, err := connectPeers(nodeURI, connect)
+	if err != nil {
+		return err
+	}
+	_ = dispatchErr
+	client := syncclient.New(&syncclient.Config{Network: &netClient{p: p, perPeer: 2}, Codec: evmmessage.CorethCodec, Stats: stats.NewNoOpStats()})
+	cf, err := os.OpenFile(filepath.Join(out, "code.bin"), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer cf.Close()
+	for _, h := range hashes {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		codes, err := client.GetCode(ctx, []common.Hash{h})
+		cancel()
+		if err != nil {
+			log.Printf("code %s: FAILED: %v", h, err)
+			continue
+		}
+		if crypto.Keccak256Hash(codes[0]) != h {
+			log.Printf("code %s: hash mismatch", h)
+			continue
+		}
+		var head [36]byte
+		copy(head[:32], h[:])
+		binary.LittleEndian.PutUint32(head[32:], uint32(len(codes[0])))
+		cf.Write(head[:])
+		cf.Write(codes[0])
+		log.Printf("code %s: %d bytes", h, len(codes[0]))
+	}
+	return cf.Sync()
 }
 
 // chooseSummary: the frontier from every connected validator, grouped by
