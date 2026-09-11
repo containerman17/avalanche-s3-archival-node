@@ -132,6 +132,26 @@ impl HotState {
         self.code.pin().get(hash).cloned()
     }
 
+    /// Whole-map visits for the dump child: no generation check, the caller
+    /// holds a copy-on-write snapshot.
+    pub fn for_each_account(&self, mut f: impl FnMut(&H, &Account)) {
+        for (k, v) in self.accounts.pin().iter() {
+            f(k, v);
+        }
+    }
+    pub fn for_each_slot(&self, mut f: impl FnMut(&H, &H, &U256)) {
+        for (a, m) in self.storage.pin().iter() {
+            for (k, v) in m.pin().iter() {
+                f(a, k, v);
+            }
+        }
+    }
+    pub fn for_each_code(&self, mut f: impl FnMut(&B256, &[u8])) {
+        for (k, v) in self.code.pin().iter() {
+            f(k, v);
+        }
+    }
+
     pub fn len(&self) -> (usize, usize, usize) {
         (self.accounts.len(), self.storage.pin().iter().map(|(_, m)| m.len()).sum(), self.code.len())
     }

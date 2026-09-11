@@ -9,7 +9,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Meta {
     pub height: u64,
     pub hash: B256,
@@ -18,6 +18,57 @@ pub struct Meta {
     pub accounts: u64,
     pub slots: u64,
     pub codes: u64,
+    /// accounts.bin and storage.bin in key order (cmd/cnode-sync writes them
+    /// so; a fork dump does not). `ExportIter` needs sorted files.
+    #[serde(default = "yes")]
+    pub sorted: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Writes `src` (an unsorted dump) as a sorted export into `dst`: records
+/// sharded by their first key byte into 256 files, each sorted in memory and
+/// appended in order; code.bin hard linked, meta.json with `sorted: true`.
+pub fn sort_export(src: &Path, dst: &Path) -> Result<Meta> {
+    let mut meta = read_meta(src)?;
+    let _ = std::fs::remove_dir_all(dst);
+    std::fs::create_dir_all(dst)?;
+    for (name, size) in [("accounts.bin", 105usize), ("storage.bin", 96)] {
+        let shard_dir = dst.join(format!("{name}.shards"));
+        std::fs::create_dir_all(&shard_dir)?;
+        let mut shards: Vec<std::io::BufWriter<std::fs::File>> = (0..256)
+            .map(|i| Ok(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(shard_dir.join(format!("{i:02x}")))?)))
+            .collect::<Result<_>>()?;
+        records(&src.join(name), size, |b| {
+            use std::io::Write;
+            shards[b[0] as usize].write_all(b).expect("shard write");
+        })?;
+        for mut s in shards {
+            use std::io::Write;
+            s.flush()?;
+        }
+        let mut out = std::io::BufWriter::with_capacity(4 << 20, std::fs::File::create(dst.join(name))?);
+        for i in 0..256 {
+            let b = std::fs::read(shard_dir.join(format!("{i:02x}")))?;
+            let mut idx: Vec<usize> = (0..b.len() / size).collect();
+            idx.sort_unstable_by(|x, y| b[x * size..x * size + 64.min(size - 32)].cmp(&b[y * size..y * size + 64.min(size - 32)]));
+            use std::io::Write;
+            for j in idx {
+                out.write_all(&b[j * size..(j + 1) * size])?;
+            }
+        }
+        use std::io::Write;
+        out.flush()?;
+        std::fs::remove_dir_all(&shard_dir)?;
+    }
+    if std::fs::hard_link(src.join("code.bin"), dst.join("code.bin")).is_err() {
+        std::fs::copy(src.join("code.bin"), dst.join("code.bin"))?;
+    }
+    meta.sorted = true;
+    std::fs::write(dst.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+    Ok(meta)
 }
 
 pub fn read_meta(dir: &Path) -> Result<Meta> {

@@ -4,6 +4,7 @@
 
 pub mod checker;
 pub mod difflog;
+pub mod dump;
 pub mod exec;
 pub mod feed;
 pub mod history;
@@ -49,6 +50,9 @@ pub struct Config {
     pub bootstrap_dir: PathBuf,
     pub checker_lag_blocks: u64,
     pub snapshot_every_blocks: u64,
+    /// Fork-dump the hot maps to `<data>/dumps/<height>` every this many
+    /// blocks (0: never). The restart snapshot; the checker re-seeds from it.
+    pub dump_every_blocks: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

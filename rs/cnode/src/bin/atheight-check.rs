@@ -28,6 +28,7 @@ fn main() {
         bootstrap_dir: PathBuf::from(arg(&a, "--bootstrap").expect("--bootstrap")),
         checker_lag_blocks: 60,
         snapshot_every_blocks: 4000,
+        dump_every_blocks: 0,
     };
     let t = std::time::Instant::now();
     let node = Node::open(cfg, Mode::AtHeight(h)).expect("open");

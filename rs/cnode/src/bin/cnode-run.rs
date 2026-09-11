@@ -1,4 +1,4 @@
-//! cnode-run --data <dir> --bootstrap <export dir> [--http URL] [--ws URL] [--validators ws1,ws2] [--at HEIGHT] [--roll-every N]
+//! cnode-run --data <dir> --bootstrap <export dir> [--http URL] [--ws URL] [--validators ws1,ws2] [--at HEIGHT] [--roll-every N] [--dump-every N]
 //! Runs the node as a process (the library's host is normally the bot) and
 //! prints one status line per block and every 10 s.
 use cnode::{Config, Mode, Node, Status};
@@ -18,6 +18,7 @@ fn main() {
         bootstrap_dir: PathBuf::from(arg(&a, "--bootstrap").expect("--bootstrap")),
         checker_lag_blocks: 60,
         snapshot_every_blocks: arg(&a, "--roll-every").map_or(4000, |s| s.parse().unwrap()),
+        dump_every_blocks: arg(&a, "--dump-every").map_or(2000, |s| s.parse().unwrap()),
     };
     let mode = match arg(&a, "--at") {
         Some(h) => Mode::AtHeight(h.parse().unwrap()),

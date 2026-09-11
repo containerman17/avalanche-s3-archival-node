@@ -4,8 +4,8 @@
 //! `<data>/HALTED` on a mismatch; the applier polls for that file every
 //! block. Every public call is safe from any thread.
 
-use crate::checker::{self, Checker, Mismatch};
-use crate::difflog;
+use crate::checker::{self, Mismatch};
+use crate::{difflog, dump};
 use crate::exec::{Applier, HotBase};
 use crate::feed::{self, now_ms, RawBlock};
 use crate::history::{History, StoredBlock};
@@ -56,37 +56,31 @@ impl Node {
         if cfg.data_dir.join("HALTED").exists() {
             bail!("{}: HALTED file present; the last run stopped on a root mismatch, decide by hand", cfg.data_dir.display());
         }
-        let vmstate = cfg.data_dir.join("vmstate");
         let history = Arc::new(History::open(&cfg.data_dir.join("history.redb"))?);
         let hot = Arc::new(HotState::new(0, B256::ZERO));
 
-        // 1. The state: a restart from the checker's newest roll, or the bootstrap export.
+        // 1. The state: the newest dump the checker has blessed (at or below
+        // its CHECKED height; any dump when it never ran), else the
+        // bootstrap export. A frozen view (AtHeight) caps the dump height too.
         let t = std::time::Instant::now();
-        let snap_height = match checker::read_manifest(&vmstate)? {
-            Some(m) if matches!(mode, Mode::AtHeight(h) if h < m.height) => {
-                // A frozen view below the newest roll: the newest older run.
-                let Mode::AtHeight(h) = mode else { unreachable!() };
-                let (rh, g) = Checker::runs(&vmstate)?.into_iter().filter(|(rh, _)| *rh <= h).last().ok_or_else(|| anyhow!("AtHeight({h}): no rolled run at or below it (the import was at a later height?)"))?;
-                let run = state::run::Run::open(&vmstate.join(format!("run.{g}")))?;
-                let (a, s) = import::load_run(&run, &hot)?;
-                let codes = import::load_code(&cfg.bootstrap_dir, &hot)?;
-                eprintln!("node: frozen view: run gen {g} at height {rh}: {a} accounts, {s} slots, {codes} codes in {:.1?}", t.elapsed());
-                rh
-            }
-            Some(m) => {
-                let run = state::run::Run::open(&vmstate.join(format!("run.{}", m.gen))).context("run")?;
-                let (a, s) = import::load_run(&run, &hot)?;
-                let codes = import::load_code(&cfg.bootstrap_dir, &hot).context("code.bin from the bootstrap export")?;
-                eprintln!("node: restart from roll gen {} at height {} root {}: {a} accounts, {s} slots, {codes} codes in {:.1?}", m.gen, m.height, m.root, t.elapsed());
-                m.height
-            }
-            None => {
-                let meta = import::read_meta(&cfg.bootstrap_dir).with_context(|| format!("no vmstate in {} and no bootstrap export in {}: run cmd/cnode-sync first", cfg.data_dir.display(), cfg.bootstrap_dir.display()))?;
-                let (a, s, c) = import::load(&cfg.bootstrap_dir, &hot)?;
-                eprintln!("node: import at height {} root {}: {a} accounts, {s} slots, {c} codes into the hot state in {:.1?} (root check: cnode-check)", meta.height, meta.state_root, t.elapsed());
-                meta.height
-            }
+        let cap = match (mode, checker::read_checked(&cfg.data_dir).map(|c| c.height)) {
+            (Mode::AtHeight(h), Some(c)) => Some(h.min(c)),
+            (Mode::AtHeight(h), None) => Some(h),
+            (Mode::Tip, c) => c,
         };
+        let src = match dump::newest(&cfg.data_dir.join("dumps"), cap)? {
+            Some((_, p)) => p,
+            None => cfg.bootstrap_dir.clone(),
+        };
+        let meta = import::read_meta(&src).with_context(|| format!("no dump in {} and no bootstrap export in {}: run cmd/cnode-sync first", cfg.data_dir.join("dumps").display(), src.display()))?;
+        if let Mode::AtHeight(h) = mode {
+            if meta.height > h {
+                bail!("AtHeight({h}): the oldest state on disk is at {}", meta.height);
+            }
+        }
+        let (a, s, c) = import::load(&src, &hot)?;
+        eprintln!("node: loaded {} at height {} root {}: {a} accounts, {s} slots, {c} codes into the hot state in {:.1?}", src.display(), meta.height, meta.state_root, t.elapsed());
+        let snap_height = meta.height;
 
         // 2. Replay the history past the snapshot (already checked blocks).
         let mut height = snap_height;
@@ -157,8 +151,10 @@ impl Node {
             let ring = block_hash_ring(&http, height, &history)?;
             let cache = s.cache.clone();
             let log = difflog::Writer::open(&cfg.data_dir.join("difflog"))?;
+            let dumper = dump::Dumper::new(&cfg.data_dir.join("dumps"))?;
+            let dump_every = cfg.dump_every_blocks;
             std::thread::Builder::new().name("cnode-applier".into()).spawn(move || {
-                if let Err(e) = applier_loop(s.clone(), history, hot, cache, ring, raw_rx, log, height, hash) {
+                if let Err(e) = applier_loop(s.clone(), history, hot, cache, ring, raw_rx, log, dumper, dump_every, height, hash) {
                     eprintln!("node: applier stopped: {e:#}");
                     s.halted.store(true, Ordering::Release);
                 }
@@ -299,6 +295,8 @@ fn applier_loop(
     ring: HashMap<u64, B256>,
     rx: Receiver<RawBlock>,
     mut log: difflog::Writer,
+    mut dumper: dump::Dumper,
+    dump_every: u64,
     mut height: u64,
     mut hash: B256,
 ) -> Result<()> {
@@ -354,6 +352,19 @@ fn applier_loop(
         let captured = s.mempool.flush();
         if !captured.is_empty() {
             history.put_mempool(b.height, &captured)?;
+        }
+        if dump_every > 0 && b.height % dump_every == 0 {
+            let meta = import::Meta { height: b.height, hash: b.hash, state_root: b.header.root, head_height: b.height, accounts: 0, slots: 0, codes: 0, sorted: false };
+            match dumper.start(&hot, meta) {
+                Ok(true) => {
+                    eprintln!("node: dump of height {} started (forked child)", b.height);
+                    if let Err(e) = dump::prune(&s.data_dir.join("dumps"), 2) {
+                        eprintln!("node: dump prune: {e:#}");
+                    }
+                }
+                Ok(false) => eprintln!("node: dump of height {} skipped, the previous one is still writing", b.height),
+                Err(e) => eprintln!("node: dump of height {}: {e:#}", b.height),
+            }
         }
         let ev = BlockEvent { height: b.height, hash: b.hash, received_ms: raw.received_ms, applied_ms, exec_ms, txs: b.txs.len() };
         s.subscribers.lock().unwrap().retain(|t| t.send(ev.clone()).is_ok());
