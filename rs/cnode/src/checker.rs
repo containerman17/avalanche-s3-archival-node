@@ -117,6 +117,20 @@ impl Checker {
         Self::open_at(dir, Manifest { gen: 0, height, root: expected })
     }
 
+    /// The rolled runs on disk as (height, gen), oldest first.
+    pub fn runs(dir: &Path) -> Result<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir)? {
+            let name = e?.file_name().to_string_lossy().to_string();
+            if let Some(g) = name.strip_prefix("run.").and_then(|g| g.parse::<u64>().ok()) {
+                let run = Run::open(&run_path(dir, g))?;
+                out.push((u64::from_le_bytes(run.user_data()[..8].try_into().unwrap()), g));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Opens the rolled pair the manifest names.
     pub fn open(dir: &Path) -> Result<(Checker, Manifest)> {
         let m = read_manifest(dir)?.ok_or_else(|| anyhow!("checker: no MANIFEST in {}", dir.display()))?;
@@ -216,8 +230,9 @@ impl Checker {
             }
         }
         write_manifest(&self.dir, &Manifest { gen: self.gen, height: rolled_h, root: rolled_root })?;
+        // Old runs stay: each is the flat state at its height (Mode::AtHeight
+        // picks the newest one at or below the height); old tries go.
         for g in 0..self.gen {
-            let _ = std::fs::remove_file(run_path(&self.dir, g));
             let _ = std::fs::remove_file(trie_path(&self.dir, g));
         }
         Ok(())

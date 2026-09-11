@@ -63,6 +63,17 @@ impl Node {
         // 1. The state: a restart from the newest roll, or the bootstrap export.
         let t = std::time::Instant::now();
         let (mut checker, snap_height, _snap_root) = match crate::checker::read_manifest(&vmstate)? {
+            Some(m) if matches!(mode, Mode::AtHeight(h) if h < m.height) => {
+                // A frozen view below the newest roll: the newest older run, no checker needed.
+                let Mode::AtHeight(h) = mode else { unreachable!() };
+                let (rh, g) = Checker::runs(&vmstate)?.into_iter().filter(|(rh, _)| *rh <= h).last().ok_or_else(|| anyhow!("AtHeight({h}): no rolled run at or below it (the import was at a later height?)"))?;
+                let run = state::run::Run::open(&vmstate.join(format!("run.{g}")))?;
+                let (a, s) = import::load_run(&run, &hot)?;
+                let codes = import::load_code(&cfg.bootstrap_dir, &hot)?;
+                eprintln!("node: frozen view: run gen {g} at height {rh}: {a} accounts, {s} slots, {codes} codes in {:.1?}", t.elapsed());
+                let (c, _) = Checker::open(&vmstate)?;
+                (c, rh, B256::ZERO)
+            }
             Some(m) => {
                 let (c, _) = Checker::open(&vmstate)?;
                 let (a, s) = import::load_run(&c.run(), &hot)?;
@@ -104,7 +115,9 @@ impl Node {
             }
             hash = sb.block["hash"].as_str().unwrap_or_default().parse()?;
             hot.apply(h, hash, &d);
-            checker.replay(h, &diff_rows, root);
+            if h > checker.height {
+                checker.replay(h, &diff_rows, root);
+            }
             height = h;
         }
         if height > snap_height {

@@ -162,6 +162,10 @@ pub struct Config {
     pub network_id: u32,
     pub blockchain_id: B256,
     pub subnet_id: B256,
+    /// Bytes of header.extra before the predicate results: subnet-evm's fee
+    /// window (customheader.PredicateBytesFromExtra), coreth's 24-byte ACP-176
+    /// state after Fortuna.
+    pub extra_prefix: usize,
 }
 
 /// avalanchego upgrade/upgrade.go: Mainnet and Fuji schedules (Unix seconds).
@@ -317,6 +321,7 @@ impl Config {
         let genesis_timestamp = g.get("timestamp").map(json_u256).transpose()?.map(|t| t.to::<u64>()).unwrap_or(0);
 
         Ok(Config {
+            extra_prefix: crate::warp::EXTRA_WINDOW_SIZE,
             chain_id,
             fee_config,
             allow_fee_recipients,

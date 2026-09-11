@@ -292,10 +292,14 @@ pub fn encode_block_results(r: &BlockResults) -> Vec<u8> {
 pub const EXTRA_WINDOW_SIZE: usize = 80;
 
 pub fn predicate_bytes_from_extra(extra: &[u8]) -> &[u8] {
-    if extra.len() <= EXTRA_WINDOW_SIZE {
+    predicate_bytes_from_extra_at(extra, EXTRA_WINDOW_SIZE)
+}
+
+pub fn predicate_bytes_from_extra_at(extra: &[u8], offset: usize) -> &[u8] {
+    if extra.len() <= offset {
         &[]
     } else {
-        &extra[EXTRA_WINDOW_SIZE..]
+        &extra[offset..]
     }
 }
 

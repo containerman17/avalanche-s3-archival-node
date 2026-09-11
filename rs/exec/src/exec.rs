@@ -1125,7 +1125,7 @@ impl<D: StateDb> Executor<D> {
         // The header's predicate results (customheader.PredicateBytesFromExtra), and
         // the proposervm context height the predicates were verified at
         // (proposervm block.go: parent's height pre-Etna, own from Etna, the epoch's under Granite).
-        let header_results = if durango { warp::parse_block_results_opt(warp::predicate_bytes_from_extra(&h.extra)).map_err(|e| anyhow!("block {}: predicate results: {e}", h.number))? } else { Default::default() };
+        let header_results = if durango { warp::parse_block_results_opt(warp::predicate_bytes_from_extra_at(&h.extra, self.cfg.extra_prefix)).map_err(|e| anyhow!("block {}: predicate results: {e}", h.number))? } else { Default::default() };
         let context_height = if granite {
             epoch_pchain
         } else if self.cfg.is_etna(time) {

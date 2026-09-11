@@ -293,6 +293,7 @@ pub fn coreth_config() -> Config {
         network_id: 1,
         blockchain_id,
         subnet_id: B256::ZERO,
+        extra_prefix: 24,
     }
 }
 
