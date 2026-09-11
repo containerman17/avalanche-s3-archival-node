@@ -84,11 +84,22 @@ pub struct Sae {
     pub settled_gas: AtomicU64,
     pub settled_time: AtomicU64,
     /// Admission-read health: `admit_reads` = per-sender baseline lookups by
-    /// pool.add / the builder; `admit_fallback` = those that missed the
-    /// projection and fell back to a backend read under `inner`. A low
-    /// fallback/reads ratio confirms most admissions now avoid the engine lock.
+    /// pool.add / the builder; `admit_fallback` = those that missed both the
+    /// projection and the settled cache and fell back to a backend read under
+    /// `inner`; `admit_inner_wait_ns` = the time head_accounts spent waiting to
+    /// acquire `inner` on those cold misses. A low fallback/reads ratio and a
+    /// near-zero wait confirm admission no longer blocks on the executor lock.
     pub admit_reads: AtomicU64,
     pub admit_fallback: AtomicU64,
+    pub admit_inner_wait_ns: AtomicU64,
+    /// Each sender's SETTLED (nonce, balance), refreshed by the executor per
+    /// settled block (from the `balances` it already builds). head_accounts
+    /// reads this WITHOUT `inner`; a cold miss does one backend read under
+    /// `inner` and warms it. Same staleness as the projection's settled_balance
+    /// (only sender-settles refresh it), which admission already tolerates.
+    /// ponytail: unbounded (one entry per sender ever settled); an evicted entry
+    /// just costs a cold inner read, so add LRU/clear-on-roll only if it grows.
+    pub settled_cache: Mutex<HashMap<Address, (u64, U256)>>,
 }
 
 impl Sae {
@@ -109,6 +120,8 @@ impl Sae {
             settled_time: AtomicU64::new(0),
             admit_reads: AtomicU64::new(0),
             admit_fallback: AtomicU64::new(0),
+            admit_inner_wait_ns: AtomicU64::new(0),
+            settled_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -222,11 +235,15 @@ pub fn sae_executor(
 ) -> anyhow::Result<()> {
     for b in rx {
         let h = b.header.number;
-        // Under the engine lock: execute on the settled state, apply the backend
-        // + Dirty, gate the root, and retire the projection ALL atomically, so a
-        // reader (Accept's pool refresh, RPC) never sees the backend nonce
-        // advanced while the projection still counts the block as unsettled.
-        let payload = {
+        // Under the engine lock, held ONLY for the cheap serialized work:
+        // execute on the settled state, apply the backend, build the senders'
+        // settled (nonce, balance), retire the projection, and warm the settled
+        // cache. apply_ws and settle_block stay in the SAME critical section so
+        // a reader never sees the backend nonce advanced while the projection
+        // still counts the block unsettled. The expensive MPT root is computed
+        // AFTER releasing `inner` (below), so pool admission stops serializing
+        // behind the executor's per-block hold.
+        let (payload, dirty) = {
             let mut g = inner.lock().unwrap();
             let inner = &mut *g;
             let Ex::Native(ex) = &mut inner.ex else { bail!("SAE mode needs the native state engine") };
@@ -239,6 +256,7 @@ pub fn sae_executor(
                     Ok(())
                 })?;
             }
+            let dirty = roller.dirty.clone();
             ex.db_mut().begin(None);
             let r = ex.execute_block(&b, parent_time).with_context(|| format!("SAE exec block {h}"))?;
             let p = ex.db_mut().finish(h, b.hash, b.header.time, r);
@@ -249,20 +267,9 @@ pub fn sae_executor(
                 be.code.insert(*ch, c.clone());
             }
             be.set_block_hash(h, b.hash);
-            let root = {
-                let mut d = roller.dirty.lock().unwrap();
-                if payload.ws.is_empty() {
-                    d.current_root()
-                } else {
-                    for (k, v) in &payload.ws {
-                        d.apply(k, v).with_context(|| format!("SAE block {h}: apply write set"))?;
-                    }
-                    d.root().with_context(|| format!("SAE block {h}: settled root"))?
-                }
-            };
-            let root = B256::from(root);
             // The senders' settled (nonce, balance) after this block, to refresh
-            // the projection's baseline (the worst-case funds check reads it).
+            // the projection's baseline (the worst-case funds check reads it) and
+            // the admission cache.
             let mut balances: HashMap<Address, (u64, U256)> = HashMap::new();
             for t in &b.txs {
                 if let Some(a) = t.sender {
@@ -271,15 +278,41 @@ pub fn sae_executor(
                     }
                 }
             }
-            roller.maybe_roll(be, inner.roll_budget, h, root);
-            // The block's OWN receipts root / bloom (the header at h+k commits
-            // these with the settled root), the gate, and the projection retire,
-            // still under the engine lock so the settled state is atomic.
-            let receipts_root = exec::exec::receipts_root(&payload.result.txs);
-            sae.on_settle(h, Settled { root, receipts_root, bloom: payload.result.bloom });
             sae.proj.lock().unwrap().settle_block(h, &b.txs, Some(&balances));
-            payload
+            sae.settled_cache.lock().unwrap().extend(balances.iter().map(|(a, v)| (*a, *v)));
+            (payload, dirty)
         };
+        // Off `inner`, under Dirty's own lock (the executor is the only writer to
+        // Dirty in SAE): the MPT root over the write set, the bulk of the
+        // per-block cost. Moving it off `inner` is what unblocks admission.
+        let root = {
+            let mut d = dirty.lock().unwrap();
+            if payload.ws.is_empty() {
+                d.current_root()
+            } else {
+                for (k, v) in &payload.ws {
+                    d.apply(k, v).with_context(|| format!("SAE block {h}: apply write set"))?;
+                }
+                d.root().with_context(|| format!("SAE block {h}: settled root"))?
+            }
+        };
+        let root = B256::from(root);
+        // Start a background roll if the overlay is over budget (short `inner`
+        // hold; needs the root and the backend).
+        {
+            let mut g = inner.lock().unwrap();
+            let inner = &mut *g;
+            let budget = inner.roll_budget;
+            let Ex::Native(ex) = &mut inner.ex else { bail!("SAE mode needs the native state engine") };
+            let roller = inner.roller.as_mut().expect("the native engine rolls");
+            roller.maybe_roll(&mut ex.db_mut().backend, budget, h, root);
+        }
+        // The gate (settled root + the block's OWN receipts root / bloom, which
+        // the header at h+k commits) records off `inner`: it is safe because the
+        // build gate needs settled(h-k), k blocks back, so recording the root
+        // slightly after the projection retire cannot affect a live build.
+        let receipts_root = exec::exec::receipts_root(&payload.result.txs);
+        sae.on_settle(h, Settled { root, receipts_root, bloom: payload.result.bloom });
         // Off the engine lock: render the traces and write the store row.
         let mut result = payload.result;
         exec::exec::render_deferred(&mut result).with_context(|| format!("SAE block {h}: callTracer render"))?;

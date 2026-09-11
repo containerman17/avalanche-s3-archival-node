@@ -310,39 +310,51 @@ pub struct PoolRpc {
 fn head_accounts(inner: &Mutex<Inner>, sae: Option<&Arc<crate::sae_mode::Sae>>, addrs: &[Address]) -> Vec<(u64, U256)> {
     match sae {
         Some(sae) => {
-            // Serve the admission baseline from the projection (its own briefly-
-            // held lock), NOT the engine `inner` the continuous executor holds
-            // for a whole block's execute + apply + settled-root. verify_light
-            // already reads the same settled_balance, so this is the same gate,
-            // not a new relaxation. Only senders the projection cannot answer
-            // (untracked, or no real settled balance yet) fall back to a backend
-            // read under `inner`.
-            let baselines: Vec<Option<(u64, U256)>> = {
-                let proj = sae.proj.lock().unwrap();
-                addrs.iter().map(|a| proj.settled_baseline(a)).collect()
-            };
-            let misses = baselines.iter().filter(|b| b.is_none()).count() as u64;
             sae.admit_reads.fetch_add(addrs.len() as u64, Ordering::Relaxed);
-            sae.admit_fallback.fetch_add(misses, Ordering::Relaxed);
-            if misses == 0 {
-                return baselines.into_iter().map(|b| b.unwrap()).collect();
-            }
-            // Some misses: lock `inner` once and read ONLY those from the
-            // backend, reusing the old logic (projected nonce over the backend
-            // settled nonce, backend balance).
-            let mut g = inner.lock().unwrap();
-            let proj = sae.proj.lock().unwrap();
-            addrs
-                .iter()
-                .zip(baselines)
-                .map(|(a, b)| match b {
-                    Some(v) => v,
-                    None => {
-                        let (n, bal) = g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance));
-                        (proj.projected_nonce(a).unwrap_or(n), bal)
+            // 1) The projection (its own brief lock): a tracked sender with a
+            // real settled balance answers without `inner` or the cache. For the
+            // rest, keep the projected nonce (settled nonce + unsettled count),
+            // which the cache/backend cannot supply.
+            let (base, pnonce): (Vec<Option<(u64, U256)>>, Vec<Option<u64>>) = {
+                let proj = sae.proj.lock().unwrap();
+                addrs.iter().map(|a| (proj.settled_baseline(a), proj.projected_nonce(a))).unzip()
+            };
+            // 2) The settled-account cache (its own brief lock): answers senders
+            // the projection cannot (placeholder balance, or untracked) WITHOUT
+            // the engine `inner` the continuous executor holds per block. Only a
+            // cold sender (never settled, not yet cached) falls through.
+            let mut out = vec![(0u64, U256::ZERO); addrs.len()];
+            let mut cold: Vec<usize> = Vec::new();
+            {
+                let cache = sae.settled_cache.lock().unwrap();
+                for (i, a) in addrs.iter().enumerate() {
+                    if let Some(v) = base[i] {
+                        out[i] = v;
+                    } else if let Some(&(n, bal)) = cache.get(a) {
+                        out[i] = (pnonce[i].unwrap_or(n), bal);
+                    } else {
+                        cold.push(i);
                     }
-                })
-                .collect()
+                }
+            }
+            if cold.is_empty() {
+                return out;
+            }
+            // 3) Cold misses: ONE backend read under `inner`, warming the cache.
+            // Time the wait to acquire `inner` so the fleet can confirm it
+            // dropped to near zero once the cache is warm.
+            sae.admit_fallback.fetch_add(cold.len() as u64, Ordering::Relaxed);
+            let t0 = Instant::now();
+            let mut g = inner.lock().unwrap();
+            sae.admit_inner_wait_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let mut cache = sae.settled_cache.lock().unwrap();
+            for &i in &cold {
+                let a = addrs[i];
+                let (n, bal) = g.head_account(a).map_or((0, U256::ZERO), |acc| (acc.nonce, acc.balance));
+                cache.insert(a, (n, bal));
+                out[i] = (pnonce[i].unwrap_or(n), bal);
+            }
+            out
         }
         None => {
             let mut g = inner.lock().unwrap();
@@ -1058,6 +1070,7 @@ impl Engine for NodeEngine {
                 "settled-txs": sae.settled_tx.load(Ordering::Relaxed), "settled-gas": sae.settled_gas.load(Ordering::Relaxed),
                 "projection-tracked": sae.proj.lock().unwrap().tracked(), "normal-op": self.is_normal(),
                 "admit-reads": sae.admit_reads.load(Ordering::Relaxed), "admit-fallback": sae.admit_fallback.load(Ordering::Relaxed),
+                "admit-inner-wait-ms": sae.admit_inner_wait_ns.load(Ordering::Relaxed) / 1_000_000,
                 "pool-dup": self.txpool.dup.load(Ordering::Relaxed), "pool-recovered": self.txpool.recovered.load(Ordering::Relaxed)}));
         }
         Ok(serde_json::json!({"height": h, "root-checked": self.stats.checked.load(Ordering::Relaxed), "normal-op": self.is_normal(),
