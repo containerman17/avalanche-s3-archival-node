@@ -147,3 +147,138 @@ fn bootstrapping_then_normal_op() {
     let _ = std::fs::remove_dir_all(tmp("switch-src"));
     let _ = Arc::new(0);
 }
+
+fn open_sae(dir: &str, signer: &Signer, k: u64) -> Tree<NodeEngine> {
+    let _g = crate::ENV_LOCK.lock().unwrap();
+    let config = format!(r#"{{"sae":true,"sae-settlement-blocks":{k}}}"#);
+    let init = Init { network_id: 1, subnet_id: [7; 32], chain_id: [9; 32], chain_data_dir: dir.into(), genesis_bytes: genesis_json(signer.address).into_bytes(), upgrade_bytes: Vec::new(), config_bytes: config.into_bytes() };
+    Tree::new(NodeEngine::open(&init).unwrap())
+}
+
+/// Wait until the SAE executor has settled through height `h` (the executor is
+/// asynchronous; k blocks behind the accepted head).
+fn wait_settled(t: &Tree<NodeEngine>, h: u64) {
+    let sae = t.engine.sae.clone().expect("sae mode");
+    for _ in 0..2000 {
+        if sae.settled_head.load(std::sync::atomic::Ordering::Relaxed) >= h {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("SAE settlement did not reach height {h} (settled head {})", sae.settled_head.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+/// The SAE oracle in the plugin engine: a chain built without execution (the
+/// header at h commits the settled root of h-k, gasUsed is worst-case
+/// sum(gasLimit)), accepted on the vote path, settled asynchronously k blocks
+/// behind. Every settled root must equal a full SYNCHRONOUS re-execution of the
+/// same txs, and heights pipeline (verify_light lets a chain of verified-but-
+/// not-accepted blocks stand > 1 deep with no executed state).
+#[test]
+fn sae_settled_roots_match_synchronous_reexecution() {
+    let s = Signer::new([0x51; 32]);
+    let ts = 1_770_000_000_000u64;
+    let cb = Address::from([0xcc; 20]);
+    let p = |ms: u64| Params { timestamp_ms: ms, coinbase: cb, desired_min_delay_excess: None };
+    // Block h (1-indexed) sends one transfer of nonce h-1 to recipient to(h).
+    let set = |h: u64| vec![s.transfer(99999, h - 1, 1_000_000_000, 50_000_000_000, 21_000, to(h), U256::from(1_000_000_000_000u64))];
+    let n: u64 = 8;
+    let k: u64 = 2;
+
+    // The synchronous oracle: build + accept the same txs, record each height's
+    // own post-execution root (the sync header's root).
+    let sdir = tmp("sae-oracle-sync");
+    let sync = open(&sdir, &s);
+    sync.engine.set_state(true);
+    let mut sync_root = vec![sync.engine.last_accepted().header.root]; // index by height, 0 = genesis
+    for h in 1..=n {
+        let parent = sync.engine.last_accepted();
+        let b = sync.engine.build(None, &parent.header, &p(ts + h * 2000), None, Some(set(h)), &[]).unwrap();
+        sync_root.push(b.block.header.root);
+        let id = b.block.hash.0;
+        sync.insert_verified(b.block, b.pending);
+        sync.accept(&id).unwrap();
+    }
+    sync.engine.shutdown();
+
+    // The SAE engine: build without execution, accept, settle behind.
+    let edir = tmp("sae-oracle");
+    let te = open_sae(&edir, &s, k);
+    te.engine.set_state(true);
+    let genesis_root = te.engine.last_accepted().header.root;
+    for h in 1..=n {
+        let parent = te.engine.last_accepted();
+        let b = te.engine.build(None, &parent.header, &p(ts + h * 2000), None, Some(set(h)), &[]).unwrap();
+        // The header commits the settled root of h-k (genesis for h <= k), and
+        // worst-case gasUsed = sum(gasLimit).
+        assert_eq!(b.block.header.gas_used, 21_000, "block {h} worst-case gasUsed");
+        let want_root = if h <= k { genesis_root } else { sync_root[(h - k) as usize] };
+        assert_eq!(b.block.header.root, want_root, "block {h} header commits settled root of h-k");
+        // Verify (verify_light, no execution) then accept.
+        let parsed = te.engine.parse(b.block.container.clone()).unwrap();
+        te.verify(parsed, None).unwrap();
+        te.accept(&b.block.hash.0).unwrap();
+        // Building each block on the accepted head keeps the settlement window
+        // small enough that h-k is settled by the time we build h.
+        if h > k {
+            wait_settled(&te, h - k);
+        }
+    }
+    // Settle the tail and check every settled root against the sync oracle.
+    wait_settled(&te, n);
+    let sae = te.engine.sae.clone().unwrap();
+    for h in 1..=n {
+        assert_eq!(sae.settled_root(h), Some(sync_root[h as usize]), "SAE settled root at height {h} != synchronous re-execution");
+    }
+    assert_eq!(te.engine.last_accepted().height, n, "accepted head");
+    assert_eq!(sae.settled_head.load(std::sync::atomic::Ordering::Relaxed), n, "settled head caught up");
+    te.engine.shutdown();
+
+    let _ = std::fs::remove_dir_all(&sdir);
+    let _ = std::fs::remove_dir_all(&edir);
+}
+
+/// verify_light pipelines: a chain of verified-but-not-accepted SAE blocks
+/// stands several deep with no executed state (heights in flight > 1, the SAE
+/// point), then accepts in order.
+#[test]
+fn sae_pipelines_verified_but_not_accepted_blocks() {
+    let s = Signer::new([0x71; 32]);
+    let ts = 1_770_000_000_000u64;
+    let cb = Address::from([0xcc; 20]);
+    let p = |ms: u64| Params { timestamp_ms: ms, coinbase: cb, desired_min_delay_excess: None };
+    let tx = |nonce: u64, i: u64| s.transfer(99999, nonce, 1_000_000_000, 50_000_000_000, 21_000, to(i), U256::from(1_000_000_000_000u64));
+    let edir = tmp("sae-pipeline");
+    let te = open_sae(&edir, &s, 3);
+    te.engine.set_state(true);
+
+    // Build a 4-deep chain, each on the previous block's pending state, and
+    // verify every block WITHOUT accepting any: the projection overlay carries
+    // the ancestors' nonces so verify_light succeeds with no executed state.
+    let g = te.engine.last_accepted();
+    let b1 = te.engine.build(None, &g.header, &p(ts + 2000), None, Some(vec![tx(0, 1)]), &[]).unwrap();
+    te.insert_verified(b1.block.clone(), b1.pending);
+    let b2 = te.engine.build(te.pending(&b1.block.hash.0).as_ref(), &b1.block.header, &p(ts + 4000), None, Some(vec![tx(1, 2)]), &[&b1.block.txs[0]]).unwrap();
+    te.insert_verified(b2.block.clone(), b2.pending);
+    let b3 = te.engine.build(te.pending(&b2.block.hash.0).as_ref(), &b2.block.header, &p(ts + 6000), None, Some(vec![tx(2, 3)]), &[&b1.block.txs[0], &b2.block.txs[0]]).unwrap();
+    te.insert_verified(b3.block.clone(), b3.pending);
+    assert_eq!(te.verified_len(), 3, "three heights in flight, none accepted, no executed state");
+
+    // A sibling of b2 on b1 (a fork) also verifies against the same overlay.
+    let b2b = te.engine.build(te.pending(&b1.block.hash.0).as_ref(), &b1.block.header, &p(ts + 4000), None, Some(vec![tx(1, 9)]), &[&b1.block.txs[0]]).unwrap();
+    let sib = te.engine.parse(b2b.block.container.clone()).unwrap();
+    drop(b2b);
+    te.verify(sib, None).unwrap();
+    assert_eq!(te.verified_len(), 4);
+
+    // Accept the b1->b2->b3 line in order; the fork is rejected.
+    te.accept(&b1.block.hash.0).unwrap();
+    te.accept(&b2.block.hash.0).unwrap();
+    te.accept(&b3.block.hash.0).unwrap();
+    wait_settled(&te, 3);
+    assert_eq!(te.engine.last_accepted().height, 3);
+    let sae = te.engine.sae.clone().unwrap();
+    assert!(sae.settled_root(3).is_some());
+    te.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&edir);
+}
