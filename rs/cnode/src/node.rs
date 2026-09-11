@@ -6,6 +6,7 @@ use crate::checker::{Checker, Mismatch};
 use crate::exec::{Applier, HotBase};
 use crate::feed::{self, now_ms, RawBlock};
 use crate::history::{History, StoredBlock};
+use crate::mempool::{Mempool, PendingEvent};
 use crate::hot::{addr_hash, rows, slot_hash, Account, HotState};
 use crate::{import, Config, Generation, Mode, Stale, Status};
 use alloy_primitives::{Address, B256, U256};
@@ -35,6 +36,9 @@ struct Shared {
     last_received_ms: AtomicU64,
     frozen: bool,
     subscribers: Mutex<Vec<Sender<BlockEvent>>>,
+    mempool: Arc<Mempool>,
+    /// The last applied block's header: the block context of `simulate`.
+    head: Mutex<Option<block::eth::Header>>,
 }
 
 pub struct Node {
@@ -116,6 +120,11 @@ impl Node {
             last_received_ms: AtomicU64::new(0),
             frozen: matches!(mode, Mode::AtHeight(_)),
             subscribers: Mutex::new(Vec::new()),
+            mempool: Mempool::new(5 * 60 * 1000),
+            head: Mutex::new(match history.block(height)? {
+                Some(b) => Some(crate::exec::block_from_json(&b.block)?.header),
+                None => None,
+            }),
         });
         let node = Node { s: s.clone(), history: history.clone() };
         if let Mode::AtHeight(h) = mode {
@@ -125,7 +134,11 @@ impl Node {
             return Ok(node);
         }
 
-        // 3. Follow: feed -> applier -> checker.
+        // 3. Follow: feed -> applier -> checker; the validators' mempools on the side.
+        for (i, ws) in cfg.validator_ws.iter().enumerate() {
+            let (m, ws) = (s.mempool.clone(), ws.clone());
+            std::thread::Builder::new().name(format!("cnode-mempool-{i}")).spawn(move || m.run(i, ws))?;
+        }
         let (raw_tx, raw_rx) = channel::<RawBlock>();
         let (chk_tx, chk_rx) = channel::<(u64, Vec<(Vec<u8>, Vec<u8>)>, B256)>();
         {
@@ -208,6 +221,49 @@ impl Node {
         &self.s.hot
     }
 
+    /// The last few minutes of pending transactions, oldest first.
+    pub fn pending(&self) -> Vec<PendingEvent> {
+        self.s.mempool.pending()
+    }
+    pub fn subscribe_pending(&self) -> Receiver<PendingEvent> {
+        self.s.mempool.subscribe()
+    }
+
+    /// Runs `txs` (RPC-shaped tx JSON with `from`, as the mempool delivers
+    /// them) as the next block on an overlay over the hot state at `g`,
+    /// in order, each seeing the previous ones. Nothing is written. If the
+    /// generation changes while it runs, `Stale`; a tx that cannot apply
+    /// (nonce, funds, intrinsic gas) fails the batch with its index.
+    // ponytail: whole-batch failure on one bad tx; per-tx skipping when the host needs it.
+    pub fn simulate(&self, g: Generation, txs: &[serde_json::Value]) -> std::result::Result<Result<Vec<exec::TxResult>>, Stale> {
+        self.live()?;
+        let head = self.s.head.lock().unwrap().clone().ok_or(Stale)?;
+        if head.number != g.height {
+            return Err(Stale);
+        }
+        let base = crate::exec::GenBase { hot: self.s.hot.clone(), g, stale: AtomicBool::new(false) };
+        let mut ap = Applier::new(base);
+        let mut b = json!({"transactions": txs});
+        for (k, v) in [("number", format!("0x{:x}", head.number + 1)), ("timestamp", format!("0x{:x}", now_ms() / 1000)), ("gasLimit", format!("0x{:x}", head.gas_limit)), ("baseFeePerGas", format!("0x{:x}", head.base_fee.unwrap_or_default())), ("miner", format!("{}", head.coinbase)), ("difficulty", "0x1".into()), ("extraData", "0x".into()), ("parentHash", format!("{}", g.hash)), ("excessBlobGas", "0x0".into())] {
+            b[k] = serde_json::Value::String(v);
+        }
+        for k in ["sha3Uncles", "stateRoot", "transactionsRoot", "receiptsRoot", "mixHash", "hash"] {
+            b[k] = serde_json::Value::String(format!("{}", B256::ZERO));
+        }
+        b["logsBloom"] = serde_json::Value::String(format!("0x{}", "00".repeat(256)));
+        b["nonce"] = serde_json::Value::String("0x0000000000000000".into());
+        b["gasUsed"] = serde_json::Value::String("0x0".into());
+        let r = (|| {
+            let blk = crate::exec::block_from_json(&b)?;
+            let r = ap.ex.execute_block(&blk, blk.header.time)?;
+            Ok(r.txs)
+        })();
+        if ap.ex.db_mut().base.stale.load(Ordering::Acquire) || self.s.hot.generation() != g {
+            return Err(Stale);
+        }
+        Ok(r)
+    }
+
     pub fn subscribe_blocks(&self) -> Receiver<BlockEvent> {
         let (tx, rx) = channel();
         self.s.subscribers.lock().unwrap().push(tx);
@@ -257,7 +313,18 @@ fn applier_loop(
         }
         let t = std::time::Instant::now();
         let (b, _r) = ap.execute(&raw.block)?;
-        let diff = ap.ex.db_mut().take_diff();
+        let mut diff = ap.ex.db_mut().take_diff();
+        // Acceptance test 3: CNODE_CORRUPT_AT=<height> flips one slot of that
+        // block's diff in the hot state and the rows; the checker must halt there.
+        if std::env::var("CNODE_CORRUPT_AT").ok().and_then(|v| v.parse::<u64>().ok()) == Some(b.height) {
+            match diff.storage.first_mut() {
+                Some((_, _, v)) => {
+                    *v += U256::from(1u8);
+                    eprintln!("CORRUPTION INJECTED at {}: one slot value +1", b.height);
+                }
+                None => eprintln!("CORRUPTION: block {} has no slot writes, try the next height", b.height),
+            }
+        }
         let exec_ms = t.elapsed().as_millis() as u64;
         hot.apply(b.height, b.hash, &diff);
         let applied_ms = now_ms();
@@ -267,7 +334,12 @@ fn applier_loop(
         hash = b.hash;
         s.last_received_ms.store(raw.received_ms, Ordering::Relaxed);
         let rows = rows(&diff);
+        *s.head.lock().unwrap() = Some(b.header.clone());
         history.put(b.height, &StoredBlock { received_ms: raw.received_ms, applied_ms, block: raw.block }, &rows)?;
+        let captured = s.mempool.flush();
+        if !captured.is_empty() {
+            history.put_mempool(b.height, &captured)?;
+        }
         let _ = chk.send((b.height, rows, b.header.root));
         let ev = BlockEvent { height: b.height, hash: b.hash, received_ms: raw.received_ms, applied_ms, exec_ms, txs: b.txs.len() };
         s.subscribers.lock().unwrap().retain(|t| t.send(ev.clone()).is_ok());

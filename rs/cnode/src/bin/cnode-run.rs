@@ -1,4 +1,4 @@
-//! cnode-run --data <dir> --bootstrap <export dir> [--http URL] [--ws URL] [--at HEIGHT] [--roll-every N]
+//! cnode-run --data <dir> --bootstrap <export dir> [--http URL] [--ws URL] [--validators ws1,ws2] [--at HEIGHT] [--roll-every N]
 //! Runs the node as a process (the library's host is normally the bot) and
 //! prints one status line per block and every 10 s.
 use cnode::{Config, Mode, Node, Status};
@@ -13,7 +13,7 @@ fn main() {
     let cfg = Config {
         rpc_ws: arg(&a, "--ws").unwrap_or_else(|| "ws://127.0.0.1:9650/ext/bc/C/ws".into()),
         rpc_http: arg(&a, "--http").unwrap_or_else(|| "http://127.0.0.1:9650/ext/bc/C/rpc".into()),
-        validator_ws: vec![],
+        validator_ws: arg(&a, "--validators").map_or(vec![], |v| v.split(',').map(String::from).collect()),
         data_dir: PathBuf::from(arg(&a, "--data").expect("--data")),
         bootstrap_dir: PathBuf::from(arg(&a, "--bootstrap").expect("--bootstrap")),
         checker_lag_blocks: 60,

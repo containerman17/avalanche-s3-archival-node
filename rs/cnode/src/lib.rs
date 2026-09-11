@@ -8,6 +8,7 @@ pub mod feed;
 pub mod history;
 pub mod hot;
 pub mod import;
+pub mod mempool;
 pub mod node;
 pub use node::{BlockEvent, Node};
 

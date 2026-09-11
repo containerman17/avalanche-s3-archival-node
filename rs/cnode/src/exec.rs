@@ -61,6 +61,40 @@ impl Base for HotBase {
     }
 }
 
+/// The hot state at one generation, for `simulate`: a read that finds the
+/// generation gone marks `stale` and answers a default; the caller drops the
+/// result.
+pub struct GenBase {
+    pub hot: Arc<HotState>,
+    pub g: crate::Generation,
+    pub stale: std::sync::atomic::AtomicBool,
+}
+
+impl Base for GenBase {
+    fn account(&self, a: Address) -> Option<(AccountInfo, bool)> {
+        match self.hot.account(self.g, &addr_hash(&a)) {
+            Ok(v) => v.map(|acc| (AccountInfo { balance: acc.balance, nonce: acc.nonce, code_hash: acc.code_hash, code: None, ..Default::default() }, acc.multicoin)),
+            Err(_) => {
+                self.stale.store(true, std::sync::atomic::Ordering::Release);
+                None
+            }
+        }
+    }
+    fn storage(&self, a: Address, slot: U256) -> U256 {
+        self.hot.storage(self.g, &addr_hash(&a), &slot_hash(&slot)).unwrap_or_else(|_| {
+            self.stale.store(true, std::sync::atomic::Ordering::Release);
+            U256::ZERO
+        })
+    }
+    fn code(&self, h: B256) -> Option<Bytecode> {
+        self.hot.code(&h).map(|c| Bytecode::new_raw(Bytes::copy_from_slice(&c)))
+    }
+    fn block_hash(&self, _n: u64) -> B256 {
+        // ponytail: BLOCKHASH in a simulation answers zero; wire the ring through when a strategy needs it.
+        B256::ZERO
+    }
+}
+
 pub struct Db<B> {
     pub base: B,
     /// Post-values this block; None = deleted.
