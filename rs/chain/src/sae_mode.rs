@@ -175,16 +175,22 @@ fn prune(g: &mut Gate, settled_head: u64, k: u64) {
     g.expected.retain(|h, _| *h >= keep);
 }
 
-/// nonce, balance of `addrs` at the SETTLED state, with the projected nonce
-/// (settled nonce + the sender's accepted-but-unsettled txs) so the pool admits
-/// against the projection: the same worst-case funds and projected-nonce rule
-/// verify_light enforces. `be` is the executor's committed backend.
+/// projected nonce, settled balance of `addrs` for pool admission: the same
+/// projected-nonce and worst-case-funds rule verify_light enforces. The nonce
+/// comes from the projection's `projected_nonce` (settled nonce + unsettled
+/// count, kept invariant under ONE lock by settle_block) rather than the
+/// backend nonce plus the unsettled count: the executor advances the backend
+/// settled nonce (under the engine lock) and retires the projection (under the
+/// projection lock) at different instants, so backend-nonce + unsettled-count
+/// transiently double-counts a half-settled block and reads as "nonce too low".
+/// A sender the projection no longer tracks (fully settled) falls back to the
+/// backend settled nonce. `be` is the executor's committed backend.
 pub fn sae_accounts(proj: &Projection, be: &mut Backend, addrs: &[Address]) -> Vec<(u64, U256)> {
     addrs
         .iter()
         .map(|a| {
-            let (nonce, balance) = be.basic(*a).unwrap().map_or((0, U256::ZERO), |i| (i.nonce, i.balance));
-            (nonce + proj.unsettled_count(a), balance)
+            let (bnonce, balance) = be.basic(*a).unwrap().map_or((0, U256::ZERO), |i| (i.nonce, i.balance));
+            (proj.projected_nonce(a).unwrap_or(bnonce), balance)
         })
         .collect()
 }

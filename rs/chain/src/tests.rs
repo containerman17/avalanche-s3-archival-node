@@ -282,3 +282,47 @@ fn sae_pipelines_verified_but_not_accepted_blocks() {
     te.engine.shutdown();
     let _ = std::fs::remove_dir_all(&edir);
 }
+
+/// Reproduces the fleet load-phase funder: one sender bursts consecutive nonces
+/// through the pool, blocks are built from the pool and accepted, they settle k
+/// behind, and then a fresh tx at the next nonce must be admitted (not "nonce
+/// too low"). Pins the SAE pool admission against the projected nonce.
+#[test]
+fn sae_pool_admits_a_funder_burst_across_settlement() {
+    use crate::pool::Code;
+    let s = Signer::new([0x99; 32]);
+    let ts = 1_770_000_000_000u64;
+    let cb = Address::from([0xcc; 20]);
+    let p = |ms: u64| Params { timestamp_ms: ms, coinbase: cb, desired_min_delay_excess: None };
+    let raw = |nonce: u64| s.transfer(99999, nonce, 1_000_000_000, 50_000_000_000, 21_000, to(nonce + 1), U256::from(1_000_000u64)).raw;
+    let edir = tmp("sae-pool-burst");
+    let te = open_sae(&edir, &s, 4);
+    te.engine.set_state(true);
+
+    // Burst 6 consecutive nonces into the pool (as the funder does).
+    let added = te.engine.pool_add((0..6).map(raw).collect(), true);
+    for (i, a) in added.iter().enumerate() {
+        assert_eq!(a.code, Code::Ok, "burst tx {i}: {}", a.message);
+    }
+    // Build from the pool and accept until the burst is mined.
+    let mut h = 0u64;
+    loop {
+        let parent = te.engine.last_accepted();
+        let b = te.engine.build(None, &parent.header, &p(ts + (h + 1) * 2000), None, None, &[]).unwrap();
+        if b.included.is_empty() {
+            break;
+        }
+        te.insert_verified(b.block.clone(), b.pending);
+        te.accept(&b.block.hash.0).unwrap();
+        h = b.block.height;
+        if h >= 20 {
+            break;
+        }
+    }
+    wait_settled(&te, h);
+    // The next nonce (6) must be admitted, not "nonce too low".
+    let a = te.engine.pool_add(vec![raw(6)], true);
+    assert_eq!(a[0].code, Code::Ok, "post-settlement tx nonce 6: {}", a[0].message);
+    te.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&edir);
+}

@@ -312,7 +312,7 @@ fn head_accounts(inner: &Mutex<Inner>, sae: Option<&Arc<crate::sae_mode::Sae>>, 
     match sae {
         Some(sae) => {
             let proj = sae.proj.lock().unwrap();
-            addrs.iter().map(|a| { let (n, b) = g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance)); (n + proj.unsettled_count(a), b) }).collect()
+            addrs.iter().map(|a| { let (n, b) = g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance)); (proj.projected_nonce(a).unwrap_or(n), b) }).collect()
         }
         None => addrs.iter().map(|a| g.head_account(*a).map_or((0, U256::ZERO), |i| (i.nonce, i.balance))).collect(),
     }
